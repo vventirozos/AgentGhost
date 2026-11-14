@@ -16,7 +16,8 @@ import pytest
 
 from ghost_agent.tools import health_internals as H
 
-LABELS = ["Models", "Memory stores", "Rules", "Projects and schedule", "Labs and sandbox", "Storage and safety"]
+LABELS = ["Models", "Memory stores", "Rules", "Projects and schedule", "Labs and sandbox", "Storage and safety",
+          "Internet tools"]   # §4UN-health: + the engines line
 
 
 # ── stand-ins with the real readers' names (a MagicMock answers everything; these answer what they hold) ──
@@ -340,7 +341,8 @@ def test_the_models_line_is_read_on_the_event_loop_and_the_stores_in_threads(tmp
     monkeypatch.setattr(H, "SECTIONS", tuple((lab, spy(lab), th) for lab, _fn, th in H.SECTIONS))
     _report(_ctx(tmp_path))
     assert seen == {"Models": True, "Memory stores": False, "Rules": False, "Projects and schedule": False,
-                    "Labs and sandbox": False, "Storage and safety": False}
+                    "Labs and sandbox": False, "Storage and safety": False,
+                    "Internet tools": True}           # §4UN-health: in-memory counters, read on the loop
 
 
 def test_models_line_without_trouble_has_no_problem(tmp_path):
@@ -1029,7 +1031,7 @@ def test_the_tool_prints_problems_third_then_the_machine_then_the_six_lines(tmp_
     assert out[0] == HEALTH_CHECK_HEAD and out[1] == "System Status: Online"
     assert third == "Problems found (1): graph is not loaded (it failed at boot)"
     labels = [ln.split(":", 1)[0] for ln in out]
-    assert labels[-7:] == ["Agent Internals"] + LABELS
+    assert labels[-8:] == ["Agent Internals"] + LABELS
     assert labels.index("Docker") < labels.index("Agent Internals")
     assert out[labels.index("Memory stores")].startswith("Memory stores: vector 120 rows")
 

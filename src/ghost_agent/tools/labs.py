@@ -103,7 +103,7 @@ def _secret_path(rel: str, name: str) -> bool:
 #: §4UL: what a DEPLOY leaves out on top of DEPLOY_EXCLUDE (a folder `put` ships them): dotfiles and dot-folders
 #: (unless params.dotfiles or a `!` line in .deployignore), the agent's own working files at the folder's top, and
 #: OS litter anywhere. `.well-known` is the one dot-folder a site serves on purpose.
-DEPLOY_ARTEFACTS_TOP = ("PROJECT_MAP.md", "WORK_LOG.md", "work_log.md", "browser_runner.py", "verify*.png",
+DEPLOY_ARTEFACTS_TOP = ("PROJECT_MAP.md", "PROJECT_CHANGES.md", "WORK_LOG.md", "work_log.md", "browser_runner.py", "verify*.png",
                         "verify*.jpg", "final-check*.png", "final_check*.png", "final-check*.jpg", "screenshot*.png",
                         "*.work_log", "deploy-check*.png")
 DEPLOY_LITTER = (".DS_Store", "Thumbs.db", "desktop.ini")
@@ -713,16 +713,20 @@ def write_refusal(context, p: Path, shown: Optional[str] = None) -> str:
     return str(rb) if rb else ""
 
 
-async def _ws_write(context, p: Path, data: bytes) -> None:
+async def _ws_write(context, p: Path, data: bytes, note: bool = True) -> None:
     """THE write of a lab action into the workspace: `write_refusal`, then every component opened O_NOFOLLOW from
     the workspace root (a link planted meanwhile is replaced, never followed). Raises WriteRefused / OSError /
     ValueError. No other code in this module writes a workspace file (pinned by an AST walk)."""
     why = write_refusal(context, p)
     if why:
         raise WriteRefused(why)
-    from .file_system import write_bytes_nofollow_rel
+    from .file_system import note_project_write_hook, prepare_project_write_hook, write_bytes_nofollow_rel
     root = Path(context.sandbox_dir).resolve()
+    if note:                                    # (a folder `get` prepares and notes its batch once)
+        prepare_project_write_hook(root, p)     # §4UM round 3: a lab get / screenshot into a project is a change
     await asyncio.to_thread(write_bytes_nofollow_rel, root, str(Path(p).relative_to(root)), data)
+    if note:
+        note_project_write_hook(root, p)
 
 
 def _ws_mkdir(context, p: Path) -> None:
@@ -732,6 +736,8 @@ def _ws_mkdir(context, p: Path) -> None:
     if why:
         raise WriteRefused(why)
     root = Path(context.sandbox_dir).resolve()
+    from .file_system import prepare_project_write_hook
+    prepare_project_write_hook(root, p)         # §4UM round 3: the folder a `get` fills is diffed at the end
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(root), flags)
     try:
@@ -1732,6 +1738,12 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
             return ToolOutcome(f"{lab_id}: deployed {shipped} ({len(data)} bytes) — {str(out['held'])[:400]}"
                                + (f". Held because: {str(out['hold_reason'])[:300]}" if out.get("hold_reason") else "")
                                + tail, status=OutcomeStatus.PARTIAL, reason_code="lab_app_held", world_changed=True)
+        _a2 = out.get("app") if isinstance(out.get("app"), dict) else {}
+        _staged = _a2.get("state") == "staged" or _a2.get("mounted") is False
+        if out.get("still_starting") or not isinstance(probe, dict) or probe.get("ok") is not False:
+            # §4UM: the version that serves now is this folder; a STAGED version goes live at `lab switch` (its
+            # deploy time is kept for it)
+            await _note_project_push(context, origin, lab_id, _root0, how="deploy", whole=True, staged=_staged)
         if out.get("still_starting"):
             return ToolOutcome(f"{lab_id}: deployed {shipped} ({len(data)} bytes) — still starting (the host keeps "
                                f"checking): {_probe_view(probe)}. `lab status lab_id={lab_id}` shows when it is up"
@@ -1778,6 +1790,7 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
                                            f"lab_id={frm}` now (each shows whether that version serves)")
                                    + f": {str(out.get('error') or _probe_view(out.get('probe')))[:300]}",
                                    status=OutcomeStatus.FAILED, reason_code="lab_switch_failed", world_changed=True)
+            await _note_project_push(context, origin, lab_id, None, how="switch", whole=True)   # §4UM
             return ToolOutcome(f"{lab_id} serves now (from {out.get('from_lab')}): {_app_view(out.get('app'))}; "
                                f"{_probe_view(out.get('probe'))}. `lab rollback lab_id={lab_id}` returns to the old "
                                f"version until {_when(out.get('rollback_until'))}."
@@ -1844,6 +1857,89 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
                        + f"{lab_id}: app {op} — {_app_view(out.get('app'))}; {_probe_view(out.get('probe'))}",
                        status=OutcomeStatus.OK if ok else OutcomeStatus.FAILED,
                        reason_code=None if ok else "lab_app_not_up", world_changed=True)
+
+
+#: §4UM: kept labs seen by `_note_project_push` — {lab_id: (owner, app url, app member, app workdir)}; a kept lab
+#: stays kept and its owner never changes, so one look per lab per process
+_KEPT_LAB_SEEN: Dict[str, Tuple[str, str, str, str]] = {}
+
+
+def _in_app_workdir(path: str, workdir: str) -> bool:
+    p = os.path.normpath("/" + str(path or "").lstrip("/"))
+    w = os.path.normpath("/" + str(workdir or "/app").lstrip("/"))
+    return p == w or p.startswith(w.rstrip("/") + "/")
+
+
+async def _note_project_push(context, origin: str, lab_id: str, src: Optional[Path], *, how: str,
+                             whole: bool = False, det: Optional[Dict[str, Any]] = None,
+                             member: str = "", path: str = "", staged: bool = False) -> None:
+    """§4UM: files pushed into a KEPT lab owned by ``project:<id>`` are the project going live — the project's
+    change log records it (``note_change_push``): which changes are live now, and where.
+
+        push                                   | what it marks
+        deploy of a folder inside the project  | every change made before it (the version is built from the
+          (``whole``; the project or a subfolder)|   project, whatever folder or build output it ships)
+        deploy into a STAGED version (``staged``)| nothing yet: the time is kept for its `lab switch`
+        switch (``src`` None, ``whole``)       | the changes made up to the staged version's deploy (unknown:
+                                               |   none), and where it is live
+        put of a file / folder                 | only into the app member's workdir (else not live, nothing);
+                                               |   the changes whose files it carried (a folder as "dir/")
+        anything sent from outside the project | no change; the deploy entry and the URL only
+
+    Probes and simulated turns record nothing. Never raises — the push itself already succeeded."""
+    try:
+        if origin not in ("owner", "autopilot") or getattr(context, "simulated", False):
+            return
+        store = getattr(context, "project_store", None)
+        if store is None:
+            return
+        seen = _KEPT_LAB_SEEN.get(lab_id)
+        if seen is None:
+            if det is None:
+                st, det = await _call(context, "GET", f"/v1/labs/{lab_id}", origin=origin, timeout=15)
+                if st != 200 or not isinstance(det, dict):
+                    return
+            if str(det.get("lifetime") or "") != "kept":
+                return
+            app = det.get("app") if isinstance(det.get("app"), dict) else {}
+            seen = (str(det.get("owner") or ""), str(app.get("url") or ""), str(app.get("member") or ""),
+                    str(app.get("workdir") or "/app"))
+            if seen[0].startswith("project:"):
+                _KEPT_LAB_SEEN[lab_id] = seen
+        owner, url, app_member, app_workdir = seen
+        if not owner.startswith("project:"):
+            return
+        pid = owner.split(":", 1)[1]
+        from ..memory.projects import note_change_push, note_change_stage, staged_at
+        if staged:
+            note_change_stage(store, pid, lab_id)
+            return
+        if how == "put" and ((app_member and member and member != app_member)
+                             or not _in_app_workdir(path, app_workdir)):
+            return                              # not into what the app serves: not live
+        before_t = None
+        files: Optional[List[str]] = []
+        ws = store._default_workspace(pid) if hasattr(store, "_default_workspace") else ""
+        if whole and src is None:               # a switch: the version staged earlier
+            before_t = staged_at(store, pid, lab_id)
+            files = None if before_t is not None else []
+        elif ws and src is not None:
+            try:
+                rel = Path(src).resolve().relative_to(Path(ws).resolve()).as_posix()
+            except (ValueError, OSError):
+                rel = None
+            if rel is not None:
+                if whole:
+                    files = None
+                elif rel in ("", "."):
+                    files = [""]
+                else:
+                    files = [rel + "/"] if Path(src).is_dir() else [rel]
+        note_change_push(store, pid, files, url=url, lab_id=lab_id, app="", how=how, before_t=before_t)
+        pretty_log("Project Live", f"{pid} {how} → {lab_id} ({'whole version' if files is None else files[:3]})",
+                   icon=Icons.LAB_CREATE)
+    except Exception:  # noqa: BLE001
+        logger.debug("project push not noted for %s", lab_id, exc_info=True)
 
 
 def _no_expiry(context, lab_id: str) -> None:
@@ -2015,6 +2111,8 @@ async def _dispatch(context, action: str, origin: str, owner: str, **a) -> str:
                                           "content_b64": base64.b64encode(data).decode()})
         if st != 200:
             return _service_reply(st, body, context, lab_id)
+        await _note_project_push(context, origin, lab_id, src, how="put", member=a["member"],
+                                 path=a["path"])                              # §4UM: a kept lab = live
         return ToolOutcome(f"[{lab_id}/{a['member']}] put {shown_path(context, src)} → {a['path']} "
                            f"({body.get('bytes')} bytes)", status=OutcomeStatus.OK, world_changed=True)
 
@@ -2639,6 +2737,8 @@ async def _put_tree(context, origin: str, lab_id: str, a: Dict[str, Any], src: P
                            reason_code="lab_not_supported", world_changed=False)
     if st != 200:
         return _service_reply(st, body, context, lab_id)
+    await _note_project_push(context, origin, lab_id, src, how="put", member=a["member"],
+                             path=a["path"])                                  # §4UM: a kept lab = live
     return ToolOutcome(f"[{lab_id}/{a['member']}] put folder {shown_path(context, src)}/ → {a['path']}/ "
                        f"({body.get('entries')} entries, {body.get('bytes')} bytes)"
                        + (f". Skipped (links/devices): {', '.join(_q(x) for x in skipped[:10])}" if skipped else "")
@@ -2825,14 +2925,26 @@ async def _get_tree(context, origin: str, lab_id: str, a: Dict[str, Any], dst: P
         return ToolOutcome(f"LAB ERROR (write_failed): could not make a folder under {shown_path(context, dst)} "
                            f"({type(e).__name__}: {e}) — no file was written.", status=OutcomeStatus.FAILED,
                            reason_code="lab_write_failed", world_changed=None)
-    for rel, blob in files:
-        try:
-            await _ws_write(context, dst.joinpath(*rel.split("/")), blob)
-            done += 1
-        except (WriteRefused, OSError, ValueError) as e:
-            return ToolOutcome(f"LAB ERROR (write_failed): wrote {done} of {len(files)} file(s) under "
-                               f"{shown_path(context, dst)}, then could not write {_q(rel)} ({type(e).__name__}: {e}).",
-                               status=OutcomeStatus.FAILED, reason_code="lab_write_failed", world_changed=True)
+    from .file_system import note_project_writes_hook, prepare_project_write_hook
+    _paths = [dst.joinpath(*rel.split("/")) for rel, _ in files]
+    _root = Path(context.sandbox_dir).resolve()
+    if _paths:
+        prepare_project_write_hook(_root, _paths[0])    # §4UM round 4: the batch — snapshot once, note once
+    _written: list = []
+    try:
+        for (rel, blob), _p in zip(files, _paths):
+            try:
+                await _ws_write(context, _p, blob, note=False)
+                _written.append(_p)
+                done += 1
+            except (WriteRefused, OSError, ValueError) as e:
+                if _p.exists():                 # round 5: a file cut off mid-write changed the folder too
+                    _written.append(_p)
+                return ToolOutcome(f"LAB ERROR (write_failed): wrote {done} of {len(files)} file(s) under "
+                                   f"{shown_path(context, dst)}, then could not write {_q(rel)} ({type(e).__name__}: {e}).",
+                                   status=OutcomeStatus.FAILED, reason_code="lab_write_failed", world_changed=True)
+    finally:
+        note_project_writes_hook(_root, _written)
     skipped = [str(x) for x in (body.get("skipped") or [])]
     more = body.get("skipped_total")
     return ToolOutcome(f"[{lab_id}/{a['member']}] got folder {a['path']}/ → {shown_path(context, dst)}/ "

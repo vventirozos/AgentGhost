@@ -66,7 +66,7 @@ async def test_deep_research_records_artifacts_into_workspace(tmp_path: Path):
         with patch.dict("sys.modules", {"ddgs": MagicMock(DDGS=_FakeDDGS)}):
             with patch.object(
                 search_mod, "helper_fetch_url_content",
-                new=AsyncMock(return_value="dummy page text"),
+                new=AsyncMock(return_value="dummy page text " * 20),
             ):
                 out = await search_mod.tool_deep_research(
                     query="test paper", workspace_model=wm,
@@ -102,7 +102,7 @@ async def test_deep_research_dedups_on_repeat(tmp_path: Path):
         with patch.dict("sys.modules", {"ddgs": MagicMock(DDGS=_FakeDDGS)}):
             with patch.object(
                 search_mod, "helper_fetch_url_content",
-                new=AsyncMock(return_value="dummy"),
+                new=AsyncMock(return_value="dummy page text " * 20),
             ):
                 await search_mod.tool_deep_research(query="x", workspace_model=wm)
                 await search_mod.tool_deep_research(query="x again", workspace_model=wm)

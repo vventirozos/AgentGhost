@@ -1346,6 +1346,12 @@ async def lifespan(app):
         context.project_store = ProjectStore(
             context.memory_dir, sandbox_root=context.sandbox_dir,
         )
+        try:
+            # §4UM: change-log entries a killed request left behind are written now (marked recovered)
+            from .memory.projects import recover_pending_changes
+            recover_pending_changes(context.project_store)
+        except Exception:  # noqa: BLE001
+            logger.debug("pending change log recovery skipped", exc_info=True)
         # Auto-clean a project's scratch space the moment it completes:
         # keep registered deliverables, delete the rest. Fires only on the
         # transition to DONE (see ProjectStore._fire_project_done).

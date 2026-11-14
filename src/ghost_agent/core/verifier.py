@@ -3443,8 +3443,12 @@ class Verifier:
                                  trace: Optional[Dict[str, Any]] = None,
                                  prior_evidence: str = "",
                                  raw_sources: str = "",
+                                 user_text: str = "",
                                  ) -> Optional[VerifyResult]:
         """Check whether *claim* is supported by *evidence*.
+
+        ``user_text`` (§4UN-dark r3): the user's whole message (``context`` is the judge's cut of the request) —
+        the onion guard's "the user typed this address" exemption reads it; empty → ``context``.
 
         ``prior_evidence`` (§4HZ): the session's earlier tool outputs and
         replies. Never shown to the judge — it only stops the mechanical
@@ -3508,7 +3512,8 @@ class Verifier:
             # §4IM bench arm: the claim-binding verdict alone, no escalation.
             return self._guard_onion_claims(
                 await self._verify_claim_binding(claim_t, evidence_t, context_t, trace=trace, raw_sources=raw_sources),
-                claim, "\n".join(str(x or "") for x in (evidence, raw_sources, prior_evidence, context)))
+                claim, "\n".join(str(x or "") for x in (evidence, raw_sources, prior_evidence, context)),
+                user_text=user_text or context)
         cb_task = (self._start_claim_binding(claim_t, evidence_t, context_t, trace=trace, raw_sources=raw_sources)
                    if _claim_binding_refute_first_enabled() else None)
         try:
@@ -3516,7 +3521,8 @@ class Verifier:
                 claim_t, evidence_t, context_t, cb_task, high_stakes=high_stakes, deep=deep, trace=trace,
                 prior_evidence=prior_evidence, raw_sources=raw_sources)
             _hay = "\n".join(str(x or "") for x in (evidence, raw_sources, prior_evidence, context))
-            return self._guard_onion_claims(self._guard_memory_refute(res, claim_t, _hay), claim, _hay)
+            return self._guard_onion_claims(self._guard_memory_refute(res, claim_t, _hay), claim, _hay,
+                                            user_text=user_text or context)
         except BaseException:
             # a caller cancellation or an incumbent exception must not leak
             # the binder task (a critic slot, an unwritten row — review §4IN M6)
@@ -3975,7 +3981,7 @@ class Verifier:
         )
 
     def _guard_onion_claims(self, result: Optional[VerifyResult], claim: str,
-                            haystack: str) -> Optional[VerifyResult]:
+                            haystack: str, user_text: str = "") -> Optional[VerifyResult]:
         """§4LH: the judge cannot check an onion address from memory — it
         CONFIRMED a retired v2 address as DuckDuckGo's "official v3" (live
         probe D2). A v2 address presented as current, or an onion address
@@ -3984,11 +3990,18 @@ class Verifier:
         if result is None or os.getenv("GHOST_VERIFY_ONION_GUARD", "1") == "0":
             return result
         from .link_grounding import onion_claim_issues
-        new = [i for i in onion_claim_issues(claim, haystack) if i not in (result.issues or [])]
+        # §4UN-dark r2: a bad-checksum address in the user's own words is quoted, not invented; one only a
+        # tool output held is a non-blocking note (logged by onion_claim_issues)
+        _notes: list = []
+        new = [i for i in onion_claim_issues(claim, haystack, user_text=user_text, notes=_notes)
+               if i not in (result.issues or [])]
+        import dataclasses
         if not new:
+            if _notes:                          # r3: a tool-seen bad-checksum address — said, never a demotion
+                return dataclasses.replace(
+                    result, reasoning=("onion note: " + " ".join(_notes) + " " + (result.reasoning or ""))[:1000])
             return result
         logger.warning("verifier: onion guard — %s", "; ".join(new)[:200])
-        import dataclasses
         demote = result.verdict == VerifyVerdict.CONFIRMED
         return dataclasses.replace(
             result,

@@ -17,6 +17,7 @@ import pytest
 from unittest.mock import patch
 
 from ghost_agent.tools import darkweb_search as dw
+from tests.onion_v3 import v3_label  # §4UN-dark: checksum-valid test addresses
 from ghost_agent.tools.darkweb_search import (
     _apply_form_token,
     _diagnose_empty_body,
@@ -26,7 +27,7 @@ from ghost_agent.tools.darkweb_search import (
     _redirected_away,
 )
 
-V3_A = "a" * 56
+V3_A = v3_label("a")
 
 # Trimmed from the REAL ahmia.fi homepage (fetched over Tor, 2026-07-28):
 # the search form with its hidden token, plus the display:none warning whose

@@ -2,7 +2,7 @@
 couplings, each bounded.
 
 (1) one ranking in the character section; (2) a reply written under a mood at 2+ or a manner never
-feeds the daily look; (3) the character sets the mood's resting point, |rest| ≤ 0.12,
+fed the daily look (removed with the look, §4UH-noself; the tone record still carries the values); (3) the character sets the mood's resting point, |rest| ≤ 0.12,
 ``GHOST_MIRROR_REST=0`` switches it off; (4) the face shows the rest faintly while the mood is neutral.
 (§4UH-loop: written for the Mirror's sentence, whose look also asked for the rest and got a "lasting mood"
 note; the Mirror is removed — the character's dials set the rest, ``character.rest_pair``.)"""
@@ -240,68 +240,15 @@ def test_a_rest_that_cannot_be_read_is_no_rest(tmp_path):
     assert st.rest() == (M.REST_MAX, -M.REST_MAX)
 
 
-# ── (2) the daily look: what it is shown ─────────────────────────────────────
+# ── (2) the tone record's values (§4UH-noself: their first reader, the daily look's strong-mood filter,
+# is removed with the look; the record still carries them) ──────────────────────────────────────────
 
-NOW = datetime.datetime(2026, 11, 10, 3, 0, 0)
-
-
-def _turn(h, tone=None, text=None):
-    now_utc = NOW.astimezone(UTC)
-    t = {"final_response": text or f"Reply {h}h: " + "a real answer, long enough to be picked. " * 3,
-         "timestamp": (now_utc - datetime.timedelta(hours=h)).isoformat()}
-    if tone is not None:
-        t["extra"] = {"mood_tone": tone}
-    return t
-
-
-def _tone(label, n, manner="", mn=0):
-    """A turn record's ``extra.mood_tone`` as the agent writes it (§4UD W2: the values beside the sentences)."""
-    return {"mood": (f"{label}, {n} of 3" if n else "neutral"), "manner": (f"{manner}, {mn} of 3" if manner else ""),
-            "label": label, "intensity": n, "manner_name": manner, "manner_intensity": mn}
-
-
-@pytest.mark.parametrize("tone,kept", [
-    (None, True),
-    (_tone("content", 1), True),
-    (_tone("neutral", 0), True),
-    (_tone("irritable", 2), False),
-    (_tone("cheerful", 3), False),
-    (_tone("neutral", 0, "sarcastic", 1), False),
-    (_tone("content", 1, "terse", 2), False),
-    ("garbage", True),
-    # the VALUES decide, never the sentence (it was parsed back with a regex): a record whose sentence
-    # says 3 and whose value says 1 was written under a faint mood
-    ({"mood": "cheerful, 3 of 3", "manner": "", "label": "cheerful", "intensity": 1, "manner_name": ""}, True),
-    ({"mood": "neutral", "manner": "", "label": "down", "intensity": 2, "manner_name": ""}, False),
-    ({"mood": "neutral", "manner": "", "label": "neutral", "intensity": True, "manner_name": ""}, True),
-    # a record from before §4UD has only the sentences: they are not read at all (review r2: counting any
-    # mood in them as strong could skip the look for two days after a deploy)
-    ({"mood": "content, 1 of 3", "manner": ""}, True),
-    ({"mood": "irritable, 3 of 3", "manner": ""}, True),
-    ({"mood": "neutral", "manner": "sarcastic, 1 of 3"}, True),
-    ({"mood": 7}, True),
-    ({"mood": "neutral", "manner": "", "manner_name": 7, "intensity": "3"}, True),
-])
-def test_a_reply_written_under_a_strong_mood_or_a_manner_is_never_shown(tmp_path, monkeypatch, tone, kept):
-    import ghost_agent.core.failure_census as FC
-    turns = [_turn(1, tone), _turn(2)]
-    monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: (turns, []))
-    got = MI.pick_replies(tmp_path, now=NOW)
-    assert any(g["text"].startswith("Reply 1h") for g in got) is kept
-    assert any(g["text"].startswith("Reply 2h") for g in got)
-
-
-def test_a_turn_record_with_a_non_dict_extra_is_no_mood():
-    assert MI.written_under_strong_mood({"extra": "x"}) is False
-    assert MI.written_under_strong_mood({"extra": None}) is False
-    assert MI.written_under_strong_mood({}) is False
-
-
-def test_the_real_tone_record_is_what_the_filter_reads(tmp_path):
-    """Review r1 n5: the record built by core/agent.py's own tone block, not a hand-written dict."""
+def test_the_real_tone_record_carries_the_values(tmp_path):
+    """Review r1 n5: the record built by core/agent.py's own tone block holds the mood's VALUES (intensity,
+    manner name) beside its sentences."""
     from ghost_agent.core import agent as A
     from ghost_agent.utils.logging import request_id_context
-    for level, manner, strong in ((1, "", False), (2, "", True), (3, "", True), (1, "terse", True)):
+    for level, manner in ((1, ""), (2, ""), (3, ""), (1, "terse")):
         sm = SelfModel(root=tmp_path / f"s{level}{manner}")
         sm.state.set_owner_mood("irritable", M.ANCHOR_DIRECTION["irritable"], level)
         if manner:
@@ -315,7 +262,7 @@ def test_the_real_tone_record_is_what_the_filter_reads(tmp_path):
         finally:
             request_id_context.reset(tok)
         rec = A.mood_tone_heard(rid)
-        assert MI.written_under_strong_mood({"extra": {"mood_tone": rec}}) is strong, rec
+        assert rec["intensity"] == level and rec["manner_name"] == manner, rec
 
 
 # ── (3) the resting point the character sets (§4UH-e2e; the Mirror's look no longer asks) ─────────

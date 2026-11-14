@@ -212,7 +212,7 @@ _PAGE_OUTCOMES = (
     (r"ERR_NAME_NOT_RESOLVED", "the host name does not resolve"),
     (r"ERR_CONNECTION_(?:REFUSED|CLOSED|RESET)|ERR_EMPTY_RESPONSE", "the site dropped the connection"),
     (r"ERR_HTTP2|ERR_SSL_PROTOCOL_ERROR|ERR_CERT", "the site's HTTPS failed"),
-    (r"ERR_ABORTED", "the address is a download, not a page"),
+    (r"ERR_ABORTED|Download is starting", "the address is a download, not a page"),   # §4UN-fetch: newer Playwright
     (r"ERR_BLOCKED_BY_CLIENT|redirected to a non-public address", "policy refused the address"),
     (r"ERR_FILE_NOT_FOUND", "no such file"),
     (r"Execution context was destroyed", "the page navigated away mid-read"),
@@ -320,7 +320,7 @@ def _runner_failure_hint(err: str) -> str:
     if "needs a URL" in e:
         parts.append("Call operation=\"navigate\" once first, or pass url=... on this call.")
     # §4PC: the common net:: errors had no route and got the generic line
-    if "net::ERR_ABORTED" in e:
+    if "net::ERR_ABORTED" in e or "Download is starting" in e:      # §4UN-fetch: Playwright ≥1.4x says the latter
         parts.append("The address is a download (a PDF or other file), not a page — fetch it with "
                      "file_system(operation='download') and read it with knowledge_base, instead of the browser.")
     if "net::ERR_FILE_NOT_FOUND" in e:

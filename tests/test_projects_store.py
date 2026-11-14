@@ -540,7 +540,7 @@ def test_delete_task_of_last_open_triggers_rollup(store):
     store.update_task(t1, status="DONE")
     assert store.get_project(pid)["status"] == ProjectStatus.ACTIVE.value
     store.delete_task(t2)
-    assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
+    assert store.project_state(pid) == "ready"            # §4UM: the roll-up ran; the project stays open
 
 
 def test_delete_task_leaving_no_tasks_does_not_complete_project(store):

@@ -516,6 +516,7 @@ class TestProjectReopenAndEvents:
         pid = project_store.create_project("Demo Site")
         tid = project_store.add_task(pid, "build the demo page")
         project_store.update_task(tid, status="DONE")
+        project_store.update_project(pid, status="DONE")       # §4UM: only the owner closes a project
         assert (project_store.get_project(pid)["status"] or "").upper() == "DONE"
         # Reviving the EXISTING task must reopen the project (add_task
         # already did; this tuple was missing DONE).

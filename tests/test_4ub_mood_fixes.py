@@ -30,7 +30,6 @@ from ghost_agent.core import agent as A
 from ghost_agent.core import feedback as F
 from ghost_agent.distill.user_correction import has_correction_phrase, is_correction_candidate
 from ghost_agent.selfhood import SelfModel
-from ghost_agent.selfhood import loop as MI
 from ghost_agent.selfhood import mood as M
 from ghost_agent.selfhood import sentiment as C
 from ghost_agent.selfhood.state import MOOD_HISTORY_FILENAME
@@ -758,21 +757,6 @@ async def test_sarcasm_is_read_off_the_owners_own_words(client, tmp_path):
     assert await C.score_message("great, it's still broken", sm.root, self_model=sm) is True
     row = C.journal_rows(sm.root)[-1]
     assert row["label"] == "positive" and row["nudge"] == 0.0 and row["held"] == C.HELD_SARCASM
-
-
-def test_only_strong_mood_replies_are_left_out_of_a_look(tmp_path, monkeypatch):
-    import ghost_agent.core.failure_census as FC
-    from tests.test_4ua_character_mood_tone import NOW as N2, _turn
-    # §4UD: the record's VALUES are read (a record with the sentences only is not read at all)
-    turns = [_turn(1, {"mood": "irritable, 2 of 3", "manner": "", "label": "irritable", "intensity": 2,
-                       "manner_name": ""}),
-             _turn(2), _turn(3, {"mood": "neutral", "manner": "", "label": "neutral", "intensity": 0,
-                                 "manner_name": ""}),
-             _turn(4, {"mood": "irritable, 3 of 3", "manner": "evil, 3 of 3"})]
-    monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: (turns, []))
-    # §4UH-loop: the daily look's reader (``loop.pick_replies``) leaves out exactly the one strong record
-    assert sorted(p["at"] for p in MI.pick_replies(tmp_path, now=N2)) == sorted(
-        t["timestamp"] for t in turns[1:])
 
 
 def test_a_labelled_row_is_never_sent_for_scoring(tmp_path, monkeypatch):

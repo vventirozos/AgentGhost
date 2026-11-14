@@ -2,11 +2,13 @@ import logging
 import datetime
 import os
 import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 import subprocess
 import platform
 import ipaddress
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import socket
 import re
@@ -222,6 +224,27 @@ def socks_url_with_identity(tor_proxy: Optional[str], identity: str) -> Optional
     except Exception:
         return tor_proxy
 
+def circuit_for_attempt(proxy: Optional[str], attempt: int) -> Optional[str]:
+    """The SOCKS proxy for retry ``attempt`` of one fetch, on a FRESH circuit. §4UN-read r2: a proxy that
+    already carries an identity (web_search's page reads pass one) came back unchanged from
+    `socks_url_with_identity`, so its "retrying on a fresh circuit" rode the same exit; here the attempt
+    is folded into that identity instead. Attempt 0 is the proxy as given."""
+    if not proxy or attempt <= 0:
+        return proxy
+    try:
+        from urllib.parse import urlparse, urlunparse
+        p = urlparse(proxy)
+        if not p.hostname:
+            return proxy
+        if not p.username:
+            return socks_url_with_identity(proxy, f"fetch{attempt}")
+        _host = f"[{p.hostname}]" if ":" in p.hostname else p.hostname
+        netloc = f"{p.username}r{attempt}:{p.password or 'isolate'}@{_host}:{p.port or 9050}"
+        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+    except Exception:  # noqa: BLE001
+        return proxy
+
+
 async def aclose_curl_response(resp) -> None:
     """Abort + reap a curl_cffi ASYNC streaming response.
 
@@ -247,10 +270,106 @@ class FetchError(str):
     is never booked as a failed fetch."""
 
 
+class PageText(str):
+    """§4UN-deep: the text of a fetched page, with what the page says about itself in ``meta``
+    ({"title", "published", "modified", "date"}, ISO dates, "" when not stated; a PDF has ``"pdf": "1"``).
+    Returned only to a caller that asks (``with_meta=True``); it is still the plain page text to every reader."""
+    meta: dict = {}
+
+
+#: §4UN-deep r2: PDFs parse one at a time on their OWN thread — never in the default executor, which every
+#: `asyncio.to_thread` in the agent shares: a hung MuPDF parse, with reads queued behind a lock there, held
+#: those shared workers. Queued here, a read that is cancelled before it starts is dropped.
+#: r3: the running parse's start time is kept with its executor. A parse busy longer than PDF_HUNG_AFTER_S
+#: when the next PDF arrives has hung (MuPDF cannot be interrupted): that executor is abandoned without
+#: waiting — its thread is leaked — and a fresh one takes the read. After PDF_MAX_REPLACEMENTS such
+#: replacements in the process, a hung reader fails the read at once instead (threads are not free).
+_PDF_STATE: Dict[str, Any] = {"cur": {"ex": ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf"),
+                                      "since": None},
+                              "replaced": 0}
+PDF_HUNG_AFTER_S = 60.0
+PDF_MAX_REPLACEMENTS = 3
+#: the longest a fetch waits for its PDF to be parsed (queue + parse) — inside deep_research's 22 s fetch
+#: attempt, so the error names the parse and does not read as a network timeout
+PDF_PARSE_TIMEOUT_S = 15.0
+_pdf_clock = time.monotonic
+
+
+#: the parser the reader calls — None is `content_check.pdf_text` (injectable: one name to replace, not a
+#: module attribute looked up through an import that may resolve to another module object)
+_PDF_PARSER = None
+
+
+def _pdf_job(cur: Dict[str, Any], data: bytes) -> str:
+    from . import content_check as _cc
+    parse = _PDF_PARSER or _cc.pdf_text
+    cur["since"] = _pdf_clock()
+    try:
+        return parse(data)
+    finally:
+        cur["since"] = None
+
+
+async def _read_pdf(data: bytes, url: str):
+    """The PDF's text (``content_check.pdf_text``: its first pages, capped in chars), or a FetchError when
+    the parse does not finish within PDF_PARSE_TIMEOUT_S or the reader is unavailable."""
+    from .aio import wait_for as _wait_for
+    cur = _PDF_STATE["cur"]
+    since = cur.get("since")
+    if since is not None and _pdf_clock() - since > PDF_HUNG_AFTER_S:
+        if _PDF_STATE["replaced"] >= PDF_MAX_REPLACEMENTS:
+            return FetchError(f"Error: PDF reader unavailable (a previous parse hung) — {url} was not read.")
+        cur["ex"].shutdown(wait=False, cancel_futures=True)
+        cur = {"ex": ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf"), "since": None}
+        _PDF_STATE["cur"] = cur
+        _PDF_STATE["replaced"] += 1
+        logger.warning("PDF parse hung for over %.0fs — reader replaced (%d of %d)",
+                       PDF_HUNG_AFTER_S, _PDF_STATE["replaced"], PDF_MAX_REPLACEMENTS)
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    job = cur["ex"].submit(_pdf_job, cur, bytes(data))
+
+    def _settle(f) -> None:
+        if fut.done():
+            return
+        if f.cancelled():          # dropped by a replaced reader: a failed read, never the caller's cancel
+            fut.set_result(FetchError(f"Error: PDF reader was replaced while {url} waited; not read."))
+        elif f.exception() is not None:
+            fut.set_exception(f.exception())
+        else:
+            fut.set_result(f.result())
+    def _back(f) -> None:
+        try:
+            loop.call_soon_threadsafe(_settle, f)
+        except RuntimeError:       # the loop is gone (a hung parse finished after its caller's loop closed)
+            pass
+    job.add_done_callback(_back)
+    try:
+        return await _wait_for(fut, PDF_PARSE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return FetchError(f"Error: PDF parse timed out after {PDF_PARSE_TIMEOUT_S:.0f}s for {url}.")
+    finally:
+        job.cancel()               # a read that never started is dropped (a running parse cannot be stopped)
+
+
+def _page_text(text: str, meta: Optional[dict]) -> "PageText":
+    out = PageText(text)
+    out.meta = dict(meta or {})
+    return out
+
+
 async def helper_fetch_url_content(
     url: str, *, proxy_override: Optional[str] = None, renew_identity: bool = True,
+    with_meta: bool = False, read_pdf: bool = False,
 ) -> str:
     """Fetch and text-extract a URL over Tor.
+
+    ``with_meta=True`` (§4UN-deep) — return a `PageText` carrying the page's title and dates (its meta
+    tags, JSON-LD, <time>, else the Last-Modified header). Nothing is fetched twice for it.
+
+    ``read_pdf=True`` (§4UN-deep) — a PDF (by content type, or a ``.pdf`` path served as one) of at most
+    5 MB is read over the same connection and its text returned; other binary files are still refused.
+    Without it a PDF is refused as before (the default contract is unchanged).
 
     ``proxy_override`` — use this SOCKS proxy instead of the env default. The
     deep-research fetch passes its per-query identity-tagged proxy so the
@@ -298,18 +417,20 @@ async def helper_fetch_url_content(
     _STREAM_LIMIT = MAX_BODY_BYTES + 4096
     _base_proxy = proxy_url
 
+    # §4UN-fetch: a 403/429 gets ONE retry with a plain curl identity on a fresh circuit (Cloudflare and
+    # Wikipedia refused the browser fingerprint from Tor exits and served a plain curl — §4FR, §4QF); a 429
+    # or 503 rotates the circuit. The browser profile is curl_cffi's current Chrome target with ITS OWN
+    # headers (a Chrome/120 UA on a chrome110 TLS fingerprint disagreed with itself).
+    _plain = False
+    _refused = 0
     for attempt in range(3):
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+            headers = {"User-Agent": _PLAIN_FETCH_UA} if _plain else None
 
             # Rotate the CIRCUIT per attempt via SOCKS-auth isolation (no
             # control port, no daemon restart) so a 503-blocked exit is
             # swapped on retry — see the 503 branch below.
-            _attempt_proxy = _base_proxy
-            if _base_proxy and attempt > 0:
-                _rot = socks_url_with_identity(_base_proxy, f"fetch{attempt}")
-                if _rot:
-                    _attempt_proxy = _rot
+            _attempt_proxy = circuit_for_attempt(_base_proxy, attempt) or _base_proxy
 
             # Read the response HEADERS first (available on a streaming
             # response before the body), decide whether we even want the
@@ -344,6 +465,11 @@ async def helper_fetch_url_content(
                 return bytes(buf)
 
             def _classify(status_code, content_type, _cl):
+                # §4UN-deep: a reader that asked for PDFs drains a PDF-looking body and decides by its bytes
+                _pdf_ok = bool(read_pdf) and status_code == 200 and (
+                    "application/pdf" in content_type
+                    or (url_path.endswith(".pdf") and ("octet-stream" in content_type
+                                                       or "html" in content_type or not content_type)))
                 is_binary = ("application/pdf" in content_type
                              or "application/octet-stream" in content_type
                              or (isinstance(content_type, str)
@@ -355,18 +481,26 @@ async def helper_fetch_url_content(
                     clen = 0
                 oversize = clen and clen > MAX_BODY_BYTES
                 # Only drain the body for a 200 we intend to parse.
-                want = (status_code == 200 and not is_binary and not oversize)
+                want = (status_code == 200 and (not is_binary or _pdf_ok) and not oversize)
+                if _pdf_ok and not oversize:
+                    is_binary = False            # decided by the bytes after the drain
                 return is_binary, oversize, want
 
             _raw = b""
+            _final_url = url
+            _last_mod = None
             if curl_cffi:
                 proxies = {"http": _attempt_proxy, "https": _attempt_proxy} if _attempt_proxy else None
-                async with curl_cffi.requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0) as client:
-                    resp = await client.get(url, headers=headers, stream=True)
+                async with curl_cffi.requests.AsyncSession(impersonate=(None if _plain else _FETCH_IMPERSONATE),
+                                                           proxies=proxies, timeout=20.0) as client:
+                    resp = await (client.get(url, headers=headers, stream=True) if headers
+                                  else client.get(url, stream=True))
                     content_type = resp.headers.get("content-type", "").lower()
                     status_code = resp.status_code
                     _cl = resp.headers.get("content-length")
-                    _encoding = getattr(resp, "encoding", None) or "utf-8"
+                    _last_mod = resp.headers.get("last-modified")
+                    _fu = getattr(resp, "url", None)
+                    _final_url = _fu if isinstance(_fu, str) and _fu else url
                     _is_binary, _oversize, _want = _classify(status_code, content_type, _cl)
                     if _want:
                         _raw = await _drain_curl(resp)
@@ -375,11 +509,11 @@ async def helper_fetch_url_content(
             else:
                 # Fallback to httpx if curl_cffi is missing for some reason
                 async with httpx.AsyncClient(proxy=_attempt_proxy, timeout=20.0, follow_redirects=True) as client:
-                    async with client.stream("GET", url, headers=headers) as resp:
+                    async with client.stream("GET", url, headers=headers or {"User-Agent": "Mozilla/5.0"}) as resp:
                         content_type = resp.headers.get("content-type", "").lower()
                         status_code = resp.status_code
                         _cl = resp.headers.get("content-length")
-                        _encoding = resp.encoding or "utf-8"
+                        _last_mod = resp.headers.get("last-modified")
                         _is_binary, _oversize, _want = _classify(status_code, content_type, _cl)
                         if _want:
                             _raw = await _drain_async(resp)
@@ -391,57 +525,166 @@ async def helper_fetch_url_content(
                 _clen = int(_cl or "0")
                 return FetchError(f"Error: response from {url} is {_clen // (1024*1024)} MB; refusing to read more than {MAX_BODY_BYTES // (1024*1024)} MB.")
             if status_code != 200:
-                # Only rotate the exit on 503. 401/403 are APPLICATION-level
-                # "you are forbidden" responses (auth token, geo block,
-                # account state) — rotating the exit node won't change them.
-                # Reserve rotation for 503, which often signals the exit node
-                # itself is being rate-limited or filtered.
+                # §4UN-fetch: 429 (rate limit per exit) and 503 (exit filtered) rotate the circuit; a 403
+                # or 429 also gets the plain-curl identity once (the site refused the FINGERPRINT). 401
+                # is the application's own answer — no retry.
+                if status_code in (403, 429) and not _plain and attempt < 2 and proxy_url and renew_identity:
+                    _plain, _refused = True, status_code
+                    _log_fetch_kind(url, f"HTTP {status_code}", "retrying once with a plain curl identity "
+                                    "on a fresh circuit")
+                    await asyncio.sleep(0.5)
+                    continue
+                if status_code in (429, 503) and proxy_url and attempt < 2 and renew_identity:
+                    # Rotate via a fresh SOCKS-isolated CIRCUIT on the next
+                    # attempt (handled at the top of the loop), NOT via
+                    # request_new_tor_identity: on this box the control
+                    # port (9051) is closed, so that path falls back to
+                    # bouncing the WHOLE Tor daemon, which an unprivileged
+                    # agent cannot do. Per-circuit isolation gets a fresh exit.
+                    _log_fetch_kind(url, f"HTTP {status_code}", "retrying on a fresh circuit")
+                    await asyncio.sleep(2)
+                    continue
+                _log_fetch_kind(url, f"HTTP {status_code}", "gave up")
                 if status_code == 503 and proxy_url:
-                    if attempt < 2 and renew_identity:
-                        # Rotate via a fresh SOCKS-isolated CIRCUIT on the next
-                        # attempt (handled at the top of the loop), NOT via
-                        # request_new_tor_identity: on this box the control
-                        # port (9051) is closed, so that path falls back to
-                        # bouncing the WHOLE Tor daemon (up to 2x per fetch),
-                        # re-circuiting every concurrent sibling fetch — and
-                        # since 2026-08-21 it cannot even do that unprivileged
-                        # (restarting the com.local.tor system daemon needs
-                        # root) and correctly returns False. Per-circuit
-                        # isolation gets a fresh exit with none of that.
-                        await asyncio.sleep(2)
-                        continue
                     return FetchError(f"Error: Access Denied (503) via Tor. The site {url} likely blocks Tor exit nodes. Try a different source.")
+                if status_code == 429:
+                    return FetchError(f"Error: Rate limited (429) by {url} on every Tor circuit tried"
+                                      f"{' and with a plain curl identity' if _plain else ''}. Try a different source.")
                 if status_code in (401, 403):
-                    return FetchError(f"Error: Access Denied ({status_code}) from {url}. Application-level forbidden — Tor rotation will not help.")
+                    _how = (" (a browser and a plain curl identity, on two circuits)" if _plain else "")
+                    return FetchError(f"Error: Access Denied ({status_code}) from {url}{_how}. Application-level forbidden — Tor rotation will not help.")
                 return FetchError(f"Error: Received status {status_code} from {url}")
-            # 200 — decode the drained body (charset-aware) and cap.
+            _hdrs = {"last-modified": _last_mod} if isinstance(_last_mod, str) and _last_mod else None
+            if read_pdf and bytes(_raw[:5]).startswith(b"%PDF-"):
+                # §4UN-deep: a PDF is read whole or not at all (a cut PDF does not parse)
+                if len(_raw) > MAX_BODY_BYTES:
+                    return FetchError(f"Error: the PDF at {url} is larger than "
+                                      f"{MAX_BODY_BYTES // (1024*1024)} MB; refusing to read it.")
+                from .content_check import page_meta
+                _pdf = await _read_pdf(_raw, url)
+                if isinstance(_pdf, FetchError):
+                    return _pdf
+                if not _pdf.strip():
+                    return FetchError(f"Error: the PDF at {url} has no extractable text "
+                                      f"(a scanned or password-protected PDF).")
+                if not with_meta:
+                    return _pdf
+                _m = page_meta("", _hdrs)
+                _m["pdf"] = "1"
+                return _page_text(_pdf, _m)
+            if read_pdf and ("application/pdf" in content_type or "octet-stream" in content_type):
+                # asked for as a PDF and it is not one: some other binary file
+                return FetchError("Error: URL points to a binary file. To read PDFs, download them using "
+                                  "file_system and ingest them using knowledge_base.")
+            # 200 — decode the drained body and cap. §4UN-fetch: with no charset in the header the BYTES go to
+            # the parser, which honours the page's own <meta charset> (windows-1253 / iso-8859-7 Greek pages
+            # came out as mojibake when decoded as utf-8).
+            _charset = page_charset(content_type, _raw)
             try:
-                text = _raw.decode(_encoding, errors="replace")
+                _parse_input = _raw.decode(_charset, errors="replace")
             except (LookupError, TypeError):
-                text = _raw.decode("utf-8", errors="replace")
-            if len(text) > MAX_BODY_BYTES:
-                text = text[:MAX_BODY_BYTES] + "\n[... TRUNCATED at 5 MB ceiling ...]"
+                _parse_input = _raw.decode("utf-8", errors="replace")
+            if len(_parse_input) > MAX_BODY_BYTES:
+                _parse_input = _parse_input[:MAX_BODY_BYTES] + "\n[... TRUNCATED at 5 MB ceiling ...]"
 
             def _parse_html(html_content):
                 from bs4 import BeautifulSoup
-                soup = BeautifulSoup(html_content, 'html.parser')
-                for script in soup(["script", "style", "nav", "footer", "iframe", "svg"]):
-                    script.decompose()
-                text_content = soup.get_text(separator=' ', strip=True)
-                return (" ".join(text_content.split()) if text_content
-                        else FetchError("Error: No text content extracted from page."))   # §4PE r3: a failure is a TYPE
-            
-            return await asyncio.to_thread(_parse_html, text)
-            
+                from .content_check import challenge_reason, extract_main_text
+                text_content = extract_main_text(html_content)           # §4UN-fetch: menus/banners/forms out
+                try:
+                    _t = BeautifulSoup(html_content, "html.parser").title
+                    _title = _t.get_text(" ", strip=True) if _t is not None else ""
+                except Exception:  # noqa: BLE001
+                    _title = ""
+                _wall = challenge_reason(200, _title, text_content or "", _final_url)
+                if _wall:
+                    return FetchError(f"Error: BLOCKED — {url} answered with {_wall}, not the page's content. "
+                                      f"Nothing was read; do not cite it. Use a different source.")
+                if not text_content:
+                    return FetchError("Error: No text content extracted from page.")   # §4PE r3: a failure is a TYPE
+                if with_meta:
+                    from .content_check import page_meta
+                    try:
+                        _m = page_meta(html_content, _hdrs)
+                    except Exception:  # noqa: BLE001 — the meta never costs the page
+                        _m = {}
+                    if _title and not (_m or {}).get("title"):
+                        _m["title"] = " ".join(_title.split())[:200]
+                    return _page_text(text_content, _m)
+                return text_content
+
+            _parsed = await asyncio.to_thread(_parse_html, _parse_input)
+            if isinstance(_parsed, FetchError) and _parsed.startswith("Error: BLOCKED"):
+                _log_fetch_kind(url, "challenge page", "not read")
+            return _parsed
+
         except Exception as e:
             if attempt < 2 and proxy_url and renew_identity:
                 # Retry on a fresh circuit (rotated at the top of the loop
                 # via socks_url_with_identity), NOT a global NEWNYM/daemon
                 # restart — see the 503 branch above.
+                _log_fetch_kind(url, type(e).__name__, "retrying on a fresh circuit")
                 await asyncio.sleep(2)
                 continue
+            _log_fetch_kind(url, type(e).__name__, "gave up")
             return FetchError(f"Error reading {url}: {str(e)}")
     return FetchError(f"Error fetching {url} after 3 retries.")
+
+
+_META_CHARSET_RE = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]+)""", re.I)
+
+
+def page_charset(content_type: Optional[str], raw: bytes) -> str:
+    """§4UN-fetch: the charset to decode a page with — a byte-order mark first, then the header's charset, then
+    the page's own <meta charset> in its first 4 KB, else utf-8 (never a statistical guess: a guessed charset
+    mangles a utf-8 page). r1: a quoted header charset is unquoted, and a page whose bytes decode cleanly as
+    UTF-8 is UTF-8 whatever its meta tag claims (CMS templates keep a stale `iso-8859-1` meta)."""
+    import codecs
+    b = bytes(raw or b"")
+    if b.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if b.startswith(b"\xff\xfe") or b.startswith(b"\xfe\xff"):
+        return "utf-16"
+
+    def _valid(cs: str) -> str:
+        try:
+            codecs.lookup(cs)
+            return cs
+        except LookupError:
+            return ""
+    m = re.search(r"""charset\s*=\s*["']?\s*([\w.:-]+)""", str(content_type or ""), re.I)
+    if m and _valid(m.group(1)):
+        return m.group(1)
+    mm = _META_CHARSET_RE.search(b[:4096])
+    if mm:
+        cs = _valid(mm.group(1).decode("ascii", "ignore"))
+        if cs and codecs.lookup(cs).name != "utf-8":
+            try:
+                if not b.isascii():
+                    codecs.getincrementaldecoder("utf-8")().decode(b, final=False)
+                    return "utf-8"              # the bytes ARE utf-8 (a cut final character is allowed)
+            except UnicodeDecodeError:
+                pass
+        if cs:
+            return cs
+    return "utf-8"
+
+
+#: §4UN-fetch: the browser-profile target — curl_cffi's current Chrome (its own UA and client hints)
+_FETCH_IMPERSONATE = "chrome"
+#: the plain identity a refused fetch retries with (§4FR / §4QF: served where the browser profile was refused)
+_PLAIN_FETCH_UA = "curl/8.7.1"
+
+
+def _log_fetch_kind(url: str, kind: str, what: str) -> None:
+    """§4UN-fetch: one INFO line per fetch failure, by kind — the logs could not say which sites refuse."""
+    try:
+        from urllib.parse import urlparse
+        from .logging import Icons, pretty_log
+        host = (urlparse(str(url)).hostname or "?")[:60]
+        pretty_log("Fetch Failure", f"{host}: {kind} — {what}", level="INFO", icon=Icons.WARN)
+    except Exception:  # noqa: BLE001
+        pass
 # --------------------------------------------------------------------------
 # Removal / negation detection
 # --------------------------------------------------------------------------

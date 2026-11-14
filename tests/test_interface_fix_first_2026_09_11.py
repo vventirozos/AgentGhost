@@ -742,8 +742,8 @@ class TestStopIsOneCall:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_touched_modules_bumped(index_html, app_js):
-    assert "app.js?v=19.28" in index_html and "style.css?v=9.0" in index_html   # 9.0: §4UJ composer toolbar
-    assert "workspace.js?v=9.14" in app_js and "matrix_graph.js?v=19.28" in app_js
+    assert "app.js?v=19.29" in index_html and "style.css?v=9.0" in index_html   # 9.0: §4UJ composer toolbar
+    assert "workspace.js?v=9.14" in app_js and "matrix_graph.js?v=19.29" in app_js
     ws = (_STATIC / "workspace.js").read_text(encoding="utf-8")
     assert "notifications.js?v=7.2" in ws
 

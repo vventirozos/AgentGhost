@@ -461,6 +461,8 @@ def test_a_clearnet_redirect_onto_the_dark_web_is_refused():
 async def test_a_trickling_stream_is_cut_by_the_wall_clock(home, fake_curl, tmp_path, monkeypatch):
     """r1 MAJOR: curl's stream timeout is a low-speed limit, not a clock."""
     monkeypatch.setattr(Q, "FETCH_TIMEOUT_S", 0.2)
+    # §4UN-fetch: the clock now scales with the size; an unknown size gets FETCH_UNKNOWN_SIZE_S
+    monkeypatch.setattr(Q, "FETCH_UNKNOWN_SIZE_S", 0.2)
 
     class _Slow(_Resp):
         async def aiter_content(self):

@@ -105,20 +105,24 @@ async def test_download_auto_heals_filename(sandbox, monkeypatch):
     # 1. No filename, URL with no path -> should auto-heal to download.bin
     url1 = "https://example.com/"
     await tool_file_system("download", sandbox, tor_proxy=proxy, url=url1, path=None)
-    mock_download.assert_called_with(url=url1, sandbox_dir=sandbox, tor_proxy=proxy, filename="download.bin")
+    mock_download.assert_called_with(url=url1, sandbox_dir=sandbox, tor_proxy=proxy, filename="download.bin",
+                                     name_from_url=True)   # §4UN-fetch: the name came from the URL
     
     # 2. Empty string filename, URL with path -> should auto-heal to file.zip
     url2 = "https://example.com/file.zip"
     await tool_file_system("download", sandbox, url=url2, path="   ")
-    mock_download.assert_called_with(url=url2, sandbox_dir=sandbox, tor_proxy=None, filename="file.zip")
+    mock_download.assert_called_with(url=url2, sandbox_dir=sandbox, tor_proxy=None, filename="file.zip",
+                                     name_from_url=True)
     
     # 3. Same as URL
     await tool_file_system("download", sandbox, url=url2, path=url2)
-    mock_download.assert_called_with(url=url2, sandbox_dir=sandbox, tor_proxy=None, filename="file.zip")
+    mock_download.assert_called_with(url=url2, sandbox_dir=sandbox, tor_proxy=None, filename="file.zip",
+                                     name_from_url=True)
     
     # 4. Valid works (does not overwrite)
     await tool_file_system("download", sandbox, url=url2, path="custom.txt")
-    mock_download.assert_called_with(url=url2, sandbox_dir=sandbox, tor_proxy=None, filename="custom.txt")
+    mock_download.assert_called_with(url=url2, sandbox_dir=sandbox, tor_proxy=None, filename="custom.txt",
+                                     name_from_url=False)   # §4UN-fetch: a name the caller chose is kept
 
 @pytest.mark.asyncio
 async def test_tool_file_search_ripgrep(sandbox):

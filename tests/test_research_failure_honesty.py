@@ -18,6 +18,7 @@ printed the error verbatim), and registry.py always wires a client — so
 the failure only existed in the configuration that actually runs.
 """
 
+from tests.onion_v3 import v3_label  # §4UN-dark: checksum-valid test addresses
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__),
@@ -90,7 +91,7 @@ class TestClearnetDeepResearch:
         """7-of-8-failed, 8-of-8-failed and "the topic has nothing" all
         rendered identically before."""
         async def _half(url, *a, **k):
-            return ("real page content about the topic"
+            return ("real page content about the topic " * 8
                     if url.endswith("0") else
                     FetchError(f"Error: Fetch of {url} timed out after 22s"))
         monkeypatch.setattr(S, "helper_fetch_url_content", _half,
@@ -118,7 +119,7 @@ class TestOnionDeepResearch:
         monkeypatch.setattr(D, "_fetch_onion_text", _fail, raising=False)
         worker = _worker_that_says_nothing_found()
         monkeypatch.setattr(D, "_darkweb_search_raw", AsyncMock(
-            return_value=([{"url": "http://" + "a" * 56 + ".onion/",
+            return_value=([{"url": "http://" + v3_label("a") + ".onion/",
                             "title": "t", "engines": {"torch"},
                             "indexes": {"torch"}}], [], False, 4)))
         out = await D.tool_darkweb_research(

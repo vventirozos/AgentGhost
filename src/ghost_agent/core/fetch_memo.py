@@ -33,6 +33,13 @@ MEMO_HEAD_CHARS = 2000
 MEMO_MAX = 200
 _TRUNCATED_RE = re.compile(r"LENGTH:\s*\d+\s*\(truncated\)|\[\.\.\. (?:range |output )?capped|\(truncated\)", re.I)
 _FAILED = "FAILED"
+_RETRY_ONCE = "RETRY_ONCE"
+#: §4UN-web: a SEARCH that failed because the engines refused or could not be
+#: reached says nothing about the query — and its own message tells the model
+#: "Retry the SAME query once". The memo refused exactly that retry ("ALREADY
+#: FAILED … do not fetch it again"). Such a failure is filed under a soft key
+#: first; only a SECOND one is the declared failure the memo refuses.
+_TRANSIENT_SEARCH_MARKERS = ("failed on TRANSPORT", "Tor proxy is not reachable")
 
 Key = Tuple[str, str, str, str]
 
@@ -78,6 +85,22 @@ def is_truncated_result(text: Any) -> bool:
     return bool(_TRUNCATED_RE.search(head))
 
 
+def retry_key(key: Optional[Key]) -> Optional[Key]:
+    """§4UN-web: the key a first transient search failure is filed under."""
+    if not key:
+        return None
+    return (key[0], key[1], _RETRY_ONCE, "")
+
+
+def transient_search_failure(key: Optional[Key], text: Any) -> bool:
+    """A search (not a page) that failed on transport or a refusal — the same
+    query on fresh circuits can succeed."""
+    if not key or key[0] == "browser":
+        return False
+    t = str(text or "")
+    return any(m in t for m in _TRANSIENT_SEARCH_MARKERS)
+
+
 def remember(memo: Dict[Key, str], key: Optional[Key], text: Any) -> bool:
     """Memoise a SUCCESSFUL, UNTRUNCATED result. Returns True when stored."""
     if not key or memo is None:
@@ -89,6 +112,7 @@ def remember(memo: Dict[Key, str], key: Optional[Key], text: Any) -> bool:
         return False
     _put(memo, key, body[:MEMO_HEAD_CHARS])
     memo.pop(failed_key(key), None)             # a later success clears an earlier failure
+    memo.pop(retry_key(key), None)
     return True
 
 
@@ -115,6 +139,9 @@ def remember_failure(memo: Dict[Key, str], key: Optional[Key], text: Any) -> boo
     if not fk or memo is None or not page_level_failure(text):
         return False
     flat = " ".join(str(text or "").split())
+    if transient_search_failure(key, text) and retry_key(key) not in memo:
+        _put(memo, retry_key(key), flat[:200])  # §4UN-web: the one retry the result asks for runs
+        return True
     m = re.search(r"STATUS:\s*([A-Z]+[^-]{0,120})", flat)
     status = (m.group(1).strip() if m else flat[:160]) or "failed"
     _put(memo, fk, status[:200])

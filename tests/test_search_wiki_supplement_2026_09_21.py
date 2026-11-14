@@ -66,18 +66,18 @@ def test_the_article_must_carry_the_subject_not_any_word():
 # ── the lookup, with the HTTP client stubbed ─────────────────────────
 
 class _Resp:
-    def __init__(self, payload): self._p = payload
+    def __init__(self, payload, status_code=200): self._p = payload; self.status_code = status_code
     def json(self): return self._p
 
 
 def _fake_get(calls):
+    # §4UN-web: ONE call — generator=search with the hits' intro extracts
     def get(url, params=None, **kw):
-        calls.append((params.get("list") or params.get("prop"), params.get("srsearch") or params.get("titles"), kw.get("proxies")))
-        if params.get("list") == "search":
-            return _Resp({"query": {"search": [{"title": "Δημήτρης Κουφοντίνας"}, {"title": "Κατάλογος της δράσης της 17Ν"}]}})
-        title = params["titles"]
-        body = ("Ο Δημήτρης Κουφοντίνας είναι Έλληνας… " * 40) if "Κουφοντίνας" in title else "Κατάλογος επιθέσεων της οργάνωσης…"
-        return _Resp({"query": {"pages": {"1": {"extract": body}}}})
+        calls.append((params.get("generator"), params.get("gsrsearch"), kw.get("proxies"), kw.get("headers")))
+        body = "Ο Δημήτρης Κουφοντίνας είναι Έλληνας… " * 40
+        return _Resp({"query": {"pages": {
+            "7": {"index": 2, "title": "Κατάλογος της δράσης της 17Ν", "extract": "Κατάλογος επιθέσεων της οργάνωσης…"},
+            "3": {"index": 1, "title": "Δημήτρης Κουφοντίνας", "extract": body}}}})
     return get
 
 
@@ -90,7 +90,8 @@ def test_lookup_returns_on_topic_articles_with_capped_intro_and_url(monkeypatch)
     assert [a["title"] for a in out] == ["Δημήτρης Κουφοντίνας — Βικιπαίδεια"]     # the list article lacks the subject
     assert len(out[0]["body"]) == S.WIKI_EXTRACT_CHARS
     assert out[0]["href"] == "https://el.wikipedia.org/wiki/%CE%94%CE%B7%CE%BC%CE%AE%CF%84%CF%81%CE%B7%CF%82_%CE%9A%CE%BF%CF%85%CF%86%CE%BF%CE%BD%CF%84%CE%AF%CE%BD%CE%B1%CF%82"
-    assert calls[0][0] == "search" and all(c[2] == {"https": "socks5h://127.0.0.1:9050", "http": "socks5h://127.0.0.1:9050"} for c in calls)
+    assert len(calls) == 1 and calls[0][0] == "search"
+    assert all(c[2] == {"https": "socks5h://127.0.0.1:9050", "http": "socks5h://127.0.0.1:9050"} for c in calls)
 
 
 # ── the merge ────────────────────────────────────────────────────────

@@ -90,13 +90,13 @@ def test_done_project_terminal_batch_still_counted(store):
     pid = store.create_project("Ship It")
     tid = store.add_task(pid, "final step")
     store.log_event(pid, tid, "autoadvance_step", {})
-    store.update_task(tid, status="DONE")  # rolls project → DONE
-    assert store.get_project(pid)["status"] == "DONE"
+    store.update_task(tid, status="DONE")  # §4UM: the plan is finished — the project stays open ("ready")
+    assert store.project_state(pid) == "ready"
     res = summarize_since(store, 0)
     assert res.advanced == 1
-    assert ("Ship It", "DONE") in res.finished
+    assert ("Ship It", "READY") in res.finished          # §4UM
     out = render_digest(res)
-    assert "Ship It" in out and "DONE" in out
+    assert "Ship It" in out and "all planned work done" in out
 
 
 def test_failed_project_rollup_surfaces(store):
@@ -172,10 +172,10 @@ def test_failed_then_done_reports_final_state_only(store):
     t1 = store.add_task(pid, "step 1")
     store.update_task(t1, status="FAILED")       # rolls project → FAILED
     assert store.get_project(pid)["status"] == "FAILED"
-    store.update_task(t1, status="DONE")         # recovers → DONE
-    assert store.get_project(pid)["status"] == "DONE"
+    store.update_task(t1, status="DONE")         # recovers → §4UM: ACTIVE, planned work done ("READY")
+    assert store.project_state(pid) == "ready"
     res = summarize_since(store, 0)
     entries = [f for f in res.finished if f[0] == "Flip Flop"]
-    assert entries == [("Flip Flop", "DONE")]
+    assert entries == [("Flip Flop", "READY")]
     out = render_digest(res)
     assert "FAILED" not in out

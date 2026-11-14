@@ -224,13 +224,30 @@ _NOT_OPENED_RE = re.compile(
     re.IGNORECASE)
 
 
-def refute_unread_source(reply: str, request: str, tool_names=()) -> List[str]:
+def _web_read_cited(body: str, tool_rows) -> bool:
+    """§4UN-read r1: the reply cites a page a web_search of this turn OPENED itself (its READ FROM PAGES
+    section) — that source was read."""
+    try:
+        from ..tools.search import web_read_urls
+        from .link_grounding import _cite_norm
+    except Exception:  # noqa: BLE001
+        return False
+    read = set()
+    for r in tool_rows or ():
+        if isinstance(r, dict) and r.get("name") == "web_search" and not r.get("_synthetic"):
+            read.update(_cite_norm(u) for u in web_read_urls(r.get("content")))
+    return bool(read) and any(_cite_norm(m.group(0)) in read for m in _URL_RE.finditer(body))
+
+
+def refute_unread_source(reply: str, request: str, tool_names=(), tool_rows=()) -> List[str]:
     """One issue when the request asked for a source the agent actually
     read, a SEARCH ran this turn (the snippet the URL echoes), no
     page-loading tool ran, the reply cites a URL as its source, and the
     reply does not itself say the page was not opened. Empty list otherwise
     — never a pass. A tool-free follow-up ("which sources did you read?")
-    answered from an earlier turn is not this shape (review §4IY)."""
+    answered from an earlier turn is not this shape (review §4IY). A URL
+    that a web_search of this turn opened itself (``tool_rows``: its READ FROM
+    PAGES section, §4UN-read) was read."""
     req = str(request or "")
     if not _READ_ASK_RE.search(req):
         return []
@@ -242,6 +259,8 @@ def refute_unread_source(reply: str, request: str, tool_names=()) -> List[str]:
         return []
     m = _URL_RE.search(body)
     if not m:
+        return []
+    if _web_read_cited(body, tool_rows):
         return []
     return [f"the request asked for a source the agent actually read, and the reply "
             f"cites {m.group(0)[:80]} as its source, but no page was opened this turn "

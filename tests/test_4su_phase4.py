@@ -226,7 +226,8 @@ def test_the_guard_exemption_reads_the_latest_row(monkeypatch):
 
 # ───────────────────────────── the briefing of a finished project ─────────────────────────────
 
-@pytest.mark.parametrize("status,word", [("DONE", "FINISHED"), ("ARCHIVED", "ARCHIVED")])
+@pytest.mark.parametrize("status,word", [("DONE", "was CLOSED by the user"),       # §4UM: only the owner closes
+                                         ("ARCHIVED", "is ARCHIVED")])
 def test_a_finished_project_s_briefing_says_how_to_reopen(tmp_path, status, word):
     from ghost_agent.core.prompts import build_project_briefing
     store = ProjectStore(tmp_path / "m", sandbox_root=tmp_path / "s")
@@ -235,7 +236,7 @@ def test_a_finished_project_s_briefing_says_how_to_reopen(tmp_path, status, word
     store.update_task(t, status="DONE", result_summary="planned")
     store.update_project(pid, status=status)
     out = build_project_briefing(store, pid)
-    assert f"This project is {word}" in out
+    assert f"This project {word}" in out
     assert "ALREADY ACTIVE" not in out and "ONE TASK AT A TIME" not in out
     assert ("resume it first" in out) == (status == "ARCHIVED")
 

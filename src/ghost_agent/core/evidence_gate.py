@@ -47,11 +47,13 @@ EVIDENCE_TOOLS = frozenset({
 # Shapes, one per tool family. Each regex is the tool's own wording.
 _BROWSER_LENGTH_RE = re.compile(r"^LENGTH:\s*(\d+)", re.M)
 _BROWSER_HTTP_RE = re.compile(r"^HTTP_STATUS:\s*([45]\d\d)", re.M)
-# anchored to the tool's OWN header lines: a snippet titled "No results found —
-# Kibana" is a result, not an empty search (fresh-eye review §4IY)
+# anchored to the tool's OWN head: a snippet titled "No results found —
+# Kibana" is a result, not an empty search (fresh-eye review §4IY); §4UN-read
+# r1: the HEAD of the result, not any line — a page web_search read may carry
+# a site-search box's "No results found." next to the answer
 _SEARCH_EMPTY_RE = re.compile(
-    r"^\s*(?:ERROR:\s*)?(?:No search results found|no results found|SYSTEM OBSERVATION: Zero|"     # the live tool says "ERROR: No search results found."
-    r"\(0 results\)|search returned 0 results)", re.I | re.M)
+    r"\A\s*(?:ERROR:\s*)?(?:No search results found|no results found|SYSTEM OBSERVATION: Zero|"     # the live tool says "ERROR: No search results found."
+    r"\(0 results\)|search returned 0 results)", re.I)
 _RECALL_ZERO_RE = re.compile(r"Zero high-confidence memories found", re.I)
 _RECALL_WEAK_RE = re.compile(r"best match:\s*LOW", re.I)
 _FS_MISSING_RE = re.compile(r"not found\.|does not exist|No such file", re.I)

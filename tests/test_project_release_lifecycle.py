@@ -64,7 +64,7 @@ async def test_release_requires_done(context, store):
     pid = store.create_project("Active", kind="GENERAL", goal="g")
     res = await tool_manage_projects(context, action="release",
                                      project_id=pid, directions=_DIRECTIONS)
-    assert "not DONE" in res
+    assert "not ready" in res          # §4UM: release needs the planned work done (ready) or a closed project
 
 
 @pytest.mark.asyncio

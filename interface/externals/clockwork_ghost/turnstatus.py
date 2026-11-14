@@ -101,6 +101,7 @@ ICON_CLASS = {
     "🐚": "tool",
     "🧰": "tool",
     "📥": "tool",
+    "📃": "tool",      # TOOL_PAGE_READ (§4UN-read)
     "📨": "accent",     # QUEUED_MSG (§4RZ)
     "🎨": "tool",
     "📄": "tool",

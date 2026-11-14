@@ -86,7 +86,7 @@ class TestFetchRetryInDeepResearch:
             calls["n"] += 1
             if calls["n"] == 1:
                 return FetchError("Error: Fetch timed out after 22s")  # retryable (§4PD: typed)
-            return "Recovered page body about postgres."
+            return "Recovered page body about postgres. " * 8   # §4UN-deep m8: a page, not a stub
 
         with patch("ghost_agent.tools.search.helper_fetch_url_content",
                    new_callable=AsyncMock) as mock_fetch:
@@ -111,7 +111,9 @@ class TestFetchRetryInDeepResearch:
 
         def forbidden(url, **kw):  # sync side_effect — AsyncMock awaits the return
             calls["n"] += 1
-            return "Error: Access Denied (403) from x. Tor rotation will not help."
+            # §4PD: the fetcher's failure is its TYPE (a plain "Error: …" string is page text)
+            from ghost_agent.utils.helpers import FetchError
+            return FetchError("Error: Access Denied (403) from x. Tor rotation will not help.")
 
         with patch("ghost_agent.tools.search.helper_fetch_url_content",
                    new_callable=AsyncMock) as mock_fetch:

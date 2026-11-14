@@ -529,6 +529,20 @@ def clear_onion_process_state():
 
 
 @pytest.fixture(autouse=True)
+def no_search_page_reads(monkeypatch):
+    """§4UN-read: web_search opens the top result pages for a specific-fact
+    query — over the real fetcher. Tests that drive web_search with scripted
+    engine rows must not dial out, so the reads are off unless a test turns
+    them on (tests/test_4un_web_read.py does, with a fake fetcher)."""
+    monkeypatch.setenv("GHOST_SEARCH_READ_PAGES", "0")
+    # §4UN-onion: the DuckDuckGo onion races as an extra engine; tests written
+    # against the clearnet engine list keep it (tests/test_4un_ddg_onion.py
+    # turns it on)
+    monkeypatch.setenv("GHOST_SEARCH_DDG_ONION", "0")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def clear_search_cache():
     """Reset the in-process web-search TTL cache between tests.
 

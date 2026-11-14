@@ -118,7 +118,9 @@ async def test_a_slot_whose_reserves_also_failed_is_not_called_replaced(monkeypa
     bad = {"http://s0.onion/thread/0", "http://s3.onion/thread/3", "http://s4.onion/thread/4"}
     text, out, _ = await _research(monkeypatch, ranked,
                                    lambda u: FetchError("Error: received status 404 from x") if u in bad else PAGE)
-    assert "replaced" not in text and "[⚠ SOURCE FAILURES: 1 of 3 hidden services" in text
+    # §4UN-darkres r1: the banner counts what was TRIED (the [SOURCES:] totals), not slots
+    assert "replaced" not in text and "[⚠ SOURCE FAILURES: 3 of 5 hidden services" in text
+    assert "[SOURCES: tried 5, loaded 2, timed out 0, failed 3, skipped 0]" in text
 
 
 async def test_a_run_whose_reserve_the_deadline_stopped_is_not_cached(monkeypatch):

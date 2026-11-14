@@ -29,7 +29,7 @@ logger = logging.getLogger("GhostAgent")
 _STATE_ONLY = frozenset({"manage_tasks", "update_profile", "introspect", "knowledge_base",
                          "vision_analysis"})
 #: manage_projects actions that only read
-_PROJECT_READS = frozenset({"status", "get", "list", "task_list", "budget", "ledger",
+_PROJECT_READS = frozenset({"status", "get", "list", "changes", "task_list", "budget", "ledger",
                             "artifact_list", "show", "info"})
 #: browser operations that only read a page (anything else — click, type, an
 #: actions list — can change a local app's state, e.g. its localStorage)

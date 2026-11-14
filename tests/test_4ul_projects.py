@@ -285,7 +285,9 @@ def _owner(ctx, text="make the header blue please"):
     return request_id_context.set("req-owner-1")
 
 
-async def test_a_write_focuses_and_reopens_a_done_project_with_a_change_task(tctx):
+async def test_a_write_focuses_and_reopens_a_closed_project_without_a_task(tctx):
+    # §4UM: a finished plan leaves the project open ("ready"); the OWNER closes it; a write reopens it with no
+    # "Change:" task — the change goes to the change log at the request's end (tests/test_4um_living_projects.py)
     s = tctx.project_store
     pid = s.create_project("Site", metadata={"constraints": ["keep it one page"]})
     t = s.add_task(pid, "Build index.html")
@@ -294,21 +296,21 @@ async def test_a_write_focuses_and_reopens_a_done_project_with_a_change_task(tct
         s.update_task(t, status="DONE", result_summary="built")
     finally:
         request_id_context.reset(tok)
-    assert s.get_project(pid)["status"] == "DONE"
+    assert s.get_project(pid)["status"] == "ACTIVE" and s.project_state(pid) == "ready"
     assert s.get_project(pid)["metadata"]["constraints"] == []
+    s.update_project(pid, status="DONE")                                 # the owner closed it
     ws = Path(s.ensure_workspace(pid))
     tok = _owner(tctx)
     try:
+        (ws / "index.html").write_text("<h1>blue</h1>")
         note = note_project_write(tctx, ws / "index.html")
     finally:
         request_id_context.reset(tok)
     p = s.get_project(pid)
     assert tctx.current_project_id == pid and p["status"] == "ACTIVE" and "reopened" in note
-    change = [x for x in s.list_tasks(pid) if x["description"].startswith("Change: ")]
-    assert len(change) == 1 and change[0]["status"] == "IN_PROGRESS"
-    assert change[0]["description"] == "Change: make the header blue please"
-    assert "REOPENED" in (p["metadata"].get("design_ledger") or json.dumps(p["metadata"]))
-    assert p["metadata"]["constraints"] == ["keep it one page"]          # re-armed with the reopen
+    assert not [x for x in s.list_tasks(pid) if x["description"].startswith("Change: ")]
+    assert MP.flush_change_log("req-owner-1", reply="Blue.") == 1
+    assert s.list_changes(pid)[0]["ask"] == "make the header blue please"
 
 
 async def test_a_write_does_nothing_for_a_background_turn_or_outside_projects(tctx):
@@ -328,7 +330,8 @@ async def test_a_write_does_nothing_for_a_background_turn_or_outside_projects(tc
         assert note_project_write(tctx, ws) == ""                      # the folder itself
     finally:
         request_id_context.reset(tok)
-    assert s.get_project(pid)["status"] == "DONE" and tctx.current_project_id is None
+    assert MP.flush_change_log("sched-1") == 0 and MP.flush_change_log("req-owner-1") == 0
+    assert s.project_state(pid) == "ready" and tctx.current_project_id is None
 
 
 async def test_a_write_in_the_request_that_closed_the_project_is_not_a_change(tctx):
@@ -338,10 +341,12 @@ async def test_a_write_in_the_request_that_closed_the_project_is_not_a_change(tc
     tok = _owner(tctx)
     try:
         s.update_task(t, status="DONE", result_summary="built")
+        (Path(s.ensure_workspace(pid)) / "NOTES.md").write_text("notes")
         assert note_project_write(tctx, Path(s.ensure_workspace(pid)) / "NOTES.md") == ""
     finally:
         request_id_context.reset(tok)
-    assert s.get_project(pid)["status"] == "DONE"
+    assert MP.flush_change_log("req-owner-1", reply="Built.") == 0     # the plan's own work, not a change
+    assert s.project_state(pid) == "ready" and s.list_changes(pid) == []
 
 
 # ───────────────────────────── 2e: the deferred DONE sweep ─────────────────────────────
@@ -354,7 +359,7 @@ def test_the_done_sweep_waits_for_the_request_end(store):
     tok = request_id_context.set("req-sweep")
     try:
         store.update_task(t, status="DONE", result_summary="done")
-        assert store.get_project(pid)["status"] == "DONE" and swept == []
+        assert store.project_state(pid) == "ready" and swept == []
         assert MP.flush_deferred_sweeps("req-sweep") == 1
     finally:
         request_id_context.reset(tok)

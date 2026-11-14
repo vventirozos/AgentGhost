@@ -73,7 +73,6 @@
     "unused-variable|src/ghost_agent/core/isolation.py|Unused variable 'files'": 1,
     "unused-variable|src/ghost_agent/memory/graph.py|Unused variable 's'": 1,
     "unused-variable|src/ghost_agent/memory/projects.py|Unused variable 'prev_closed_req'": 1,
-    "unused-variable|src/ghost_agent/tools/file_system.py|Unused variable 'attempt'": 1,
     "unused-variable|src/ghost_agent/tools/file_system.py|Unused variable 'exit_code'": 1,
     "unused-variable|src/ghost_agent/tools/memory.py|Unused variable 'deleted_count'": 1,
     "unused-variable|src/ghost_agent/tools/memory.py|Unused variable 'preview'": 1,

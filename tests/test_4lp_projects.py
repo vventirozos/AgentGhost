@@ -451,11 +451,20 @@ async def test_the_model_cannot_mark_an_owner_project_as_a_probes(context, store
 
 async def test_no_preview_for_an_action_that_would_refuse(context, store):
     from ghost_agent.tools.projects import tool_manage_projects_for_model
+    from ghost_agent.utils.logging import request_id_context
     pid = store.create_project("Half done")
-    res = await tool_manage_projects_for_model(context, action="unrelease", project_id=pid)
-    assert "confirmation_needed" not in res and "not RELEASED" in res
-    res = await tool_manage_projects_for_model(context, action="release", project_id=pid)
-    assert "confirmation_needed" not in res
+    tok = request_id_context.set("a1b2c3d4")            # the owner's turn: past the who-may-act wall
+    try:
+        res = str(await tool_manage_projects_for_model(context, action="unrelease", project_id=pid))
+        assert "confirmation_needed" not in res and "not RELEASED" in res
+        res = str(await tool_manage_projects_for_model(context, action="release", project_id=pid))
+        assert "confirmation_needed" not in res
+    finally:
+        request_id_context.reset(tok)
+    # §4UM review M1: the wall runs whatever the project's state — a turn that is not the owner's is refused
+    # by it, before the action's own "not RELEASED"
+    res = str(await tool_manage_projects_for_model(context, action="unrelease", project_id=pid))
+    assert "confirmation_needed" not in res and "NOT done" in res
 
 
 async def test_the_owner_turns_autopilot_on_and_off_and_a_probe_cannot(context, store):

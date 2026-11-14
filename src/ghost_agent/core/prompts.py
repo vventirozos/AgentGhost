@@ -116,14 +116,31 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     # §4SU Phase 4 (audit: the pacing rule and "DO NOT create" were shown
     # on FINISHED projects): a DONE / ARCHIVED project gets one line on how
     # to reopen it instead; the retrospective below says what was built
-    _finished = str(proj.get("status", "")).upper() in ("DONE", "ARCHIVED")
+    try:
+        _state = store.project_state(project_id, proj)
+    except Exception:
+        _state = str(proj.get("status") or "").lower()
+    # (§4UM review: a legacy DONE the old roll-up set by itself reads "ready", not closed)
+    _finished = str(proj.get("status", "")).upper() in ("DONE", "ARCHIVED") and _state != "ready"
     if _finished:
         _arch = str(proj.get("status", "")).upper() == "ARCHIVED"
+        # §4UM: only the user closes a project; a change written into its folder reopens it (and is logged)
         lines.append(
-            f"*** This project is {'ARCHIVED' if _arch else 'FINISHED'} (id={project_id}): no open work. "
-            "If the user asks for more on it, add it HERE — task_add / task_decompose, or replan for a "
-            "new plan (that reopens it" + ("; resume it first" if _arch else "") + "). Do not create a "
-            "new project for the same topic. ***")
+            (f"*** This project is ARCHIVED (id={project_id}): no open work. If the user asks for more on "
+             "it, resume it first, then make the change HERE. "
+             if _arch else
+             f"*** This project was CLOSED by the user (id={project_id}). If they ask for a change, make it "
+             "HERE, straight in its files — that reopens it and the system logs the change; add tasks "
+             "(task_add / task_decompose) only for multi-step work. ")
+            + "Do not create a new project for the same topic. ***")
+    elif _state == "ready":
+        # §4UM: planned work done, the project stays open — a living app the user keeps changing
+        lines.append(
+            f"*** All planned work on this project is done (id={project_id}, state READY) — it stays OPEN: a "
+            "living app/site. When the user asks for a change, make it straight in its files (the system logs "
+            "each change, and each deploy, in the change log and PROJECT_CHANGES.md — no task needed for it); add "
+            "tasks only for multi-step work. Never call it complete or closed: only the user closes it "
+            "(manage_projects action=update status=DONE when they ask). ***")
     # Hard directive at the top. Small Qwen models routinely re-call
     # `manage_projects action=create` AND re-interpret the user's
     # original "start a new project" message every few turns — they
@@ -224,7 +241,9 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             "it instead of re-deriving it. ***"
         )
     lines.append(
-        f"TITLE: {proj['title']}  ({proj['kind']} · {proj['status']})"
+        # §4UM live probe: an open (ready) project never shows the legacy auto-close's raw DONE
+        f"TITLE: {proj['title']}  ({proj['kind']} · {'ACTIVE' if _state == 'ready' else proj['status']}"
+        + (f" · {_state}" if _state in ("ready", "working") else "") + ")"
     )
     goal = (proj.get("goal") or "").strip()
     if goal:
@@ -543,6 +562,21 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             res = f" → {res[:170]}" if res else ""
             lines.append(f"  - [{t.get('id')}] {desc}{res}")
 
+    # §4UM: the owner's changes (system-written at each request's end) and where the project is live —
+    # the record of incremental work a finished plan never shows
+    try:
+        from ..memory.projects import live_line, recent_change_lines
+        _changes = recent_change_lines(store, project_id, 5)
+        _live = live_line(store, project_id)
+    except Exception:
+        _changes, _live = [], ""
+    if _changes:
+        lines.append("RECENT CHANGES (newest first; the whole log: manage_projects action=changes, "
+                     "or PROJECT_CHANGES.md):")
+        lines.extend(f"  - {c}" for c in _changes)
+    if _live:
+        lines.append(f"LIVE AT: {_live}")
+
     # RECENT WORK LOG — the automatic per-request record of interactive
     # work (request → files touched → outcome → conclusion), written by
     # the finalize chain since 2026-07-18. This is what preserves the
@@ -645,6 +679,15 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                            "manage_projects action=describe_file)")
         if more_files > 0:
             lines.append(f"  (+{more_files} more)")
+
+    # §4UM: the folder as it is on disk NOW (generated each turn, never a stale record)
+    try:
+        from ..memory.projects import folder_layout
+        _layout = folder_layout(store, project_id, 40)
+    except Exception:
+        _layout = []
+    if _layout:
+        lines.append(f"FILES (on disk now): {', '.join(_layout)}")
 
     # RETROSPECTIVE — only for projects in a terminal state, where the
     # structured what-worked/what-failed record (assembled from

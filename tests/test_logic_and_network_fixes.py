@@ -112,7 +112,7 @@ async def test_deep_research_gather_resilience(mock_find, mock_fetch):
         async def mock_fetch_side_effect(url, *args, **kwargs):
             if "bad.com" in url:
                 raise ValueError("Simulated network failure")
-            return "Good Content"
+            return "Good Content " * 20   # §4UN-deep m8: a page, not a stub
             
         mock_fetch.side_effect = mock_fetch_side_effect
         

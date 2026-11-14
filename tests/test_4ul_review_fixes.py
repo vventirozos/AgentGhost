@@ -154,7 +154,8 @@ async def test_a_checked_unattended_done_closes(turns_on, monkeypatch, store):
     _fake_turn(monkeypatch, _closing_script(store, tid, check=True), seen)
     await _advance(_ctx(store), pid, owner=False)
     assert seen[0]["_out"].status is OutcomeStatus.OK
-    assert store.get_task(tid)["status"] == "DONE" and store.get_project(pid)["status"] == "DONE"
+    # §4UM: the finished plan leaves the project open ("ready") — only the owner closes it
+    assert store.get_task(tid)["status"] == "DONE" and store.project_state(pid) == "ready"
 
 
 @pytest.mark.parametrize("then", ["timeout", "deferred", "crash", "[ATTEMPT_ABORTED_UPSTREAM] owner"])
@@ -301,10 +302,13 @@ async def test_a_write_after_the_owners_task_turn_closed_the_project_is_the_same
         request_id_context.reset(tok)
     tok = request_id_context.set("req-owner-site")
     try:
+        (Path(store.ensure_workspace(pid)) / "NOTES.md").write_text("notes")
         assert note_project_write(ctx, Path(store.ensure_workspace(pid)) / "NOTES.md") == ""
     finally:
         request_id_context.reset(tok)
-    assert store.get_project(pid)["status"] == "DONE"
+    # §4UM: the plan's own request — no change-log entry; the project stays open ("ready")
+    assert MP.flush_change_log("req-owner-site", reply="Built.") == 0 and store.list_changes(pid) == []
+    assert store.project_state(pid) == "ready"
 
 
 async def test_the_turn_records_the_request_it_runs_in(turns_on, monkeypatch, store):

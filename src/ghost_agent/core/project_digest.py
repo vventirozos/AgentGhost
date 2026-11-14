@@ -154,7 +154,8 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
                 new_status = str(
                     (ev.get("payload") or {}).get("new_status") or ""
                 ).upper()
-                if new_status in ("DONE", "FAILED") \
+                # §4UM: READY = every planned task done, the project stays open
+                if new_status in ("DONE", "FAILED", "READY") \
                         and pid not in finished_pids:
                     finished_pids.add(pid)
                     touched.add(pid)
@@ -207,9 +208,10 @@ def render_digest(res: DigestResult, *, max_needs_user: int = 3) -> str:
         else "**While you were away** — project updates:"      # never "advanced 0" (§4LP)
     ]
     if res.finished:
-        lines.append(f"{len(res.finished)} project(s) reached a final status:")
+        lines.append(f"{len(res.finished)} project(s) finished their planned work or stopped:")
         for title, status in res.finished[:max_needs_user]:
-            lines.append(f"  - [{title}] → {status}")
+            lines.append(f"  - [{title}] → "
+                         + ("all planned work done (stays open for changes)" if status == "READY" else status))
     if res.milestones:
         lines.append("Milestones:")
         lines.extend(f"  - {m}" for m in res.milestones[:4])

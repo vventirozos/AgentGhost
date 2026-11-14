@@ -10,6 +10,7 @@ error lines and booked a second OK.
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from tests.onion_v3 import v3_label  # §4UN-dark: checksum-valid test addresses
 import pytest
 
 from ghost_agent.tools.outcome import OutcomeStatus, ToolOutcome
@@ -49,7 +50,7 @@ async def test_one_of_three_fetched_is_OK_not_a_strike(mock_find_spec, mock_ddgs
     inst = MagicMock(); mock_ddgs.return_value.__enter__.return_value = inst
     _ddgs(inst, ["https://a.example/1", "https://b.example/2", "https://c.example/3"])
     with patch("ghost_agent.tools.search.helper_fetch_url_content", new_callable=AsyncMock) as f:
-        f.side_effect = lambda url, **kw: ("A real page about postgres." if "a.example" in url
+        f.side_effect = lambda url, **kw: ("A real page about postgres. " * 8 if "a.example" in url
                                            else FetchError("Error: Access Denied (403) from x. Tor rotation will not help."))
         out = await tool_deep_research("pg", False, PROXY, llm_client=None, max_context=8192)
     # §4GI round 3, MEASURED: a non-OK status here is read as a failed
@@ -63,7 +64,7 @@ async def test_one_of_three_fetched_is_OK_not_a_strike(mock_find_spec, mock_ddgs
     # the coverage limit is still REPORTED, in the text and the reason code
     assert "SOURCE FAILURES: 2 of 3" in str(out)
     assert out.reason_code == "research_sources_partial"
-    assert "A real page about postgres." in str(out)
+    assert "A real page about postgres. " * 8 in str(out)
 
 
 @pytest.mark.asyncio
@@ -74,7 +75,7 @@ async def test_everything_fetched_is_OK(mock_find_spec, mock_ddgs):
     inst = MagicMock(); mock_ddgs.return_value.__enter__.return_value = inst
     _ddgs(inst, ["https://a.example/1"])
     with patch("ghost_agent.tools.search.helper_fetch_url_content", new_callable=AsyncMock) as f:
-        f.side_effect = lambda url, **kw: "A real page about postgres."
+        f.side_effect = lambda url, **kw: "A real page about postgres. " * 8
         out = await tool_deep_research("pg", False, PROXY, llm_client=None, max_context=8192)
     assert out.status is OutcomeStatus.OK
     assert "SOURCE FAILURES" not in str(out)
@@ -195,7 +196,7 @@ def _dw_env(monkeypatch, page_side_effect):
     """Drive `tool_darkweb_research` with a fake engine page and fake onion
     fetches. No network, no Tor."""
     from ghost_agent.tools import darkweb_search as dw
-    v3a, v3b = "a" * 56, "b" * 56
+    v3a, v3b = v3_label("a"), v3_label("b")
     html = (f'<a href="http://{v3a}.onion/">One</a>'
             f'<a href="http://{v3b}.onion/">Two</a>')
 

@@ -881,6 +881,11 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                     else (lambda: pad_photo(photos[0], aspect)))
                 ref_name = f"{PHOTO_DIR}/ref_combined_{uuid.uuid4().hex[:8]}.jpg"
                 await asyncio.to_thread(lambda: (Path(sandbox_dir) / PHOTO_DIR).mkdir(parents=True, exist_ok=True))
+                try:            # §4UM round 3: the joined reference is a working file, never a project change
+                    from ..memory.projects import note_system_path
+                    note_system_path(Path(sandbox_dir) / ref_name)
+                except Exception:  # noqa: BLE001
+                    pass
                 await asyncio.to_thread((Path(sandbox_dir) / ref_name).write_bytes, data)
         except Exception as e:  # noqa: BLE001 — a corrupt photo must be a result, not a crash
             return f"ERROR: could not prepare the reference pictures ({e.__class__.__name__}). Nothing was rendered."
@@ -1140,9 +1145,14 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         # node already spent a minute or more producing.
         await asyncio.to_thread(
             lambda: Path(sandbox_dir).mkdir(parents=True, exist_ok=True))
+        from .file_system import note_project_write_hook, prepare_project_write_hook
+        _saved = [file_path] + ([Path(sandbox_dir) / _whole_name] if _whole_name else [])
+        prepare_project_write_hook(sandbox_dir, *_saved)    # §4UM round 3: a render saved in a project is a change
         await asyncio.to_thread(file_path.write_bytes, image_bytes)
         if _whole_name:
             await asyncio.to_thread((Path(sandbox_dir) / _whole_name).write_bytes, _whole_bytes)
+        for _sp in _saved:      # round 4: logged, but a render alone never reopens a project the owner closed
+            note_project_write_hook(sandbox_dir, _sp, reopen=False)
         # §4QP: a render with no scene yet gets ONE look, time permitting —
         # AFTER the save (r1 M1: a cancel during the look — the hard stop, the
         # idle supervisor — must not lose a picture the node already paid for)

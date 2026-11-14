@@ -1566,7 +1566,7 @@ class TestProducerParserParity:
     # 2026-09-21 (§4JP): the write site's message gained `{rewrite_note}` —
     # a hint, not a path; the renderer's heuristic counts it as a slot. The
     # ledger's captures were re-checked (the parity assertions below pass).
-    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 5, 5, 6]   # §4SH r1: Finished 5 (+ the honest check phrase, after the path); §4SH: Finished (4: the path, then three check notes after the `;` terminator)   # §4QA: both write receipts carry the stray-prefix NOTE (a hint after the path, not a path)   # §4PE: one download receipt with 4 slots replaced two 2-slot sites   # §4KW: + link delete (1), link rename (2); §4NU: append (4), more_parts write (4); §4OC: edit success names its old_string (2 — the ledger regex accepts the trailing «…» and still takes the path first)
+    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 5, 5, 5, 6]   # §4UN-fetch: download receipt 4→5 (the redirect note, after the receipt's period — a hint, not a path);   # §4SH r1: Finished 5 (+ the honest check phrase, after the path); §4SH: Finished (4: the path, then three check notes after the `;` terminator)   # §4QA: both write receipts carry the stray-prefix NOTE (a hint after the path, not a path)   # §4PE: one download receipt with 4 slots replaced two 2-slot sites   # §4KW: + link delete (1), link rename (2); §4NU: append (4), more_parts write (4); §4OC: edit success names its old_string (2 — the ledger regex accepts the trailing «…» and still takes the path first)
 
     def _rendered_messages(self):
         """Every `SUCCESS:` message tools/file_system.py can emit, rendered.
@@ -1816,6 +1816,9 @@ class TestProducerParserParity:
          "'h.py' (matched on its unique first+last lines; the middle "
          "differed from your old_text).", ["h.py"]),
         ("SUCCESS: Downloaded 'https://x.example/i.zip' to 'i.zip'.", ["i.zip"]),
+        # §4UN-fetch: the real receipt — sizes, type, and the redirect note after the period
+        ("SUCCESS: Downloaded 'https://x.example/abs/1' to 'i2.pdf' (1,024 bytes, application/pdf). "
+         "Final URL after redirects: https://x.example/pdf/1.pdf. Note: a PDF.", ["i2.pdf"]),
         ("SUCCESS: Copied 'j0.md' to 'j.md'.", ["j.md"]),
         ("SUCCESS: Renamed/Moved 'k0.md' to 'k.md'.", ["k.md"]),
         ("SUCCESS: Deleted 'l.md'.", []),

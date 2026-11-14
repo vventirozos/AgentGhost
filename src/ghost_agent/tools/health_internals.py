@@ -7,7 +7,7 @@ agent's internals, memories, graphs, lessons, nothing about labs". This module
 adds six lines, one per group of parts, and what is wrong with them:
 
     Models · Memory stores · Rules · Projects and schedule ·
-    Labs and sandbox · Storage and safety
+    Labs and sandbox · Storage and safety · Internet tools (§4UN-health)
 
 (§4TD, 2026-11-06: the third line was "Learning" — the lesson count and the
 owner's rules. The lesson store is removed; the line is the owner's rules, and
@@ -535,6 +535,48 @@ def _storage(context, out: _Parts) -> None:
 
 # ── the report ──────────────────────────────────────────────────────────────
 
+# ── Internet tools ──────────────────────────────────────────────────────────
+
+#: what happened to an engine in a round, in the operator's words (search._failure_category's categories,
+#: plus the two that are not a loss: still running when another engine won / when the round ended)
+_ENGINE_GROUPS = (("blocked", ("blocked",)), ("unreachable", ("conn-error", "timeout")),
+                  ("error", ("error",)), ("empty", ("empty", "off-topic")),
+                  ("low-relevance", ("low-relevance",)),
+                  ("outrun", ("unfinished",)), ("cut off", ("abandoned", "late")))
+
+
+def _internet(context, out: _Parts, now: Optional[float] = None) -> None:
+    """§4UN-health: what the agent's OWN recent search rounds met (every search tool: web search, deep
+    research, fact checks) — per engine, how many rounds it won and what happened in the others — and how
+    many result pages web_search read. In memory (``search.engine_health``): since this process started, at
+    most the last 24 h. No live test, and it never judges: an engine still running when another won was
+    OUTRUN, not failing (review r1), and a round every engine refused is the engines refusing Tor exits that
+    hour, not a fault here (the model-node lesson, §4SY). Engine names and outcomes come from fixed
+    allow-lists; no query is held."""
+    import time as _time
+    from .search import engine_health, _PROCESS_T0
+    now = _time.time() if now is None else float(now)
+    h = engine_health(now=now)
+    span = (f"since the restart {_ago(now - _PROCESS_T0)}" if now - _PROCESS_T0 <= 86400
+            else "in the last 24 h")
+    reads = h["reads"]
+    if not h["waves"] and not reads:
+        out.parts.append(f"no search rounds {span}")
+        return
+    head = f"search rounds {span} (all search tools): {h['waves']} tried, {h['won']} found results"
+    if h.get("low_only"):
+        head += f", {h['low_only']} only weak matches"
+    out.parts.append(head)
+    for name, per in sorted(h["engines"].items(), key=lambda kv: (-kv[1].get("win", 0), kv[0])):
+        label = f"{name[:-2]} (backup try)" if name.endswith("-h") else name
+        rest = [f"{sum(per.get(o, 0) for o in outs)} {word}" for word, outs in _ENGINE_GROUPS
+                if sum(per.get(o, 0) for o in outs)]
+        out.parts.append(f"{label}: {per.get('win', 0)} won" + (", " + ", ".join(rest) if rest else ""))
+    if reads:
+        out.parts.append(f"result pages read {reads.get('read', 0)} of {sum(reads.values())} tried")
+    out.parts.append("(from my own recent searches; no live test was run)")
+
+
 #: (label, reader, in a thread?) in the order the lines are printed
 SECTIONS: Tuple[Tuple[str, Callable[[object, _Parts], None], bool], ...] = (
     ("Models", _models, False),
@@ -543,6 +585,7 @@ SECTIONS: Tuple[Tuple[str, Callable[[object, _Parts], None], bool], ...] = (
     ("Projects and schedule", _projects, True),
     ("Labs and sandbox", _labs, True),
     ("Storage and safety", _storage, True),
+    ("Internet tools", _internet, False),        # §4UN-health: in-memory counters, read on the loop
 )
 
 

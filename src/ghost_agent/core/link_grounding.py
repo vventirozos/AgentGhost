@@ -86,12 +86,42 @@ def _label(host: str) -> str:
     return host.lower()[: -len(".onion")].rsplit(".", 1)[-1]
 
 
+def onion_v3_valid(host_or_url: str) -> bool:
+    """§4UN-dark: a v3 onion address whose built-in checksum holds. The 56 characters are base32 of
+    pubkey(32) + checksum(2) + version(1, = 3), checksum = SHA3-256(".onion checksum" + pubkey + 0x03)[:2]
+    — so a one-character garble (a summarizer copying an address and changing a letter) fails here
+    wherever it came from. Takes a host or a URL."""
+    import base64
+    import hashlib
+    raw = str(host_or_url or "").strip().lower()
+    if "://" in raw:
+        from urllib.parse import urlparse
+        raw = (urlparse(raw).hostname or "")
+    raw = raw.split("/", 1)[0]
+    if not raw.endswith(".onion"):
+        return False
+    label = raw[: -len(".onion")].rsplit(".", 1)[-1]
+    if len(label) != 56 or not re.fullmatch(r"[a-z2-7]{56}", label):
+        return False
+    try:
+        b = base64.b32decode(label.upper())
+    except Exception:  # noqa: BLE001
+        return False
+    pub, chk, ver = b[:32], b[32:34], b[34:35]
+    return ver == b"\x03" and hashlib.sha3_256(b".onion checksum" + pub + b"\x03").digest()[:2] == chk
+
+
 def _onion_kind(host: str) -> str:
-    """"v3", "v2", or "invalid" (wrong length or a non-base32 character)."""
+    """"v3", "v2", or "invalid" (wrong length, a non-base32 character, or — §4UN-dark — a 56-character
+    address whose built-in v3 checksum fails: one garbled letter)."""
     lab = _label(host)
     if not _BASE32_RE.fullmatch(lab):
         return "invalid"
-    return {56: "v3", 16: "v2"}.get(len(lab), "invalid")
+    kind = {56: "v3", 16: "v2"}.get(len(lab), "invalid")
+    if kind == "v3":
+        if not onion_v3_valid(lab + ".onion"):
+            return "invalid"
+    return kind
 
 
 def _failed_browser_result(content) -> bool:
@@ -126,6 +156,15 @@ def fetched_urls(tools_run) -> List[str]:
             if m and m.group(1) not in out:
                 out.append(m.group(1))
             continue
+        if t.get("name") == "web_search":
+            # §4UN-read: the result pages web_search opened itself (its READ FROM PAGES section) were
+            # read; the listed results were not
+            try:
+                from ..tools.search import web_read_urls
+                out.extend(u for u in web_read_urls(t.get("content")) if u not in out)
+            except Exception:  # noqa: BLE001
+                pass
+            continue
         if t.get("name") not in ("browser", "deep_research", "darkweb_research", "fact_check"):
             continue
         content = t.get("content")
@@ -157,6 +196,11 @@ def fetched_urls(tools_run) -> List[str]:
                     u = m.group(1).rstrip(".,)")
                     if u not in out:
                         out.append(u)
+            try:            # §4UN-deep: a page that loaded and held nothing relevant was still READ
+                from ..tools.search import nothing_relevant_urls
+                out.extend(u for u in nothing_relevant_urls(text) if u not in out)
+            except Exception:  # noqa: BLE001
+                pass
             continue
         for m in re.finditer(r"(?m)^(?:FINAL_)?URL:\s*(https?://\S+)", text):
             u = m.group(1).rstrip(".,)")
@@ -177,7 +221,16 @@ def search_result_urls(tools_run) -> List[str]:
     for t in tools_run or []:
         if not isinstance(t, dict) or t.get("name") not in _SEARCH_LIST_TOOLS:
             continue
-        for m in _URL_RE.finditer(str(t.get("content") or "")):
+        _txt = str(t.get("content") or "")
+        if t.get("name") == "web_search":
+            # §4UN-read r1: the pages web_search READ are not snippets (`fetched_urls` has them), and a
+            # link inside their text was on a page, not in a result list
+            try:
+                from ..tools.search import without_read_section
+                _txt = without_read_section(_txt)
+            except Exception:  # noqa: BLE001
+                pass
+        for m in _URL_RE.finditer(_txt):
             u = m.group(0).rstrip(_TRAIL)
             if u not in out:
                 out.append(u)
@@ -476,15 +529,22 @@ def _mostly_latin(text: str) -> bool:
     return not letters or sum(c.isascii() for c in letters) / len(letters) >= 0.6
 
 
-def onion_claim_issues(claim: str, haystack: str) -> List[str]:
+def onion_claim_issues(claim: str, haystack: str, *, user_text: str = "",
+                       notes: "List[str] | None" = None) -> List[str]:
     """Deterministic onion issues in ``claim`` against what the turn saw:
     an address of an impossible length, a v3 address no tool output holds,
     and — in a Latin-script reply only (the context words are English) — a
-    v2 address presented as current."""
+    v2 address presented as current.
+
+    §4UN-dark r2: a 56-character address whose checksum fails is NOT an issue when it is in ``user_text``
+    (the user's own words: the reply quotes it). One that only tool output held gets a non-blocking NOTE
+    (appended to ``notes`` and logged) — a page can carry a mistyped address, and the reply repeating it
+    should say so, but it was not invented. Unseen anywhere: an issue."""
     issues: List[str] = []
     if not claim:
         return issues
     hay = _norm(haystack)
+    user = _norm(user_text)
     latin = _mostly_latin(claim)
     seen = set()
     for m in _ONION_RE.finditer(claim):
@@ -499,8 +559,23 @@ def onion_claim_issues(claim: str, haystack: str) -> List[str]:
                 issues.append(f"{host} is a v2 onion address: Tor removed v2 onion services in October "
                               f"2021, so it cannot be a current address.")
         elif kind == "invalid":
-            issues.append(f"{host} is not a valid onion address: a current (v3) address is 56 "
-                          f"characters of a-z and 2-7.")
+            if len(_label(host)) == 56 and _BASE32_RE.fullmatch(_label(host)):
+                _pat = rf"(?<![a-z0-9]){re.escape(host)}"
+                if user and re.search(_pat, user):
+                    continue                    # r2: the user typed it — the reply quotes it
+                if re.search(_pat, hay):
+                    _note = (f"{host} came from tool output but its built-in checksum fails: at least one "
+                             f"character is wrong, so it cannot load as written.")
+                    if notes is not None:
+                        notes.append(_note)
+                    import logging
+                    logging.getLogger(__name__).info("onion guard note: %s", _note)
+                    continue
+                issues.append(f"{host} is not a valid onion address: its built-in checksum fails, so at "
+                              f"least one character is wrong.")
+            else:
+                issues.append(f"{host} is not a valid onion address: a current (v3) address is 56 "
+                              f"characters of a-z and 2-7.")
         elif not re.search(rf"(?<![a-z0-9]){re.escape(host)}", hay):
             issues.append(f"The onion address {host} appears in no tool output this turn — an onion "
                           f"address cannot be confirmed from memory.")

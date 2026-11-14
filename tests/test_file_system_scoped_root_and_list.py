@@ -300,9 +300,11 @@ async def test_httpx_tor_retry_rotates_identity_once_per_attempt(tmp_path, monke
         async def __aexit__(self, *a):
             return False
 
+    seen_proxies = []
+
     class _Client:
         def __init__(self, *a, **k):
-            pass
+            seen_proxies.append(k.get("proxy"))
 
         async def __aenter__(self):
             return self
@@ -328,4 +330,7 @@ async def test_httpx_tor_retry_rotates_identity_once_per_attempt(tmp_path, monke
         "http://example.com/x.bin", tmp_path,
         "socks5://127.0.0.1:9050", "x.bin")
     assert out.startswith("Error")
-    assert len(rotations) == 3  # one per attempt — was 6 with the double fire
+    # §4UN-fetch: no global identity rotation at all — it was a no-op here (control port closed, the
+    # agent cannot restart Tor); each attempt rides its own SOCKS-isolated circuit instead
+    assert len(rotations) == 0
+    assert len(seen_proxies) == 3 and len(set(seen_proxies)) == 3, seen_proxies   # a fresh circuit per attempt

@@ -20,6 +20,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ghost_agent.tools import darkweb_search as dw
+from tests.onion_v3 import v3_label  # §4UN-dark: checksum-valid test addresses
 from ghost_agent.tools.darkweb_search import (
     tool_darkweb_search,
     tool_darkweb_research,
@@ -32,9 +33,9 @@ from ghost_agent.tools.darkweb_search import (
 # Sample .onion hosts used as fake RESULTS. Deliberately NOT any configured
 # engine's own onion address — those are now filtered out of results as
 # nav/self-links, so reusing an engine host here would (correctly) vanish.
-V3_A = "a" * 56
-V3_B = "b" * 56
-V3_C = "c" * 56
+V3_A = v3_label("a")
+V3_B = v3_label("b")
+V3_C = v3_label("c")
 
 # The real onion host of the built-in `torch` engine — used only to prove the
 # self-link filter drops an engine's own address from its result page.
@@ -81,9 +82,13 @@ def test_extract_onion_unwraps_redirect():
 
 
 def test_parse_dedups_within_page():
-    html = f'<a href="http://{V3_A}.onion/a">one</a><a href="http://{V3_A}.onion/b">two</a>'
+    # §4UN-dark: per URL (a forum's threads are separate results), the same URL once, ≤3 paths per host
+    html = (f'<a href="http://{V3_A}.onion/a">one</a><a href="http://{V3_A}.onion/b">two</a>'
+            f'<a href="https://{V3_A}.onion/a/">one again</a>'
+            + "".join(f'<a href="http://{V3_A}.onion/p{i}">p{i}</a>' for i in range(4)))
     res = _parse_onion_results(html)
-    assert len(res) == 1  # same onion host collapses
+    assert [r["url"] for r in res] == [f"http://{V3_A}.onion/a", f"http://{V3_A}.onion/b",
+                                       f"http://{V3_A}.onion/p0"]
 
 
 def test_clearnet_urls_are_ignored():
@@ -202,7 +207,12 @@ async def test_search_requires_query():
 @pytest.mark.asyncio
 async def test_search_caches_success():
     html = f'<a href="http://{V3_A}.onion/">Cached</a>'
-    stub = _fetch_stub({"ahmia.fi": html})
+    _ahmia = _fetch_stub({"ahmia.fi": html})
+
+    async def stub(url, proxy, timeout, **kw):      # §4UN-dark r2: every other engine ANSWERS "no match" —
+        if "ahmia.fi" in url:                        # a run with an unreachable engine is not cached
+            return await _ahmia(url, proxy, timeout, **kw)
+        return 200, "<p>No documents match your query.</p>"
     with patch.object(dw, "_fetch_raw_html", side_effect=stub) as m:
         await tool_darkweb_search("cache me", tor_proxy="socks5://127.0.0.1:9050")
         calls_after_first = m.call_count
@@ -268,12 +278,16 @@ def test_tools_advertised_in_definitions():
     names = {t["function"]["name"] for t in TOOL_DEFINITIONS}
     assert "darkweb_search" in names
     assert "darkweb_research" in names
-    # Schema sanity: query is a required string param.
+    # Schema sanity: query is a string param — required for the search; the
+    # research may take `urls` instead (§4UN-darkres)
     for t in TOOL_DEFINITIONS:
         if t["function"]["name"] in ("darkweb_search", "darkweb_research"):
             params = t["function"]["parameters"]
             assert params["properties"]["query"]["type"] == "string"
-            assert params["required"] == ["query"]
+            if t["function"]["name"] == "darkweb_search":
+                assert params["required"] == ["query"]
+            else:
+                assert params["required"] == [] and params["properties"]["urls"]["type"] == "array"
 
 
 def test_runner_dict_wires_darkweb_tools():
@@ -296,8 +310,8 @@ async def test_ahmia_endpoints_not_double_counted():
     hit corroborated by two INDEPENDENT indexes. Under the old engine-name
     counting X (ahmia+ahmia-onion) tied Y (ahmia+torch) and won on discovery
     order; index-based counting gives Y 2 vs X 1, so Y ranks first."""
-    X = "d" * 56  # only in Ahmia (reached over both its transports)
-    Y = "e" * 56  # in Ahmia AND Torch -> genuinely corroborated
+    X = v3_label("d")  # only in Ahmia (reached over both its transports)
+    Y = v3_label("e")  # in Ahmia AND Torch -> genuinely corroborated
     ahmia_html = f'<a href="http://{X}.onion/">X first</a><a href="http://{Y}.onion/">Y second</a>'
     ahmia_onion_html = f'<a href="http://{X}.onion/">X only</a>'
     torch_html = f'<a href="http://{Y}.onion/">Y</a>'
@@ -315,7 +329,7 @@ async def test_ahmia_endpoints_not_double_counted():
 async def test_engine_self_links_filtered_from_results():
     """An engine's own onion address appearing in its page chrome (nav/footer)
     must not surface as a bogus result."""
-    real = "f" * 56
+    real = v3_label("f")
     torch_html = (
         f'<a href="http://{TORCH_ENGINE_HOST}.onion/">Torch Home</a>'
         f'<a href="http://{real}.onion/">Real Result</a>'

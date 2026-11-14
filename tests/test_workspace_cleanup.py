@@ -557,7 +557,7 @@ async def test_tool_deliverables_survive_sweep_on_last_task(store, tmp_path):
         result="done", deliverables=["report.pdf"],
     )
 
-    assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
+    assert store.project_state(pid) == "ready"           # §4UM: a finished plan stays open; the sweep ran
     assert (pdir / "report.pdf").exists()       # registered before sweep
     assert not (pdir / "scratch.png").exists()  # scratch removed
 
@@ -575,6 +575,6 @@ def test_end_to_end_completion_sweeps_workspace(store):
 
     plan.update_status(tid, TaskStatus.DONE, result="done")
 
-    assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
+    assert store.project_state(pid) == "ready"           # §4UM: a finished plan stays open; the sweep ran
     assert (pdir / "final.txt").exists()
     assert not (pdir / "scratch.log").exists()

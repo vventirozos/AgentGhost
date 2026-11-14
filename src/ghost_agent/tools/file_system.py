@@ -20,7 +20,9 @@ except ImportError:
     curl_requests = None
 from ..utils.logging import Icons, pretty_log, request_elapsed_s, request_id_context, slot_session_context
 from ..utils.edit_ledger import record_edit
-from ..utils.helpers import request_new_tor_identity
+from ..utils.helpers import socks_url_with_identity
+# §4UN-fetch: no longer called (each attempt rides its own SOCKS circuit); kept as a patch target for older tests
+from ..utils.helpers import request_new_tor_identity  # noqa: F401  pylint: disable=unused-import
 
 def _read_head(path: Path, max_bytes: int = 8192) -> bytes:
     """Read the first `max_bytes` of a file. Used by `_looks_like_binary`
@@ -6692,8 +6694,8 @@ async def _save_download_stream(target_path: Path, chunks, _max: int = _DOWNLOAD
                     continue
                 buffer.extend(chunk)
                 total += len(chunk)
-                if len(head) < 512:
-                    head += bytes(chunk)[: 512 - len(head)]
+                if len(head) < 65536:                      # §4UN-fetch: past leading comments/styles (r3: 64 KB)
+                    head += bytes(chunk)[: 65536 - len(head)]
                 if total > _max:
                     overflow = True
                     break
@@ -6723,7 +6725,249 @@ async def _save_download_stream(target_path: Path, chunks, _max: int = _DOWNLOAD
     return total, overflow, head
 
 
-def _download_receipt(url, filename, target_path: Path, total: int, ctype, head: bytes) -> str:
+#: §4UN-fetch: curl_cffi's current Chrome target with its own headers (was chrome110 TLS under a mismatched UA)
+_DOWNLOAD_IMPERSONATE = "chrome"
+#: a refusal over Tor worth another circuit and the plain identity (429 = a per-exit rate limit)
+_TOR_RETRY_STATUSES = frozenset({401, 403, 429, 503})
+#: no byte for this long → the transfer is stalled. The session's curl `timeout` is this same value: on a
+#: stream curl_cffi sets it as BOTH the connect limit and the low-speed limit (which also covers the wait for
+#: the first byte), so curl's own abort never outlasts the stall timer (r1: a 45 s timer under a 60 s curl
+#: limit ended at ~60 s — `quit_now` is only seen when data arrives) and a connect or a slow-starting export
+#: keeps its full minute (r2: 45 s shrank both). A tuple `(connect, read)` does not separate them: curl_cffi
+#: 0.14 sets the low-speed limit to connect + read (measured: (3, 2) aborted a stalled stream at 8 s).
+_DOWNLOAD_STALL_S = 60.0
+#: The overall cap is from the download's start, across every attempt (r1: each attempt had its own, up to
+#: 3 × 900 s). Each attempt's body gets a floor plus its size at a slow-but-alive Tor rate from its own first
+#: response (r2: a retry inheriting the first attempt's leftovers was starved and reported "too slow"); an
+#: unknown size runs on the stall timer alone.
+_DOWNLOAD_BASE_S = 60.0
+_DOWNLOAD_MIN_RATE = 50_000          # bytes/s
+_DOWNLOAD_MAX_S = 900.0
+_DOWNLOAD_PROGRESS_STEP = 5_000_000
+
+
+class _DownloadStalled(Exception):
+    """§4UN-fetch: no data arrived for `_DOWNLOAD_STALL_S`."""
+
+
+class _DownloadTimedOut(Exception):
+    """§4UN-fetch: the transfer ran past the download's clock (curl's stream `timeout` is only a low-speed
+    limit: a 45 MB file at 20 KB/s held a turn for 37 minutes, three times)."""
+
+    def __init__(self, msg: str, received: int = 0, clen=None, limit: float = 0.0, capped: bool = False):
+        super().__init__(msg)
+        self.received, self.clen, self.limit, self.capped = received, clen, limit, capped
+
+
+def _download_deadline_s(clen) -> float:
+    """The transfer budget for a body of ``clen`` bytes; an unknown size gets the cap (the stall timer ends
+    a dead transfer long before it)."""
+    if clen is None:
+        return _DOWNLOAD_MAX_S
+    return min(_DOWNLOAD_MAX_S, _DOWNLOAD_BASE_S + float(clen) / _DOWNLOAD_MIN_RATE)
+
+
+def _clock_end(clock) -> float:
+    """The monotonic time the download must end by: the current attempt's size budget once its body arrived,
+    never past the cap from the download's start."""
+    cap = clock["start"] + _DOWNLOAD_MAX_S
+    return min(cap, clock["end"]) if clock.get("end") else cap
+
+
+def _content_length(headers):
+    """The Content-Length as an int, None when absent or malformed (§4UN-fetch: `int("12, 12")` raised and the
+    failure read as a Tor refusal)."""
+    try:
+        raw = headers.get("Content-Length") or headers.get("content-length")
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        v = int(str(raw).strip()) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+    return v if v is not None and v >= 0 else None
+
+
+async def _guarded_chunks(chunks, url, clen, got, clock=None):
+    """The body's chunks with a stall timer, the download's one clock (``clock``: {"start", "end"} shared by
+    every attempt) and a progress line every 5 MB; ``got[0]`` counts the bytes received (for a "cut at N MB"
+    message)."""
+    from ..utils.aio import wait_for as _aio_wait_for
+    if clock is None:
+        clock = {"start": time.monotonic(), "end": None}
+    t0 = time.monotonic()
+    clock["end"] = t0 + _download_deadline_s(clen)          # r2: this attempt's own floor
+    end = _clock_end(clock)
+    capped = end < clock["end"]
+    limit = end - t0
+
+    def _timed_out():
+        _of = f" of {clen / 1e6:.1f} MB" if clen else ""
+        return _DownloadTimedOut(f"the download did not finish within {limit:.0f} s "
+                                 f"({got[0] / 1e6:.1f} MB received{_of})", got[0], clen, limit, capped)
+    next_log = _DOWNLOAD_PROGRESS_STEP
+    it = chunks.__aiter__()
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            raise _timed_out()
+        try:
+            chunk = await _aio_wait_for(it.__anext__(), min(_DOWNLOAD_STALL_S, left))
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            if time.monotonic() >= end - 0.01:
+                raise _timed_out() from None
+            raise _DownloadStalled(f"no data for {_DOWNLOAD_STALL_S:.0f} s "
+                                   f"({got[0] / 1e6:.1f} MB received)") from None
+        if chunk:
+            got[0] += len(chunk)
+            if got[0] >= next_log:
+                next_log += _DOWNLOAD_PROGRESS_STEP
+                _of = f" of {clen / 1e6:.1f}" if clen else ""
+                _download_log("progress", url, f"{got[0] / 1e6:.0f}{_of} MB in {time.monotonic() - t0:.0f} s")
+        yield chunk
+
+
+def _failure_kind(e: BaseException, received: int) -> str:
+    """What an exception during a download was: "stall" | "timeout" | "cut" | "tor_down" | "other"."""
+    if isinstance(e, _DownloadStalled):
+        return "stall"
+    if isinstance(e, (_DownloadTimedOut, asyncio.TimeoutError, TimeoutError)):
+        return "timeout"
+    t = f"{type(e).__name__} {e}".lower()
+    if "operation too slow" in t or "bytes/sec transferred" in t or "less than 1 bytes/sec" in t:
+        # r3: curl's low-speed abort — after bytes it is a stall (the same limit as the stall timer), before
+        # the first byte the site did not answer in time
+        return "stall" if received > 0 else "timeout"
+    if "timed out" in t or "timeout" in t or "(28)" in t:
+        return "timeout"
+    if received > 0:
+        return "cut"
+    if isinstance(e, ConnectionRefusedError) or "couldn't connect to server" in t or "connection refused" in t:
+        return "tor_down"
+    return "other"
+
+
+def _proxy_down(e: BaseException, proxy_url) -> bool:
+    """The refused connection was to the Tor proxy itself (not a site): Tor is down."""
+    try:
+        p = urllib.parse.urlparse(str(proxy_url or ""))
+        host, port = (p.hostname or ""), str(p.port or 9050)
+    except Exception:  # noqa: BLE001
+        return False
+    t = str(e)
+    if isinstance(e, ConnectionRefusedError) and not t:
+        return True
+    return bool(host) and host in t and port in t
+
+
+def _download_log(kind: str, url, detail: str) -> None:
+    """§4UN-fetch: one INFO line per download failure (by kind) and per 5 MB of progress."""
+    try:
+        host = (urllib.parse.urlparse(str(url)).hostname or "?")[:60]
+        pretty_log("Download Progress" if kind == "progress" else "Download Failure",
+                   f"{host}: {'' if kind == 'progress' else kind + ' — '}{detail}"[:200],
+                   level="INFO", icon=Icons.TOOL_DOWN)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+#: §4UN-fetch r1: server-script endpoints (`get.php?id=7`, `file.aspx`) — the URL's name says what made the
+#: file, not what it is; the server's Content-Disposition / Content-Type decide
+_SCRIPT_SUFFIXES = frozenset({".php", ".php3", ".php5", ".asp", ".aspx", ".ashx", ".jsp", ".jspx", ".cgi",
+                              ".do", ".action", ".dll"})
+
+
+def _known_extension(name: str) -> bool:
+    from ..utils.content_check import (CONTENT_TYPE_EXT, _BINARY_ONLY, _EXPECTED_KIND, _HTML_OK,
+                                       _TEXT_NOT_HTML)
+    suf = Path(str(name or "")).suffix.lower()
+    if suf in _SCRIPT_SUFFIXES:
+        return False
+    return bool(suf) and (suf in _EXPECTED_KIND or suf in _BINARY_ONLY or suf in _TEXT_NOT_HTML
+                          or suf in _HTML_OK or suf in set(CONTENT_TYPE_EXT.values()))
+
+
+_CD_NAME_RE = re.compile(r"""filename\*\s*=\s*(?:UTF-8|utf-8)?''([^;]+)|filename\s*=\s*"?([^";]+)"?""", re.I)
+
+
+def _name_from_response(filename, headers, sandbox_dir=None) -> str:
+    """§4UN-fetch: a URL-derived name with no known extension (`arxiv.org/pdf/2401.12345` → `2401.12345`) takes
+    the server's Content-Disposition name, else the Content-Type's extension — the knowledge base reads a PDF
+    only by its `.pdf`. Same sanitising as the URL name. Returns ``filename`` when nothing better is known."""
+    name = str(filename or "")
+    if _known_extension(name):
+        return name
+    from ..utils.content_check import CONTENT_TYPE_EXT
+    try:
+        cd = str(headers.get("Content-Disposition") or headers.get("content-disposition") or "")
+    except Exception:  # noqa: BLE001
+        cd = ""
+    m = _CD_NAME_RE.search(cd)
+    if m:
+        raw = (m.group(1) or m.group(2) or "").strip()
+        cand = download_target_name(None, "https://x/" + urllib.parse.quote(urllib.parse.unquote(raw)))
+        if cand and cand != "download.bin" and _known_extension(cand):
+            parent = str(Path(name).parent) if name and "/" in name else ""
+            return f"{parent}/{cand}" if parent and parent != "." else cand
+    try:
+        ct = str(headers.get("Content-Type") or headers.get("content-type") or "").split(";")[0].strip().lower()
+    except Exception:  # noqa: BLE001
+        ct = ""
+    ext = CONTENT_TYPE_EXT.get(ct)
+    if ext and ext not in (".html",) and name:
+        base = name[:-len(".bin")] if name.endswith("download.bin") else name
+        _suf = Path(base).suffix.lower()
+        if _suf in _SCRIPT_SUFFIXES:
+            base = base[:-len(_suf)]
+        return base + ext
+    return name
+
+
+def _free_server_name(sandbox_dir, name: str) -> str:
+    """§4UN-fetch r1: a server-derived name must not replace a workspace file this request has not read (the
+    unread-rewrite guard ran on the URL's name only) — such a name gets `-2`, `-3`… Returns "" when no free
+    name is found (the caller keeps the URL's name)."""
+    def _blocked(n):
+        try:
+            pth = _get_safe_path(sandbox_dir, n)
+        except ValueError:
+            return True
+        return bool(unread_rewrite_refusal(pth, n))
+    if not _blocked(name):
+        return name
+    p = Path(name)
+    stem, suf = (str(p.with_suffix("")), p.suffix)
+    for i in range(2, 100):
+        cand = f"{stem}-{i}{suf}"
+        try:
+            if not _get_safe_path(sandbox_dir, cand).exists() and not _blocked(cand):
+                return cand
+        except ValueError:
+            return ""
+    return ""
+
+
+#: §4UN-fetch r4: a request for one of these that a redirect sent to the site root or an .html page got a page
+_REDIRECT_FILE_SUFFIXES = frozenset({".pdf", ".xls", ".doc"})
+
+
+def _redirected_to_a_page(url, final_url, suffix: str) -> bool:
+    if suffix not in _REDIRECT_FILE_SUFFIXES or not final_url or str(final_url) == str(url):
+        return False
+    try:
+        u = urllib.parse.urlparse(str(final_url))
+    except ValueError:
+        return False
+    path = u.path or "/"
+    if path == "/":
+        return not u.query          # r5: `/?f=report.pdf&sig=…` is a download gateway, not the home page
+    return path.lower().endswith((".html", ".htm"))
+
+
+def _download_receipt(url, filename, target_path: Path, total: int, ctype, head: bytes,
+                      final_url: Optional[str] = None) -> str:
     """§4PE (F6): what landed — size and type — and a warning when a 200
     carried an HTML page under a binary name (the §4LL "saved the error page
     as the photo" incident). The write is stamped as this request's, so a
@@ -6732,9 +6976,17 @@ def _download_receipt(url, filename, target_path: Path, total: int, ctype, head:
         _mark_written(target_path)
     except Exception:  # noqa: BLE001
         pass
-    ct = str(ctype or "").split(";")[0].strip().lower() or "unknown type"
+    # §4UN-fetch (final review): the type and the final URL are server-chosen text inside a receipt the
+    # verifier's file ledger parses — a ")" in the type plus a "'" in the URL let the ledger capture a fake path
+    ct = re.sub(r"[^a-z0-9/.+-]", "", str(ctype or "").split(";")[0].strip().lower())[:80] or "unknown type"
     suffix = Path(str(filename)).suffix.lower()
-    body = f"Downloaded '{url}' to '{filename}' ({total:,} bytes, {ct})."
+    # §4UN-fetch (suite): the redirect note goes AFTER the receipt's period — the verifier's file ledger
+    # (agent._fs_path_ledger) ends the download shape at "(N bytes, type)." and went blind to every
+    # redirected download while the note sat between the ")" and the ".".
+    _via = (f" Final URL after redirects: {str(final_url)[:300].replace(chr(39), '%27')}."
+            if final_url and str(final_url) != str(url) else "")
+    _url_q = str(url).replace("'", "%27")     # a "'" in the asked URL could also plant a ledger path
+    body = f"Downloaded '{_url_q}' to '{filename}' ({total:,} bytes, {ct}).{_via}"
     # §4PE r3: a suspect body is PARTIAL with a "PARTIAL:" head — the first cut
     # said "treat as FAILED" under a SUCCESS head, which the verifier booked
     # as delivered
@@ -6742,17 +6994,37 @@ def _download_receipt(url, filename, target_path: Path, total: int, ctype, head:
         return ToolOutcome.partial(
             f"PARTIAL: {body} ⚠ The file is EMPTY (0 bytes): the server sent no body — do not use it; "
             f"try another source or tell the user.", world_changed=True, reason_code="download_empty")
-    if suffix in _BINARY_SUFFIXES and (re.search(rb"<!doctype\s+html|<html[\s>]", head[:512], re.I)
-                                       or ct == "text/html"):
+    # §4UN-fetch: the first bytes against the type the name promises, for EVERY name (was: only names in
+    # `_BINARY_SUFFIXES` and only an HTML head in the first 512 bytes — a JSON error saved as .jpg, an HTML
+    # page as data.csv or .avif, a page opening with 600 bytes of comments all read SUCCESS)
+    from ..utils.content_check import body_mismatch, kind_note
+    from ..utils.content_check import sniff_kind
+    _why = ""
+    # r5: only when the body is a page (HTML or text) — a real PDF behind a download gateway is the file
+    if sniff_kind(head) in ("html/xml", "text") and _redirected_to_a_page(url, final_url, suffix):
+        _why = "the link redirected to a page, not the file"
+    _why = _why or body_mismatch(filename, ctype, head, total)
+    if _why:
+        _code = ("download_html_body" if "HTML page" in _why else
+                 "download_redirected_to_page" if "redirected" in _why else "download_wrong_type")
+        _what = ("a challenge, login or error page" if "HTML page" in _why else
+                 "a redirect to another page (the final URL above)" if "redirected" in _why and _via else
+                 f"a redirect to {str(final_url)[:120]}" if "redirected" in _why else
+                 "an error message or another format")
+        _download_log("wrong content", url, _why)
         return ToolOutcome.partial(
-            f"PARTIAL: {body} ⚠ The body is an HTML page, not a {suffix} file — the site answered 200 "
-            f"with a page (a challenge, login or error page). Do not use '{filename}' as the {suffix}; "
-            f"try another source, and if none works, tell the user.", world_changed=True,
-            reason_code="download_html_body")
-    return f"SUCCESS: Downloaded '{url}' to '{filename}' ({total:,} bytes, {ct})."
+            f"PARTIAL: {body} ⚠ {_why[:1].upper() + _why[1:]} — the site answered 200 with {_what}. "
+            f"Do not use '{filename}' as the {suffix or 'file'}; try another source, and if none works, tell "
+            f"the user.", world_changed=True, reason_code=_code)
+    _note = kind_note(filename, head)
+    return (f"SUCCESS: Downloaded '{_url_q}' to '{filename}' ({total:,} bytes, {ct}).{_via}"
+            + (f" Note: {_note}." if _note else ""))
 
 
-async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filename: str = None):
+async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filename: str = None,
+                             name_from_url: bool = False):
+    """``name_from_url``: ``filename`` was derived from the URL (the caller named nothing) — a name with no
+    known extension may then take the server's Content-Disposition name or the Content-Type's extension."""
     # §4NL r2: the refusal lives HERE, not only in the dispatcher — a direct
     # caller (subject_photos, a future tool) must not put an onion file in the
     # workspace either
@@ -6787,7 +7059,9 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
     _ssrf = _ssrf_check(url)
     if _ssrf:
         return f"Error: {_ssrf}"
-    mode = "TOR" if proxy_url and "127.0.0.1" in proxy_url else "WEB"
+    # §4UN-fetch: Tor mode is a SOCKS proxy on any host (was: "127.0.0.1" in the URL — `localhost:9050` or a
+    # remote Tor host ran in WEB mode: no retries, no plain profile)
+    mode = "TOR" if proxy_url and str(proxy_url).lower().startswith("socks") else "WEB"
 
     # Full URL — the [:35] pre-truncation also starved the durable mirror (it
     # saw 35 chars too). Let the stream truncate; the durable log keeps it whole.
@@ -6808,19 +7082,35 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
             return ToolOutcome.rejected("REJECTED: " + _unread, reason_code="unread_rewrite")
     headers = {"User-Agent": "Mozilla/5.0"}
     last_error = None
+    _last_kind = ""          # §4UN-fetch: "status" | "timeout" | "stall" | "cut" | "other" — what the message says
     _plain = False           # switched on by the first Tor refusal (see _PLAIN_PROFILE_UA)
+    _final_url = url
+    import secrets as _secrets
+    _salt = _secrets.token_hex(3)
+    # §4UN-fetch r1: ONE clock for every attempt (see _DOWNLOAD_MAX_S)
+    _clock = {"start": time.monotonic(), "end": None}
+    _tries = 0
     for attempt in range(3):
+        if attempt and time.monotonic() >= _clock["start"] + _DOWNLOAD_MAX_S - 0.01:
+            break                                   # the overall cap is spent: no attempt can finish
+        _tries = attempt + 1
+        # §4UN-fetch: each attempt rides its OWN Tor circuit (SOCKS-auth isolation). The old
+        # `request_new_tor_identity` was a no-op here — the control port is closed and an unprivileged
+        # agent cannot restart Tor — so all three attempts used one exit, 5 s apart.
+        _attempt_proxy = (socks_url_with_identity(proxy_url, f"dl{attempt}{_salt}")
+                          if (mode == "TOR" and attempt > 0) else proxy_url)
+        _got = [0]
         try:
             if curl_requests:
-                proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+                proxies = {"http": _attempt_proxy, "https": _attempt_proxy} if _attempt_proxy else None
                 try:
                     target_path = _get_safe_path(sandbox_dir, filename)
                 except ValueError as ve: return str(ve)
-                
+
                 async with curl_requests.AsyncSession(
-                        impersonate=(None if _plain else "chrome110"),
+                        impersonate=(None if _plain else _DOWNLOAD_IMPERSONATE),
                         headers=({"User-Agent": _PLAIN_PROFILE_UA} if _plain else None),
-                        proxies=proxies, timeout=60.0) as client:
+                        proxies=proxies, timeout=_DOWNLOAD_STALL_S) as client:
                     # Manual redirect follow (auto-redirect OFF) so each hop's
                     # Location is SSRF-validated before we fetch it.
                     cur_url = url
@@ -6842,42 +7132,45 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                         cur_url = _next
                     else:
                         return "Error: too many redirects (possible redirect loop)."
+                    _final_url = cur_url
                     if resp.status_code != 200:
-                        # Abort the transfer BEFORE the identity-renew sleep:
-                        # an open streaming response pumps its body into the
-                        # unbounded response queue in RAM the whole 5s.
+                        # Abort the transfer BEFORE any retry: an open streaming response pumps its body
+                        # into the unbounded response queue in RAM.
                         await _aclose_curl(resp)
-                        if resp.status_code in [401, 403, 503] and mode == "TOR":
-                            # ⚠ RECORD THE REFUSAL. This path re-tried with a fresh Tor
-                            # identity and left `last_error` at None, so three Cloudflare
-                            # 403s reported as "Failed after 3 attempts. Last error: None"
-                            # — the model retried the same tool blind (§4FR, 2026-09-09).
+                        if resp.status_code in _TOR_RETRY_STATUSES and mode == "TOR":
+                            # ⚠ RECORD THE REFUSAL (§4FR: "Last error: None" sent the model retrying blind).
                             last_error = (f"HTTP {resp.status_code} from {_server_name(resp)} "
-                                          f"({'plain' if _plain else 'chrome110'} profile)")
-                            if not _plain:
-                                # The site refused the FINGERPRINT, not the exit: the
-                                # next attempt uses a plain curl identity on the same
-                                # circuit, without spending 5 s on a new one (review,
-                                # 2026-09-09). `continue` — this branch sits AFTER the
-                                # hop loop, inside the attempt loop.
-                                _plain = True
-                                continue
-                            await asyncio.to_thread(request_new_tor_identity)
-                            await asyncio.sleep(5)
+                                          f"({'plain' if _plain else 'browser'} profile)")
+                            _last_kind = "status"
+                            _download_log("refused", url, last_error)
+                            # The site refused the FINGERPRINT or this exit: the next attempt uses a plain curl
+                            # identity, on a fresh circuit (429 is a per-exit rate limit — retried too).
+                            _plain = True
                             continue
                         return _download_error(resp.status_code, url)
 
-                    clength = resp.headers.get("Content-Length")
-                    if clength and int(clength) > 50000000:
+                    _clen = _content_length(resp.headers)
+                    if _clen is not None and _clen > _DOWNLOAD_MAX_BYTES:
                         await _aclose_curl(resp)
-                        return f"Error: File is too large ({int(clength)/1000000:.1f}MB). Download limit is 50MB."
+                        return f"Error: File is too large ({_clen/1000000:.1f}MB). Download limit is 50MB."
 
+                    if name_from_url:
+                        _renamed = _name_from_response(filename, resp.headers, sandbox_dir)
+                        if _renamed and _renamed != filename:
+                            _renamed = _free_server_name(sandbox_dir, _renamed)   # r1: never over an unread file
+                        if _renamed and _renamed != filename:
+                            try:
+                                target_path = _get_safe_path(sandbox_dir, _renamed)
+                                filename = _renamed
+                            except ValueError:
+                                pass
                     _nr = _nonregular_refusal(target_path, filename)    # §4PE (F3): a FIFO target wedged the loop
                     if _nr:
                         await _aclose_curl(resp)
                         return _nr
                     try:
-                        _total, _overflow, _head = await _save_download_stream(target_path, resp.aiter_content())
+                        _total, _overflow, _head = await _save_download_stream(
+                            target_path, _guarded_chunks(resp.aiter_content(), url, _clen, _got, _clock))
                     finally:
                         # On the overflow break the transfer is still live —
                         # abort it instead of letting it stream into the
@@ -6886,11 +7179,13 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                     if _overflow:
                         return ("Error: download exceeded the 50MB cap (server omitted or exceeded "
                                 "Content-Length). Nothing was saved.")
-                    return _download_receipt(url, filename, target_path, _total, resp.headers.get("Content-Type"), _head)
+                    return _download_receipt(url, filename, target_path, _total, resp.headers.get("Content-Type"),
+                                             _head, final_url=_final_url)
             else:
                 # follow_redirects=False + manual hop loop so each Location is
                 # SSRF-validated before the fetch (see _download_redirect_target).
-                async with httpx.AsyncClient(proxy=proxy_url, headers=headers, follow_redirects=False, timeout=60.0) as client:
+                async with httpx.AsyncClient(proxy=_attempt_proxy, headers=headers, follow_redirects=False,
+                                             timeout=_DOWNLOAD_STALL_S) as client:
                     cur_url = url
                     for _hop in range(_MAX_DOWNLOAD_REDIRECTS + 1):
                         async with client.stream("GET", cur_url) as resp:
@@ -6902,21 +7197,15 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                                 cur_url = _next
                                 continue  # closes this stream, re-requests the validated hop
                             if resp.status_code != 200:
-                                if resp.status_code in [401, 403, 503] and mode == "TOR":
-                                    # ⚠ RECORD THE REFUSAL. This path re-tried with a fresh Tor
-                                    # identity and left `last_error` at None, so three Cloudflare
-                                    # 403s reported as "Failed after 3 attempts. Last error: None"
-                                    # — the model retried the same tool blind (§4FR, 2026-09-09).
+                                if resp.status_code in _TOR_RETRY_STATUSES and mode == "TOR":
                                     last_error = (f"HTTP {resp.status_code} from {_server_name(resp)}")
-                                    # Rotation happens ONCE below the hop
-                                    # loop — rotating here too doubled the
-                                    # identity churn + 10s of sleep per retry.
-                                    break  # break the hop loop → outer attempt retry
+                                    _last_kind = "status"
+                                    break  # break the hop loop → outer attempt retry (a fresh circuit)
                                 return _download_error(resp.status_code, url)
 
-                            clength = resp.headers.get("Content-Length")
-                            if clength and int(clength) > 50000000:
-                                return f"Error: File is too large ({int(clength)/1000000:.1f}MB). Download limit is 50MB."
+                            _clen = _content_length(resp.headers)
+                            if _clen is not None and _clen > _DOWNLOAD_MAX_BYTES:
+                                return f"Error: File is too large ({_clen/1000000:.1f}MB). Download limit is 50MB."
 
                             try:
                                 target_path = _get_safe_path(sandbox_dir, filename)
@@ -6925,19 +7214,17 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                             _nr = _nonregular_refusal(target_path, filename)    # §4PE (F3)
                             if _nr:
                                 return _nr
-                            _total, _overflow, _head = await _save_download_stream(target_path, resp.aiter_bytes())
+                            _total, _overflow, _head = await _save_download_stream(
+                                target_path, _guarded_chunks(resp.aiter_bytes(), url, _clen, _got, _clock))
                             if _overflow:
                                 return ("Error: download exceeded the 50MB cap (server omitted or exceeded "
                                         "Content-Length). Nothing was saved.")
                             return _download_receipt(url, filename, target_path, _total,
-                                                     resp.headers.get("Content-Type"), _head)
+                                                     resp.headers.get("Content-Type"), _head, final_url=cur_url)
                     else:
                         return "Error: too many redirects (possible redirect loop)."
-                    # reached only via the 401/403/503 `break` → fall to the
-                    # outer `for attempt` Tor-identity retry.
+                    # reached only via the refusal `break` → the outer attempt loop (a fresh circuit)
                     if mode == "TOR":
-                        await asyncio.to_thread(request_new_tor_identity)
-                        await asyncio.sleep(5)
                         continue
         except _LocalSaveError as le:
             # §4PE (F5): "[Errno 21] Is a directory" was reported, after three
@@ -6945,32 +7232,63 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
             return (f"Error: could not save '{filename}': {le}. Nothing was saved. This is a local "
                     f"path problem, not the site — fix the destination name and call again.")
         except Exception as e:
+            _prev_kind = _last_kind
             last_error = e
+            _last_kind = _failure_kind(e, _got[0])
+            _download_log(_last_kind, url, f"{type(e).__name__}: {str(e)[:120]}"
+                          + (f" after {_got[0] / 1e6:.1f} MB" if _got[0] else ""))
+            _te = e if isinstance(e, _DownloadTimedOut) else None   # typed alias (pylint cannot narrow `e`)
+            if _te is not None and _te.received > 0 and _te.capped and attempt > 0:
+                # r2: the retry did not run out of ITS time — the whole download hit the overall cap after an
+                # earlier attempt failed
+                _was = {"stall": "stalled", "cut": "was cut mid-file", "timeout": "timed out",
+                        "status": "was refused"}.get(_prev_kind, "failed")
+                _of = f" of {_te.clen / 1e6:.1f} MB" if _te.clen else ""
+                return (f"Error: the download hit its {_DOWNLOAD_MAX_S:.0f} s overall limit — an earlier attempt "
+                        f"{_was}, and the retry on a fresh Tor circuit reached {_te.received / 1e6:.1f} MB{_of} "
+                        f"before the limit. Nothing was saved. The site did not refuse the agent; one later "
+                        f"retry may work, else use a mirror or tell the user.")
+            if _te is not None and _te.received > 0:
+                # r1: the transfer was MOVING, just slower than the clock — another circuit restarts it from
+                # zero on a spent clock; say what happened instead
+                _of = f" of {_te.clen / 1e6:.1f} MB" if _te.clen else ""
+                return (f"Error: the download was too slow over Tor — cut at {_te.received / 1e6:.1f} MB{_of} after "
+                        f"{_te.limit:.0f} s (the limit for this file). Nothing was saved. The site did not refuse "
+                        f"the agent; a retry starts from zero. Use a smaller file or a mirror, or tell the user "
+                        f"the file is too slow to fetch over Tor.")
+            if mode == "TOR" and _last_kind == "tor_down" and _proxy_down(e, proxy_url):
+                return (f"Error: Tor is not reachable on this machine — the connection to the Tor proxy was "
+                        f"refused ({str(e)[:120]}). No download can run until it is back; nothing was saved. "
+                        f"Tell the user Tor is down — retrying will not help.")
             if mode == "TOR":
-                await asyncio.to_thread(request_new_tor_identity)
-                await asyncio.sleep(5)
+                await asyncio.sleep(0.5)
                 continue
-            
+
     if mode == "TOR":
-        # The host's egress is Tor, and some sites answer a browser-shaped
-        # Tor client with a challenge page (Cloudflare: HTTP 403, text/html)
-        # while a plain curl from the sandbox — which has its own direct
-        # egress by design, see sandbox/docker.py — gets the file. Say so,
-        # and name that route: the model's only other option is to retry
-        # this one, which it did twice on 2026-09-09 (request probe, §4FR).
-        # §4FS review: a first version recommended `curl` from the sandbox.
-        # The sandbox's egress is cleartext from the host IP (docker.py sets
-        # no proxy; under host networking its Tor cannot bind), and the
-        # agent's rule is Tor-only — a tool message must not steer the model
-        # through that hole. The plain-profile retry above is the honest
-        # remedy; past it, the file has to come from the user.
-        return (
-            f"Error: Failed after 3 attempts over Tor — {last_error or 'no usable response'}. "
-            "Tried a browser profile and a plain curl profile over Tor; the site refuses this "
-            "agent from Tor exits, and retrying this tool will not change that. The agent's "
-            "egress is Tor-only by policy: ask the user to provide the file or a mirror that "
-            "accepts Tor. Do NOT fetch it any other way."
-        )
+        if _last_kind == "status":
+            # The host's egress is Tor, and some sites answer a Tor client with a challenge page. The
+            # plain-profile retry is the honest remedy; past it, the file has to come from the user (§4FS: a
+            # message must never steer the model to the sandbox's cleartext egress).
+            _tried = ("a browser profile and a plain curl profile over Tor, on separate circuits" if _plain
+                      else "separate Tor circuits")
+            return (
+                f"Error: Failed after {_tries} attempt{'s' if _tries != 1 else ''} over Tor — "
+                f"{last_error or 'no usable response'}. "
+                f"Tried {_tried}; the site refuses this agent from Tor exits, and retrying this tool will not "
+                "change that. The agent's egress is Tor-only by policy: ask the user to provide the file or a "
+                "mirror that accepts Tor. Do NOT fetch it any other way."
+            )
+        _n = f"{_tries} Tor circuit{'s' if _tries != 1 else ''}"
+        _what = {
+            "timeout": f"the site did not answer in time on {_n} (a slow or overloaded site, or slow "
+                       "circuits) — it did not refuse the agent",
+            "stall": f"the transfer stalled (no data for a long stretch) on {_n}",
+            "cut": f"the connection was cut in the middle of the file on {_n}",
+        }.get(_last_kind, f"the connection failed on {_n}")
+        return (f"Error: Failed after {_tries} attempt{'s' if _tries != 1 else ''} over Tor — "
+                f"{last_error or 'no usable response'}: {_what}. "
+                f"Nothing was saved. One later retry may work; if it fails again, use another source or tell "
+                f"the user the file could not be downloaded.")
     return f"Error: Failed after 3 attempts. Last error: {last_error}"
 
 async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None, sandbox_manager=None):
@@ -7782,12 +8100,105 @@ QUARANTINE_OPS = frozenset({"quarantine_list", "quarantine_inspect", "quarantine
 ACCEPTED_OPS = ADVERTISED_OPS + ("list", "ls", "dir", "tree", "list_dir", "list_directory")
 
 
-#: §4UL: operations that put work into a file (the projects hook below)
+#: §4UL: operations that put work into a file (the projects hook below); §4UM review M4: delete too, and a
+#: move/rename changes its SOURCE (removed) as well as its destination
 _PROJECT_WRITE_OPS = frozenset({"write", "append", "append_file", "write_append", "edit", "replace",
-                                "move", "rename", "copy"})
+                                "move", "rename", "copy", "delete", "download"})
+_PROJECT_MOVE_OPS = frozenset({"move", "rename"})
 
 
-def note_project_write_hook(sandbox_dir, path) -> str:
+def _download_target(path, kwargs) -> str:
+    """Where a `download` lands, for the §4UM hooks (the download's own `download_target_name`; "" when the URL
+    cannot be read — the download reports that itself)."""
+    t = path or kwargs.get("filename") or kwargs.get("file")
+    url = kwargs.get("url")
+    if t and re.match(r"https?://", str(t), re.I):           # the URL in the path (the impl heals it the same way)
+        url, t = url or str(t), None
+    try:
+        return download_target_name(t, url) if (t or url) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def download_target_name(target_path, url) -> str:
+    """Where a `download` lands: the named path, else the URL's own file name (decoded, control characters and
+    separators dropped), else ``download.bin``. ONE function for the download itself and the §4UM project hooks."""
+    # Auto-heal missing or invalid target_path
+    # `startswith("http")` also discarded legitimate filenames — httpd.conf,
+    # http_log.txt, https_cert.pem — so test for an actual URL instead.
+    _tp = str(target_path or "").strip()
+    if _tp and "://" not in _tp and _tp != str(url):
+        return target_path
+    parsed = urllib.parse.urlparse(str(url))
+    path_name = Path(parsed.path).name
+    # PERCENT-DECODE the name (§4JZ). Saved raw, a Wikimedia URL lands
+    # as `960px-Zoi_..._%28cropped%29.jpg` while every human-readable
+    # reference to it — the model's, the page's — says `(cropped)`, so
+    # a later `reference_images` / read by that name misses. Seen live.
+    # ⚠ Re-take `.name` AFTER decoding: `%2F` decodes to a separator,
+    # and a filename that smuggles one would escape this directory.
+    if path_name:
+        decoded = Path(urllib.parse.unquote(path_name)).name
+        # ⚠ Drop CONTROL characters, not just surrounding whitespace.
+        # `%00` put a real NUL in the name; `_get_safe_path` then raised
+        # ValueError("embedded null byte") and the handler returned that
+        # BARE STRING, which the outcome classifier reads as neither a
+        # failure nor a rejection — a download that wrote nothing was
+        # booked as a success. And `%0A` let the URL inject whole fake
+        # result lines into the tool output the model reads.
+        # (Deliberately NOT quoting the literal prefix here: the
+        # producer/parser parity check scans this file for message
+        # shapes, and a comment carrying one registers as a producer.)
+        decoded = "".join(c for c in decoded if c.isprintable())
+        decoded = decoded.replace("\\", "_").strip()
+        # Leading dots are legitimate (`.env`, `.gitignore`); only a
+        # name that is ENTIRELY dots is a traversal shape.
+        if decoded.strip(".") == "":
+            decoded = ""
+        if len(decoded) > 180:
+            stem, _, ext = decoded.rpartition(".")
+            decoded = (stem[:170] + "." + ext[:9]) if stem else decoded[:180]
+        if decoded:
+            path_name = decoded
+    return path_name if path_name else "download.bin"
+
+
+def _hook_context(sandbox_dir, path):
+    """(request context, workspace-relative path) when ``path`` lies inside ``projects/<id>/``, else (None, "")."""
+    if not path:
+        return None, ""
+    from ..core.request_scope import current_scope
+    sc = current_scope()
+    ctx = getattr(sc, "context", None) if sc is not None else None
+    root = getattr(ctx, "sandbox_dir", None) if ctx is not None else None
+    if not root or sandbox_dir is None:
+        return None, ""
+    p = Path(str(path))
+    full = (p if p.is_absolute() else Path(sandbox_dir) / p).resolve()
+    rel = full.relative_to(Path(root).resolve())
+    if len(rel.parts) >= 3 and rel.parts[0] == "projects":
+        return ctx, rel.as_posix()
+    return None, ""
+
+
+def prepare_project_write_hook(sandbox_dir, *paths) -> None:
+    """§4UM review M3/M4: BEFORE an operation changes files in ``projects/<id>/``, the owner's request snapshots
+    that project's folder (`tools.projects.prepare_project_write`) — the request's end diffs it. Guarded."""
+    for path in paths:
+        try:
+            ctx, rel = _hook_context(sandbox_dir, path)
+            if ctx is None:
+                continue
+            from . import projects as _pj
+            fn = getattr(_pj, "prepare_project_write", None)
+            if fn is not None:
+                fn(ctx, rel)
+        except Exception:  # noqa: BLE001 — bookkeeping never breaks a write
+            import logging as _logging
+            _logging.getLogger("GhostAgent").debug("project write not prepared", exc_info=True)
+
+
+def note_project_write_hook(sandbox_dir, path, reopen: bool = True) -> str:
     """§4UL (projects hook): a successful write whose file lies inside
     ``projects/<id>/`` of the workspace is the project's work, whichever
     project the turn has pinned (none, or another) — handed to
@@ -7796,30 +8207,49 @@ def note_project_write_hook(sandbox_dir, path) -> str:
     Returns the hook's note for the tool result ("" = none). Guarded: an
     absent hook or any error = nothing happens."""
     try:
-        if not path:
-            return ""
-        from ..core.request_scope import current_scope
-        sc = current_scope()
-        ctx = getattr(sc, "context", None) if sc is not None else None
-        root = getattr(ctx, "sandbox_dir", None) if ctx is not None else None
-        if not root or sandbox_dir is None:
+        ctx, rel = _hook_context(sandbox_dir, path)
+        if ctx is None:
             return ""
         from . import projects as _pj
         fn = getattr(_pj, "note_project_write", None)
         if fn is None:
             return ""
-        p = Path(str(path))
-        full = (p if p.is_absolute() else Path(sandbox_dir) / p).resolve()
-        rel = full.relative_to(Path(root).resolve())
-        if len(rel.parts) >= 3 and rel.parts[0] == "projects":
-            return str(fn(ctx, rel.as_posix()) or "")
+        return str((fn(ctx, rel) if reopen else fn(ctx, rel, reopen=False)) or "")
     except Exception:  # noqa: BLE001 — bookkeeping never breaks a write
         import logging as _logging
         _logging.getLogger("GhostAgent").debug("project write not noted", exc_info=True)
     return ""
 
 
+def note_project_writes_hook(sandbox_dir, paths) -> str:
+    """Round 4: `note_project_write_hook` for a batch (a lab folder `get`) — one call into the projects hook."""
+    try:
+        rels = []
+        ctx = None
+        for p in paths:
+            c, rel = _hook_context(sandbox_dir, p)
+            if c is not None:
+                ctx = c
+                rels.append(rel)
+        if ctx is None or not rels:
+            return ""
+        from . import projects as _pj
+        fn = getattr(_pj, "note_project_writes", None)
+        return str(fn(ctx, rels) or "") if fn is not None else ""
+    except Exception:  # noqa: BLE001 — bookkeeping never breaks a write
+        import logging as _logging
+        _logging.getLogger("GhostAgent").debug("project writes not noted", exc_info=True)
+    return ""
+
+
 async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, read_budget: "ReadBudget | None" = None, **kwargs):
+    _op0 = str(operation or "").strip().lower()
+    if _op0 == "download":
+        prepare_project_write_hook(sandbox_dir, _download_target(path, kwargs))
+    elif _op0 in _PROJECT_WRITE_OPS:
+        # §4UM review M3/M4: the project's folder snapshot BEFORE the change (its source, its destination)
+        prepare_project_write_hook(sandbox_dir, path or kwargs.get("filename") or kwargs.get("file"),
+                                   destination)
     res = await _tool_file_system_impl(operation=operation, sandbox_dir=sandbox_dir, path=path, content=content,
                                        replace_with=replace_with, destination=destination, pattern=pattern,
                                        max_context=max_context, read_budget=read_budget, **kwargs)
@@ -7829,10 +8259,18 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
             _st = getattr(getattr(res, "status", None), "value", None)
             _ok = (_st in ("ok", "partial") if _st is not None
                    else not str(res or "").lstrip().lower().startswith(("error", "system instruction")))
-            if _ok:
+            if _ok and _op == "download":
+                _dt = _download_target(path, kwargs)
+                _full = Path(_dt) if Path(_dt).is_absolute() else Path(sandbox_dir) / _dt
+                _note = note_project_write_hook(sandbox_dir, _dt) if _full.is_file() else ""
+                if _note:
+                    res = append_note(res, "\n" + _note)
+            elif _ok:
                 _target = destination if _op in ("move", "rename", "copy") else path
                 _note = note_project_write_hook(sandbox_dir,
                                                 _target or kwargs.get("filename") or kwargs.get("file"))
+                if _op in _PROJECT_MOVE_OPS and path:
+                    _note = note_project_write_hook(sandbox_dir, path) or _note      # the source is gone
                 if _note:
                     res = append_note(res, "\n" + _note)
     except Exception:  # noqa: BLE001
@@ -8018,45 +8456,15 @@ async def _tool_file_system_impl(operation: str = None, sandbox_dir: Path = None
             # cannot choose a path for it
             return await _quarantine_download(str(url), kwargs.get("tor_proxy"))
             
-        # Auto-heal missing or invalid target_path
-        # `startswith("http")` also discarded legitimate filenames — httpd.conf,
-        # http_log.txt, https_cert.pem — so test for an actual URL instead.
-        _tp = str(target_path or "").strip()
-        if not _tp or "://" in _tp or _tp == str(url):
-            parsed = urllib.parse.urlparse(str(url))
-            path_name = Path(parsed.path).name
-            # PERCENT-DECODE the name (§4JZ). Saved raw, a Wikimedia URL lands
-            # as `960px-Zoi_..._%28cropped%29.jpg` while every human-readable
-            # reference to it — the model's, the page's — says `(cropped)`, so
-            # a later `reference_images` / read by that name misses. Seen live.
-            # ⚠ Re-take `.name` AFTER decoding: `%2F` decodes to a separator,
-            # and a filename that smuggles one would escape this directory.
-            if path_name:
-                decoded = Path(urllib.parse.unquote(path_name)).name
-                # ⚠ Drop CONTROL characters, not just surrounding whitespace.
-                # `%00` put a real NUL in the name; `_get_safe_path` then raised
-                # ValueError("embedded null byte") and the handler returned that
-                # BARE STRING, which the outcome classifier reads as neither a
-                # failure nor a rejection — a download that wrote nothing was
-                # booked as a success. And `%0A` let the URL inject whole fake
-                # result lines into the tool output the model reads.
-                # (Deliberately NOT quoting the literal prefix here: the
-                # producer/parser parity check scans this file for message
-                # shapes, and a comment carrying one registers as a producer.)
-                decoded = "".join(c for c in decoded if c.isprintable())
-                decoded = decoded.replace("\\", "_").strip()
-                # Leading dots are legitimate (`.env`, `.gitignore`); only a
-                # name that is ENTIRELY dots is a traversal shape.
-                if decoded.strip(".") == "":
-                    decoded = ""
-                if len(decoded) > 180:
-                    stem, _, ext = decoded.rpartition(".")
-                    decoded = (stem[:170] + "." + ext[:9]) if stem else decoded[:180]
-                if decoded:
-                    path_name = decoded
-            target_path = path_name if path_name else "download.bin"
+        _named = bool(str(target_path or "").strip()) and "://" not in str(target_path) and str(target_path) != str(url)
+        try:
+            target_path = download_target_name(target_path, url)
+        except ValueError as e:                 # an unparsable URL (`http://[bad/x`): a refusal, never a crash
+            return ToolOutcome.rejected(f"Error: the URL {str(url)[:200]!r} cannot be read ({e}). Nothing was "
+                                        "downloaded.", reason_code="bad_url")
 
-        return await tool_download_file(url=str(url), sandbox_dir=sandbox_dir, tor_proxy=kwargs.get("tor_proxy"), filename=target_path)
+        return await tool_download_file(url=str(url), sandbox_dir=sandbox_dir, tor_proxy=kwargs.get("tor_proxy"),
+                                        filename=target_path, name_from_url=not _named)
 
     #: §4KB: operations that act on the PROJECT, not on one file. They must
     #: be exempt from the path requirement below, which would otherwise

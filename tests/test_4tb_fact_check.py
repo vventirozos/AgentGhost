@@ -390,7 +390,8 @@ async def test_deep_research_fills_the_titles_it_is_handed(monkeypatch):
     out = str(await S.tool_deep_research("beagle sleep", llm_client=None, tor_proxy=None, source_titles=titles))
     assert f"### SOURCE: {A_URL}\n" in out
     assert titles == {A_URL: "How long do beagles sleep?"}                # a missing title is not invented
-    assert "How long do beagles sleep?" not in out                       # the report itself is unchanged
+    # §4UN-deep M2: the report names each page's title on its [PAGE] line (the search's, when the page has none)
+    assert f"### SOURCE: {A_URL}\n[PAGE] Date: undated | Title: \"How long do beagles sleep?\"\n" in out
     # …and without the out-parameter nothing changes
     assert str(await S.tool_deep_research("beagle sleep", llm_client=None, tor_proxy=None)) == out
 

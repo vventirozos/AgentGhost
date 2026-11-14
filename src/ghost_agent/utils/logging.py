@@ -1011,6 +1011,7 @@ class Icons:
     TOOL_FILE_S  = "🔍"
     TOOL_FILE_I  = "👀"
     TOOL_DOWN    = "📥"   # download / incoming (wide-base; was ⬇️)
+    TOOL_PAGE_READ = "📃"  # §4UN-read: web_search opened a result page itself (one line per page)
     QUEUED_MSG   = "📨"   # a message the user sent while a turn runs (§4RZ)
     TOOL_BROWSER = "🌎"   # headless browser automation (distinct from shell 🐚)
     TOOL_DARKWEB = "🧅"   # dark-web (.onion) search over Tor (onion = 🧅, distinct from clearnet 🌐)

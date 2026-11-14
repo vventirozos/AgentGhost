@@ -25,7 +25,7 @@ from enum import Enum
 from pathlib import Path
 
 from ..tools.file_system import write_text_nofollow as _fs_write_nofollow
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("GhostAgent")
 
@@ -156,6 +156,32 @@ CREATE TABLE IF NOT EXISTS conversation_focus (
 );
 
 CREATE INDEX IF NOT EXISTS idx_focus_project ON conversation_focus(project_id);
+
+-- §4UM: the project's change log ("living projects"). kind 'change' = one owner
+-- request that changed the project's files (numbered 1, 2, …); kind 'deploy' =
+-- the files went live (a lab deploy / keep / switch / put). Mirrored to the
+-- project folder's PROJECT_CHANGES.md.
+CREATE TABLE IF NOT EXISTS project_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'change',
+    num INTEGER,
+    ts REAL NOT NULL,
+    req_id TEXT NOT NULL DEFAULT '',
+    ask TEXT NOT NULL DEFAULT '',
+    added_json TEXT NOT NULL DEFAULT '[]',
+    changed_json TEXT NOT NULL DEFAULT '[]',
+    removed_json TEXT NOT NULL DEFAULT '[]',
+    summary TEXT NOT NULL DEFAULT '',
+    deployed INTEGER NOT NULL DEFAULT 0,
+    deployed_at REAL,
+    url TEXT NOT NULL DEFAULT '',
+    pushed_json TEXT NOT NULL DEFAULT '[]',
+    meta_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_changes_project ON project_changes(project_id, ts);
 """
 
 
@@ -305,8 +331,10 @@ def _run_deferred(items) -> int:
     for store, pid, _t in items:
         try:
             # a later write in the same request may have reopened it — the
-            # next DONE fires again
-            if str((store.get_project(pid) or {}).get("status") or "").upper() != "DONE":
+            # next DONE fires again. §4UM: a ready project (planned work
+            # finished, open) is swept like a DONE one was.
+            if (str((store.get_project(pid) or {}).get("status") or "").upper() != "DONE"
+                    and not store.planned_work_done(pid)):
                 continue
             store._run_project_done(pid)
             n += 1
@@ -344,6 +372,982 @@ def flush_deferred_sweeps(request_id: str) -> int:
         return 0
 
 
+# §4UM: the change log's per-request accumulator. An OWNER request that changes a project's folder is one
+# change; it collects here ({request key: {project: entry}}) and ONE entry is written at the request's end
+# (`flush_change_log`, called from handle_chat's finally). The request key is the ROOT request (a project task's
+# turn inside the owner's request writes for it); an unattended task turn after the plan was finished is its
+# own key (one entry per task turn, ask "task: …"). What changed is found two ways (review M3/M4):
+#   * a FOLDER DIFF: a bounded stat snapshot of the project folder (`snapshot_folder`) taken when the request
+#     first has the project in play — the project focused at the request's start (`watch_project`), or before
+#     the first file_system / execute write into another project — and diffed at the flush: added, changed,
+#     removed, whatever made them (a shell heredoc, `sed -i`, `rm`, `mv`, a pinned `execute`);
+#   * the NOTED paths (`note_change_write`, the write hooks): a project first touched mid-request with no
+#     snapshot before the write, and a folder too large to snapshot.
+# Pushes to the project's kept lab collect too (one ``deploy`` entry). Entries are persisted minimally (no
+# snapshot) in ``pending_changes.json`` beside the store, so a kill mid-request still writes them at the next
+# start (`recover_pending_changes`). A request that never flushes is written by a later flush after
+# DEFERRED_SWEEP_MAX_AGE_S.
+_PENDING_CHANGES: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_PENDING_SEQ = [0]
+import weakref as _weakref  # noqa: E402
+#: every live ProjectStore (a streamed reply's summary is filled in whichever store holds the entry)
+_KNOWN_STORES: "_weakref.WeakSet" = _weakref.WeakSet()
+#: the owner's message of each running root request (the ask of its entries — never a task turn's prompt)
+_REQUEST_ASK: Dict[str, str] = {}
+_CHANGE_SKIP_NAMES = {"PROJECT_CHANGES.md", "PROJECT_MAP.md"}
+#: §4UM review M2: the agent-owned change log file's first line — a file of that name without it is the
+#: project's own and is never overwritten (a project's own CHANGELOG.md is ordinary content: its edits ARE changes)
+CHANGES_FILE_HEADER = "<!-- written by the agent: this project's change log (§4UM). Edits here are overwritten. -->"
+#: entries rendered into the file (the store keeps them all)
+CHANGES_FILE_MAX = 200
+#: the folder snapshot: entries (files AND folders) seen at most, and seconds at most (more = "too large": the
+#: noted paths alone count; remembered per project for TOO_LARGE_RECHECK_S), and folders never walked (build/
+#: and dist/ are walked: they can be deliverables)
+SNAPSHOT_MAX_FILES = 5000
+SNAPSHOT_MAX_SECONDS = 1.0
+TOO_LARGE_RECHECK_S = 3600.0
+_SNAPSHOT_SKIP_DIRS = frozenset({".git", "node_modules", ".deps", "__pycache__", ".venv", "venv", ".tox",
+                                 ".pytest_cache", ".mypy_cache", ".cache", ".next"})
+#: round 3: skipped only when they ARE what the name suggests (a virtualenv; a cargo build dir) — else content
+_SNAPSHOT_SKIP_IF = {"env": ("pyvenv.cfg",), "target": ("CACHEDIR.TAG", ".rustc_info.json")}
+#: the walk at the flush (the one that decides the entry) may take this long
+SNAPSHOT_FLUSH_SECONDS = 5.0
+_TOO_LARGE: Dict[str, float] = {}
+PENDING_FILE = "pending_changes.json"
+#: §4UM round 2: a diffed path counts only when it moved at/after the request's first write tool (less this
+#: slack: a sandbox clock behind a bind mount)
+WRITE_TIME_SLACK_S = 1.0
+#: §4UM round 2 M1/M2: files the SYSTEM wrote or moved away (a browser screenshot, a check file, the research
+#: mirror, the scratch and workspace sweeps): absolute path → when. Never a change of the owner's.
+_SYSTEM_PATHS: Dict[str, float] = {}
+_SYSTEM_PATHS_MAX = 4000
+#: round 3: the same, per request (its own registrations — another request's sweep cannot evict them; dropped at
+#: its flush)
+_SYSTEM_BY_REQ: Dict[str, set] = {}
+_SYSTEM_BY_REQ_MAX = 200
+#: §4UM round 2 m1: the last write-tool note of every path: absolute path → (entry key, when) — another
+#: request's (a concurrent task turn's) write is not this request's change
+_RECENT_NOTES: Dict[str, Tuple[str, float]] = {}
+_PERSIST_LOCK = threading.Lock()
+#: §4UM round 2 m4: an entry whose write raised is kept and retried at the next flush, this many times at most
+FLUSH_MAX_ATTEMPTS = 3
+
+
+def _abs_key(path) -> str:
+    """One spelling of a path for the system/notes registries (its folder resolved; the file itself may be gone)."""
+    p = str(path)
+    return os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))
+
+
+def note_system_path(path, t: Optional[float] = None) -> None:
+    """§4UM round 2: the system wrote, or moved away, ``path`` (absolute host path) — the folder diff never
+    counts it as the owner's change. Never raises."""
+    try:
+        k = _abs_key(path)
+        rid = _change_rid()
+        with _DEFERRED_LOCK:
+            _SYSTEM_PATHS.pop(k, None)
+            _SYSTEM_PATHS[k] = float(t or time.time())
+            while len(_SYSTEM_PATHS) > _SYSTEM_PATHS_MAX:
+                _SYSTEM_PATHS.pop(next(iter(_SYSTEM_PATHS)))
+            if rid:
+                mine = _SYSTEM_BY_REQ.setdefault(rid, set())
+                if len(mine) < _SYSTEM_PATHS_MAX:
+                    mine.add(k)
+                while len(_SYSTEM_BY_REQ) > _SYSTEM_BY_REQ_MAX:
+                    _SYSTEM_BY_REQ.pop(next(iter(_SYSTEM_BY_REQ)))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def push_covers(pushed, rel: str) -> bool:
+    """§4UM: a push list covers ``rel`` when it names it, or names a folder above it (``"site/"``; ``""`` or
+    ``"/"`` = the whole project folder)."""
+    for f in pushed or ():
+        f = str(f)
+        if f == rel or f in ("", "/") or (f.endswith("/") and rel.startswith(f)):
+            return True
+    return False
+
+
+def _next_seq() -> int:
+    _PENDING_SEQ[0] += 1
+    return _PENDING_SEQ[0]
+
+
+def _change_rid(rid: Optional[str] = None) -> str:
+    if rid is None:
+        try:
+            from ..utils.logging import request_id_context
+            rid = str(request_id_context.get() or "")
+        except Exception:  # noqa: BLE001
+            rid = ""
+    rid = str(rid or "")
+    return "" if rid in ("", "SYSTEM") else request_root(rid)
+
+
+def _skip_change_path(rel: str) -> bool:
+    _name = rel.split("/")[-1] if rel else ""
+    if not rel or _name in _CHANGE_SKIP_NAMES or rel.endswith(".md.tmp") \
+            or (_name.startswith(".PROJECT_CHANGES.md.") and _name.endswith(".tmp")):
+        return True
+    try:
+        from ..core.workspace_cleanup import _is_debris
+        return bool(_is_debris(rel))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _project_root(store, project_id: str) -> Optional[Path]:
+    try:
+        ws = store._default_workspace(_canon_id(project_id))
+        root = _contained_workspace(store, ws) if ws else None
+        return root if root is not None and root.is_dir() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def snapshot_folder(root: Optional[Path], max_files: int = SNAPSHOT_MAX_FILES,
+                    max_seconds: float = SNAPSHOT_MAX_SECONDS) -> Optional[Dict[str, List[int]]]:
+    """§4UM review M3: {project-relative path: [size, mtime_ns, ctime_ns]} of the regular files under ``root``
+    (no link followed; .git, node_modules, .deps, caches, virtualenvs, target/ and dot-folders skipped; the
+    system-written files and debris left out). None when more than ``max_files`` entries (every file and folder
+    seen counts) or ``max_seconds`` would be needed, or the folder cannot be read; {} for a missing folder."""
+    if root is None:
+        return {}
+    import stat as _stat
+    out: Dict[str, List[int]] = {}
+    seen = 0
+    deadline = time.monotonic() + max_seconds
+
+    def _skip_dir(dirpath: str, d: str) -> bool:
+        if d in _SNAPSHOT_SKIP_DIRS or d.startswith("."):
+            return True
+        marks = _SNAPSHOT_SKIP_IF.get(d)
+        return bool(marks) and any(os.path.lexists(os.path.join(dirpath, d, m)) for m in marks)
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [d for d in dirnames if not _skip_dir(dirpath, d)]
+            seen += len(dirnames) + len(filenames)
+            if seen > max_files or time.monotonic() > deadline:
+                return None
+            for f in filenames:
+                full = os.path.join(dirpath, f)
+                rel = os.path.relpath(full, root).replace(os.sep, "/")
+                if _skip_change_path(rel):
+                    continue
+                try:
+                    st = os.lstat(full)
+                except OSError:
+                    continue
+                if not _stat.S_ISREG(st.st_mode):
+                    continue
+                out[rel] = [int(st.st_size), int(st.st_mtime_ns), int(st.st_ctime_ns)]
+    except Exception:  # noqa: BLE001 — round 3: anything unreadable is "too large" (never a stuck "taking")
+        return None
+    return out
+
+
+def _pending_entry(store, project_id: str, key: str, ask: str = "", source: str = "owner") -> Dict[str, Any]:
+    bucket = _PENDING_CHANGES.setdefault(key, {})
+    k = f"{id(store)}:{project_id}"
+    e = bucket.get(k)
+    ask = _REQUEST_ASK.get(key) or ask        # the owner's message of the request, when known
+    if e is None:
+        e = bucket[k] = {"store": store, "pid": project_id, "rid": key, "ask": str(ask or "")[:400],
+                         "first": time.time(), "last": time.time(), "files": {}, "pushes": [],
+                         "reopened_from": "", "source": source}
+    elif ask and not e["ask"]:
+        e["ask"] = str(ask)[:400]
+    return e
+
+
+def _persist(store) -> None:
+    """Write this store's pending entries (no snapshots) to ``pending_changes.json`` — atomic, best effort. The
+    rows are built under the pending lock; one writer at a time (a later state never loses to an older one)."""
+    try:
+        mem = getattr(store, "memory_dir", None)
+        if mem is None:
+            return
+        with _PERSIST_LOCK:
+            with _DEFERRED_LOCK:
+                rows = [{k: v for k, v in e.items() if k not in ("store", "snap")}
+                        for bucket in _PENDING_CHANGES.values() for e in bucket.values()
+                        if e["store"] is store and (e["files"] or e["pushes"] or e.get("wrote"))]
+                data = json.dumps(rows, default=str) if rows else ""
+            path = Path(mem) / PENDING_FILE
+            if not data:
+                if path.exists():
+                    path.unlink()
+                return
+            tmp = Path(mem) / f".{PENDING_FILE}.{uuid.uuid4().hex[:8]}.tmp"
+            tmp.write_text(data, encoding="utf-8")
+            os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        logger.debug("pending change log not persisted", exc_info=True)
+
+
+def note_request_ask(request_id: str, text: str) -> None:
+    """§4UM review: the OWNER's message of a root request — the ask of every entry it writes (a project task's
+    turn inside it has its own prompt in ``last_user_content``)."""
+    rid = _change_rid(request_id)
+    if rid and rid == str(request_id or ""):        # a root request only: a task turn's prompt is never the ask
+        with _DEFERRED_LOCK:
+            _REQUEST_ASK[rid] = " ".join(str(text or "").split())[:400]
+            while len(_REQUEST_ASK) > 200:
+                _REQUEST_ASK.pop(next(iter(_REQUEST_ASK)))
+
+
+def watch_project(store, project_id: str, *, rid: Optional[str] = None, key: Optional[str] = None,
+                  ask: str = "", source: str = "owner", task_id: str = "", write: bool = False,
+                  evidence: bool = False) -> bool:
+    """§4UM review M3: the request has ``project_id`` in play — take the folder snapshot its flush diffs
+    against (once per request and project). ``key``: the entry's own key (an unattended task turn); default the
+    root request. ``write``: a writing tool is about to run on the project (round 2: only such a request's
+    folder is diffed at all). Returns True when a snapshot was taken now. Never raises."""
+    try:
+        project_id = _canon_id(project_id)
+        k = key or _change_rid(rid)
+        if not k or not project_id:
+            return False
+        ck = f"{id(store)}:{project_id}"
+        with _DEFERRED_LOCK:
+            e = _pending_entry(store, project_id, k, ask, source)
+            if task_id:
+                e["task_id"] = str(task_id)
+            if write:
+                _mark_wrote(e, evidence)
+            if "snap" in e:
+                return False
+            if time.time() - _TOO_LARGE.get(ck, 0.0) < TOO_LARGE_RECHECK_S:
+                e["snap"] = "too_large"         # walked and too large within the hour: not walked again
+                return False
+            e["snap"] = "taking"
+            e["snap_seq"] = _next_seq()         # writes noted before it are not in its "before"
+        snap = None
+        try:
+            snap = snapshot_folder(_project_root(store, project_id))
+        finally:
+            with _DEFERRED_LOCK:
+                e["snap"] = snap if snap is not None else "too_large"
+                if snap is None:
+                    _TOO_LARGE[ck] = time.time()
+                else:
+                    _TOO_LARGE.pop(ck, None)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug("project folder not watched for %s", project_id, exc_info=True)
+        return False
+
+
+def _mark_wrote(e: Dict[str, Any], evidence: bool = False) -> None:
+    """(under the lock) a writing tool ran on the entry's project in this request: its folder is diffed. Round 4:
+    ``evidence`` — the tool REALLY wrote (a reported path, a command with write targets): only then may the entry
+    name no file ("files not all listed" on a folder too large to compare); a pinned `pytest` / `ls` never does."""
+    if not e.get("wrote"):
+        e["wrote"] = True
+        e["wrote_t"] = time.time()
+    if evidence:
+        e["write_evidence"] = True
+
+
+def mark_task_write(store, project_id: str, rid: Optional[str] = None, evidence: bool = False) -> bool:
+    """§4UM round 2: an UNATTENDED task turn (its own entry, keyed by its request id) runs a writing tool on
+    ``project_id`` — mark that entry (only one the task turn's start opened; never a new one). Never raises."""
+    try:
+        if rid is None:
+            from ..utils.logging import request_id_context
+            rid = str(request_id_context.get() or "")
+        project_id = _canon_id(project_id)
+        cur, chain = str(rid or ""), []
+        with _DEFERRED_LOCK:
+            while cur and cur not in chain and len(chain) < 8:
+                chain.append(cur)
+                cur = _REQUEST_PARENTS.get(cur, "")
+            for k in chain:
+                e = (_PENDING_CHANGES.get(k) or {}).get(f"{id(store)}:{project_id}")
+                if e is not None and e.get("source") == "task":
+                    _mark_wrote(e, evidence)
+                    return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def note_change_write(store, project_id: str, rel: str, *, ask: str = "", rid: Optional[str] = None,
+                      reopened_from: str = "", known: Optional[set] = None, persist: bool = True) -> Optional[str]:
+    """§4UM: record that this request wrote ``rel`` (project-relative) in ``project_id``'s folder. Decides
+    added / changed / removed from disk: gone → removed; a file the project never knew (not registered,
+    described, or in an earlier change) and born during this request → added; else changed. (The folder
+    diff at the flush overrides it for every path it saw.) Returns the kind, or None when nothing was
+    recorded. Never raises."""
+    try:
+        rid = _change_rid(rid)
+        project_id = _canon_id(project_id)
+        rel = ProjectStore._normalize_rel_path(project_id, rel) or ""
+        if not rid or not project_id or _skip_change_path(rel):
+            return None
+        ws = store._default_workspace(project_id)
+        full = Path(ws) / rel if ws else None
+        if full is not None and full.is_dir():
+            return None
+        with _DEFERRED_LOCK:
+            e = _pending_entry(store, project_id, rid, ask)
+            if reopened_from and not e["reopened_from"]:
+                e["reopened_from"] = reopened_from
+            prev = e["files"].get(rel)
+            _mark_wrote(e, True)
+        if full is not None and not full.exists():
+            kind = "removed"
+            if prev and prev["kind"] == "added":
+                with _DEFERRED_LOCK:
+                    e["files"].pop(rel, None)       # made and removed in the same request: never there
+                if persist:
+                    _persist(store)
+                return "removed"
+        elif prev:
+            kind = "added" if prev["kind"] == "added" else "changed"
+        else:
+            if known is None:
+                known = known_project_files(store, project_id)
+            kind = "changed" if rel in known else "added"
+            if kind == "added" and full is not None:
+                try:
+                    born = getattr(full.stat(), "st_birthtime", None)
+                    if born is not None and float(born) < e["first"] - 5.0:
+                        kind = "changed"            # an older file the records never listed
+                except OSError:
+                    pass
+        with _DEFERRED_LOCK:
+            e["files"][rel] = {"kind": kind, "seq": _next_seq(), "t": time.time()}
+            e["last"] = time.time()
+            _mark_wrote(e, True)
+            if full is not None:
+                _ak = _abs_key(full)
+                _RECENT_NOTES.pop(_ak, None)
+                _RECENT_NOTES[_ak] = (rid, time.time())
+                while len(_RECENT_NOTES) > _SYSTEM_PATHS_MAX:
+                    _RECENT_NOTES.pop(next(iter(_RECENT_NOTES)))
+        if persist:
+            _persist(store)
+        return kind
+    except Exception:  # noqa: BLE001
+        logger.warning("change not noted for %s %s", project_id, rel, exc_info=True)
+        return None
+
+
+def known_project_files(store, project_id: str) -> set:
+    """The files the project's records already name (deliverables, the manifest, earlier changes) — a write to one
+    of them is "changed", not "added"."""
+    known: set = set()
+    try:
+        known.update(store.list_deliverables(project_id))
+        known.update(store.get_file_manifest(project_id))
+        for c in store.list_changes(project_id, kind="change"):
+            known.update(c["added"])
+            known.update(c["changed"])
+    except Exception:  # noqa: BLE001
+        pass
+    return known
+
+
+def note_change_writes(store, project_id: str, rels, *, ask: str = "", reopened_from: str = "") -> int:
+    """Round 4: a BATCH of written paths (a lab folder `get`) — the records read once, the pending file written
+    once. Returns how many were noted."""
+    known = known_project_files(store, _canon_id(project_id))
+    n = sum(1 for r in rels if note_change_write(store, project_id, r, ask=ask, reopened_from=reopened_from,
+                                                 known=known, persist=False))
+    _persist(store)
+    return n
+
+
+def note_change_push(store, project_id: str, files=None, *, url: str = "", lab_id: str = "", app: str = "",
+                     how: str = "deploy", rid: Optional[str] = None, before_t: Optional[float] = None,
+                     key: Optional[str] = None) -> None:
+    """§4UM: this request pushed the project's files to its lab (``files=None`` = the whole version: a deploy
+    or a switch; else the project-relative paths a `lab put` sent). ``before_t``: only changes written up to
+    then are in the version (a switch serves the version staged at that time). Outside any request it is
+    recorded at once. Never raises."""
+    try:
+        project_id = _canon_id(project_id)
+        k = key or _change_rid(rid)
+        if not project_id:
+            return
+        if not k:
+            store.record_deploy(project_id, url=url, files=files, how=how, lab_id=lab_id, app=app,
+                                before_ts=before_t)
+            return
+        with _DEFERRED_LOCK:
+            e = _pending_entry(store, project_id, k)
+            e["pushes"].append({"seq": _next_seq(), "t": time.time(),
+                                "files": None if files is None else [str(f) for f in files],
+                                "url": str(url or ""), "lab_id": str(lab_id or ""), "app": str(app or ""),
+                                "how": str(how or "deploy"), "before_t": before_t})
+        _persist(store)
+    except Exception:  # noqa: BLE001
+        logger.warning("lab push not noted for %s", project_id, exc_info=True)
+
+
+def note_change_stage(store, project_id: str, lab_id: str, at: Optional[float] = None) -> None:
+    """§4UM review: a deploy into a STAGED version (not serving yet) — when it was made; `lab switch` of that
+    lab serves the changes made up to then."""
+    try:
+        at = float(at or time.time())
+
+        def _mut(meta):
+            st = dict(meta.get("staged_deploys") or {})
+            st[str(lab_id)] = at
+            meta["staged_deploys"] = dict(sorted(st.items(), key=lambda kv: kv[1])[-8:])
+            return meta
+        store._atomic_metadata_update(_canon_id(project_id), _mut)
+    except Exception:  # noqa: BLE001
+        logger.debug("staged deploy not noted for %s", project_id, exc_info=True)
+
+
+def staged_at(store, project_id: str, lab_id: str) -> Optional[float]:
+    try:
+        v = (((store.get_project(project_id) or {}).get("metadata") or {}).get("staged_deploys") or {}).get(lab_id)
+        return float(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def pending_change_files(store, project_id: str) -> set:
+    """Paths a running request added or changed in ``project_id`` (not yet in the log) — kept by a sweep."""
+    out: set = set()
+    with _DEFERRED_LOCK:
+        for bucket in _PENDING_CHANGES.values():
+            for e in bucket.values():
+                if e["store"] is store and e["pid"] == _canon_id(project_id):
+                    out.update(r for r, f in e["files"].items() if f["kind"] != "removed")
+    return out
+
+
+def _reply_summary(reply: str) -> str:
+    """§4UM review: the final reply as plain text (markdown, links and tool banners stripped, whitespace
+    collapsed), ≤300 chars — what the request said it did."""
+    txt = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", str(reply or ""))
+    kept = []
+    for ln in txt.splitlines():
+        ln = re.sub(r"[*_`#>]+", "", ln).strip(" -•\t")
+        if ln and not ln.startswith(("[exited", "<!--")):
+            kept.append(ln)
+    out = " ".join(" ".join(kept).split())
+    return out[:300].rstrip() + ("…" if len(out) > 300 else "")
+
+
+def _was_ready_before(store, project_id: str, rid: str, t: float) -> bool:
+    """The project's first plan was finished by ANOTHER request (``metadata.first_ready_at`` /
+    ``first_ready_req``) — or, finished before §4UM, an older roll-up event before ``t``."""
+    proj = store.get_project(project_id) or {}
+    m = proj.get("metadata") or {}
+    if m.get("first_ready_at"):
+        by = str(m.get("first_ready_req") or "")
+        mine = {rid, request_root(rid)} if rid else set()
+        return not (by and (by in mine or request_root(by) in mine))
+    for ev in store.list_events(project_id, limit=20, event_type="project_auto_rollup") or []:
+        try:
+            if float(ev.get("ts") or 0) < t:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _planned_in_request(store, project_id: str, rid: str, first_t: Optional[float] = None) -> bool:
+    """The request built the project's FIRST plan (created it, or closed one of its tasks before the plan
+    was ever finished) — that is recorded by the tasks, not as an owner change. Once the plan has been
+    finished, a request that changes the files is a change even when it adds and closes tasks for it."""
+    try:
+        if first_t is not None and _was_ready_before(store, project_id, rid, first_t):
+            return False
+        for t in store.list_tasks(project_id) or []:
+            c = str(t.get("closed_req_id") or "")
+            if c and (c == rid or request_root(c) == rid):
+                return True
+        for ev in store.list_events(project_id, limit=5, event_type="project_created") or []:
+            c = str((ev.get("payload") or {}).get("req") or "")
+            if c and (c == rid or request_root(c) == rid):
+                return True
+    except Exception:  # noqa: BLE001
+        logger.debug("planned-work check skipped for %s", project_id, exc_info=True)
+    return False
+
+
+def _file_t(st: List[int]) -> float:
+    """When a snapshotted file last moved: its content (mtime) or its name (ctime: a rename, a copy -p)."""
+    return max(st[1], st[2] if len(st) > 2 else 0) / 1e9
+
+
+def _change_t(st: List[int], since: float) -> float:
+    """§4UM-s: when a changed file's change happened — its content time (mtime) when the content moved during
+    the request (on or after ``since``); the name time (ctime) only for content older than that (a rename, a
+    copy -p brought it in). ctime alone also moves on a metadata touch — an xattr written when the file is
+    opened (macOS ``com.apple.lastuseddate#PS``), a chmod — so it never dates a fresh write: req 56dff518's
+    entry read 12:19 (index.html's ctime) for files last written at 11:52."""
+    m = st[1] / 1e9
+    return m if m >= since else _file_t(st)
+
+
+def _foreign(e: Dict[str, Any], root: Path, rel: str, t: float) -> bool:
+    """§4UM round 2: a diffed path that is not this request's change — the system wrote or moved it (a
+    screenshot, a check file, the research mirror, a sweep), another request's write tool noted it during this
+    request, or it moved before this request ran its first writing tool."""
+    ak = _abs_key(root / rel)
+    since = float(e["first"]) - WRITE_TIME_SLACK_S
+    with _DEFERRED_LOCK:
+        if ak in _SYSTEM_BY_REQ.get(str(e["rid"]), ()):
+            return True                         # this request's own system write (never evicted)
+        sys_t = _SYSTEM_PATHS.get(ak)
+        other = _RECENT_NOTES.get(ak)
+    if sys_t is not None and sys_t >= since:
+        return True
+    if other is not None and other[0] != e["rid"] and other[1] >= since:
+        return True
+    return t < float(e.get("wrote_t") or e["first"]) - WRITE_TIME_SLACK_S
+
+
+_UNREAD = object()
+
+
+def _push_times(e: Dict[str, Any]) -> Optional[List[float]]:
+    """§4UM-s review: every time a version of ``e``'s project was cut — a push (this request's, another request's
+    still pending, a recorded deploy entry) and a staged deploy (``metadata.staged_deploys`` and a pending switch's
+    ``before_t``: the version a switch serves). A recorded switch marked its changes when it ran. None when they
+    cannot be read (the caller then keeps the later time)."""
+    try:
+        pid, store = e["pid"], e["store"]
+        with _DEFERRED_LOCK:
+            pend = [p for b in _PENDING_CHANGES.values() for x in b.values()
+                    if x["store"] is store and x["pid"] == pid for p in x["pushes"]]
+        out: List[float] = []
+        for p in pend + list(e["pushes"]):
+            out += [float(p["t"])] + ([float(p["before_t"])] if p.get("before_t") is not None else [])
+        meta = (store.get_project(pid) or {}).get("metadata") or {}
+        out += [float(v) for v in (meta.get("staged_deploys") or {}).values() if v]
+        with store._lock, store._connect() as conn:
+            out += [float(r[0]) for r in conn.execute("SELECT ts FROM project_changes WHERE project_id = ? "
+                                                      "AND kind = 'deploy'", (pid,)).fetchall()]
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _push_between(times: Optional[List[float]], lo: float, hi: float) -> bool:
+    """A version cut at a time in (lo, hi] — unknown counts as one."""
+    return times is None or any(lo < t <= hi for t in times)
+
+
+def _diffed_files(e: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """The entry's files: the paths its write tools noted, and the folder diff (when a snapshot was taken) less
+    what is not this request's (`_foreign`). A path first noted as added stays added."""
+    files = {r: dict(f) for r, f in e["files"].items() if not _skip_change_path(r)}
+    root = _project_root(e["store"], e["pid"])
+    snap = e.get("snap")
+    now = snapshot_folder(root, max_seconds=SNAPSHOT_FLUSH_SECONDS) if isinstance(snap, dict) else None
+    if isinstance(snap, dict) and now is None:
+        # round 3 M2: the flush walk failed (too large, too slow, unreadable) — never a silent drop: the entry
+        # carries folder_too_large and the paths the tools reported. Round 5: the folder was comparable at the
+        # start and is not now — it grew past the cap during the request: that IS write evidence
+        e["snap"] = "too_large"
+        with _DEFERRED_LOCK:
+            _TOO_LARGE[f"{id(e['store'])}:{e['pid']}"] = time.time()
+            if e.get("wrote"):
+                e["write_evidence"] = True
+    for r in list(files):
+        there = root is not None and (root / r).exists()
+        if files[r]["kind"] != "removed" and not there:     # a noted file gone since (made, then removed)
+            if files[r]["kind"] == "added":
+                files.pop(r)
+            else:
+                files[r]["kind"] = "removed"
+        elif files[r]["kind"] == "removed" and there:       # removed, then made again
+            if now is not None and snap.get(r) is not None and now.get(r) is not None \
+                    and snap[r][:2] == now[r][:2]:
+                files.pop(r)                    # as it was: no change
+            else:
+                files[r]["kind"] = "changed"
+    if now is None:
+        return files
+    since = float(e.get("wrote_t") or e["first"]) - WRITE_TIME_SLACK_S     # as `_foreign` reads it
+    _cuts: Any = _UNREAD
+    for rel in set(snap) | set(now):
+        a, b = snap.get(rel), now.get(rel)
+        if a is not None and b is not None and a[:2] == b[:2]:
+            continue
+        if a is None:
+            kind, t = "added", _file_t(b)
+        elif b is None:
+            kind = "removed"
+            try:                                # when it went: the folder it was in changed then
+                _ps = os.stat((root / rel).parent) if (root / rel).parent.exists() else None
+                t = max(_ps.st_mtime, _ps.st_ctime) if _ps is not None else time.time()
+            except OSError:
+                t = time.time()
+        else:
+            kind, t = "changed", _file_t(b)
+        # §4UM-s: `t` (content OR name time) decides whether the path is this request's; the change is dated by
+        # its content's own time — unless a push lies between that and `t` (content renamed into place after a
+        # push is not in that push: the later time keeps it out of `_covered` and `record_deploy` alike)
+        ct = _change_t(b, since) if b is not None else t
+        if ct < t:
+            if _cuts is _UNREAD:
+                _cuts = _push_times(e)          # once per flush, only when a file's ctime ran ahead of its mtime
+            if _push_between(_cuts, ct, t):
+                ct = t
+        prev = files.get(rel)
+        if prev is None and _foreign(e, root, rel, t):
+            continue
+        if prev is not None and prev["kind"] == "added" and kind == "changed" \
+                and int(prev.get("seq") or 0) < int(e.get("snap_seq") or 0):
+            kind = "added"                      # m5: added (noted) before the snapshot saw it — still added
+        if prev is not None and kind == "removed" and prev["kind"] == "added":
+            files.pop(rel, None)
+            continue
+        files[rel] = {"kind": kind, "t": max(ct, prev["t"]) if prev else ct,
+                      **({"seq": prev["seq"]} if prev and prev.get("seq") else {})}
+    for r in [r for r, f in files.items() if f["kind"] == "removed" and r not in snap]:
+        if any(k.startswith(r.rstrip("/") + "/") for k in snap):
+            files.pop(r)                        # a removed FOLDER: its files are listed one by one
+    return files
+
+
+def _covered(rel: str, f: Dict[str, Any], pushes: List[Dict[str, Any]]) -> bool:
+    """A push after the write carried ``rel`` (a noted write: by order; a diffed one: by time)."""
+    for p in pushes:
+        if not (p["files"] is None or push_covers(p["files"], rel)):
+            continue
+        if p.get("before_t") is not None and f["t"] > float(p["before_t"]) + 1e-6:
+            continue                            # a switch: not in the version it serves
+        if (p["seq"] > f["seq"]) if f.get("seq") else (p["t"] >= f["t"]):
+            return True
+    return False
+
+
+def _write_pending(e: Dict[str, Any], reply: str = "") -> int:
+    store, pid, rid = e["store"], e["pid"], e["rid"]
+    proj = store.get_project(pid)
+    if not proj:
+        return 0
+    n = 0
+    # §4UM round 2: only a request that ran a writing tool on the project has its folder diffed — a read, a
+    # search or a screenshot is never a change. A DONE project reopens only at a write tool's noted path
+    # (`note_project_write`), never from the diff alone.
+    files = _diffed_files(e) if e.get("wrote") and not e.get("files_done") else {}
+    pushes = [] if e.get("pushes_done") else list(e["pushes"])
+    # round 3 M2: a writing request on a folder that could not be compared is an entry even with no file named
+    unlisted = bool(e.get("wrote") and e.get("write_evidence") and not e.get("files_done")
+                    and e.get("snap") == "too_large" and not files and not e.get("recovered"))
+    if (e.get("wrote") and not files and not unlisted and e.get("snap") == "too_large" and not e.get("files_done")
+            and not e.get("recovered")):
+        # round 5: a command with no visible write (a generator, `make`) on a folder too large to compare may
+        # have changed files — said once, at INFO; no entry (a pinned `pytest` / `ls` must not make one)
+        logger.info("change log: project %s is too large to compare; a command ran that may have changed files — "
+                    "no change entry", pid)
+    if (files or unlisted) and not _planned_in_request(store, pid, rid, e["first"]):
+        if str(proj.get("status") or "").upper() == "RELEASED":
+            files, unlisted = {}, False         # immutable: never a change entry (changes go to create_version)
+    else:
+        files, unlisted = {}, False
+    if files or unlisted:
+        added = sorted(r for r, f in files.items() if f["kind"] == "added")
+        changed = sorted(r for r, f in files.items() if f["kind"] == "changed")
+        removed = sorted(r for r, f in files.items() if f["kind"] == "removed")
+        live = {r: f for r, f in files.items() if f["kind"] != "removed"}
+        if unlisted and not files:              # what changed is unknown: live once a whole version went after it
+            _wt = {"t": float(e.get("last") or time.time())}
+            deployed = any(_covered("", _wt, [p]) for p in pushes if p["files"] is None)
+        elif live:
+            deployed = all(_covered(r, f, pushes) for r, f in live.items())
+        else:                                   # removal only: live once a whole version went after it
+            deployed = all(_covered(r, f, [p for p in pushes if p["files"] is None]) for r, f in files.items())
+        last_t = max([f["t"] for f in files.values()] or [float(e.get("last") or time.time())])
+        url = next((p["url"] for p in reversed(pushes) if p["url"]), "")
+        meta: Dict[str, Any] = {}
+        if e["reopened_from"]:
+            meta["reopened_from"] = e["reopened_from"]
+        if e.get("source") == "task":
+            meta.update(source="task", task_id=e.get("task_id") or "")
+        if e.get("recovered"):
+            meta["recovered"] = True
+        if e.get("snap") == "too_large":
+            meta["folder_too_large"] = True
+        entry = store.add_change(pid, ts=last_t, req_id=rid, ask=e["ask"], added=added, changed=changed,
+                                 removed=removed, summary=_reply_summary(reply), deployed=deployed,
+                                 deployed_at=(max(p["t"] for p in pushes) if deployed and pushes else None),
+                                 url=url if deployed else "", render=not pushes, meta=meta or None)
+        e["files_done"] = True                  # a retry after a failed deploy write adds no second entry
+        if entry:
+            n += 1
+            if e["reopened_from"]:
+                store.log_event(pid, None, "project_reopened",
+                                {"reason": f"reopened by change #{entry['num']}",
+                                 "from_status": e["reopened_from"], "req": rid})
+    if pushes:
+        whole = any(p["files"] is None for p in pushes)
+        pfiles = None if whole else sorted({f for p in pushes for f in (p["files"] or [])})
+        last = pushes[-1]
+        _bt = [p["before_t"] for p in pushes if p["files"] is None and p.get("before_t") is not None]
+        store.record_deploy(pid, url=next((p["url"] for p in reversed(pushes) if p["url"]), ""),
+                            files=pfiles, how="+".join(dict.fromkeys(p["how"] for p in pushes)),
+                            lab_id=last["lab_id"], app=last["app"], req_id=rid,
+                            ts=max(p["t"] for p in pushes),
+                            before_ts=(max(_bt) if _bt and len(_bt) == sum(1 for p in pushes
+                                                                          if p["files"] is None) else None))
+        e["pushes_done"] = True
+        n += 1
+    return n
+
+
+def flush_change_log(request_id: str, reply: str = "") -> int:
+    """§4UM: write the change log entries ``request_id`` collected (one per project it changed, plus one
+    deploy entry when it pushed to the project's lab). Called at the end of every agent turn, BEFORE the
+    deferred sweeps (the sweep keeps the change's files); also writes any other request's entries older
+    than DEFERRED_SWEEP_MAX_AGE_S. Never raises. Returns how many entries were written."""
+    n = 0
+    try:
+        rid = str(request_id or "")
+        # entries are keyed by the ROOT request: a project task's turn inside the owner's request (its own
+        # handle_chat ends first) flushes nothing of the owner's — the owner's request end writes them
+        cutoff = time.time() - DEFERRED_SWEEP_MAX_AGE_S
+        mine: List[Dict[str, Any]] = []
+        stale: List[Dict[str, Any]] = []
+        with _DEFERRED_LOCK:
+            if rid:
+                mine += list((_PENDING_CHANGES.pop(rid, {}) or {}).values())
+                _REQUEST_ASK.pop(rid, None)
+            _sys_mine = _SYSTEM_BY_REQ.get(rid) if rid else None
+            for k in list(_PENDING_CHANGES):
+                b = _PENDING_CHANGES[k]
+                if b and all(e["last"] < cutoff and e["first"] < cutoff for e in b.values()):
+                    stale += list(_PENDING_CHANGES.pop(k).values())
+        stores = {}
+        for e, rep in [(x, reply) for x in mine] + [(x, "") for x in stale]:
+            stores[id(e["store"])] = e["store"]
+            try:
+                n += _write_pending(e, rep)
+            except Exception:  # noqa: BLE001
+                # §4UM round 2 m4: kept pending (and on disk) — the next flush retries it, a few times at most
+                e["attempts"] = int(e.get("attempts") or 0) + 1
+                if e["attempts"] < FLUSH_MAX_ATTEMPTS:
+                    logger.warning("change log entry not written for %s (kept, retried at the next flush)",
+                                   e.get("pid"), exc_info=True)
+                    with _DEFERRED_LOCK:
+                        _PENDING_CHANGES.setdefault(str(e["rid"]), {})[f"{id(e['store'])}:{e['pid']}"] = e
+                else:
+                    logger.warning("change log entry for %s dropped after %d failed writes", e.get("pid"),
+                                   e["attempts"], exc_info=True)
+        for st in stores.values():
+            _persist(st)
+        if rid:
+            with _DEFERRED_LOCK:
+                if _SYSTEM_BY_REQ.get(rid) is _sys_mine:
+                    _SYSTEM_BY_REQ.pop(rid, None)
+    except Exception:  # noqa: BLE001
+        logger.warning("change log not flushed for %s", request_id, exc_info=True)
+    return n
+
+
+def set_change_summary(request_id: str, reply: str) -> int:
+    """§4UM review: a STREAMED reply is complete only after handle_chat's finally wrote the request's entries —
+    fill their empty summaries now (and re-render the file). Returns how many were set."""
+    rid = _change_rid(request_id)
+    summary = _reply_summary(reply)
+    if not rid or not summary:
+        return 0
+    n = 0
+    for store in list(_KNOWN_STORES):
+        try:
+            with store._lock, store._connect() as conn:
+                rows = conn.execute("SELECT id, project_id FROM project_changes WHERE req_id = ? AND kind = 'change' "
+                                    "AND summary = ''", (rid,)).fetchall()
+                for r in rows:
+                    conn.execute("UPDATE project_changes SET summary = ? WHERE id = ?", (summary, r["id"]))
+                conn.commit()
+            for pid in {r["project_id"] for r in rows}:
+                store.render_changelog(pid)
+            n += len(rows)
+        except Exception:  # noqa: BLE001
+            logger.debug("change summary not set for %s", rid, exc_info=True)
+    return n
+
+
+def _already_logged(store, project_id: str, rid: str) -> set:
+    """The kinds ("change", "deploy") the log already holds for (project, request)."""
+    if not rid:
+        return set()
+    try:
+        with store._lock, store._connect() as conn:
+            return {r[0] for r in conn.execute("SELECT DISTINCT kind FROM project_changes WHERE project_id = ? "
+                                               "AND req_id = ?", (project_id, rid)).fetchall()}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def recover_pending_changes(store) -> int:
+    """§4UM review: entries a killed process left in ``pending_changes.json`` are written now (no reply, no
+    folder diff — the noted paths and pushes), marked recovered. Call once at start. Returns entries written.
+    Round 2 m3/m4: a (project, request) already in the log is not written twice; the file goes only once every
+    row was written (a row that fails stays pending: retried at a later flush); a corrupt file is moved aside
+    to ``pending_changes.json.bad`` with one warning."""
+    n = 0
+    try:
+        path = Path(store.memory_dir) / PENDING_FILE
+        if not path.exists():
+            return 0
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8") or "[]")
+            if not isinstance(rows, list):
+                raise ValueError("not a list")
+        except (ValueError, UnicodeDecodeError) as exc:
+            os.replace(path, path.with_name(PENDING_FILE + ".bad"))
+            logger.warning("change log: %s is unreadable (%s) — moved aside to %s.bad", PENDING_FILE, exc,
+                           PENDING_FILE)
+            return 0
+        for r in rows:
+            if not isinstance(r, dict) or not r.get("pid"):
+                continue
+            _logged = _already_logged(store, str(r["pid"]), str(r.get("rid") or ""))
+            e = dict(r, store=store, recovered=True)
+            # round 3: what the flush already wrote (a kill between its two writes) is not written again; the rest is
+            if "change" in _logged or not r.get("files"):
+                e["files_done"] = True
+            if "deploy" in _logged or not r.get("pushes"):
+                e["pushes_done"] = True
+            if e.get("files_done") and e.get("pushes_done"):
+                continue
+            e.setdefault("files", {})
+            e.setdefault("pushes", [])
+            e.setdefault("reopened_from", "")
+            e.setdefault("rid", "")
+            e.setdefault("first", time.time())
+            e["last"] = 0.0                     # stale: a later flush retries it if this write fails
+            try:
+                n += _write_pending(e, "")
+            except Exception:  # noqa: BLE001
+                logger.warning("recovered change log entry not written for %s (kept pending)", r.get("pid"),
+                               exc_info=True)
+                with _DEFERRED_LOCK:
+                    _PENDING_CHANGES.setdefault(str(e["rid"] or "recovered"), {})[f"{id(store)}:{e['pid']}"] = e
+        _persist(store)                         # gone when every row was written; else the rows still pending
+        if n:
+            logger.info("change log: %d entr%s recovered from a request that never ended", n, "y" if n == 1 else "ies")
+    except Exception:  # noqa: BLE001
+        logger.warning("pending change log not recovered", exc_info=True)
+    return n
+
+
+def backfill_change(store, project_id: str, ask: str, added=(), changed=(), summary: str = "",
+                    ts: Optional[float] = None, req: str = "", deployed: bool = False, url: str = "",
+                    removed=(), lab_id: str = "", how: str = "put",
+                    allow_duplicate: bool = False) -> Optional[Dict[str, Any]]:
+    """§4UM: add a past change to the log by hand (work done before the log existed). Idempotent: an entry
+    with the same ``req``, or the same ``ts`` (±60 s) and ask, is returned as it is (``meta.existing``). With
+    ``deployed`` and a ``url`` it also records the push (a deploy entry at the same time; ``metadata.live``
+    only when no newer deploy is recorded); ``deployed`` without a url marks only this entry."""
+    norm_ask = " ".join(str(ask or "").split())[:300]
+    for c in ([] if allow_duplicate else store.list_changes(project_id, kind="change")):
+        if (req and c.get("req_id") == req) or (
+                ts is not None and abs(float(c["ts"]) - float(ts)) <= 60 and c.get("ask") == norm_ask):
+            return dict(c, meta=dict(c.get("meta") or {}, existing=True))
+    e = store.add_change(project_id, ts=ts, req_id=req, ask=ask, added=added, changed=changed,
+                         removed=removed, summary=summary, render=not (deployed and url),
+                         deployed=bool(deployed and not url), meta={"backfilled": True})
+    if e and deployed and url:
+        store.record_deploy(project_id, url=url, files=list(added) + list(changed), how=how,
+                            lab_id=lab_id, req_id=req, ts=float(e["ts"]) + 0.001)
+    return e
+
+
+def _when(ts) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except (TypeError, ValueError, OverflowError):
+        return "?"
+
+
+def change_line(e: Dict[str, Any]) -> str:
+    """One change-log entry as one line (§4UM)."""
+    if e.get("kind") == "deploy":
+        m = e.get("meta") or {}
+        what = "whole folder" if m.get("whole") else ", ".join((e.get("changed") or [])[:6]) or "files"
+        return (f"{_when(e['ts'])} LIVE ({m.get('how') or 'deploy'}: {what})"
+                + (f" → {e['url']}" if e.get("url") else "")
+                + (f", includes #{m['through']}" if m.get("through") else ""))
+    files = []
+    if e.get("added"):
+        files.append("+" + ", +".join(e["added"][:6]))
+    if e.get("changed"):
+        files.append("~" + ", ~".join(e["changed"][:6]))
+    if e.get("removed"):
+        files.append("-" + ", -".join(e["removed"][:4]))
+    return (f"#{e.get('num')} {_when(e['ts'])} · {'live' if e.get('deployed') else 'NOT deployed'}"
+            + (f" · asked: \"{str(e.get('ask') or '')[:120]}\"" if e.get("ask") else "")
+            + (f" · files: {'; '.join(files)}" if files else "")
+            + (" · (files not all listed: folder too large)" if (e.get("meta") or {}).get("folder_too_large") else "")
+            + (f" · {str(e.get('summary') or '')[:160]}" if e.get("summary") else ""))
+
+
+def recent_change_lines(store, project_id: str, n: int = 5) -> List[str]:
+    """The last ``n`` change-log entries (changes and deploys), newest first."""
+    try:
+        return [change_line(e) for e in store.list_changes(project_id, limit=n)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+#: folders the generated layout never walks
+_LAYOUT_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".deps", ".venv", "venv", ".pytest_cache",
+                     ".mypy_cache", "dist", "build", ".next", ".cache"}
+
+
+def folder_layout(store, project_id: str, max_files: int = 60) -> List[str]:
+    """§4UM: the project's files as they are on disk now (project-relative, sorted; dotfiles, caches and
+    dependency folders left out) — the briefing's layout, never a stale record. Last entry "(+N more)"."""
+    try:
+        ws = store._default_workspace(_canon_id(project_id))
+        root = _contained_workspace(store, ws) if ws else None
+        if root is None or not root.is_dir():
+            return []
+        out: List[str] = []
+        extra = 0
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = sorted(d for d in dirnames if d not in _LAYOUT_SKIP_DIRS and not d.startswith("."))
+            for f in sorted(filenames):
+                if f.startswith(".") or f.endswith((".pyc", ".tmp")):
+                    continue
+                rel = (Path(dirpath) / f).relative_to(root).as_posix()
+                if len(out) < max_files:
+                    out.append(rel)
+                else:
+                    extra += 1
+            if len(out) >= max_files and extra > 500:
+                break
+        if extra:
+            out.append(f"(+{extra} more)")
+        return out
+    except Exception:  # noqa: BLE001
+        logger.debug("folder layout skipped for %s", project_id, exc_info=True)
+        return []
+
+
+def live_line(store, project_id: str) -> str:
+    """"Live at <url> (last deployed <when>, includes change #N; behind: #a–#b not deployed)" or ""."""
+    try:
+        li = store.live_info(project_id)
+    except Exception:  # noqa: BLE001
+        li = None
+    if not li:
+        return ""
+    behind = li.get("behind") or []
+    tail = ""
+    if behind:
+        span = f"#{behind[0]}" if len(behind) == 1 else f"#{behind[0]}–#{behind[-1]}"
+        tail = f"; BEHIND: change(s) {span} not deployed yet"
+    return (f"Live at {li.get('url') or '(no url)'} (last deployed {_when(li.get('at'))}"
+            + (f", includes change #{li['through']}" if li.get("through") else "") + tail + ")")
+
+
 class ProjectStore:
     """SQLite-backed store for projects, tasks, artifacts, and events.
 
@@ -372,6 +1376,7 @@ class ProjectStore:
         self.on_project_done = None
         self._lock = threading.RLock()
         self._init_db()
+        _KNOWN_STORES.add(self)
 
     def _fire_project_done(self, project_id: str) -> None:
         """Invoke the ``on_project_done`` hook for a just-completed project.
@@ -812,7 +1817,7 @@ class ProjectStore:
                 # (the owner's constraint_retire) stays retired
                 _auto = _constraint_list(meta.get("constraints_done_retired"))
                 _mk = {c.lower() for c in moving}
-                if reason == "project completed":
+                if reason in ("project completed", "planned work finished"):     # §4UM: a finished plan too
                     _auto += [c for c in moving if c.lower() not in {a.lower() for a in _auto}]
                 else:
                     _auto = [c for c in _auto if c.lower() not in _mk]
@@ -1168,6 +2173,12 @@ class ProjectStore:
                            {"reason": f"new task added to a {reopened_from} project",
                             "from_status": reopened_from})
             self.rearm_done_constraints(project_id, reason="task added")      # §4UL
+        if str(status).upper() != "DONE" and self._planned_done_at(project_id):
+            # §4UM: new planned work on a ready project — it is "working" again, and the next finish fires the
+            # clean-up again; the finish retired the constraints, the new work re-arms them
+            self._clear_planned_done(project_id)
+            if not reopened_from:
+                self.rearm_done_constraints(project_id, reason="task added")
         return task_id
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
@@ -1406,7 +2417,9 @@ class ProjectStore:
         tasks settle. No-op if work is still open or the project is locked.
 
         Rules (task terminal set = DONE / FAILED / BLOCKED):
-          * all tasks DONE                       → project DONE
+          * all tasks DONE                       → project stays/returns ACTIVE,
+            "ready" (§4UM: only the owner closes a project) — the
+            clean-up hooks fire once (`_planned_work_finished`)
           * all tasks terminal, ≥1 FAILED/BLOCKED → project FAILED
           * all remaining-open tasks are NEEDS_USER (≥1 of them, rest
             terminal)                            → project NEEDS_USER
@@ -1442,8 +2455,17 @@ class ProjectStore:
             if any(s in failure for s in statuses):
                 new_status = ProjectStatus.FAILED.value
             else:
-                new_status = ProjectStatus.DONE.value
+                # §4UM (operator 11-13: "keep the projects open unless i ask the agent to set it done … an open
+                # project should be live, it's just not final"): every planned task is DONE — the project
+                # STAYS OPEN (ACTIVE, shown as "ready"); only the owner closes it (update status=DONE). What a
+                # DONE transition used to fire (clean-up sweep, notify promise, constraint retirement) fires
+                # once on this "planned work finished" transition instead.
+                self._planned_work_finished(project_id, current, statuses)
+                return
         else:
+            if self._planned_done_at(project_id):
+                # open work came back (a task revised to PENDING) — the next finish fires again
+                self._clear_planned_done(project_id)
             # Not all terminal — only roll up if the *only* non-terminal
             # work is waiting on the user. Anything else means there is
             # still autonomous work to do.
@@ -1482,17 +2504,360 @@ class ProjectStore:
             {"new_status": new_status,
              "had_failures": any(s in failure for s in statuses)},
         )
-        # A genuine completion is the cleanup trigger. Fire only for DONE —
-        # FAILED / NEEDS_USER stay resumable (a revised task can roll the
-        # project forward to DONE later), so their workspace must survive.
-        if new_status == ProjectStatus.DONE.value:
-            # Constraint lifecycle rides EVERY DONE transition — this raw-SQL
-            # rollup (last task closed via task_update/delete_task) is the
-            # path projects normally finish on; retiring only in
-            # update_project would miss the incident's exact shape (review
-            # catch, 2026-08-01).
-            self.retire_constraints(project_id, reason="project completed")
-            self._fire_project_done(project_id)
+        # §4UM: the roll-up never sets DONE any more (only the owner closes a project) — a finished plan is
+        # `_planned_work_finished` above, which fires the clean-up; FAILED / NEEDS_USER stay resumable and fire
+        # nothing.
+
+    # ------------------------------------------------------------ §4UM ready
+    def _planned_done_at(self, project_id: str) -> float:
+        proj = self.get_project(project_id) or {}
+        try:
+            return float((proj.get("metadata") or {}).get("planned_done_at") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _clear_planned_done(self, project_id: str) -> None:
+        try:
+            def _mut(meta):
+                meta.pop("planned_done_at", None)
+                return meta
+            self._atomic_metadata_update(project_id, _mut)
+        except Exception:  # noqa: BLE001
+            logger.debug("planned_done clear skipped for %s", project_id, exc_info=True)
+
+    def _planned_work_finished(self, project_id: str, current: str, statuses: List[str]) -> None:
+        """§4UM: every task is DONE. The project goes (back) to ACTIVE — it was ACTIVE, or waited on the
+        owner / was blocked / had failed work that is now done — and is "ready". The hooks a DONE transition
+        fired run once per finish (``metadata.planned_done_at`` marks it; open work clears it)."""
+        # guarded on the status the roll-up read (an ACTIVE one too): a concurrent transition (an ARCHIVE)
+        # in between wins — nothing is marked and no hook fires on it
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE projects SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (ProjectStatus.ACTIVE.value, _now(), project_id, current))
+            conn.commit()
+            if cur.rowcount == 0:
+                return
+        holder: Dict[str, bool] = {}
+
+        def _mark(meta):
+            if meta.get("planned_done_at"):
+                holder["already"] = True
+                return meta
+            meta["planned_done_at"] = _now()
+            if not meta.get("first_ready_at"):           # never cleared: the first plan was built (and by which request)
+                meta["first_ready_at"] = meta["planned_done_at"]
+                meta["first_ready_req"] = _change_rid()
+            return meta
+
+        if self._atomic_metadata_update(project_id, _mark) is None or holder.get("already"):
+            return
+        self.log_event(project_id, None, "project_auto_rollup",
+                       {"new_status": "READY", "had_failures": False,
+                        "note": "all planned tasks are done; the project stays open"})
+        # Constraint lifecycle (2026-08-01): stored constraints bind the PLANNED work; a finished plan retires
+        # them (they replayed into every later request), new tasks re-arm them (add_task).
+        self.retire_constraints(project_id, reason="planned work finished")
+        self._fire_project_done(project_id)
+
+    def project_state(self, project_id: str, proj: Optional[Dict[str, Any]] = None,
+                      tasks: Optional[List[Dict[str, Any]]] = None) -> str:
+        """§4UM: how a project reads to the owner — ``working`` (planned work open or not planned yet),
+        ``ready`` (ACTIVE, every task DONE: live, open for changes), ``done`` (closed by the owner), or the
+        status itself in lower case (needs_user, failed, archived, released, paused, blocked)."""
+        proj = proj if proj is not None else (self.get_project(project_id) or {})
+        st = str(proj.get("status") or "").upper()
+        if st == ProjectStatus.DONE.value and self.closed_by_rollup(project_id):
+            return "ready"                    # §4UM review: a legacy auto-close is not the owner's close
+        if st != ProjectStatus.ACTIVE.value:
+            return st.lower() or "unknown"
+        if tasks is None:
+            tasks = self.list_tasks(project_id) or []
+        sts = [str(t.get("status") or "").upper() for t in tasks]
+        if sts and all(s == "DONE" for s in sts):
+            return "ready"
+        if not sts and (proj.get("metadata") or {}).get("planned_done_at"):
+            return "ready"
+        return "working"
+
+    def closed_by_rollup(self, project_id: str) -> bool:
+        """§4UM review: a DONE that came from the old task roll-up (before §4UM: ``project_auto_rollup``
+        ``new_status: DONE``) and not from the owner — the latest status event decides. Such a project reads
+        "ready" everywhere (no data migration); a write or a task reopens it like any DONE."""
+        try:
+            with self._lock, self._connect() as conn:
+                row = conn.execute(
+                    "SELECT type, payload_json FROM project_events WHERE project_id = ? AND type IN "
+                    "('project_auto_rollup', 'project_updated', 'project_reopened', 'project_closed') "
+                    "AND (type != 'project_updated' OR payload_json LIKE '%\"status\"%') "
+                    "ORDER BY id DESC LIMIT 1", (_canon_id(project_id),)).fetchone()
+            if not row or row["type"] != "project_auto_rollup":
+                return False
+            return str((json.loads(row["payload_json"] or "{}") or {}).get("new_status") or "").upper() == "DONE"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def planned_work_done(self, project_id: str) -> bool:
+        """§4UM: ACTIVE with every planned task DONE (the old DONE roll-up)."""
+        try:
+            return self.project_state(project_id) == "ready"
+        except Exception:  # noqa: BLE001
+            return False
+
+    # ------------------------------------------------------------ §4UM change log
+    CHANGELOG_NAME = "PROJECT_CHANGES.md"
+
+    @staticmethod
+    def _row_to_change(row) -> Dict[str, Any]:
+        d = dict(row)
+        for k in ("added", "changed", "removed", "pushed"):
+            try:
+                d[k] = list(json.loads(d.pop(f"{k}_json") or "[]"))
+            except Exception:  # noqa: BLE001
+                d[k] = []
+        try:
+            d["meta"] = dict(json.loads(d.pop("meta_json") or "{}"))
+        except Exception:  # noqa: BLE001
+            d["meta"] = {}
+        d["deployed"] = bool(d.get("deployed"))
+        return d
+
+    def add_change(self, project_id: str, *, kind: str = "change", ts: Optional[float] = None,
+                   req_id: str = "", ask: str = "", added=(), changed=(), removed=(), summary: str = "",
+                   deployed: bool = False, deployed_at: Optional[float] = None, url: str = "",
+                   meta: Optional[Dict[str, Any]] = None, render: bool = True) -> Optional[Dict[str, Any]]:
+        """Append one change-log entry (§4UM). ``kind='change'`` entries are numbered 1, 2, … per project;
+        ``kind='deploy'`` entries are not. Re-renders the folder's PROJECT_CHANGES.md. Returns the entry, or None
+        for an unknown project."""
+        project_id = _canon_id(project_id)
+        if not self.get_project(project_id):
+            return None
+        kind = "deploy" if str(kind) == "deploy" else "change"
+        ts = float(ts or _now())
+
+        def _paths(xs):
+            return [str(x)[:300] for x in list(dict.fromkeys(xs or []))[:200]]
+
+        with self._lock, self._connect() as conn:
+            num = None
+            if kind == "change":
+                row = conn.execute("SELECT MAX(num) AS m FROM project_changes "
+                                   "WHERE project_id = ? AND kind = 'change'", (project_id,)).fetchone()
+                num = int((row["m"] if row else 0) or 0) + 1
+            cur = conn.execute(
+                "INSERT INTO project_changes(project_id, kind, num, ts, req_id, ask, added_json, changed_json, "
+                "removed_json, summary, deployed, deployed_at, url, pushed_json, meta_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (project_id, kind, num, ts, str(req_id or "")[:64], " ".join(str(ask or "").split())[:300],
+                 json.dumps(_paths(added)), json.dumps(_paths(changed)), json.dumps(_paths(removed)),
+                 " ".join(str(summary or "").split())[:300], 1 if deployed else 0,
+                 (float(deployed_at or ts) if deployed else None), str(url or "")[:300], "[]",
+                 json.dumps(dict(meta or {}))[:4000]))
+            conn.commit()
+            cid = cur.lastrowid
+            row = conn.execute("SELECT * FROM project_changes WHERE id = ?", (cid,)).fetchone()
+        entry = self._row_to_change(row) if row else None
+        if render:
+            self.render_changelog(project_id)
+        return entry
+
+    def list_changes(self, project_id: str, limit: Optional[int] = None, offset: int = 0,
+                     kind: Optional[str] = None) -> List[Dict[str, Any]]:
+        """The change log, newest first (§4UM)."""
+        project_id = _canon_id(project_id)
+        q = "SELECT * FROM project_changes WHERE project_id = ?"
+        args: List[Any] = [project_id]
+        if kind:
+            q += " AND kind = ?"
+            args.append(str(kind))
+        q += " ORDER BY ts DESC, id DESC"
+        if limit is not None:
+            q += " LIMIT ? OFFSET ?"
+            args += [max(0, int(limit)), max(0, int(offset or 0))]
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(q, args).fetchall()
+        return [self._row_to_change(r) for r in rows]
+
+    def mark_changes_deployed(self, project_id: str, *, files=None, before_ts: Optional[float] = None,
+                              at: Optional[float] = None, url: str = "", render: bool = False) -> List[int]:
+        """Mark undeployed change entries live (§4UM). ``files=None`` (a whole-folder deploy): every one made
+        at or before ``before_ts``. ``files`` (a `lab put` of single files): each entry accumulates the files
+        pushed after it; it is live once every file it added or changed has been pushed (a pushed ``"dir/"``
+        covers every file under it — a folder put or a subfolder deploy). Returns the
+        numbers newly marked."""
+        project_id = _canon_id(project_id)
+        at = float(at or _now())
+        pushed = None if files is None else {str(f) for f in files if f}
+        done: List[int] = []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT * FROM project_changes WHERE project_id = ? AND kind = 'change' "
+                                "AND deployed = 0", (project_id,)).fetchall()
+            for r in rows:
+                e = self._row_to_change(r)
+                if before_ts is not None and float(e["ts"]) > float(before_ts) + 1e-6:
+                    continue
+                if pushed is None:
+                    conn.execute("UPDATE project_changes SET deployed = 1, deployed_at = ?, url = ? WHERE id = ?",
+                                 (at, str(url or "")[:300], e["id"]))
+                    done.append(int(e["num"] or 0))
+                    continue
+                need = set(e["added"]) | set(e["changed"])
+                hit = {r for r in need if push_covers(pushed, r)}
+                have = (set(e["pushed"]) & need) | hit
+                if not hit:
+                    continue
+                if need and need <= have:
+                    conn.execute("UPDATE project_changes SET deployed = 1, deployed_at = ?, url = ?, "
+                                 "pushed_json = ? WHERE id = ?",
+                                 (at, str(url or "")[:300], json.dumps(sorted(have)), e["id"]))
+                    done.append(int(e["num"] or 0))
+                else:
+                    conn.execute("UPDATE project_changes SET pushed_json = ? WHERE id = ?",
+                                 (json.dumps(sorted(have)), e["id"]))
+            conn.commit()
+        if render and done:
+            self.render_changelog(project_id)
+        return sorted(n for n in done if n)
+
+    def record_deploy(self, project_id: str, *, url: str = "", files=None, how: str = "deploy",
+                      lab_id: str = "", app: str = "", req_id: str = "", ts: Optional[float] = None,
+                      before_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """§4UM: the project's files went live (a lab deploy / keep / switch / put). Marks the changes it
+        carries, appends a ``deploy`` entry and records where the project is live
+        (``metadata.live``)."""
+        project_id = _canon_id(project_id)
+        if not self.get_project(project_id):
+            return None
+        ts = float(ts or _now())
+        marked = self.mark_changes_deployed(project_id, files=files, at=ts, url=url,
+                                            before_ts=ts if before_ts is None else before_ts)
+        through = 0
+        for e in self.list_changes(project_id, kind="change"):
+            if e["deployed"]:
+                through = max(through, int(e["num"] or 0))
+
+        def _mut(meta):
+            try:
+                if float((meta.get("live") or {}).get("at") or 0) > ts:
+                    return meta                   # §4UM review: an older (backfilled) deploy never overwrites a newer one
+            except (TypeError, ValueError):
+                pass
+            meta["live"] = {"url": str(url or (meta.get("live") or {}).get("url") or "")[:300],
+                            "lab_id": str(lab_id or (meta.get("live") or {}).get("lab_id") or "")[:40],
+                            "app": str(app or (meta.get("live") or {}).get("app") or "")[:80],
+                            "at": ts, "how": str(how)[:40], "through": through}
+            return meta
+
+        self._atomic_metadata_update(project_id, _mut)
+        flist = None if files is None else [str(f) for f in files][:100]
+        return self.add_change(project_id, kind="deploy", ts=ts, req_id=req_id, url=url, deployed=True,
+                               deployed_at=ts, changed=flist or [],
+                               meta={"how": how, "lab_id": lab_id, "app": app, "through": through,
+                                     "marked": marked, "whole": files is None})
+
+    def live_info(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """§4UM: where the project is live and which changes are not there yet: ``{url, lab_id, app, at, how,
+        through, behind: [nums]}``, or None when it was never deployed."""
+        proj = self.get_project(project_id) or {}
+        live = (proj.get("metadata") or {}).get("live")
+        if not isinstance(live, dict) or not live.get("at"):
+            return None
+        behind = sorted(int(e["num"] or 0) for e in self.list_changes(project_id, kind="change")
+                        if not e["deployed"])
+        return dict(live, behind=[n for n in behind if n])
+
+    def change_files(self, project_id: str) -> set:
+        """§4UM: every path an owner change added or changed (recorded or still pending in a running
+        request) plus PROJECT_CHANGES.md once the log has an entry — the clean-up sweep keeps them (a change
+        registers its files)."""
+        out: set = set()
+        try:
+            if self.list_changes(project_id, limit=1):
+                out.add(self.CHANGELOG_NAME)              # only once there is a log (an empty keep-set means more)
+            for e in self.list_changes(project_id, kind="change"):
+                out.update(e["added"])
+                out.update(e["changed"])
+                out.difference_update(e["removed"])
+        except Exception:  # noqa: BLE001
+            logger.debug("change files unreadable for %s", project_id, exc_info=True)
+        out.update(pending_change_files(self, project_id))
+        return out
+
+    def render_changelog(self, project_id: str) -> Optional[str]:
+        """Write the change log to ``PROJECT_CHANGES.md`` in the project folder (§4UM; newest first, the last
+        CHANGES_FILE_MAX entries; atomic through a unique tmp name, no symlink followed, best effort). A file of
+        that name that does not start with CHANGES_FILE_HEADER is the project's own: nothing is written.
+        Returns the path written or None."""
+        try:
+            proj = self.get_project(project_id)
+            if not proj:
+                return None
+            ws = (proj.get("workspace_dir") or "").strip() or self._default_workspace(_canon_id(project_id))
+            if not ws:
+                return None
+            ws_path = _contained_workspace(self, ws)
+            if ws_path is None or not ws_path.is_dir():
+                return None
+            target = ws_path / self.CHANGELOG_NAME
+            if target.is_symlink():
+                logger.warning("%s: %s is a link — the change log file is not written", project_id, target.name)
+                return None
+            if target.exists():
+                try:
+                    with open(target, "r", encoding="utf-8", errors="replace") as fh:
+                        first = fh.readline().strip()
+                except OSError:
+                    first = ""
+                if first != CHANGES_FILE_HEADER:
+                    logger.warning("%s: %s is not the agent's (no header) — left as it is; the change log "
+                                   "stays in the store", project_id, target.name)
+                    return None
+            lines = [CHANGES_FILE_HEADER, f"# Changes — {proj.get('title') or project_id}", "",
+                     "Every change the owner asked for, and every time the project went live. Newest first.", ""]
+            entries = self.list_changes(project_id, limit=CHANGES_FILE_MAX)
+            for e in entries:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(e["ts"])))
+                if e["kind"] == "deploy":
+                    m = e.get("meta") or {}
+                    what = "the whole folder" if m.get("whole") else (", ".join(e["changed"][:12]) or "files")
+                    lines.append(f"## Live · {when} · {m.get('how') or 'deploy'}"
+                                 + (f" → {e['url']}" if e.get("url") else ""))
+                    lines.append(f"- Pushed: {what}"
+                                 + (f" (includes change #{m['through']})" if m.get("through") else ""))
+                    lines.append("")
+                    continue
+                state = "live" if e["deployed"] else "not deployed yet"
+                lines.append(f"## #{e['num']} · {when} · {state}")
+                if e.get("ask"):
+                    lines.append(f"- Asked: {e['ask']}")
+                if e["added"]:
+                    lines.append(f"- Added: {', '.join(e['added'][:30])}")
+                if e["changed"]:
+                    lines.append(f"- Changed: {', '.join(e['changed'][:30])}")
+                if e["removed"]:
+                    lines.append(f"- Removed: {', '.join(e['removed'][:30])}")
+                if (e.get("meta") or {}).get("folder_too_large"):
+                    lines.append("- Files: not all listed (the folder was too large to compare)")
+                if e.get("summary"):
+                    lines.append(f"- Summary: {e['summary']}")
+                lines.append("")
+            if len(entries) >= CHANGES_FILE_MAX:
+                lines.append("(older entries: manage_projects action=changes)")
+            import uuid as _uuid
+            tmp = ws_path / f".{self.CHANGELOG_NAME}.{_uuid.uuid4().hex[:12]}.tmp"
+            try:
+                _fs_write_nofollow(tmp, "\n".join(lines).rstrip() + "\n")
+                os.replace(tmp, target)
+            finally:
+                try:
+                    if tmp.exists() or tmp.is_symlink():
+                        tmp.unlink()
+                except OSError:
+                    pass
+            return str(target)
+        except Exception:  # noqa: BLE001
+            logger.debug("change log file render skipped for %s", project_id, exc_info=True)
+            return None
 
     def reset_orphaned_in_progress(self, older_than_seconds: float = 900.0) -> int:
         """Reset stale IN_PROGRESS tasks back to PENDING (a claimed hold: back to its hold). Returns the count.

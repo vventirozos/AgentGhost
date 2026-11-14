@@ -223,7 +223,9 @@ def test_a_hedged_extract_still_has_facts(facts):
 
 
 @pytest.mark.parametrize("facts", ["There is no information about the query in the text.",
-                                   "The source does not mention OpenZFS.", "The page does not contain relevant facts."])
+                                   "The page does not contain relevant facts."])
+# §4UN-deep r1: "The source does not mention OpenZFS." is no longer folded — only refusals that say no
+# relevant/hard facts or information about the query are; a negative statement stays (never lose a fact)
 def test_more_refusal_wordings_are_recognised(facts):
     assert S.distilled_block_has_facts(f"### SOURCE: https://a\n[EDGE EXTRACTED FACTS]:\n{facts}") is False
 

@@ -44,7 +44,25 @@ PART_MAX_AGE_S = 3600.0
 MAX_FILE_BYTES = 50_000_000            # the download tool's own cap
 MAX_TOTAL_BYTES = 2_000_000_000
 MAX_REDIRECTS = 5
-FETCH_TIMEOUT_S = 90.0
+FETCH_TIMEOUT_S = 90.0                 # curl's connect + low-speed limit, and the floor of the wall clock
+#: §4UN-fetch: the transfer's wall clock scales with the file — a flat 90 s (connect included) failed every
+#: onion file over ~10–20 MB while the message advertised 50 MB. Onion circuits are slow: 25 KB/s budgeted.
+ONION_MIN_RATE = 25_000                # bytes/s
+FETCH_MAX_S = 1200.0
+#: r1: an unknown size runs on the stall timer, up to the cap (a fixed 600 s doomed a steady chunked file)
+FETCH_UNKNOWN_SIZE_S = FETCH_MAX_S
+#: no byte for this long → stalled. Equal to curl's `timeout`, which on a stream is both the connect limit
+#: and the low-speed limit (first byte included): curl's abort never outlasts the timer, and an onion connect
+#: keeps its 90 s (r2: clipping the timeout to a 60 s stall shrank the connect; a tuple does not separate the
+#: two — curl_cffi 0.14 sets the low-speed limit to connect + read)
+STALL_S = FETCH_TIMEOUT_S
+
+
+def fetch_deadline_s(clen: Optional[int]) -> float:
+    """The wall clock for an onion download of ``clen`` bytes (unknown size: `FETCH_UNKNOWN_SIZE_S`)."""
+    if clen is None:
+        return FETCH_UNKNOWN_SIZE_S
+    return min(FETCH_MAX_S, FETCH_TIMEOUT_S + float(clen) / ONION_MIN_RATE)
 INSPECT_TIMEOUT_S = 60.0
 INSPECT_IMAGE = "ghost-agent-base:latest"
 STRINGS_HEAD_CHARS = 4000
@@ -274,8 +292,6 @@ async def _stream_download(url: str, proxy: str, tmp: Path) -> Tuple[Optional[st
     must stay on a dark-web host (a hop to the clearnet changes what the file
     IS — refused, not followed). Returns (error, final_url, size)."""
     from ..utils.helpers import aclose_curl_response, url_ssrf_reason
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     proxies = {"http": proxy, "https": proxy}
     try:
         import curl_cffi.requests as creq
@@ -283,7 +299,8 @@ async def _stream_download(url: str, proxy: str, tmp: Path) -> Tuple[Optional[st
         return "Error: curl_cffi is required for a dark-web download.", url, 0
     cur = url
     t0 = time.monotonic()
-    async with creq.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=FETCH_TIMEOUT_S) as c:
+    # §4UN-fetch: curl_cffi's current Chrome with its own headers (was chrome110 TLS under a Chrome/120 UA)
+    async with creq.AsyncSession(impersonate="chrome", proxies=proxies, timeout=FETCH_TIMEOUT_S) as c:
         for _hop in range(MAX_REDIRECTS + 1):
             reason = url_ssrf_reason(cur, resolve=False)
             if reason:
@@ -291,7 +308,7 @@ async def _stream_download(url: str, proxy: str, tmp: Path) -> Tuple[Optional[st
             if not is_darkweb_url(cur):
                 return (f"Error: the download was redirected off the dark web (to {_host(cur)}); "
                         f"refused — use the clearnet download for a clearnet file."), cur, 0
-            r = await c.get(cur, headers=headers, stream=True, allow_redirects=False)
+            r = await c.get(cur, stream=True, allow_redirects=False)
             try:
                 if r.status_code in (301, 302, 303, 307, 308):
                     loc = r.headers.get("location")
@@ -307,17 +324,41 @@ async def _stream_download(url: str, proxy: str, tmp: Path) -> Tuple[Optional[st
                     return (f"Error: file is too large ({int(clen) / 1e6:.1f} MB); "
                             f"the limit is {MAX_FILE_BYTES // 1_000_000} MB."), cur, 0
                 total = 0
+                _known = int(clen) if clen and clen.isdigit() else None
+                deadline = fetch_deadline_s(_known)
+                from ..utils.aio import wait_for as _aio_wait_for
+                it = r.aiter_content().__aiter__()
                 with open(tmp, "wb") as fh:
-                    async for chunk in r.aiter_content():
+                    while True:
+                        # r1: curl's `timeout` on a stream is a LOW-SPEED limit, not a wall clock — a host
+                        # trickling 1 B/s would hold the turn open. §4UN-fetch: the clock scales with the size
+                        # and a stall (no byte for STALL_S) ends it early.
+                        left = deadline - (time.monotonic() - t0)
+                        if left <= 0:
+                            return (f"Error: download did not finish within {deadline:.0f} s "
+                                    f"({total / 1e6:.1f} MB received"
+                                    f"{f' of {_known / 1e6:.1f} MB' if _known else ''}) — the onion host is too slow "
+                                    f"over Tor."), cur, 0
+                        try:
+                            chunk = await _aio_wait_for(it.__anext__(), min(STALL_S, left))
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            if time.monotonic() - t0 >= deadline - 0.01:
+                                continue                    # the wall clock: reported at the loop's head
+                            return (f"Error: the download stalled — no data for {STALL_S:.0f} s "
+                                    f"({total / 1e6:.1f} MB received)."), cur, 0
+                        except Exception as _ce:  # noqa: BLE001
+                            # r3: curl's own low-speed abort (the same limit as STALL_S) is a stall, said so
+                            if "operation too slow" in str(_ce).lower() or "bytes/sec" in str(_ce).lower():
+                                return (f"Error: the download stalled — no data for about {STALL_S:.0f} s "
+                                        f"({total / 1e6:.1f} MB received; curl's low-speed limit)."), cur, 0
+                            raise
                         if not chunk:
                             continue
                         total += len(chunk)
                         if total > MAX_FILE_BYTES:
                             return (f"Error: download exceeded the {MAX_FILE_BYTES // 1_000_000} MB cap."), cur, 0
-                        if time.monotonic() - t0 > FETCH_TIMEOUT_S:
-                            # r1: curl's `timeout` on a stream is a LOW-SPEED limit, not a
-                            # wall clock — a host trickling 1 B/s would hold the turn open
-                            return (f"Error: download did not finish within {FETCH_TIMEOUT_S:.0f} s."), cur, 0
                         fh.write(chunk)
                 return None, cur, total
             finally:
@@ -335,6 +376,31 @@ def _host(url: str) -> str:
     return h or "(unknown host)"
 
 
+def _not_the_file(url, final_url, kind: str, head: bytes, size: int) -> bool:
+    """§4UN-fetch r1: the body is a page (an error, login or challenge page) or nothing, not the file the link
+    named. Judged by the URL's own name (`body_mismatch`) — a real .xml/.rss/.svg/.html is its file; a link
+    with no known file name is not the file only when the body is an HTML DOCUMENT."""
+    if kind == "empty" or not size:
+        return True
+    if kind != "html/xml":
+        return False
+    from urllib.parse import unquote, urlparse
+    from ..utils.content_check import (_BINARY_ONLY, _EXPECTED_KIND, _HTML_OK, _TEXT_NOT_HTML,
+                                       body_mismatch)
+    name = ""
+    for u in (url, final_url):
+        try:
+            name = unquote(urlparse(str(u or "")).path.rsplit("/", 1)[-1]) or name
+        except ValueError:
+            pass
+    suf = Path(name).suffix.lower() if name else ""
+    if suf in _HTML_OK:
+        return False
+    if suf in _EXPECTED_KIND or suf in _BINARY_ONLY or suf in _TEXT_NOT_HTML:
+        return bool(body_mismatch(name, None, head, size))
+    return bool(re.match(rb"\s*(?:<!--.*?-->\s*)*<(?:!doctype\s+html|html|head|body)\b", head, re.I | re.S))
+
+
 def _hashes(path: Path) -> Tuple[str, str, bytes]:
     sha, md5 = hashlib.sha256(), hashlib.md5()
     head = b""
@@ -345,7 +411,7 @@ def _hashes(path: Path) -> Tuple[str, str, bytes]:
             if not buf:
                 break
             if first:
-                head, first = buf[:64], False
+                head, first = buf[:65536], False     # §4UN-fetch r1/r3: enough to judge an HTML page
             sha.update(buf)
             md5.update(buf)
     return sha.hexdigest(), md5.hexdigest(), head
@@ -377,11 +443,11 @@ async def quarantine_download(url: str, tor_proxy: Optional[str], *, home: Optio
     tmp = Path(_tmp)
     try:
         from ..utils.aio import wait_for as _wait_for
-        err, final_url, size = await _wait_for(_stream_download(str(url), proxy, tmp), FETCH_TIMEOUT_S * 2 + 10)
+        err, final_url, size = await _wait_for(_stream_download(str(url), proxy, tmp), FETCH_MAX_S + 120)
         if err:
             return ToolOutcome.failed(err, world_changed=False, reason_code="quarantine_fetch_failed")
         sha, md5, head = _hashes(tmp)
-        kind = sniff_type(head)
+        kind = sniff_type(head[:64])                # the sniff reads the first bytes, as before r1
         if is_media_type(kind) and env_flag("GHOST_QUARANTINE_REFUSE_MEDIA", False):
             return ToolOutcome.rejected(
                 f"SYSTEM BLOCK: the file is {kind} and media from dark-web hosts is refused "
@@ -403,6 +469,15 @@ async def quarantine_download(url: str, tor_proxy: Optional[str], *, home: Optio
             os.chmod(_sidecar(qdir, sha), 0o600)
         os.chmod(blob, 0o600)
         danger = " ⚠ EXECUTABLE/SCRIPT TYPE — never run it." if rec["dangerous"] else ""
+        if _not_the_file(url, final_url, kind, head, size):
+            # §4UN-fetch: an onion host that answers a file URL with a page (an error, login or captcha page)
+            # or with nothing did not deliver the file — PARTIAL, not OK
+            _what = "EMPTY (0 bytes)" if kind == "empty" else "an HTML page (an error, login or challenge page)"
+            return ToolOutcome.partial(
+                f"PARTIAL: QUARANTINED{note}: id={sha[:16]}… type={kind} size={size:,} bytes sha256={sha}\n"
+                f"⚠ The host answered with {_what}, not the file — do not treat it as the file. It is kept in "
+                f"the quarantine (quarantine_inspect shows its text); try another link or tell the user.",
+                world_changed=True, reason_code="quarantine_not_the_file")
         return ToolOutcome.ok(
             f"QUARANTINED{note}: id={sha[:16]}… type={kind} size={size:,} bytes sha256={sha}\n"
             f"The file is in the quarantine (not in the workspace): it cannot be read, run, opened or served. "

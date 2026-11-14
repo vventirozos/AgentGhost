@@ -54,13 +54,14 @@ def test_project_status_terminal_members_exist():
     assert ProjectStatus.NEEDS_USER.value == "NEEDS_USER"
 
 
-def test_rollup_all_done_marks_project_done(store):
+def test_rollup_all_done_marks_project_ready(store):
+    # §4UM: a finished plan leaves the project open ("ready"); only the owner closes it
     pid = store.create_project("P")
     t1 = store.add_task(pid, "a")
     t2 = store.add_task(pid, "b")
     store.update_task(t1, status="DONE")
     store.update_task(t2, status="DONE")
-    assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
+    assert store.get_project(pid)["status"] == ProjectStatus.ACTIVE.value and store.project_state(pid) == "ready"
 
 
 def test_rollup_any_failed_marks_project_failed_not_done(store):
@@ -101,19 +102,20 @@ def test_rollup_does_not_fire_with_open_work(store):
 
 def test_failed_project_not_locked_rolls_forward_to_done(store):
     """FAILED is not a locked terminal — fixing the failed task rolls the
-    project forward to DONE."""
+    project forward (§4UM: to ACTIVE, planned work done — "ready")."""
     pid = store.create_project("P")
     t1 = store.add_task(pid, "a")
     store.update_task(t1, status="FAILED")
     assert store.get_project(pid)["status"] == ProjectStatus.FAILED.value
     store.update_task(t1, status="DONE")
-    assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
+    assert store.project_state(pid) == "ready"
 
 
 def test_done_project_is_locked(store):
     pid = store.create_project("P")
     t1 = store.add_task(pid, "a")
     store.update_task(t1, status="DONE")
+    store.update_project(pid, status="DONE")              # §4UM: the owner closed it
     assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
     # A later spurious FAILED on the (already-done) task must not un-done it.
     store.update_task(t1, status="FAILED")

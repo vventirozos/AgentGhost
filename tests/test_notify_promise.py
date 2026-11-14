@@ -10,6 +10,7 @@ start (capture), both finalize paths (fire), and main.py's
 on_project_done hook (idle completions).
 """
 
+import time
 import json
 import os
 import sys
@@ -77,11 +78,24 @@ def test_capture_refreshes_existing_ask(store):
     assert entry["req_id"] == "b" and "ping me" in entry["ask"]
 
 
-def test_capture_skips_settled_project(store):
+def test_capture_on_a_ready_project_waits_for_the_next_change(store, alog, tmp_path):
+    """§4UM review: a ready project is open for changes, so "notify me when done" there is about the change
+    the owner is asking for — captured, and it does not fire on the plan that finished before the ask."""
     pid = store.create_project("P")
     tid = store.add_task(pid, "only task")
-    store.update_task(tid, status="DONE")           # rolls project DONE
-    assert store.get_project(pid)["status"] == "DONE"
+    store.update_task(tid, status="DONE")           # §4UM: planned work done — the project stays open ("ready")
+    assert store.project_state(pid) == "ready"
+    assert capture_promise(store, pid, "notify me when done") is True
+    assert fire_promise_if_settled(store, alog, pid) is False
+    assert peek_promise(store, pid) is not None and _records(tmp_path) == []
+    store.add_change(pid, ts=time.time() + 1, ask="the change", added=["a.js"])
+    assert fire_promise_if_settled(store, alog, pid) is True
+
+
+def test_capture_skips_a_project_the_owner_closed(store):
+    pid = store.create_project("P")
+    store.update_project(pid, status="DONE")
+    assert store.project_state(pid) == "done"
     assert capture_promise(store, pid, "notify me when done") is False
     assert peek_promise(store, pid) is None
 
@@ -103,7 +117,7 @@ def test_fire_delivers_on_done_and_consumes(store, alog, tmp_path):
     capture_promise(store, pid, "notify me in slack when done",
                     req_id="5299219b")
     store.update_task(tid, status="DONE")
-    assert store.get_project(pid)["status"] == "DONE"
+    assert store.project_state(pid) == "ready"                        # §4UM: open, planned work done
     fired = fire_promise_if_settled(store, alog, pid, req_id="17606976",
                                     headline="All 7 tasks completed; demo "
                                              "runs.")
@@ -113,7 +127,7 @@ def test_fire_delivers_on_done_and_consumes(store, alog, tmp_path):
     assert recs[0]["severity"] == SEVERITY_NOTIFY
     assert recs[0]["phase"] == "project"
     assert "Mini AI v3" in recs[0]["summary"]
-    assert "is DONE" in recs[0]["summary"]
+    assert "all planned work is done" in recs[0]["summary"]          # §4UM
     assert "All 7 tasks completed" in recs[0]["summary"]
     assert recs[0]["meta"]["project_id"] == pid
     assert recs[0]["meta"]["req_id"] == "17606976"
@@ -213,11 +227,11 @@ def test_request_52_shape_end_to_end(store, alog, tmp_path):
     store.update_task(t1, status="DONE")
     assert fire_promise_if_settled(store, alog, pid) is False  # still open
     store.update_task(t2, status="DONE")
-    assert store.get_project(pid)["status"] == "DONE"
+    assert store.project_state(pid) == "ready"                        # §4UM: open, planned work done
     assert fire_promise_if_settled(store, alog, pid,
                                    headline="all tasks complete") is True
     recs = _records(tmp_path)
-    assert len(recs) == 1 and "is DONE" in recs[0]["summary"]
+    assert len(recs) == 1 and "all planned work is done" in recs[0]["summary"]
 
 
 # ------------------------------------------------------------- wiring pins

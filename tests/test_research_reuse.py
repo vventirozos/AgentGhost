@@ -152,7 +152,8 @@ async def test_closing_a_task_indexes_research_and_briefing_surfaces_it(context,
 
     # Before closing: not yet in the index, briefing doesn't mention it.
     assert get_research_index(store, pid) == []
-    assert "transformer.md" not in build_project_briefing(store, pid)
+    # (§4UM: the FILES line lists it as a file on disk; the research notes do not, yet)
+    assert "RESEARCH NOTES" not in build_project_briefing(store, pid)
 
     await tool_manage_projects(context, action="task_update",
                                project_id=pid, task_id=tid, status="DONE",

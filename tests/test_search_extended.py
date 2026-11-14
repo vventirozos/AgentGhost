@@ -40,7 +40,7 @@ async def test_deep_research_flow(mock_ddgs):
     
     # Mock page fetching
     with patch("ghost_agent.tools.search.helper_fetch_url_content", new_callable=AsyncMock) as mock_fetch:
-        mock_fetch.return_value = "Page text content"
+        mock_fetch.return_value = "Page text content " * 20   # §4UN-deep m8: a page, not a stub
         
         res = await tool_deep_research("query", anonymous=True, tor_proxy="socks5://localhost:9050")
         

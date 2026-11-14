@@ -50,8 +50,11 @@ def capture_promise(store, project_id, user_text, req_id: str = "") -> bool:
         proj = store.get_project(project_id)
         if not proj:
             return False
-        if str(proj.get("status") or "").upper() in _TERMINAL:
+        _rd = getattr(store, "planned_work_done", None)
+        if str(proj.get("status") or "").upper() in _TERMINAL and not (callable(_rd) and _rd(project_id) is True):
             return False
+        # §4UM review: a ready project (planned work done, still open) takes the ask — it fires on the next
+        # plan finish, or on this request's change (``_ready_settled``)
         # a probe's ask is never parked: it would page the owner later,
         # from the idle loop (§4LZ review)
         from ..utils.logging import is_probe_request_id, request_kind
@@ -101,6 +104,22 @@ def consume_promise(store, project_id) -> Optional[dict]:
         return None
 
 
+def _ready_settled(store, project_id, proj, asked_at: float) -> bool:
+    """§4UM: a ready project settled the ask when its plan finished AFTER the ask, or a change was made after it
+    (recorded, or written by the running request)."""
+    m = (proj or {}).get("metadata") or {}
+    try:
+        if float(m.get("planned_done_at") or 0.0) >= asked_at:
+            return True
+        lc = getattr(store, "list_changes", None)
+        if callable(lc) and any(float(e.get("ts") or 0) >= asked_at for e in lc(project_id, limit=3, kind="change")):
+            return True
+        from ..memory.projects import pending_change_files
+        return bool(pending_change_files(store, project_id))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def fire_promise_if_settled(store, activity_log, project_id, *,
                             model_notified: bool = False,
                             req_id: str = "",
@@ -120,9 +139,17 @@ def fire_promise_if_settled(store, activity_log, project_id, *,
         if not proj:
             return False
         status = str(proj.get("status") or "").upper()
-        if status not in _TERMINAL:
+        _pr = peek_promise(store, project_id)
+        if _pr is None:
             return False
-        if peek_promise(store, project_id) is None:
+        _ready = getattr(store, "planned_work_done", None)
+        if callable(_ready) and _ready(project_id) is True:
+            # §4UM: a project's planned work finishing is the "done" the user waited for — the project
+            # itself stays open ("ready"; a legacy auto-closed DONE reads ready too); only the owner closes it
+            if not _ready_settled(store, project_id, proj, float(_pr.get("ts") or 0.0)):
+                return False
+            status = "READY"
+        elif status not in _TERMINAL:
             return False
         if model_notified:
             consume_promise(store, project_id)  # promise kept elsewhere
@@ -141,6 +168,9 @@ def fire_promise_if_settled(store, activity_log, project_id, *,
         if status == "DONE":
             msg = (f"Project '{title}' is DONE — "
                    + (head or "all tasks complete."))
+        elif status == "READY":
+            msg = (f"Project '{title}': all planned work is done (it stays open for changes) — "
+                   + (head or "every task is complete."))
         else:
             msg = (f"Project '{title}' FAILED — "
                    + (head or "see chat for details."))

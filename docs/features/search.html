@@ -59,8 +59,8 @@
   <div class="scroll"><table>
     <thead><tr><th>Tool</th><th>Use</th></tr></thead>
     <tbody>
-      <tr><td><code>web_search</code></td><td>Quick lookups: a date, a price, a definition. Returns the top results with their text.</td></tr>
-      <tr><td><code>deep_research</code></td><td>Reads several sources, follows them up, and writes one answer with citations.</td></tr>
+      <tr><td><code>web_search</code></td><td>Quick lookups: a date, a price, a definition. Returns the top results with their text; for a specific fact (a price, a version, a date, a result, “the latest”) it also opens the top one or two pages and adds the parts that answer.</td></tr>
+      <tr><td><code>deep_research</code></td><td>Reads up to eight pages (PDFs too, at most two from one site), takes from each the parts that answer the question, and lists every page with its title and date.</td></tr>
       <tr><td><code>fact_check</code></td><td>Takes a statement and researches whether the sources support or refute it.</td></tr>
       <tr><td><code>browser</code></td><td>A real browser for pages that need clicking, typing, scrolling or a screenshot.</td></tr>
     </tbody>
@@ -81,9 +81,11 @@
 
   <h2 id="how">How it works</h2>
   <ol class="flow">
-    <li><h4>Clean the query</h4><p>The search engines Ghost reaches over Tor do not understand <code>site:</code>, quoted phrases or <code>AND</code>/<code>OR</code>; with them a search returns nothing. Ghost strips these and turns <code>site:python.org</code> into a keyword, and says so in the result. A past year added to a “today” question is dropped too, so old pages do not win.</p></li>
-    <li><h4>Race several engines</h4><p>Which search engine answers depends on the Tor exit in use, and it changes from circuit to circuit. So Ghost fires one request per engine (DuckDuckGo, Yandex, Brave, Yahoo) at the same time and takes the first good answer. A retry uses a fresh Tor circuit rather than the one that just failed.</p></li>
+    <li><h4>Clean the query</h4><p>The search engines Ghost reaches over Tor do not understand <code>site:</code>, quoted phrases or <code>AND</code>/<code>OR</code>. Ghost removes them before the query is sent and says so in the result. A <code>site:</code> host is not a filter, but that site's results are listed first. A past year added to a “today” question is dropped too, so old pages do not win, and words like “latest” or “today” ask the engines for recent pages on the first try.</p></li>
+    <li><h4>Race several engines</h4><p>Which search engine answers depends on the Tor exit in use, and it changes from circuit to circuit. So Ghost fires one request per engine (DuckDuckGo, Yandex, Brave and Yahoo — plus DuckDuckGo's own onion service when it is switched on; it ships off) at the same time and takes the first answer that matches the question; an answer about something else gets a few seconds for a better one from the engines still working. A retry uses a fresh Tor circuit rather than the one that just failed. When the engines refused (a block page or HTTP 403/429), Ghost asks again with the same words on new circuits instead of rewording the question; when they really found nothing, it tries the question's content words once, without changing what is asked.</p></li>
     <li><h4>Read the pages</h4><p>The top results are fetched with safeguards that stop a page from pointing Ghost at your private network. PDFs are parsed; picture-heavy pages can be read by the vision model.</p></li>
+    <li><h4>web_search opens the top pages for a specific fact</h4><p>A question that asks for one fact (a number, a version, a price, a date, a result, “the latest”, and the Greek πόσο, πότε, τιμή, τελευταία, σήμερα…) does not stop at the snippets. <code>web_search</code> opens the top one or two readable results at the same time, each on its own Tor circuit, and waits at most 12 seconds. The parts of each page that carry the question are added under <strong>READ FROM PAGES</strong>, with the page's title and date. A page that fails, is a stub or bot check, or never mentions the question is left out without a word, and the results above stay as they were. “How to” and tutorial questions do not open pages. Channel members get this too.</p></li>
+    <li><h4>Research reads the part that answers</h4><p>For <code>deep_research</code> and <code>fact_check</code>, a long page is not cut at its start: the parts that carry the question's words are read, with the page's opening. Each page is listed with its title and date, a number the extractor wrote that the page does not hold is marked, and pages that had nothing relevant are named on one line. A run with a time limit returns the pages it finished.</p></li>
     <li><h4>Answer from the evidence</h4><p>The model writes its reply from what the pages actually say. A checker afterwards compares claims in the reply against the tool results.</p></li>
   </ol>
   <h3 id="browser">The browser</h3>
@@ -95,9 +97,12 @@
   <h2 id="limits">Limits and switches</h2>
   <ul>
     <li>Tor is slow and some sites block it. A typical search takes 10–20 seconds; a deep research run takes minutes.</li>
-    <li>Use plain keywords. To prefer a source, name it (“python asyncio docs”), don't use <code>site:</code>.</li>
+    <li>Use plain keywords. To prefer a source, name it (“python asyncio docs”); <code>site:</code> only lists that site's results first, it does not filter.</li>
+    <li>Some news and finance sites cannot be read over Tor. Their search snippets are shown last, marked “snippet only”, and are not opened.</li>
     <li>Sites behind logins or heavy bot checks may refuse the browser. YouTube refuses most Tor exits; a link usually works in under half a minute, sometimes not at all.</li>
-    <li>Results are cached briefly, so asking the same thing twice in a row is fast.</li>
+    <li>Results are cached briefly, so asking the same thing twice in a row is fast (the pages a search read are cached with it).</li>
+    <li><code>GHOST_SEARCH_DDG_ONION=1</code> adds DuckDuckGo's onion service to the engine race. <strong>It ships off.</strong> On 11-13, through Tor, it answered 7 of 35 test searches early in the day (the normal DuckDuckGo address answered 1 of 35), then 0 of the next 72 — every one blocked with HTTP 202. To turn it on, export <code>GHOST_SEARCH_DDG_ONION=1</code> (or on / true / yes) in the launcher, <code>~/Data/AI/bin/start-ghost-agent.sh</code>, and restart the agent; any other value, or none, keeps it off.</li>
+    <li><code>GHOST_SEARCH_READ_PAGES=0</code> stops <code>web_search</code> opening pages; <code>GHOST_SEARCH_READ_S</code> sets its time budget (12 s).</li>
     <li>Channel members in Slack can use <code>web_search</code> only; <code>deep_research</code>, <code>fact_check</code> and the browser are owner tools.</li>
     <li>Production runs with <code>--mandatory-tor</code>: if Tor is down, searches fail rather than leak out directly.</li>
   </ul>

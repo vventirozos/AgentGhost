@@ -1357,7 +1357,7 @@ class TestDownloadNamesAreReadable:
         import ghost_agent.tools.file_system as fs
         seen = {}
 
-        async def fake_download(url, sandbox_dir, tor_proxy, filename=None):
+        async def fake_download(url, sandbox_dir, tor_proxy, filename=None, **_kw):   # §4UN-fetch: name_from_url
             seen["filename"] = filename
             return f"SUCCESS: Downloaded '{url}' to '{filename}'."
 

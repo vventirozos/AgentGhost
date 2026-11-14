@@ -532,6 +532,22 @@ async def test_site_notify_promise_capture(monkeypatch, sim, captured):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("sim,watched", [(True, False), (False, True)])
+async def test_site_change_watch_at_request_start(monkeypatch, sim, watched):
+    """Guards (§4UM review): a simulated turn starts no change-log watch on the owner's project."""
+    import ghost_agent.tools.projects as TP
+    watch = MagicMock()
+    monkeypatch.setattr(TP, "begin_request_watch", watch)
+    monkeypatch.setattr(TP, "begin_request_focus", lambda *a, **k: None)
+    ctx = _turn_ctx(sim)
+    ctx.current_project_id = "p1"
+    ctx.project_store = MagicMock()
+    await GhostAgent(ctx).handle_chat({"messages": [{"role": "user", "content": "explain how dogs sleep"}],
+                                       "model": "m"}, FakeBgTasks())
+    assert watch.called is watched
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("sim,consumed", [(True, False), (False, True)])
 async def test_site_warmup_head_check(caplog, sim, consumed):
     """Guards: an isolate's head differs by design; it must not raise a false MISS or use up the one-shot check."""
@@ -610,7 +626,7 @@ def test_the_guards_read_the_flag_through_one_function():
     assert readers == [] and getattrs == []
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
              and n.func.id == "is_simulated_context"]
-    assert len(calls) == 8, "a guard was added or dropped: give it a site test above and change this count"
+    assert len(calls) == 9, "a guard was added or dropped: give it a site test above and change this count"
     assert not [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "is_read_only"]
 
 

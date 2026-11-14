@@ -62,12 +62,15 @@ async def test_helper_fetch_url_content_403_no_tor_renewal():
 
         result = await helper_fetch_url_content("http://example.com")
 
-        # Returns the application-level forbidden error, no Tor rotation,
-        # no second GET attempt.
+        # Returns the application-level forbidden error, no Tor daemon renewal.
+        # §4UN-fetch: ONE retry with a plain curl identity on a fresh circuit (Cloudflare and Wikipedia
+        # refused the browser fingerprint from Tor exits and served plain curl — §4FR, §4QF), then the
+        # forbidden error naming both identities; never a third GET.
         assert "Access Denied (403)" in result
         assert "Application-level forbidden" in result
+        assert "plain curl identity" in result
         assert mock_renew.call_count == 0
-        assert mock_session_instance.get.call_count == 1
+        assert mock_session_instance.get.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -126,7 +129,9 @@ async def test_tool_search_ddgs_retry():
         mock_ddgs_instance = MagicMock()
         mock_ddgs_class.return_value.__enter__.return_value = mock_ddgs_instance
 
-        mock_ddgs_instance.text.side_effect = [Exception("Tor blocked")] + [[{"title": "t", "body": "b", "href": "h"}]]
+        # (§4UN-web: the winning row is ON TOPIC — a batch with none of the
+        # query's words is a soft loss the race keeps going past)
+        mock_ddgs_instance.text.side_effect = [Exception("Tor blocked")] + [[{"title": "t test query", "body": "b", "href": "h"}]]
 
         result = await tool_search_ddgs("test query", "socks5://127.0.0.1:9050")
 
@@ -206,10 +211,14 @@ async def test_tool_download_file_retry(tmp_path):
         # the same circuit, because the site refused the fingerprint, not the
         # exit. An EXCEPTION still rotates. So: one rotation, one sleep, and
         # the second session must be the plain profile.
-        assert mock_renew.call_count == 1
+        # §4UN-fetch: no global rotation (a no-op here: control port closed, agent unprivileged) — every
+        # attempt rides its OWN SOCKS-isolated circuit; the exception costs one short pause
+        assert mock_renew.call_count == 0
         assert mock_sleep.call_count == 1
         sessions = mock_requests.AsyncSession.call_args_list
-        assert sessions[0].kwargs.get("impersonate") == "chrome110"
+        assert sessions[0].kwargs.get("impersonate") == "chrome"
+        _px = [str((s.kwargs.get("proxies") or {}).get("https")) for s in sessions]
+        assert len(set(_px)) == 3, _px
         assert sessions[1].kwargs.get("impersonate") is None
         assert sessions[1].kwargs.get("headers", {}).get("User-Agent", "").startswith("curl/")
 

@@ -105,6 +105,11 @@ def note_created(host_path, kind: str, req_id: Optional[str] = None) -> None:
             _NOTED.setdefault(req_id, {})[key] = kind
             while len(_NOTED) > _MAX_OPEN_TURNS:      # a cancelled turn never finishes
                 _NOTED.pop(next(iter(_NOTED)))
+        try:    # §4UM round 2/3: a NEW screenshot / check file is the system's, never a project change
+            from ..memory.projects import note_system_path
+            note_system_path(p)
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001 — bookkeeping never breaks a tool
         pass
 
@@ -149,6 +154,11 @@ def _move_to_trash(path: Path, root: Path, trash: Path, req_id: str) -> Optional
     except (OSError, ValueError):
         return None
     dest = Path(trash) / time.strftime("%Y%m%d") / _safe_id(req_id) / rel
+    try:
+        from ..memory.projects import note_system_path
+        note_system_path(src)       # §4UM round 2: the sweep's move is not the owner's removal
+    except Exception:  # noqa: BLE001
+        pass
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():

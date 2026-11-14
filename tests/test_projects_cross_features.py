@@ -88,7 +88,7 @@ async def test_dependency_gates_autoadvance_until_done(context, store):
     # it may fail later for other reasons, but not on the dependency).
     for t in store.list_tasks(lib):
         store.update_task(t["id"], status="DONE")
-    assert store.get_project(lib)["status"] == "DONE"
+    assert store.project_state(lib) == "ready"          # §4UM: a ready dependency is met
     r2 = await advance_once(context, app)
     assert "dependency" not in (r2.summary or "")
 

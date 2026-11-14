@@ -194,7 +194,7 @@ class TestReviewCatches2026_08_01:
         tid = store.add_task(pid, "only task")
         store.update_task(tid, status="DONE")
         proj = store.get_project(pid)
-        assert str(proj["status"]).upper() == "DONE"
+        assert store.project_state(pid) == "ready"      # §4UM: the finished plan stays open; constraints retire
         meta = proj["metadata"]
         assert meta["constraints"] == []
         assert meta["constraints_retired"] == [f"Start with: {PHRASE}"]

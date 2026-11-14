@@ -559,6 +559,8 @@ class StrikeLedger:
         #: §4OE-4: every web_search this request (the run above resets on an open)
         self.search_total: int = 0
         self.search_total_steered: bool = False
+        #: §4UN-read: a web_search of this request opened result pages itself
+        self.search_read_any: bool = False
         self.SEARCH_TOTAL_CAP = SEARCH_TOTAL_CAP
         self.search_yield_steered: bool = False
         # §4KL: consecutive tool batches that refused a member call and ran
@@ -572,13 +574,19 @@ class StrikeLedger:
 
     # -- failure path ------------------------------------------------------
 
-    def note_search_yield(self, fname) -> int:
+    def note_search_yield(self, fname, opened: bool = False) -> int:
         """§4JJ: advance the un-opened search run for one dispatched call —
         a `web_search` extends it, a SEARCH_OPEN_TOOLS call resets it, any
-        other tool leaves it. Returns the run after the call."""
+        other tool leaves it. Returns the run after the call. §4UN-read: a
+        web_search that ``opened`` result pages itself (its READ FROM PAGES
+        section) counts as a search AND an open — the run resets."""
         if fname == "web_search":
-            self.search_run += 1
             self.search_total += 1
+            if opened:
+                self.search_read_any = True
+                self.search_run = 0
+            else:
+                self.search_run += 1
         elif fname in SEARCH_OPEN_TOOLS:
             self.search_run = 0
         return self.search_run

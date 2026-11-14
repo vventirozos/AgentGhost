@@ -252,7 +252,7 @@ async def test_done_on_stale_parse_failure_uses_live_recheck(context):
     assert row["status"] == "DONE"
     assert row["failure_reason"] == ""
     assert "live syntax re-check" in row["result_summary"]
-    assert store.get_project(pid)["status"] == "DONE"
+    assert store.project_state(pid) == "ready"          # §4UM: rolled forward; the project stays open
 
 
 async def test_done_refused_when_file_still_broken(context):

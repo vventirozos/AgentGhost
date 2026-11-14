@@ -122,7 +122,8 @@ async def test_tool_search_ddgs_empty_list_triggers_tor_cycle(mock_find_spec, mo
     result = await tool_search_ddgs("test query", None)
 
     assert "ZERO results" in result
-    assert mock_ddgs_instance.text.call_count == 4 * len(_RACE_ENGINES)
+    from src.ghost_agent.tools.search import reformulate_keeping_meaning   # §4UN-web
+    assert mock_ddgs_instance.text.call_count == (2 + len(reformulate_keeping_meaning("test query"))) * len(_RACE_ENGINES)
 
 
 @pytest.mark.asyncio
@@ -160,8 +161,8 @@ async def test_tool_search_ddgs_exception_logging(mock_find_spec, mock_ddgs, moc
     await tool_search_ddgs("test params", None)
 
     # (2 primary waves + 2 reformulation waves) × the full race set
-    from src.ghost_agent.tools.search import _RACE_ENGINES
-    assert mock_ddgs_instance.text.call_count == 4 * len(_RACE_ENGINES)
+    from src.ghost_agent.tools.search import _RACE_ENGINES, reformulate_keeping_meaning   # §4UN-web
+    assert mock_ddgs_instance.text.call_count == (2 + len(reformulate_keeping_meaning("test params"))) * len(_RACE_ENGINES)
 
     # The per-wave failure log aggregates every engine's error string.
     logs = [call.args[1] for call in mock_pretty_log.call_args_list]

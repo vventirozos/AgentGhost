@@ -30,6 +30,7 @@
     <div class="subnav">
       <a href="autonomous_activity.html">Autonomous activity (core.autonomous_activity)</a>
       <a href="background_jobs.html">Background jobs</a>
+      <a href="change_log.html">Living projects and the change log</a>
       <a href="cross_project_map.html">Cross-project map</a>
       <a href="long_tasks.html">Long tasks</a>
       <a href="planning.html">Planning (core.planning)</a>
@@ -397,6 +398,8 @@
   </ul>
 
   <footer><a href="../../index.html">← Back to index</a></footer>
+  <h2 id="4um">Living projects: no DONE roll-up, the change log <span class="tag">2026-11-13 &sect;4UM</span></h2>
+  <p>The roll-up no longer sets DONE: a finished plan leaves the project ACTIVE (&ldquo;ready&rdquo;, <code>_planned_work_finished</code>, <code>planned_done_at</code>, a <code>project_auto_rollup</code> event with <code>new_status: READY</code>), and the DONE hook fires once per finish. New: <code>project_state</code>, <code>planned_work_done</code>, the <code>project_changes</code> table with <code>add_change</code> / <code>list_changes</code> / <code>mark_changes_deployed</code> / <code>record_deploy</code> / <code>live_info</code> / <code>change_files</code> / <code>render_changelog</code>, and the module-level <code>note_change_write</code>, <code>note_change_push</code>, <code>flush_change_log</code>, <code>backfill_change</code>, <code>push_covers</code>, <code>folder_layout</code>, <code>live_line</code>, <code>recent_change_lines</code>. <code>retire_constraints(reason="planned work finished")</code> retires like a DONE close (re-armed by new tasks). Review fixes: <code>closed_by_rollup</code> (a legacy DONE from the old roll-up reads ready); <code>snapshot_folder</code>, <code>watch_project</code>, <code>set_change_summary</code>, <code>recover_pending_changes</code>, <code>note_change_stage</code>; the log file is <code>PROJECT_CHANGES.md</code> (header-guarded, last 200 entries); <code>record_deploy</code> never replaces a newer <code>metadata.live</code>; <code>backfill_change</code> is idempotent. See <a href="change_log.html">Living projects and the change log</a>.</p>
 </main>
 
 <h2 id="4mm">§4MM (2026-10-08): probe-origin events</h2>

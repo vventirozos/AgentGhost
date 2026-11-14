@@ -1,11 +1,11 @@
 """§4UH-loop (2026-11-12): the Mirror is removed; the strange loop is the character's.
 
 * the Mirror's module, diary and switch-back path are gone (`selfhood.mirror` does not import);
-* what the new loop still needs lives in `selfhood.loop`: the home, the replies a look may read, a probe's
-  self-image, the resting point's unit and switch, the `mirror` command;
+* what the new loop still needs lives in `selfhood.loop`: the home, a probe's self-image, the resting point's
+  unit and switch, the `mirror` command (the reply picker went with the daily self-look, §4UH-noself);
 * only the owner on a private surface (and a probe of one) hears the character's sentence — the §4TZ gating,
   now over the character instead of the diary; frozen per request;
-* `mirror` shows the path the loop has taken: each sentence, what moved it, where it is now, and the looks.
+* `mirror` shows the path the loop has taken: each sentence, what moved it, and where it is now.
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import datetime
 import hashlib
 import importlib
 import json
-import random
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -26,7 +25,6 @@ from ghost_agent.core.agent import GhostAgent
 from ghost_agent.selfhood import SelfModel
 from ghost_agent.selfhood import character as C
 from ghost_agent.selfhood import loop as L
-from ghost_agent.selfhood import selfview as V
 from ghost_agent.utils.logging import (
     ORIGIN_PROBE, reply_surface_context, request_id_context, request_origin_context, requester_role_context)
 
@@ -36,7 +34,7 @@ NOW = datetime.datetime(2026, 11, 3, 14, 0, 0)
 
 @pytest.fixture(autouse=True)
 def _character_on(monkeypatch):
-    for env in (C.ENV, L.REST_ENV, V.VOTE_ENV):
+    for env in (C.ENV, L.REST_ENV):
         monkeypatch.delenv(env, raising=False)
     C._MEMO.clear()
     yield
@@ -100,7 +98,7 @@ def test_nothing_in_src_imports_it():
 
 
 def test_the_idle_phase_writes_no_diary(tmp_path):
-    """The character phase runs (day close, rule, look) and nothing writes a mirror file."""
+    """The character phase runs (day close, rule) and nothing writes a mirror file."""
     import asyncio
     home = _home(tmp_path)
     agent = GhostAgent.__new__(GhostAgent)
@@ -315,99 +313,6 @@ def test_command_matcher(text, yes):
     assert L.is_mirror_command(text) is yes
 
 
-def test_look_epoch_reads_local_and_z_stamps():
-    assert L._look_epoch("2026-11-11T23:27:00Z") == datetime.datetime(
-        2026, 11, 11, 23, 27, tzinfo=datetime.timezone.utc).timestamp()
-    assert L._look_epoch("2026-11-11T23:27:00") > 0
-    assert L._look_epoch("") == 0.0 and L._look_epoch("not a time") == 0.0
-
-
-def _pool(monkeypatch, hours_ago, tone=None):
-    import ghost_agent.core.failure_census as FC
-    now_utc = NOW.astimezone(datetime.timezone.utc)
-    turns = [{"final_response": f"Reply {h}h: " + "a real answer, long enough to be picked. " * 3,
-              "timestamp": (now_utc - datetime.timedelta(hours=h)).isoformat(),
-              "extra": ({"mood_tone": tone} if tone and h % 2 else {})} for h in hours_ago]
-    monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: (turns, []))
-
-
-def _hours(got):
-    return sorted(int(g["text"].split("h:")[0].split()[-1]) for g in got)
-
-
-def test_pick_replies_takes_six_different_ones_at_random(tmp_path, monkeypatch):
-    _pool(monkeypatch, range(1, 13))
-    draws = set()
-    for seed in range(20):
-        got = L.pick_replies(tmp_path, now=NOW, rng=random.Random(seed))
-        assert len(got) == L.REPLIES_PER_LOOK == 6 and len({g["at"] for g in got}) == 6
-        draws.add(tuple(_hours(got)))
-    assert len(draws) > 5
-
-
-def test_pick_replies_only_takes_replies_written_since_the_last_look(tmp_path, monkeypatch):
-    _pool(monkeypatch, [1, 5, 9, 13, 20, 30])
-    after = (NOW - datetime.timedelta(hours=10)).isoformat(timespec="seconds")
-    for seed in range(10):
-        assert _hours(L.pick_replies(tmp_path, now=NOW, rng=random.Random(seed), after=after)) == [1, 5, 9]
-    edge = (NOW - datetime.timedelta(hours=9)).isoformat(timespec="seconds")
-    assert _hours(L.pick_replies(tmp_path, now=NOW, rng=random.Random(0), after=edge)) == [1, 5]
-
-
-@pytest.mark.parametrize("after", ["", None, "not a time", "2026-10-01T00:00:00"])
-def test_pick_replies_goes_two_days_back_at_most(tmp_path, monkeypatch, after):
-    _pool(monkeypatch, [1, 47, 49, 80])
-    for seed in range(6):
-        assert _hours(L.pick_replies(tmp_path, now=NOW, rng=random.Random(seed), after=after)) == [1, 47]
-
-
-def test_pick_replies_leaves_out_replies_written_under_a_strong_mood(tmp_path, monkeypatch):
-    _pool(monkeypatch, [1, 2, 3, 4], tone={"intensity": 2})               # odd hours: a strong mood
-    assert _hours(L.pick_replies(tmp_path, now=NOW, rng=random.Random(0))) == [2, 4]
-
-
-def test_pick_replies_skips_short_and_aborted(tmp_path, monkeypatch):
-    import ghost_agent.core.failure_census as FC
-    now_utc = NOW.astimezone(datetime.timezone.utc)
-    ts = (now_utc - datetime.timedelta(hours=1)).isoformat()
-    turns = [{"final_response": "ok", "timestamp": ts},
-             {"final_response": "x" * 100 + " [ATTEMPT_ABORTED_TIMEOUT]", "timestamp": ts},
-             {"final_response": "A real answer about the weather in Athens, rain all week. " * 2, "timestamp": ts}]
-    monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: (turns, []))
-    got = L.pick_replies(tmp_path, now=NOW, rng=random.Random(0))
-    assert len(got) == 1 and "Athens" in got[0]["text"]
-
-
-def test_pick_replies_reads_real_day_folders_owner_only(tmp_path):
-    now_utc = NOW.astimezone(datetime.timezone.utc)
-    day = tmp_path / "system" / "trajectories" / now_utc.date().isoformat()
-    day.mkdir(parents=True)
-    at = (now_utc - datetime.timedelta(hours=2)).isoformat().replace("+00:00", "Z")
-    body = " — a reply long enough to be picked by the look: rain in Athens all week, 14 °C."
-
-    def row(i, text, **extra):
-        return {"id": f"t{i}", "timestamp": at, "session_id": "s", "task_kind": "user_request",
-                "user_request": "q", "final_response": text + body, "extra": extra}
-    rows = [row(1, "OWNER", req_id="abc123", origin="user"),
-            row(2, "MEMBER", req_id="slack-1", requester_role="member"),
-            row(3, "PROBE", req_id="probe-1"),
-            row(4, "JOB", req_id="job-1"),
-            row(5, "SIM", req_id="x", origin="sim")]
-    (day / "session-s.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    for k in range(12):
-        got = L.pick_replies(tmp_path, now=NOW, rng=random.Random(k))
-        assert [g["text"].split(" ")[0] for g in got] == ["OWNER"]
-
-
-@pytest.mark.parametrize("tone,strong", [
-    ({"intensity": 1}, False), ({"intensity": 2}, True), ({"intensity": 3}, True),
-    ({"manner_name": "sarcastic"}, True), ({"manner_name": "  "}, False), ({"intensity": True}, False),
-    ({"mood": "irritable, 2 of 3"}, False), ("x", False), (None, False)])
-def test_written_under_strong_mood_reads_the_values_only(tone, strong):
-    assert L.written_under_strong_mood({"extra": {"mood_tone": tone}}) is strong
-    assert L.written_under_strong_mood({}) is False and L.written_under_strong_mood({"extra": None}) is False
-
-
 def test_a_probe_section_has_the_characters_header_and_rule():
     s = L.probe_section("I am  a test\nsentence.")
     assert s == f"{C.HEADER}\n«I am a test sentence.»\n{C.RULE}\n\n"
@@ -478,7 +383,7 @@ def test_the_owners_word_a_pin_and_a_veto_are_their_own_steps(tmp_path):
     assert len(steps) == 5
 
 
-def test_the_banner_shows_the_loop_its_path_now_and_the_looks(tmp_path):
+def test_the_banner_shows_the_loop_its_path_and_now(tmp_path):
     home = _home(tmp_path)
     _log(home, START_ROW, MOVE_W, MOVE_D)
     _write_state(home, {"warmth": 0, "humour": 1, "directness": 1})
@@ -490,35 +395,14 @@ def test_the_banner_shows_the_loop_its_path_now_and_the_looks(tmp_path):
     assert f"warmth -1 → 0, directness 0 → +1, by itself, from how its days went → «{now_s}»" in b
     assert "  - warmth: 7 days clearly better" in b
     assert f"**Now:** «{now_s}»" in b and "my mood rests at pleasantness" in b
-    assert "No look yet" in b and "shown, not counted" in b
     assert "diary" not in b.lower() and "Mirror" not in b
-    assert b.index("**Where it has gone**") < b.index("**Now:**") < b.index("**What I see")
-
-
-def test_the_banner_shows_the_latest_looks(tmp_path):
-    home = _home(tmp_path)
-    for k in range(9):
-        V._append(home, {"at": f"2026-11-0{k + 1}T23:00:00Z" if k < 9 else "", "date": f"2026-11-0{k + 1}",
-                         "observed": {"warmth": 1, "humour": 1, "directness": 0},
-                         "dials": dict(C.START), "replies": 6})
-    b = L.banner(home)
-    assert b.count("· 6 replies —") == V.SHOW_LAST
-    assert "2026-11-09" in b and "**2026-11-01**" not in b
-
-
-def test_the_banner_says_the_vote_when_it_is_on(tmp_path, monkeypatch):
-    home = _home(tmp_path)
-    assert "shown, not counted" in L.banner(home)
-    monkeypatch.setenv(V.VOTE_ENV, "1")
-    b = L.banner(home)
-    assert "adds a vote" in b and "shown, not counted" not in b
+    assert b.index("**Where it has gone**") < b.index("**Now:**")
 
 
 def test_the_banner_before_any_change_and_with_an_unreadable_character(tmp_path):
     home = _home(tmp_path)
     b = L.banner(home)
     assert "**Where it has gone:** nowhere yet" in b and f"**Now:** «{START_SENTENCE}»" in b
-    assert f"at least {V.MIN_REPLIES} replies" in b
     p = home / C.SELFHOOD_REL / C.CHARACTER_FILENAME
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("{not json")
@@ -532,9 +416,8 @@ def test_the_banner_never_raises(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise OSError("disk gone")
     monkeypatch.setattr(C, "log_rows", boom)
-    monkeypatch.setattr(V, "history_lines", boom)
     b = L.banner(home)
-    assert "could not be read just now" in b and "looks at my own replies could not be read" in b
+    assert "could not be read just now" in b
 
 
 def test_the_owner_command_is_answered_with_the_banner(tmp_path):

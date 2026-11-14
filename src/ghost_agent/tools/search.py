@@ -88,8 +88,120 @@ _DDGS_TOR_TIMEOUT = 18
 # mojeek keeps the full budget so it can still win late, and the wave deadline
 # stays sized off mojeek (_DDGS_TOR_TIMEOUT + grace). Measure per-exit before
 # tightening the fast engines further; do NOT shorten mojeek below ~15.
-_DDGS_ENGINE_TIMEOUT = {"mojeek": 18}
+_DDGS_ENGINE_TIMEOUT = {"mojeek": 18, "duckduckgo_onion": 20}
 _DDGS_FAST_ENGINE_TIMEOUT = 12
+
+# §4UN-onion (2026-11-13, operator-approved): DuckDuckGo's ONION service races as an EXTRA engine.
+# Measured that day (primp, impersonate=random, a fresh SOCKS identity per request, POST /html/ with q):
+# clearnet html.duckduckgo.com through Tor exits answered 1 of 35 searches (34 × HTTP 202); the onion
+# answered 7 of 35 (20 × 202, 8 timeouts at 30 s; replies took 7–17 s; HTTPS verified with the default
+# CA). It rides its own circuit (socks5h — the onion name is resolved by Tor, never locally) with a 20 s
+# ddgs timeout, but the WAVE DEADLINE stays sized off the clearnet engines (`_race_wave_deadline`): a
+# round another engine wins never waits for it, and an onion answer later than the deadline is dropped
+# (logged "duckduckgo_onion abandoned"). Ships OFF: only ``GHOST_SEARCH_DDG_ONION=1`` (on/true/yes) races it.
+DDG_ONION_HOST = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion"
+DDG_ONION_ENGINE = "duckduckgo_onion"
+#: engines raced IN ADDITION to `_RACE_ENGINES` (not in the wave-deadline max)
+_EXTRA_RACE_ENGINES: Tuple[str, ...] = (DDG_ONION_ENGINE,)
+_ddg_onion_state: Dict[str, Any] = {"ok": None}
+
+
+#: §4UN-onion final review: the onion-only wait (every clearnet engine refused, the onion still running)
+#: happens at most ONCE per search, and not at all once the onion timed out in it —
+#: a search state set by `tool_search_ddgs` / `tool_deep_research` (a wave outside one gets a fresh state)
+import contextvars as _cv_onion
+_ONION_SEARCH: "_cv_onion.ContextVar[Optional[Dict[str, Any]]]" = _cv_onion.ContextVar(
+    "ghost_onion_search_state", default=None)
+
+
+def _ddg_onion_on() -> bool:
+    """Ships OFF (operator, 11-13: through Tor the onion answered 7 of 35 searches early that day, then
+    0 of 72 — every one a 202 block). Only an explicit "1" / "on" / "true" / "yes" races it."""
+    return os.environ.get("GHOST_SEARCH_DDG_ONION", "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def _unwrap_ddg_href(href: str) -> str:
+    """A DuckDuckGo result link as the page's own address: ``…/l/?uddg=<url>&rut=…`` — absolute,
+    protocol-relative (``//duckduckgo.com/l/…``, ``//<onion>/l/…``) or relative (``/l/…``) — → ``<url>``;
+    a protocol-relative link → https. ddgs has ALREADY percent-decoded the href once, so nothing is
+    decoded again (r1: ``%2526`` in the page stays ``%26``); ``rut=`` is dropped wherever it stands."""
+    h = str(href or "").strip()
+    m = re.match(r"(?:(?:https?:)?//(?:[\w-]+\.)*(?:duckduckgo\.com|" + re.escape(DDG_ONION_HOST)
+                 + r"))?/l/\?(.*)$", h)
+    if m:
+        q = m.group(1)
+        i = q.find("uddg=")
+        if i >= 0 and (i == 0 or q[i - 1] == "&"):
+            prefix, target = q[:i], q[i + len("uddg="):]
+            # final review: only DDG's OWN rut goes — before uddg, or (when none stood there) the last
+            # parameter, which DDG appends; a rut inside the target URL is the target's
+            if not re.search(r"(?:^|&)rut=", prefix):
+                target = re.sub(r"&rut=[^&]*$", "", target)
+            return target
+    if h.startswith("//"):
+        h = "https:" + h
+    return h
+
+
+def register_ddg_onion() -> bool:
+    """Register ``duckduckgo_onion`` — ddgs's DuckDuckGo html engine against the onion base URL — in the
+    ddgs engine map the DDGS class reads (once; idempotent). False, and the engine is NOT raced, when the
+    installed ddgs no longer has that shape: an unknown backend name makes ddgs race EVERY engine ("auto")."""
+    if _ddg_onion_state["ok"] is not None:
+        return bool(_ddg_onion_state["ok"])
+    ok = False
+    try:
+        import ddgs.ddgs as _ddgs_mod
+        from ddgs.engines import ENGINES
+        from ddgs.engines.duckduckgo import Duckduckgo
+
+        class DuckduckgoOnion(Duckduckgo):
+            """DuckDuckGo's onion service (§4UN-onion)."""
+            name = DDG_ONION_ENGINE
+            search_url = f"https://{DDG_ONION_HOST}/html/"
+
+            def post_extract_results(self, results):
+                out = []
+                for r in results:
+                    try:
+                        # r1: around ddgs's normalising __setattr__ — it would decode the href again
+                        object.__setattr__(r, "href", _unwrap_ddg_href(r.href))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not r.href.startswith(("http://", "https://")):
+                        continue                          # a relative link that was not a redirect
+                    host = (r.href.split("/", 3)[2]).lower()
+                    if host == DDG_ONION_HOST or host == "duckduckgo.com" or host.endswith(".duckduckgo.com"):
+                        continue                          # its own ads (y.js) and internal links
+                    out.append(r)
+                return super().post_extract_results(out)
+
+        ok = (getattr(Duckduckgo, "search_method", None) == "POST"
+              and str(getattr(Duckduckgo, "search_url", "")).endswith("/html/")
+              and getattr(_ddgs_mod, "ENGINES", None) is ENGINES and "text" in ENGINES)
+        if ok:
+            ENGINES["text"][DDG_ONION_ENGINE] = DuckduckgoOnion
+    except Exception as exc:  # noqa: BLE001 — a missing engine degrades the race, never search
+        logger.debug("duckduckgo onion engine not registered: %s", exc)
+        ok = False
+    if not ok:
+        pretty_log("Search Engine", "duckduckgo_onion NOT registered: the installed ddgs changed its "
+                   "DuckDuckGo engine or engine map — not raced", icon=Icons.TOOL_SEARCH, level="WARNING")
+    _ddg_onion_state["ok"] = ok
+    return ok
+
+
+def raced_engines(proxy: Optional[str]) -> Tuple[str, ...]:
+    """The engines a wave races: `_RACE_ENGINES`, plus the DuckDuckGo onion when the switch is on, the
+    engine is registered and the wave has a Tor proxy to reach it through."""
+    if not (_ddg_onion_on() and proxy and register_ddg_onion()):
+        return _RACE_ENGINES
+    return _RACE_ENGINES + _EXTRA_RACE_ENGINES
+
+
+def _engine_salt(engine: str) -> str:
+    """The circuit salt of an engine (the first four letters; the onion has its own — "duck" is taken)."""
+    return "dgon" if engine == DDG_ONION_ENGINE else engine[:4]
 
 
 def _engine_timeout(engine: str) -> int:
@@ -353,8 +465,9 @@ def site_operator_note(query: str) -> str:
     # words at all; the plain wording is kept.)
     return (f"[Note: these search engines do not support site restrictions — "
             f"{shown} {'were' if len(ops) > 1 else 'was'} removed, so these "
-            f"results are NOT limited to (or cleared of) that site. To aim at "
-            f"a site, add its name as a plain keyword.]")
+            f"results are NOT limited to (or cleared of) that site; any results "
+            f"from a `site:` host are listed first. To aim at a site, add its "
+            f"name as a plain keyword.]")
 
 
 _OPERAND_STOPWORDS = frozenset({
@@ -644,15 +757,62 @@ def result_on_topic(result: Dict, dist: List[str]) -> bool:
                for t in long_toks for w in words)
 
 
+#: §4UN-web: a number the query names — a version, a model, an edition ("PostgreSQL 19", "Python 3.13");
+#: a 4-digit year is not one (the stale-year rule owns years)
+_QUERY_NUMBER_RE = re.compile(r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)*)(?![\w])")
+#: r1: two numbers compared ("2019 vs 2022") are what is asked, years or not
+_NUMBER_VS_RE = re.compile(r"(?<![\w.])(\d[\d,.]*)\s*(?:vs\.?|versus)\s*(\d[\d,.]*)(?![\w])", re.I)
+
+
+def query_numbers(query: str) -> List[str]:
+    """The numbers a query names (years excluded): "postgresql 19 release date" → ["19"]."""
+    q = str(query or "")
+    compared = {x.replace(",", "") for m in _NUMBER_VS_RE.finditer(q) for x in m.groups()}
+    nums = [n.replace(",", "") for n in _QUERY_NUMBER_RE.findall(q)]     # r1: "1,000" is 1000
+    return [n for n in dict.fromkeys(nums) if n in compared or not _YEAR_RE.fullmatch(n)]
+
+
+def result_has_numbers(result: Dict, numbers: List[str], query: str = "") -> bool:
+    """Every number of the query appears in the result as that number — "19" in "PostgreSQL 19.1", never in
+    "119" or "1.19"; "3.13" in "3.13.1", never in "3.131"."""
+    text = f"{result.get('title') or ''} {result.get('body') or ''} {result.get('href') or result.get('url') or ''}"
+    text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text)                # r1: "1,000" is 1000
+    _products = [w for w in re.findall(r"[^\W\d_]{2,}", _rel_fold(query), re.UNICODE)]
+
+    def _has(n: str) -> bool:
+        if re.search(rf"(?<![\d.]){re.escape(n)}(?!\d)", text):
+            return True
+        # r1/r2: a version glued to the query's product word drops its dots ("python313" for
+        # python 3.13) — 3+ digits and that word right before them ("Model X13" is not 1.3)
+        glued = n.replace(".", "")
+        if "." not in n or len(glued) < 3 or not _products:
+            return False
+        low = _rel_fold(text)
+        return any(re.search(rf"(?<![^\W\d_]){re.escape(p)}[-_]?{glued}(?!\d)", low, re.UNICODE)
+                   for p in _products)
+    return all(_has(n) for n in numbers)
+
+
 def rank_on_topic(query: str, results: List[Dict]) -> List[Dict]:
     """Stable partition: results carrying a distinctive token first, the
-    rest after, order preserved within each half. Nothing is dropped."""
+    rest after, order preserved within each half. Nothing is dropped.
+    §4UN-web: inside each half, a result naming every NUMBER of the query
+    (the version asked about) comes first — "PostgreSQL 17 Released!" no
+    longer leads a search for PostgreSQL 19."""
+    rows = list(results or [])
+    nums = query_numbers(query)
+
+    def _by_numbers(part: List[Dict]) -> List[Dict]:
+        if not nums:
+            return part
+        return ([r for r in part if result_has_numbers(r, nums, query)]
+                + [r for r in part if not result_has_numbers(r, nums, query)])
     dist = distinctive_tokens(query)
     if not dist:
-        return list(results or [])
-    hit = [r for r in results or [] if result_on_topic(r, dist)]
-    miss = [r for r in results or [] if not result_on_topic(r, dist)]
-    return hit + miss
+        return _by_numbers(rows)
+    hit = [r for r in rows if result_on_topic(r, dist)]
+    miss = [r for r in rows if not result_on_topic(r, dist)]
+    return _by_numbers(hit) + _by_numbers(miss)
 
 
 # ── §4MX: per-result drop (operator decision, reverses §4IL "never drop") ──
@@ -821,11 +981,22 @@ def _junk_host(url: str) -> Optional[str]:
     return None
 
 
-def _filter_junk(raw_results, omitted: Optional[List[str]] = None) -> List[Dict]:
+#: §4UN-web: junk-listed hosts whose SEARCH SNIPPET is worth showing (prices, headlines) although the
+#: page is not readable over Tor — web_search lists them last, labelled; deep_research never fetches them
+SNIPPET_ONLY_DOMAINS = frozenset({"yahoo.com", "forbes.com", "bloomberg.com", "scmp.com", "msn.com", "cnn.com",
+                                  "foxnews.com", "wsj.com", "medium.com", "quora.com"})
+SNIPPET_ONLY_TAG = "snippet only — this site is not readable over Tor; do not open it"
+SNIPPET_ONLY_MAX = 3
+
+
+def _filter_junk(raw_results, omitted: Optional[List[str]] = None,
+                 snippet_rows: Optional[List[Dict]] = None) -> List[Dict]:
     """Drop results with missing/relative URLs or junk-domain hosts. The
     junk hosts dropped are appended to ``omitted`` (deduplicated) so the
     result can NAME them (§4PD: a batch of two finance.yahoo.com pages used
-    to come back as "ZERO results … the query was too specific")."""
+    to come back as "ZERO results … the query was too specific"). A dropped
+    row of a ``SNIPPET_ONLY_DOMAINS`` host is appended to ``snippet_rows``
+    (§4UN-web) — web_search shows its snippet last; the batch never holds it."""
     valid = []
     for r in raw_results or []:
         # `or` chain, not `.get('href', default)`: a result dict with an
@@ -840,6 +1011,8 @@ def _filter_junk(raw_results, omitted: Optional[List[str]] = None) -> List[Dict]
         if j:
             if omitted is not None and j not in omitted:
                 omitted.append(j)
+            if snippet_rows is not None and j in SNIPPET_ONLY_DOMAINS:
+                snippet_rows.append(r)
             continue
         valid.append(r)
     return valid
@@ -873,6 +1046,13 @@ def _failure_category(msg: str) -> str:
     operator only needs to know HOW an engine lost, not the exception
     plumbing. Unknown errors stay category "error" and keep a snippet."""
     m = (msg or "").lower()
+    # §4UN-web: the engine REFUSED (non-200, a captcha page) — `_guarded_engine_search`
+    # raises this; ddgs used to turn it into "No results found." and the model was told
+    # its query was too specific
+    if m.startswith("blocked") or "blocked:" in m:
+        return "blocked"
+    if m == "low-relevance":
+        return "low-relevance"
     if not m or m == "empty" or "no results found" in m:
         return "empty"
     # Distinct from "empty": the engine ANSWERED, the answer was about
@@ -905,7 +1085,9 @@ _RACE_WAVE_GRACE = 4
 #: often are launched again on FRESH circuits inside the same wave and the
 #: same deadline. ``GHOST_SEARCH_HEDGE_S=0`` disables.
 _RACE_HEDGE_AT_S = 6.0
-_RACE_HEDGE_ENGINES = ("yandex", "brave")
+#: §4UN-web: yahoo replaces brave — 30 days live (10-14→11-13, 1,728 rounds): yandex 453 wins, yahoo 322,
+#: yandex-h 87, duckduckgo 20, brave and brave-h 0
+_RACE_HEDGE_ENGINES = ("yandex", "yahoo")
 
 
 def _race_hedge_at() -> float:
@@ -937,7 +1119,7 @@ def _race_wave_deadline() -> float:
 # requests. (The deeper fix is a cancellable racer so losers don't linger
 # up to 18s each; until then, headroom is the mitigation.)
 from concurrent.futures import ThreadPoolExecutor as _TPE
-_RACE_POOL = _TPE(max_workers=(len(_RACE_ENGINES) + len(_RACE_HEDGE_ENGINES)) * 8,
+_RACE_POOL = _TPE(max_workers=(len(_RACE_ENGINES) + len(_EXTRA_RACE_ENGINES) + len(_RACE_HEDGE_ENGINES)) * 8,
                   thread_name_prefix="search-race")
 # §4PD: ddgs runs EVERY engine call on one class-level executor it sizes at
 # cpu+4 (18 here) — a third of this pool. Past ~3 concurrent waves an engine
@@ -1170,6 +1352,124 @@ def _patch_ddgs_snippet_join() -> bool:
     return bool(_ddgs_patch_state["applied"])
 
 
+# ── §4UN-web: a refusal is not "no results" ─────────────────────────────
+# ddgs `BaseSearchEngine.request` returns None for ANY non-200 answer (a 403,
+# a 429 rate limit, a 302 to a captcha), and a 200 captcha page parses to zero
+# results — both reached the race as "No results found.", so 30 days of live
+# waves logged ~800 "N empty" and 16 conn-errors: an exit block on an ordinary
+# query ("electric car battery lifespan") told the model "the query was too
+# specific" and ran two meaning-changing rewordings. The engine's `search` is
+# replaced, once and only while the library still has the shape below, by one
+# that raises ``blocked: …`` for those — the race files them with the transport
+# failures (`_failure_category`).
+#: §4UN-web r1: STRUCTURAL markers — element ids, form actions and redirect
+#: hosts of the engines' own challenge pages; they do not occur on an
+#: ordinary empty results page whatever the query was
+_CHALLENGE_MARKERS = (
+    "anomaly-modal", "challenge-form", "cf-chl", "/sorry/index",
+    "g-recaptcha", "h-captcha", "captcha-delivery",
+)
+#: r2: Yahoo's consent wall is a challenge only when it IS the page — the form
+#: posts there, or the page redirects there; a footer "Privacy" link to the
+#: same host is on ordinary pages
+_CHALLENGE_REDIRECT_RE = re.compile(
+    r"<form\b[^>]*\baction\s*=\s*[\"']?https?://consent\.yahoo\.com"
+    r"|<meta\b[^>]*http-equiv\s*=\s*[\"']?refresh[^>]*consent\.yahoo\.com"
+    r"|(?:window\.|document\.)?location(?:\.href)?\s*=\s*[\"']https?://consent\.yahoo\.com", re.I)
+#: TEXT markers: read only on a SHORT page (a challenge page is a few lines,
+#: an empty results page with a long footer is not) and with the query's own
+#: text removed first — the search box and the links echo it ("recaptcha v3
+#: threshold" with no results read as a captcha page)
+_CHALLENGE_TEXT_MARKERS = (
+    "captcha", "are you a robot", "unusual traffic", "bots use duckduckgo", "verify you are human",
+    "access denied", "enable javascript and cookies to continue",
+)
+CHALLENGE_TEXT_MAX_CHARS = 3000
+_DDGS_SEARCH_IDIOM = ("html_text = self.request(self.search_method, self.search_url, params=payload)",
+                      "results = self.extract_results(html_text)")
+_DDGS_REQUEST_IDIOM = "if resp.status_code == 200:"
+_ddgs_block_patch_state: Dict[str, Any] = {"applied": None}
+
+
+def _strip_query_echo(low: str, query: str) -> str:
+    """The page without the query's own text, in the spellings a results page
+    echoes it (plain, +-joined, %20-joined, URL-encoded, HTML-escaped)."""
+    q = " ".join(str(query or "").lower().split())
+    if not q:
+        return low
+    import html as _html
+    from urllib.parse import quote, quote_plus
+    if len(q) < 4:                                       # r2: query "a" deleted every "a" ("captcha")
+        return low
+    forms = {q, q.replace(" ", "+"), q.replace(" ", "%20"), quote_plus(q).lower(), quote(q).lower(),
+             _html.escape(q).lower()}
+    # r2: the WHOLE query only, as whole words (single words of it cut "enable javascript and cookies")
+    for f in sorted(forms, key=len, reverse=True):
+        if f:
+            low = re.sub(rf"(?<!\w){re.escape(f)}(?!\w)", " ", low)
+    return low
+
+
+def engine_page_is_challenge(html_text: str, query: str = "") -> bool:
+    """A search page that is a bot check, not a results page (§4UN-web).
+    Read only when the page parsed to ZERO results. A structural marker
+    decides; a text marker counts only on a short page, after the query's own
+    text is removed (r1)."""
+    low = str(html_text or "")[:200_000].lower()
+    if any(m in low for m in _CHALLENGE_MARKERS) or _CHALLENGE_REDIRECT_RE.search(low):
+        return True
+    rest = _strip_query_echo(low, query)
+    text = re.sub(r"<script\b.*?</script>|<style\b.*?</style>", " ", rest, flags=re.S)
+    text = " ".join(re.sub(r"<[^>]+>", " ", text).split())
+    if len(text) > CHALLENGE_TEXT_MAX_CHARS:
+        return False
+    return any(m in text for m in _CHALLENGE_TEXT_MARKERS)
+
+
+def _guarded_engine_search(self, query, region="us-en", safesearch="moderate", timelimit=None, page=1, **kwargs):
+    """`BaseSearchEngine.search` that SAYS when the engine refused: a non-200
+    answer, or a challenge page with no results, raises ``blocked: …``."""
+    payload = self.build_payload(query=query, region=region, safesearch=safesearch, timelimit=timelimit,
+                                 page=page, **kwargs)
+    if self.search_method == "GET":
+        resp = self.http_client.request(self.search_method, self.search_url, params=payload)
+    else:
+        resp = self.http_client.request(self.search_method, self.search_url, data=payload)
+    status = getattr(resp, "status_code", None)
+    if status != 200:
+        raise RuntimeError(f"blocked: HTTP {status} from {getattr(self, 'name', 'engine')}")
+    html_text = getattr(resp, "text", "") or ""
+    if not html_text:
+        return None
+    results = self.post_extract_results(self.extract_results(html_text))
+    if not results and engine_page_is_challenge(html_text, query):
+        raise RuntimeError(f"blocked: challenge page from {getattr(self, 'name', 'engine')}")
+    return results
+
+
+def _patch_ddgs_block_detection() -> bool:
+    """Install `_guarded_engine_search` once. False (nothing touched) when the
+    installed ddgs no longer has the request/search shape it replaces."""
+    if _ddgs_block_patch_state["applied"] is not None:
+        return bool(_ddgs_block_patch_state["applied"])
+    try:
+        import inspect as _inspect
+        from ddgs.base import BaseSearchEngine
+        ok = (all(i in _inspect.getsource(BaseSearchEngine.search) for i in _DDGS_SEARCH_IDIOM)
+              and _DDGS_REQUEST_IDIOM in _inspect.getsource(BaseSearchEngine.request))
+        if ok:
+            BaseSearchEngine.search = _guarded_engine_search
+        _ddgs_block_patch_state["applied"] = ok
+        if not ok:
+            pretty_log("Search Engine", "block detection NOT applied: the installed ddgs changed its "
+                       "request/search shape — refusals read as empty again", icon=Icons.TOOL_SEARCH,
+                       level="WARNING")
+    except Exception as exc:  # noqa: BLE001 — a missing patch degrades labels, never search
+        _ddgs_block_patch_state["applied"] = False
+        logger.debug("ddgs block detection patch skipped: %s", exc)
+    return bool(_ddgs_block_patch_state["applied"])
+
+
 # §4JJ (2026-09-21): the wave's region was a fixed "wt-wt". Of the raced
 # engines, duckduckgo and brave read it (yandex and yahoo ignore it), so a
 # Greek-script query got worldwide ranking from the two engines that could
@@ -1221,43 +1521,106 @@ def wiki_supplement_wanted(query: str) -> bool:
     return 0 < len(_rel_tokens(query)) <= WIKI_SUPPLEMENT_MAX_TOKENS
 
 
-def wiki_article_on_topic(query: str, article: Dict) -> bool:
-    """The article's title or intro carries the query's SUBJECT — its
-    leading content word (folded) — not merely any word of it."""
+#: §4UN-web: Wikipedia's API answers 429 over Tor to a browser-impersonating client and 200 to a plain one
+#: (§4QF, measured for `subject_photos`); the lookup used `impersonate="chrome"` and never checked the
+#: status, so `r.json()` raised on the 429 body — 0 of 22 eligible Greek queries in 30 days got an article
+WIKI_HEADERS = {"User-Agent": "curl/8.7.1"}
+
+
+#: §4UN-web r1: capitalised words that name what is ASKED about the subject,
+#: not the subject ("Νίκος Καζαντζάκης Βιογραφία" required "βιογραφια").
+#: Folded; a Greek one also matches its inflections (5-letter stem).
+_WIKI_GENERIC_WORDS = frozenset(_rel_fold(w).replace("ς", "σ") for w in """
+βιογραφία ιστορία ζωή έργο έργα θάνατος γέννηση οικογένεια ταινίες βιβλία δίσκοι τραγούδια ποιήματα
+σύζυγος παιδιά ηλικία ύψος περιουσία καριέρα φωτογραφίες νέα πληροφορίες wikipedia βικιπαίδεια
+biography history life death birth family films movies books albums songs poems works quotes career
+wife husband children age height net worth news info facts photos wiki""".split())
+
+
+def _wiki_generic(tok: str) -> bool:
+    t = tok.replace("ς", "σ")
+    if t in _WIKI_GENERIC_WORDS:
+        return True
+    return bool(_GREEK_RE.search(t)) and len(t) >= 5 and any(
+        len(g) >= 5 and _GREEK_RE.search(g) and t[:5] == g[:5] for g in _WIKI_GENERIC_WORDS)
+
+
+def _wiki_subject_tokens(query: str, original: Optional[str] = None) -> List[str]:
+    """The tokens an article must carry to be about the query (folded).
+
+    The NAME the owner typed: every capitalised word of the original text — the
+    first word only when the next one is capitalised too (a two-word name, not
+    sentence case) — all required. With no capitals (a lower-cased query), the
+    leading distinctive token, as before. §4UN-web: the bare leading-token rule
+    took a verb as the subject — with no Greek dictionary every Greek word is
+    distinctive, so "Πότε πέθανε ο Καζαντζάκης" required "πεθανε"."""
+    words = str(original or query or "").split()
+    cores = [w.lstrip(_LEAD_PUNCT).rstrip(_TRAIL_PUNCT) for w in words]
+    caps = []
+    for k, c in enumerate(cores):
+        if not _CAP_WORD_RE.fullmatch(c):
+            continue
+        if k == 0 and not (len(cores) > 1 and _CAP_WORD_RE.fullmatch(cores[1])):
+            continue
+        caps.append(c)
+    toks = [t for c in caps for t in _rel_tokens(c) if not _YEAR_RE.fullmatch(t) and not _wiki_generic(t)]
+    if toks:
+        return list(dict.fromkeys(toks))
     dist = distinctive_tokens(query)
-    if not dist:
+    return dist[:1]
+
+
+def _wiki_token_found(tok: str, words: set, flat: str) -> bool:
+    if tok in flat:
+        return True
+    if len(tok) >= 5 and _GREEK_RE.search(tok):          # a Greek case ending: match on the stem
+        stem = tok[:5] if len(tok) >= 7 else tok[:4]
+        return any(w.startswith(stem) for w in words)
+    return False
+
+
+def wiki_article_on_topic(query: str, article: Dict, original: Optional[str] = None) -> bool:
+    """The article's title or intro carries the query's SUBJECT (every token
+    of `_wiki_subject_tokens`) — not merely any word of it."""
+    subj = _wiki_subject_tokens(query, original)
+    if not subj:
         return False
-    hay = re.sub(r"\W+", "", _rel_fold(f"{article.get('title') or ''} {article.get('body') or ''}"), flags=re.UNICODE)
-    return dist[0] in hay
+    text = _rel_fold(f"{article.get('title') or ''} {article.get('body') or ''}")
+    words = set(re.findall(r"\w+", text, re.UNICODE))
+    flat = re.sub(r"\W+", "", text, flags=re.UNICODE)
+    return all(_wiki_token_found(t, words, flat) for t in subj)
 
 
-def _wiki_lookup(query: str, proxy: Optional[str]) -> List[Dict]:
-    """Synchronous (runs on the race pool): full-text search, then the
-    intro extract of the top hits, on the language's Wikipedia."""
+def _wiki_lookup(query: str, proxy: Optional[str], original: Optional[str] = None) -> List[Dict]:
+    """Synchronous (runs on the race pool): ONE call — full-text search with
+    the top hits' intro extracts (generator=search) — on the language's
+    Wikipedia, as a plain client (§4UN-web). A refusal is logged and is []."""
     import curl_cffi.requests as creq
     from urllib.parse import quote as _quote
     lang = _WIKI_LANG[region_for_query(query)]
     base = f"https://{lang}.wikipedia.org/w/api.php"
     proxies = {"https": proxy, "http": proxy} if proxy else None
-    r = creq.get(base, params={"action": "query", "list": "search", "srsearch": query, "format": "json",
-                               "srlimit": 2, "utf8": 1}, proxies=proxies, timeout=WIKI_SUPPLEMENT_TIMEOUT,
-                 impersonate="chrome")
-    hits = ((r.json() or {}).get("query") or {}).get("search") or []
+    r = creq.get(base, params={"action": "query", "generator": "search", "gsrsearch": query, "gsrlimit": 2,
+                               "prop": "extracts", "exintro": 1, "explaintext": 1, "exlimit": 2,
+                               "redirects": 1, "format": "json", "utf8": 1},
+                 headers=dict(WIKI_HEADERS), proxies=proxies, timeout=WIKI_SUPPLEMENT_TIMEOUT)
+    status = getattr(r, "status_code", 200)
+    if status != 200:
+        pretty_log("Wiki Supplement", f"{lang}.wikipedia answered HTTP {status} — no encyclopedia lookup this time",
+                   level="INFO", icon=Icons.SKIP)
+        return []
+    pages = ((r.json() or {}).get("query") or {}).get("pages") or {}
+    ordered = sorted((p for p in pages.values() if isinstance(p, dict)),
+                     key=lambda p: int(p.get("index") or 99))
     out: List[Dict] = []
-    for h in hits[:2]:
-        title = str(h.get("title") or "").strip()
-        if not title:
-            continue
-        r2 = creq.get(base, params={"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1,
-                                    "redirects": 1, "format": "json", "titles": title}, proxies=proxies,
-                      timeout=WIKI_SUPPLEMENT_TIMEOUT, impersonate="chrome")
-        pages = ((r2.json() or {}).get("query") or {}).get("pages") or {}
-        extract = str((next(iter(pages.values()), {}) or {}).get("extract") or "").strip()
-        if not extract:
+    for pg in ordered[:2]:
+        title = str(pg.get("title") or "").strip()
+        extract = str(pg.get("extract") or "").strip()
+        if not title or not extract:
             continue
         article = {"title": f"{title} — Βικιπαίδεια", "body": " ".join(extract[:WIKI_EXTRACT_CHARS].split()),
                    "href": f"https://{lang}.wikipedia.org/wiki/{_quote(title.replace(' ', '_'))}"}
-        if wiki_article_on_topic(query, article):
+        if wiki_article_on_topic(query, article, original):
             out.append(article)
     return out
 
@@ -1289,8 +1652,27 @@ def merge_wiki_first(wiki: List[Dict], web: List[Dict]) -> List[Dict]:
     return list(wiki) + [r for r in (web or []) if (r.get("href") or r.get("url")) not in seen]
 
 
+#: §4UN-web r1: how long the engines already in flight may take to beat a
+#: low-relevance batch (web_search only)
+LOW_RELEVANCE_GRACE_S = 3.0
+import contextvars as _cv_soft
+#: §4UN-web r1: True inside a web_search — its waves treat a low-relevance
+#: batch as a soft loss. Deep research and the counter-search race as before.
+_SOFT_LOW_RACE: "_cv_soft.ContextVar[bool]" = _cv_soft.ContextVar("ghost_soft_low_race", default=False)
+
+
+def _batch_coverage(query: str, rows: List[Dict]) -> float:
+    """The best single row's share of the query's words (0 when unknown)."""
+    try:
+        tokens = [t for t in _rel_tokens(query) if not _YEAR_RE.fullmatch(t)]
+        return max((result_coverage(r, tokens) for r in rows), default=0.0) if tokens else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
-                            max_results: int = 20, stats: Optional[Dict] = None) -> List[Dict]:
+                            max_results: int = 20, stats: Optional[Dict] = None,
+                            timelimit: Optional[str] = None, soft_low: Optional[bool] = None) -> List[Dict]:
     """Race ALL engines in parallel, each on its OWN Tor circuit; the first
     engine to return non-empty (junk-filtered) results wins the wave.
 
@@ -1303,22 +1685,29 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     lands; a fully-blocked wave costs at most the ddgs timeout + grace.
     """
     from ddgs import DDGS
+    if soft_low is None:
+        soft_low = _SOFT_LOW_RACE.get()                   # §4UN-web r1: set by web_search only
     _patch_ddgs_snippet_join()
+    _patch_ddgs_block_detection()                         # §4UN-web: a refusal is "blocked", not "empty"
     _ensure_ddgs_threads()                                # §4PD
     region = region_for_query(query)
     _omitted_by_engine: Dict[str, List[str]] = {}     # §4PD: junk hosts each engine's batch lost
+    _snippets_by_engine: Dict[str, List[Dict]] = {}   # §4UN-web: snippet-only rows each engine's batch lost
 
     def _run_engine(engine: str, proxy: Optional[str],
                     timeout: Optional[float] = None) -> List[Dict]:
         _eng_timeout = timeout or _engine_timeout(engine)
         kwargs: Dict[str, Any] = {"timeout": _eng_timeout}
         if proxy:
+            if engine == DDG_ONION_ENGINE and proxy.startswith("socks5://"):
+                proxy = "socks5h://" + proxy[len("socks5://"):]     # §4UN-onion: Tor resolves the onion name
             kwargs["proxy"] = proxy
         t_start = time.monotonic()
         try:
+            _text_kw: Dict[str, Any] = {"timelimit": timelimit} if timelimit else {}   # §4UN-web freshness
             with DDGS(**kwargs) as ddgs:
                 return list(ddgs.text(query, max_results=max_results, region=region,
-                                      safesearch="moderate", backend=engine))
+                                      safesearch="moderate", backend=engine, **_text_kw))
         except StopIteration as e:
             # StopIteration cannot legally cross an asyncio Future boundary
             # (PEP 479 — it corrupts the event loop's future chaining), and
@@ -1340,6 +1729,9 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
     tasks: Dict[Any, str] = {}
+    _onion_state = _ONION_SEARCH.get()
+    if _onion_state is None:
+        _onion_state = {}
 
     def _launch(engine: str, salt: str, label: str, timeout: Optional[float] = None):
         proxy = _proxy_for_attempt(tor_proxy, query, wave, salt=salt)
@@ -1351,8 +1743,9 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
         tasks[task] = label
         return task
 
-    for engine in _RACE_ENGINES:
-        _launch(engine, engine[:4], engine)
+    _engines = raced_engines(tor_proxy)                   # §4UN-onion: + the DuckDuckGo onion
+    for engine in _engines:
+        _launch(engine, _engine_salt(engine), engine)
 
     # Several searches can race concurrently in one agent turn; the query
     # tag on every wave log line keeps their interleaved output readable.
@@ -1361,12 +1754,38 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     pending = set(tasks)
     failures: List[Tuple[str, str]] = []
     timed_out = False
+    # §4UN-web (web_search only, ``soft_low``): a batch in which NOTHING passes the coverage floor
+    # is a soft loss — kept while the engines ALREADY IN FLIGHT get a short grace to do better
+    # (r1: racing on to the deadline plus a hedge took a low-relevance query from ~2 s to ~30 s);
+    # no hedge is started for it. Without ``soft_low`` (deep research, the counter-search) a low
+    # batch wins as before.
+    fallback: Optional[Tuple[str, List[Dict]]] = None
+    _fallback_score = -1.0
+    _grace_end: Optional[float] = None
     hedge_at = _race_hedge_at()
     hedged = hedge_at <= 0
     try:
         while pending:
             elapsed = time.monotonic() - t0
             remaining = deadline - elapsed
+            if not any(tasks[t] not in _EXTRA_RACE_ENGINES for t in pending):
+                # §4UN-onion r1: only an EXTRA engine (the onion) is still running. It never starts the
+                # hedge by itself; and when a clearnet engine ANSWERED (empty, off-topic, low relevance)
+                # the wave ends now — the onion is waited for (to the unchanged deadline) only when every
+                # clearnet engine was refused or unreachable. (Without this, every answered-empty wave ran
+                # to the full 16 s deadline.)
+                hedged = True
+                if fallback is not None or any(_failure_category(m) in _ANSWERED_KINDS for _, m in failures):
+                    break
+                # final review: this wait at most once per search, and never after the onion timed out
+                if _onion_state.get("onion_spent"):
+                    break
+                _onion_state["onion_spent"] = True
+            if _grace_end is not None:
+                if elapsed >= _grace_end:
+                    break
+                remaining = min(remaining, _grace_end - elapsed)
+                hedged = True                              # r1: no hedge for a low-relevance batch
             if remaining <= 0:
                 timed_out = True
                 break
@@ -1386,6 +1805,8 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
             done, pending = await asyncio.wait(
                 pending, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
             if not done:
+                if _grace_end is not None:
+                    break                                  # the grace ran out: the low batch stands
                 if hedged:
                     timed_out = True
                     break
@@ -1393,10 +1814,13 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
             for task in done:
                 engine = tasks[task]
                 try:
-                    valid = _filter_junk(task.result(), _omitted_by_engine.setdefault(engine, []))
+                    valid = _filter_junk(task.result(), _omitted_by_engine.setdefault(engine, []),
+                                         _snippets_by_engine.setdefault(engine, []))
                 except Exception as e:  # noqa: BLE001 — a losing engine must never sink the wave
                     failures.append((engine, _brief_engine_error(e)))
                     continue
+                if stats is not None and _snippets_by_engine.get(engine):
+                    stats.setdefault("snippet_pool", []).extend(_snippets_by_engine[engine])
                 if valid:
                     # Liveness is not relevance: an engine that answers
                     # fast with an unrelated page set would otherwise win
@@ -1413,11 +1837,32 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                         failures.append((engine, "off-topic"))
                         continue
                     valid = rank_on_topic(query, valid)          # §4IL: on-topic first
+                    _soft = False
+                    if soft_low:
+                        try:
+                            _soft = prune_off_topic(query, valid)[1]
+                        except Exception:  # noqa: BLE001 — a relevance bug never sinks a wave
+                            _soft = False
+                    if _soft:
+                        failures.append((engine, "low-relevance"))
+                        _score = _batch_coverage(query, valid)
+                        if _score > _fallback_score:              # r1: the best low batch, not the first
+                            fallback, _fallback_score = (engine, valid), _score
+                        if _grace_end is None:
+                            _grace_end = (time.monotonic() - t0) + LOW_RELEVANCE_GRACE_S
+                            pretty_log("Search Low Relevance",
+                                       f"{engine}: none of {len(valid)} result(s) matches most of the query "
+                                       f"‹{qtag}› — kept; the engines in flight get {LOW_RELEVANCE_GRACE_S:.0f}s "
+                                       f"to do better", level="INFO", icon=Icons.SKIP)
+                        continue
                     if stats is not None:
                         stats["omitted_hosts"] = list(_omitted_by_engine.get(engine, []))
+                        stats["snippet_rows"] = list(_snippets_by_engine.get(engine, []))
+                        _engine_tally(stats, engine, "win")
                     pretty_log("Web Search",
                                f"{engine} won wave {wave} in {time.monotonic() - t0:.1f}s "
                                f"({len(valid)} results) ‹{qtag}›", icon=Icons.TOOL_SEARCH)
+                    _log_wave_engines(wave, _engines_token(tasks, failures, winner=engine))
                     return valid
                 failures.append((engine, "empty"))
     finally:
@@ -1434,7 +1879,19 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                         pass
             else:
                 task.cancel()
-    if failures or timed_out:
+    # §4UN-onion: an EXTRA engine still running when the wave ended without a winner was dropped —
+    # named ("abandoned"), never a failure kind (`search_failure_counts` does not read it). Last round:
+    # only its own TIMEOUT spends the onion's one wait here (the wait itself spends it above) — a wave
+    # that merely ended while it ran (a clearnet engine answered) leaves the wait for a later wave
+    _late = [tasks[t] for t in pending if tasks.get(t) in _EXTRA_RACE_ENGINES]
+    if any(e in _EXTRA_RACE_ENGINES and _failure_category(m) == "timeout" for e, m in failures):
+        _onion_state["onion_spent"] = True
+    if stats is not None:
+        for engine, msg in failures:
+            _engine_tally(stats, engine, _failure_category(msg))
+        for engine in _late:
+            _engine_tally(stats, engine, "abandoned")
+    if failures or timed_out or _late:
         # Operator stream gets ONE terse line — categories, not reprs:
         #   wave 0 ‹postgresql 20 features…›: no winner — 5 empty; mojeek conn-error
         # "empty" is the boring default so it's a bare count; engines are
@@ -1445,29 +1902,41 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
         for engine, msg in failures:
             cats.setdefault(_failure_category(msg), []).append((engine, msg))
         if stats is not None:
+            # final review: the extra engines (the onion) stay out of the counts that choose between a
+            # fresh-circuit retry and a rewording — they are measured per engine (`stats["engines"]`)
             _tally = stats.setdefault("cats", {})
             for _c, _lst in cats.items():
-                _tally[_c] = _tally.get(_c, 0) + len(_lst)
+                _n = sum(1 for e, _ in _lst if e not in _EXTRA_RACE_ENGINES)
+                if _n:
+                    _tally[_c] = _tally.get(_c, 0) + _n
         parts: List[str] = []
-        if "empty" in cats:
-            parts.append(f"{len(cats['empty'])} empty")
-        if "off-topic" in cats:
-            parts.append(
-                f"{'+'.join(e for e, _ in cats['off-topic'])} off-topic")
+        # §4UN-web: every category names its engines (the 30-day log could only COUNT 3,212 empties)
+        for cat in ("empty", "blocked", "off-topic", "low-relevance"):
+            if cat in cats:
+                parts.append(f"{'+'.join(e for e, _ in cats[cat])} {cat}")
         for cat in ("conn-error", "timeout"):
             if cat in cats:
                 parts.append(f"{'+'.join(e for e, _ in cats[cat])} {cat}")
         if "error" in cats:
             engines = "+".join(e for e, _ in cats["error"])
             parts.append(f"{engines} error: {cats['error'][0][1][:48]}")
+        if _late:
+            parts.append(f"{'+'.join(_late)} abandoned")
         if timed_out:
             parts.append(f"wave deadline {deadline}s")
         pretty_log("Search Wave Empty",
-                   f"wave {wave} ‹{qtag}›: no winner — " + "; ".join(parts),
+                   f"wave {wave} ‹{qtag}›: no winner — " + "; ".join(parts)
+                   + (f" — using {fallback[0]}'s low-relevance batch" if fallback else ""),
                    level="INFO", icon=Icons.SKIP)
         logging.getLogger(__name__).debug(
             "search wave %s ‹%s› detail: %s", wave, qtag,
             "; ".join(f"{e}: {m}" for e, m in failures))
+    _log_wave_engines(wave, _engines_token(tasks, failures, late=_late))
+    if fallback is not None:
+        if stats is not None:
+            stats["omitted_hosts"] = list(_omitted_by_engine.get(fallback[0], []))
+            stats["snippet_rows"] = list(_snippets_by_engine.get(fallback[0], []))
+        return fallback[1]
     return []
 
 
@@ -1499,6 +1968,66 @@ def _looks_like_name_query(query: str) -> bool:
     if len(_CAP_WORD_RE.findall(q)) >= 2:
         return True
     return bool(re.search(r'"[^"]{3,}"', q))
+
+
+#: §4UN-web: question words dropped by the reformulation (they are not in the
+#: folded stopword list in every form the model writes them)
+_QUESTION_WORDS = frozenset("""how what why when where who whom whose which is are was were can could
+does do did should would will shall""".split())
+_LEAD_PUNCT = "\"'“”‘’([{"            # a leading "." is meaning (".net")
+#: §4UN-web r1 (MAJOR): words that turn a query or a claim into its OPPOSITE
+#: (negation) or change its range (comparison) — "python 3.13 no gil" is not
+#: "python 3.13 gil", "Vaccines do not cause autism" not "Vaccines cause
+#: autism". They are stopwords for RELEVANCE scoring, never dropped from a query.
+_MEANING_WORDS_RAW = """not no never without nor none neither cannot isn't don't doesn't didn't won't can't
+aren't wasn't weren't hasn't haven't shouldn't couldn't wouldn't under over below above before after
+vs versus less more fewer than except instead
+δεν μην μη χωρίς ούτε ουδέποτε ποτέ όχι κάτω πάνω πριν μετά λιγότερο περισσότερο εκτός αντί""".split()
+
+
+def _meaning_fold(word: str) -> str:
+    """Lower case with the ACCENTS KEPT (r3: stripped, "Πότε" — when — was the
+    negation "ποτέ" — never)."""
+    import unicodedata
+    return unicodedata.normalize("NFC", str(word or "").casefold()).replace("ς", "σ").replace("’", "'")
+
+
+#: words typed without accents are matched too, except where the unaccented
+#: form is another word (ποτε: ποτέ never / πότε when)
+_ACCENT_AMBIGUOUS = frozenset({"ποτε"})
+
+
+def _with_unaccented(words) -> frozenset:
+    out = set()
+    for w in words:
+        f = _meaning_fold(w)
+        out.add(f)
+        bare = _rel_fold(f).replace("ς", "σ")
+        if bare not in _ACCENT_AMBIGUOUS:
+            out.add(bare)
+    return frozenset(out)
+
+
+_MEANING_WORDS = _with_unaccented(_MEANING_WORDS_RAW)
+
+
+def is_meaning_word(word: str) -> bool:
+    """A negation or comparison word (any case, accents, ’ or ')."""
+    return _meaning_fold(word) in _MEANING_WORDS
+
+
+#: r2: the NEGATIONS among them — these flip a claim; the rest (comparisons)
+#: only qualify the word they compare
+_NEGATION_WORDS = _with_unaccented("""not no never without nor none neither cannot isn't
+don't doesn't didn't won't can't aren't wasn't weren't hasn't haven't shouldn't couldn't wouldn't
+δεν μην μη χωρίς ούτε ουδέποτε ποτέ όχι""".split())
+#: comparisons whose partner is the word BEFORE them ("taller than")
+_COMPARE_BACK_WORDS = frozenset(_meaning_fold(w) for w in ("than",))
+
+
+def is_negation_word(word: str) -> bool:
+    return _meaning_fold(word) in _NEGATION_WORDS
+_TRAIL_PUNCT = "?!.,;:\"'“”‘’)]}"
 
 
 def _reformulate_query(query: str) -> List[str]:
@@ -1579,6 +2108,43 @@ def _reformulate_query(query: str) -> List[str]:
         reformulations.append(f"{query} example")
 
     return reformulations[:2]
+
+
+def reformulate_keeping_meaning(query: str) -> List[str]:
+    """The retry query for a search whose engines ANSWERED empty — at most one,
+    and only a form that keeps the query's meaning (§4UN-web).
+
+    The query's content words in their order: question words, articles and
+    other function words go; every name, number, version and date stays, and
+    nothing is cut to "the first N words". [] when that IS the query (the model
+    is told the search found nothing and is better placed to re-word it).
+
+    The old strategies changed the question: numbers and versions were stripped
+    ("Python 3.13 release date" → "Python release date"), a question was cut to
+    its first five words ("what is the capital of australia" → "what is the
+    capital of"), and keyword queries got a "how to"/"tutorial"/"example" filler
+    ("how to dimitris glynos athens" — anonymous mode lower-cases the query, so
+    the name guard never fired; live: "how to veronica moser artist"). A search
+    that failed because the ENGINES REFUSED is not reworded at all
+    (`tool_search_ddgs` reruns the same query on fresh circuits).
+
+    web_search only: deep research keeps `_reformulate_query` (its own lane)."""
+    q = " ".join(str(query or "").split())
+    if not q:
+        return []
+    kept: List[str] = []
+    for w in q.split():
+        core = w.lstrip(_LEAD_PUNCT).rstrip(_TRAIL_PUNCT)
+        if not core:
+            continue
+        fold = _rel_fold(core)
+        if (re.search(r"\d", core) or is_meaning_word(core)
+                or (fold not in _REL_STOPWORDS and fold not in _QUESTION_WORDS)):
+            kept.append(core)
+    form = " ".join(kept)
+    if len(kept) < 2 or _norm_cache_key(form) == _norm_cache_key(q):
+        return []
+    return [form]
 
 def _clean_for_cpp(text: str) -> str:
     """Aggressively strip lone surrogates and raw control characters to prevent C++ JSON parser crashes.
@@ -1661,7 +2227,237 @@ def _with_batch_notes(text: str, prune_note: str, stats: Optional[Dict]) -> str:
     return text + ("\n\n" + "\n".join(notes) if notes else "")
 
 
+# §4UN-web: the text the owner's request typed, when anonymous mode scrubbed it
+# (lower-cased) before the engines saw it — (query sent, query as typed). Read
+# only for what casing carries: a name's capitals (the encyclopedia subject).
+import contextvars as _contextvars
+_QUERY_AS_TYPED: "_contextvars.ContextVar[Optional[Tuple[str, str]]]" = _contextvars.ContextVar(
+    "ghost_query_as_typed", default=None)
+
+
+def _typed_original(query: str) -> Optional[str]:
+    v = _QUERY_AS_TYPED.get()
+    if v and v[0] == query and v[1] != query:
+        return v[1]
+    return None
+
+
+#: §4UN-web freshness: words that ask about NOW → the engines that read a time
+#: limit (duckduckgo df, yahoo btf, brave tf; yandex ignores it) get one, on the
+#: FIRST wave only — the second wave and the hedge stay unrestricted
+_FRESH_WEEK_RE = re.compile(r"\b(?:today|tonight|right\s+now|as\s+of\s+now|this\s+week|σήμερα|σημερα|"
+                            r"τώρα|τωρα|απόψε|αποψε|αυτή\s+την\s+εβδομάδα)\b", re.I | re.UNICODE)
+#: r1: "now" alone is a brand or a filler ("now tv", "how to know now what") —
+#: it asks about the present only as the query's LAST word ("is the bridge open now?")
+_FRESH_NOW_END_RE = re.compile(r"\bnow\s*[?!.]*\s*$", re.I)
+_FRESH_MONTH_RE = re.compile(r"\bthis\s+month\b", re.I)
+_FRESH_YEAR_RE = re.compile(r"\b(?:latest|newest|recent|recently|currently|this\s+year|"
+                            r"τελευταί\w*|τελευται\w*|πρόσφατ\w*|προσφατ\w*|τρέχουσ\w*|τρεχουσ\w*|τρέχον\w*|τρεχον\w*)\b",
+                            re.I | re.UNICODE)
+#: r1: "current" is recency only before a word that is not electrical/physical
+#: ("current prime minister", "current price"), and not as a noun ("current
+#: sensor", "measure current", "ocean current"); in doubt, no time limit
+_FRESH_CURRENT_RE = re.compile(r"\bcurrent\s+(\w+)", re.I)
+_CURRENT_NOUN_NEXT = frozenset("""with through flow flows flowing draw sensor sensors density source sources limit limiting
+limiter transformer transformers clamp meter meters measure measurement measuring in of at and vs rating ratings
+carrying divider mirror loop loops probe shunt gain amplifier controlled mode regulator ripple spike consumption
+affairs account accounts liabilities assets ratio yield""".split())
+_CURRENT_NOUN_BEFORE_RE = re.compile(r"\b(?:measure|measuring|measured|electric|electrical|alternating|direct|ac|dc|"
+                                     r"ocean|rip|eddy|leakage|peak|rms|max|maximum|input|output|load|inrush|"
+                                     r"bias|surge|tidal|jet|gulf|convection)\s+current\b", re.I)
+
+
+def _current_means_now(query: str) -> bool:
+    if _CURRENT_NOUN_BEFORE_RE.search(query):
+        return False
+    return any(m.group(1).lower() not in _CURRENT_NOUN_NEXT for m in _FRESH_CURRENT_RE.finditer(query))
+
+
+def freshness_timelimit(query: str) -> Optional[str]:
+    """The ddgs ``timelimit`` for a query that asks about now: "w" (today, now,
+    this week — engines index a day late, so a week), "m", "y" (latest,
+    current, recent); None otherwise."""
+    q = str(query or "")
+    if _FRESH_WEEK_RE.search(q) or _FRESH_NOW_END_RE.search(q):
+        return "w"
+    if _FRESH_MONTH_RE.search(q):
+        return "m"
+    if _FRESH_YEAR_RE.search(q) or _current_means_now(q):
+        return "y"
+    return None
+
+
+def site_operator_hosts(query: str) -> List[str]:
+    """§4UN-web: the hosts of the `site:` restrictions the sanitiser removes
+    (not exclusions) — their results are listed first."""
+    out: List[str] = []
+    for op in removed_site_operators(query):
+        if op.startswith("-") or not op.lower().startswith("site:"):
+            continue
+        h = re.sub(r"^[a-z]+://", "", op.split(":", 1)[1].strip(), flags=re.I).split("/")[0].lower()
+        h = h.lstrip("*.")                                 # r1: "site:*.python.org", "site:.gov"
+        h = h[4:] if h.startswith("www.") else h
+        if h and h not in out:
+            out.append(h)
+    return out
+
+
+def _result_host(r: Dict) -> str:
+    try:
+        from urllib.parse import urlparse as _up
+        h = (_up(str(r.get("href") or r.get("url") or "")).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
+    return h[4:] if h.startswith("www.") else h
+
+
+def site_first(results: List[Dict], hosts: List[str]) -> List[Dict]:
+    """Stable partition: results on one of ``hosts`` (or a subdomain) first."""
+    if not hosts:
+        return list(results or [])
+    def _on(r):
+        h = _result_host(r)
+        return any(h == x or h.endswith("." + x) for x in hosts)
+    rows = list(results or [])
+    return [r for r in rows if _on(r)] + [r for r in rows if not _on(r)]
+
+
+def snippet_only_rows(query: str, rows: List[Dict], shown: List[Dict]) -> List[Dict]:
+    """§4UN-web: the snippet-only rows (junk-listed news/finance hosts) worth
+    listing under the results: on topic by the same coverage rule as the
+    batch, not already shown, at most ``SNIPPET_ONLY_MAX``."""
+    seen = {str(r.get("href") or r.get("url") or "") for r in shown or []}
+    tokens = [t for t in _rel_tokens(query) if not _YEAR_RE.fullmatch(t)]
+    out: List[Dict] = []
+    for r in rows or []:
+        href = str(r.get("href") or r.get("url") or "")
+        if not href or href in seen:
+            continue
+        seen.add(href)
+        if len(tokens) >= 2 and not (result_coverage(r, tokens) >= _MIN_RESULT_COVERAGE
+                                     or _carries_subject(r, tokens)):
+            continue
+        out.append(r)
+        if len(out) >= SNIPPET_ONLY_MAX:
+            break
+    return out
+
+
+#: failure kinds in which an engine ANSWERED (it reached the index and returned a page)
+_ANSWERED_KINDS = frozenset({"empty", "off-topic", "low-relevance"})
+
+
+def _engine_tally(stats: Dict, engine: str, outcome: str) -> None:
+    """§4UN-onion: per-engine outcomes of a search's waves — ``stats["engines"][engine][outcome]``
+    (win / blocked / empty / timeout / conn-error / abandoned / …), so each engine can be compared."""
+    e = stats.setdefault("engines", {}).setdefault(engine, {})
+    e[outcome] = e.get(outcome, 0) + 1
+
+
+def _engines_token(tasks: Dict, failures: List[Tuple[str, str]], winner: Optional[str] = None,
+                   late=()) -> str:
+    """§4UN-onion r1: every raced engine's outcome on the wave line, one stable, greppable token each —
+    `` | engines: duckduckgo=blocked yandex=win duckduckgo_onion=abandoned`` (launch order; a hedge is
+    ``yandex-h``; an engine still running when another won is ``unfinished``). Read by
+    ``scripts/search_engine_stats.py``."""
+    out: Dict[str, str] = {}
+    for label in tasks.values():
+        out.setdefault(label, "unfinished")
+    for engine, msg in failures:
+        out[engine] = _failure_category(msg)
+    for engine in late or ():
+        out[engine] = "abandoned"                          # last round: was "late" (old logs keep it)
+    if winner:
+        out[winner] = "win"
+    return " | engines: " + " ".join(f"{e}={o}" for e, o in out.items())
+
+
+def _log_wave_engines(wave: int, token: str) -> None:
+    """The per-engine line of a wave — durable log only (INFO, day-stamped), so the operator's stream
+    keeps its one terse wave line: ``search wave engines — wave 0 | engines: a=win b=blocked``. No query
+    on it (final review: it bypassed `pretty_log`'s redaction; the tally does not need it)."""
+    logger.info("search wave engines — wave %s%s", wave, token)
+    _record_wave_engines(token)
+
+
+# §4UN-health: what the agent's OWN recent searches met, for check_health's "Internet tools" line — in memory,
+# since this process started (bounded; the dated log + scripts/search_engine_stats.py keep the history).
+# Counts only: an engine name or outcome that is not of the fixed shape is dropped, never printed.
+from collections import deque as _deque                                    # noqa: E402
+_ENGINE_LEDGER_MAX = 4000
+_ENGINE_HEALTH_WINDOW_S = 86400.0
+_PROCESS_T0 = time.time()
+_ENGINE_WAVES: "_deque" = _deque(maxlen=_ENGINE_LEDGER_MAX)    # (t, ((engine, outcome), …))
+_PAGE_READ_EVENTS: "_deque" = _deque(maxlen=_ENGINE_LEDGER_MAX)  # (t, outcome)
+_ENGINE_PAIR_RE = re.compile(r"^([a-z][a-z_]{1,23}(?:-h)?)=([a-z][a-z-]{1,15})$")
+#: only these names and outcomes are counted — anything else in a token is dropped, never printed
+_KNOWN_ENGINE_OUTCOMES = frozenset(("win", "blocked", "conn-error", "timeout", "error", "empty", "off-topic",
+                                    "low-relevance", "unfinished", "abandoned", "late"))
+
+
+def _known_engine(name: str) -> bool:
+    base = name[:-2] if name.endswith("-h") else name
+    return base in _RACE_ENGINES or base in _RACE_HEDGE_ENGINES or base in (
+        "duckduckgo", "yandex", "brave", "yahoo", "mojeek", "google", "bing", "wikipedia", "duckduckgo_onion")
+
+
+def _record_wave_engines(token: str, now: Optional[float] = None) -> None:
+    try:
+        body = str(token or "").split("| engines:", 1)[1]
+    except IndexError:
+        return
+    pairs = tuple(m.groups() for m in (_ENGINE_PAIR_RE.match(w) for w in body.split())
+                  if m and _known_engine(m.group(1)) and m.group(2) in _KNOWN_ENGINE_OUTCOMES)
+    if pairs:
+        _ENGINE_WAVES.append((time.time() if now is None else float(now), pairs))
+
+
+def engine_health(window_s: float = _ENGINE_HEALTH_WINDOW_S, now: Optional[float] = None) -> Dict[str, Any]:
+    """{"since": start of the window, "waves": n, "won": waves with a winner,
+    "engines": {engine: {outcome: n}}, "reads": {outcome: n}} over the last ``window_s`` of this process."""
+    now = time.time() if now is None else float(now)
+    since = max(_PROCESS_T0, now - float(window_s))
+    engines: Dict[str, Dict[str, int]] = {}
+    waves = won = low_only = 0
+    for t, pairs in list(_ENGINE_WAVES):
+        if t < since:
+            continue
+        waves += 1
+        _won = any(o == "win" for _e, o in pairs)
+        won += _won
+        low_only += (not _won) and any(o == "low-relevance" for _e, o in pairs)   # the weak batch came back
+        for e, o in pairs:
+            per = engines.setdefault(e, {})
+            per[o] = per.get(o, 0) + 1
+    reads: Dict[str, int] = {}
+    for t, o in list(_PAGE_READ_EVENTS):
+        if t >= since:
+            reads[o] = reads.get(o, 0) + 1
+    return {"since": since, "waves": waves, "won": won, "low_only": low_only, "engines": engines, "reads": reads}
+
+
+def search_failure_counts(stats: Optional[Dict]) -> Tuple[int, int, int]:
+    """(refused, transport, answered-empty) engine answers of a search's waves."""
+    c = (stats or {}).get("cats") or {}
+    refused = int(c.get("blocked", 0))
+    transport = int(c.get("conn-error", 0)) + int(c.get("timeout", 0))
+    empty = int(c.get("empty", 0)) + int(c.get("off-topic", 0)) + int(c.get("low-relevance", 0))
+    return refused, transport, empty
+
+
 async def tool_search_ddgs(query: str, tor_proxy: str):
+    """web_search's engine side (see `_tool_search_ddgs`): its race waves treat
+    a low-relevance batch as a soft loss (§4UN-web r1)."""
+    _tok = _SOFT_LOW_RACE.set(True)
+    _otok = _ONION_SEARCH.set({})                         # §4UN-onion: one onion-only wait per search
+    try:
+        return await _tool_search_ddgs(query, tor_proxy)
+    finally:
+        _ONION_SEARCH.reset(_otok)
+        _SOFT_LOW_RACE.reset(_tok)
+
+
+async def _tool_search_ddgs(query: str, tor_proxy: str):
     # Fail-closed (§4P): under --mandatory-tor a falsy proxy is replaced with
     # the loopback Tor default so the (always-public) search engines are never
     # queried cleartext — the socket guard can't backstop these curl_cffi
@@ -1672,6 +2468,8 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
     if tor_proxy and "socks5://" in tor_proxy and "socks5h://" not in tor_proxy:
         tor_proxy = tor_proxy.replace("socks5://", "socks5h://")
 
+    _typed = _typed_original(query)                        # §4UN-web: before the query changes below
+    _site_hosts = site_operator_hosts(query)               # §4UN-web: listed first, though not restricted
     # Strip Google-style operators the ddgs scraper backends choke on
     # (site:/quotes/boolean OR) BEFORE we spend a Tor round trip on a
     # query that would return nothing. This is the in-code backstop for
@@ -1683,6 +2481,8 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
 
     # Cache hit: the model fires many near-identical queries per turn.
     _cache_key = _norm_cache_key(query)
+    if _site_hosts:                                       # r1: the host-first order is a different answer
+        _cache_key = f"{_cache_key}|site:{','.join(sorted(_site_hosts))}"
     _cached = _cache_get(_cache_key)
     if _cached is not None:
         # §4PD: say it is a repeat — the hit used to be byte-identical to a
@@ -1690,18 +2490,21 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
         return _cached + "\n\n[cached: the same query ran within the last 5 minutes — these are its results again, not a new search]"
     _stats: Dict = {}                                     # §4PD: what the waves saw (omitted hosts, failure kinds)
 
-    def format_search_results(results: List[Dict]) -> str:
+    def format_search_results(results: List[Dict], start: int = 1, tag: str = "") -> str:
         formatted = []
-        for i, res in enumerate(results, 1):
+        for i, res in enumerate(results, start):
             # `or` not `.get(k, default)`: a row can carry an explicit
             # key=None (the href=None shape _filter_junk guards against),
             # and `.get('href', …)` returns that None instead of the
             # fallback — dropping the source link / rendering the string
             # "None" as the body.
-            title = _clean_for_cpp(res.get('title') or 'No Title')
-            body = _clean_for_cpp(res.get('body') or res.get('content') or 'No content')
+            # §4UN-read: a snippet line cannot start like the read section's own lines (only while reads
+            # are on — r1: with the switch off the result is byte-identical to before)
+            _q = quote_read_grammar if _page_reads_on() else str
+            title = _q(_clean_for_cpp(res.get('title') or 'No Title'))
+            body = _q(_clean_for_cpp(res.get('body') or res.get('content') or 'No content'))
             link = res.get('href') or res.get('url') or '#'
-            formatted.append(f"### {i}. {title}\n{body}\n[Source: {link}]")
+            formatted.append(f"### {i}. {title}\n{body}\n[Source: {link}" + (f" — {tag}" if tag else "") + "]")
         return "\n\n".join(formatted)
 
     if not importlib.util.find_spec("ddgs"):
@@ -1718,28 +2521,78 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
     # failed), so it never delays the web batch.
     _wiki_task = None
     if wiki_supplement_wanted(query):
+        import functools as _functools
         _wiki_task = asyncio.get_running_loop().run_in_executor(
-            _RACE_POOL, _wiki_lookup, query, _proxy_for_attempt(tor_proxy, query, 0, salt="wiki"))
+            _RACE_POOL, _functools.partial(_wiki_lookup, query, _proxy_for_attempt(tor_proxy, query, 0, salt="wiki"),
+                                           **({"original": _typed} if _typed else {})))
         # §4PD: a lookup that fails after the wait is a retrieved exception, not
         # an asyncio "Future exception was never retrieved" ERROR line
         _wiki_task.add_done_callback(lambda t: (t.exception() if not t.cancelled() else None))
+
+    _shown_rows: List[Dict] = []                         # §4UN-read: the batch as listed, for the page reads
+
+    def _render(rows: List[Dict], wiki: Optional[List[Dict]] = None) -> Tuple[str, bool]:
+        """The batch as the model gets it, judged against the ORIGINAL query
+        (a reworded query's rows too — §4UN-web), with the `site:` host's
+        results first and the snippet-only rows last. (text, low)."""
+        rows, low, pnote = _prune_report(query, rows)
+        shown = merge_wiki_first(wiki or [], site_first(rows, _site_hosts))[:8]
+        _shown_rows[:] = [r for r in shown if r not in (wiki or [])]   # r1: the encyclopedia row is shown already
+        out = format_search_results(shown)
+        snip = snippet_only_rows(query, _stats.get("snippet_rows") or [], shown)
+        if snip:
+            out += "\n\n" + format_search_results(snip, start=len(shown) + 1, tag=SNIPPET_ONLY_TAG)
+        if low and not wiki:
+            out = LOW_RELEVANCE_NOTE + "\n\n" + out
+        _shown_hosts = {_junk_host(str(r.get("href") or r.get("url") or "")) for r in snip}
+        _st = dict(_stats, omitted_hosts=[h for h in (_stats.get("omitted_hosts") or []) if h not in _shown_hosts])
+        return _with_batch_notes(out, pnote, _st), low
+
+    async def _answer(rows: List[Dict]) -> str:
+        nonlocal _wiki_task
+        _wiki = await _wiki_supplement(_wiki_task, WIKI_SUPPLEMENT_WAIT_AFTER_WIN); _wiki_task = None
+        if _wiki:
+            pretty_log("Wiki Supplement", f"el.wikipedia: {_wiki[0]['title'][:60]} — placed first",
+                       icon=Icons.TOOL_SEARCH)
+        out, low = _render(rows, _wiki)
+        out += await _read_section(low)
+        if not low:                                       # §4PD: a low-relevance batch is not an answer to repeat for 5 min
+            _cache_put(_cache_key, out)                   # §4UN-read: with its page reads, for the same 5 min
+        return out
+
+    async def _read_section(low: bool) -> str:
+        """§4UN-read: the READ FROM PAGES section for a specific-fact query ("" otherwise)."""
+        if low or not _page_reads_on() or not wants_page_read(query):
+            return ""
+        sec = await read_top_pages(query, list(_shown_rows), tor_proxy)
+        return ("\n\n" + sec) if sec else ""
+
+    _fresh = freshness_timelimit(query)
+    if _fresh:
+        pretty_log("Web Search", f"asks about now — first wave limited to the last "
+                   f"{ {'w': 'week', 'm': 'month', 'y': 'year'}[_fresh] } where the engine reads it ‹{truncate_query(query)}›",
+                   icon=Icons.TOOL_SEARCH)
+    _limited_low: Optional[Tuple[List[Dict], Dict]] = None
     for wave in range(2):
-        valid_results = await _race_search_wave(query, tor_proxy, wave, stats=_stats)
+        # (r1: a low-relevance batch is the wave's answer after the short in-wave grace — no
+        # second wave for it; that took a low-relevance query to ~30 s)
+        valid_results = await _race_search_wave(query, tor_proxy, wave, stats=_stats,
+                                                **({"timelimit": _fresh} if _fresh and wave == 0 else {}))
         if valid_results:
-            _wiki = await _wiki_supplement(_wiki_task, WIKI_SUPPLEMENT_WAIT_AFTER_WIN); _wiki_task = None
-            if _wiki:
-                pretty_log("Wiki Supplement", f"el.wikipedia: {_wiki[0]['title'][:60]} — placed first",
-                           icon=Icons.TOOL_SEARCH)
-            valid_results, _low, _pnote = _prune_report(query, valid_results)
-            clean_output = format_search_results(merge_wiki_first(_wiki, valid_results)[:8])
-            if _low and not _wiki:
-                clean_output = LOW_RELEVANCE_NOTE + "\n\n" + clean_output
-            clean_output = _with_batch_notes(clean_output, _pnote, _stats)
-            if not _low:                                  # §4PD: a low-relevance batch is not an answer to repeat for 5 min
-                _cache_put(_cache_key, clean_output)
-            return clean_output
+            # r2: …except when the first wave was TIME-LIMITED ("latest X"): the unlimited wave
+            # may find the page the limit hid; the limited batch stands if it does not
+            if wave == 0 and _fresh and prune_off_topic(query, valid_results)[1]:
+                _limited_low = (valid_results, {k: _stats.get(k) for k in ("omitted_hosts", "snippet_rows")})
+                continue
+            if wave == 1 and _limited_low is not None and prune_off_topic(query, valid_results)[1]:
+                break
+            _limited_low = None
+            return await _answer(valid_results)
         if wave == 0:
             await asyncio.sleep(1)
+    if _limited_low is not None:
+        _stats.update({k: v for k, v in _limited_low[1].items() if v is not None})
+        return await _answer(_limited_low[0])
     _wiki = await _wiki_supplement(_wiki_task, WIKI_SUPPLEMENT_TIMEOUT * 3)
     if _wiki:
         # Every web ticket failed; the encyclopedia alone is still an answer.
@@ -1753,25 +2606,40 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
                         "to the user, or search again later.\n\n" + format_search_results(_wiki))
         return clean_output
 
-    # --- QUERY REFORMULATION ---
-    # Both waves with the original query failed (≈12 engine-circuit
-    # tickets). Before giving up, try 2 reformulated queries: one broader,
-    # one as a question. Each gets one wave of its own; the offset wave
-    # index keeps its circuit tags from colliding with the primary waves'.
-    reformulations = _reformulate_query(query)
-    for ridx, reformulated in enumerate(reformulations):
-        pretty_log("Search Retry", f"Reformulated: {truncate_query(reformulated)}", icon=Icons.TOOL_SEARCH)
-        valid_results = await _race_search_wave(reformulated, tor_proxy, 10 + ridx, stats=_stats)
+    _refused, _transport, _empty = search_failure_counts(_stats)
+    _reworded: List[str] = []
+    if _refused + _transport > _empty:
+        # §4UN-web: the ENGINES REFUSED or could not be reached — rewording cannot fix that; the same
+        # query once more on fresh circuits can (search reachability over Tor is per exit)
+        pretty_log("Search Retry", f"engines refused or unreachable ({_refused} blocked, {_transport} transport, "
+                   f"{_empty} empty) — the same query on fresh circuits, not reworded ‹{truncate_query(query)}›",
+                   icon=Icons.TOOL_SEARCH)
+        valid_results = await _race_search_wave(query, tor_proxy, 2, stats=_stats)
         if valid_results:
-            valid_results, _low, _pnote = _prune_report(reformulated, valid_results)
-            clean_output = format_search_results(valid_results[:8])
-            if _low:
-                clean_output = LOW_RELEVANCE_NOTE + "\n\n" + clean_output
-            clean_output = _with_batch_notes(clean_output, _pnote, _stats)
-            result = f"[Reformulated query: '{reformulated}']\n\n{clean_output}"
-            if not _low:
-                _cache_put(_cache_key, result)
-            return result
+            return await _answer(valid_results)
+    else:
+        # --- QUERY REFORMULATION --- (§4UN-web: one meaning-keeping form, at most)
+        _reworded = reformulate_keeping_meaning(query)
+        for ridx, reformulated in enumerate(_reworded):
+            pretty_log("Search Retry", f"Reformulated: {truncate_query(reformulated)}", icon=Icons.TOOL_SEARCH)
+            valid_results = await _race_search_wave(reformulated, tor_proxy, 10 + ridx, stats=_stats)
+            if valid_results:
+                clean_output, _low = _render(valid_results)
+                clean_output += await _read_section(_low)
+                result = f"[Reformulated query: '{reformulated}']\n\n{clean_output}"
+                if not _low:
+                    _cache_put(_cache_key, result)
+                return result
+
+    # §4UN-web: the engines found the query only on sites this agent cannot read — their snippets are
+    # the answer there is (a price, a headline), said so, never cached
+    _snip = snippet_only_rows(query, _stats.get("snippet_pool") or [], [])
+    if _snip:
+        pretty_log("Web Search", f"only snippet-only sites answered ({', '.join(sorted({_junk_host(str(r.get('href') or '')) or '?' for r in _snip}))}) "
+                   f"‹{truncate_query(query)}›", icon=Icons.TOOL_SEARCH)
+        return ("NOTE: the engines found this only on sites this agent cannot read over Tor — the "
+                "search SNIPPETS below are all there is (not the pages); say so to the user.\n\n"
+                + format_search_results(_snip, tag=SNIPPET_ONLY_TAG))
 
     if not await asyncio.to_thread(_proxy_reachable, tor_proxy):
         # every engine failed because the PROXY is down, not because of the
@@ -1781,26 +2649,24 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
                 "engine could be contacted. Rephrasing will not help. Tell the user web "
                 "search is down right now, and answer from your own knowledge only if you "
                 "say so.")
-    _cats = _stats.get("cats") or {}
-    _transport = int(_cats.get("conn-error", 0)) + int(_cats.get("timeout", 0))
-    _empty = int(_cats.get("empty", 0)) + int(_cats.get("off-topic", 0))
-    if _transport and _transport >= _empty:
+    _refused, _transport, _empty = search_failure_counts(_stats)
+    if (_refused + _transport) and (_refused + _transport) >= _empty:
         # §4PD: the waves MEASURED transport failures — "the query was too
         # specific" sent the model rewriting a query that was fine
         return (
-            f"ERROR: web search failed on TRANSPORT, not on the query — {_transport} engine "
-            f"attempt(s) could not connect or timed out over Tor ({_empty} answered empty). "
-            "Rephrasing will not help right now. Retry the SAME query once after other work, "
-            "or answer from your own knowledge and say web search was unreachable."
+            f"ERROR: web search failed on TRANSPORT, not on the query — {_refused} engine answer(s) "
+            f"were refusals (HTTP 403/429 or a captcha page) and {_transport} attempt(s) could not "
+            f"connect or timed out over Tor ({_empty} answered empty). Rephrasing will not help right "
+            "now. Retry the SAME query once after other work, or answer from your own knowledge and "
+            "say web search was unreachable."
         )
-    if _stats.get("omitted_hosts") and not _empty and not _transport:
+    if _stats.get("omitted_hosts") and not _empty and not _transport and not _refused:
         return ("ERROR: web search found results only on " + ", ".join(_stats["omitted_hosts"][:4])
                 + " — sites this agent does not read over Tor — so nothing is shown. Search again "
                 "with the site's name as a plain keyword, or tell the user which site holds it.")
     return (
-        "ERROR: web search returned ZERO results across all engines and "
-        "circuits, even after reformulation. Likely the query was too "
-        "specific/long or every Tor exit was transiently blocked. DO NOT "
+        "ERROR: web search returned ZERO results — the engines answered, with nothing for this "
+        "query" + (" or its reworded form" if _reworded else "") + ". DO NOT "
         "retry the same search. Instead: (a) drop to 2-4 PLAIN keywords (no "
         "quotes/operators/years), or (b) if you already have enough context, "
         "proceed with your own knowledge and state that web search was "
@@ -1852,9 +2718,419 @@ def _record_project_findings(context, query: str, output: str) -> Optional[str]:
         return None
 
 
+# ── §4UN-read (batch C): web_search reads the top result pages itself ────────
+# Measured before: 86 of 111 search requests never opened a page, and internet turns graded RIGHT 27 %
+# vs 50 % for the rest — the answer was built from search SNIPPETS (a price, a version, a date cut off
+# mid-sentence, or an engine's stale cache). For a question that asks for a number, a version, a price,
+# a date or "the latest", the tool opens the top 1–2 readable results (in parallel, each on its own Tor
+# circuit, inside one 12 s budget) and appends the parts of each page that carry the query. A page that
+# fails, is thin, is a bot check or never mentions the query is left out without a word: the results
+# above are the answer they were before. Members and Slack read through this too (they have no browser).
+# ``GHOST_SEARCH_READ_PAGES=0`` turns it off; ``GHOST_SEARCH_READ_S`` moves the budget.
+
+WEB_READ_HEAD = "READ FROM PAGES (opened by the tool; prefer these over snippets):"
+WEB_READ_MAX_PAGES = 2
+#: results considered, top first — a skipped one lets the third take its place
+WEB_READ_SCAN = 3
+WEB_READ_PAGE_CHARS = 2500
+_WEB_READ_BUDGET_S = env_float("GHOST_SEARCH_READ_S", 12.0)
+_PAGE_READ_COUNTS: Dict[str, int] = {}
+
+#: words that ask for ONE specific fact — folded like `_rel_fold` (case, accents; final ς → σ)
+_READ_FACT_WORDS = frozenset(_rel_fold(w) for w in """
+    price prices pricing priced cost costs date dates release released releases launch launched
+    latest newest today tonight yesterday tomorrow now recent recently winner winners score scores
+    result results deadline deadlines schedule schedules timetable version versions changelog rate rates
+    population ceo cfo cto chairman mayor salary salaries wage wages fee fees
+    τιμή τιμές τιμών κόστος κοστίζει κοστίζουν σήμερα τώρα χθες αύριο ημερομηνία έκδοση εκδόσεις
+    κυκλοφορία κυκλοφόρησε κυκλοφορεί αποτέλεσμα αποτελέσματα σκορ προθεσμία ωράριο δρομολόγια
+    ισοτιμία πληθυσμός πόσο πόση πόσα πόσοι πόσες πόσους πόσων πόσος
+    ποσό ποσά αμοιβή αμοιβές τέλη κόστη
+    νικητής νικήτρια νικητές επιτόκιο επιτόκια πληθωρισμός πληθωρισμού βαθμολογία ηλικία αεπ
+    inflation gdp standings
+    """.split())
+#: final check: a STRONG fact word — the question names the one fact it wants, so a "vs", "best",
+#: "application" or "μάθημα" beside it does not make it a how-to ("Olympiacos vs PAOK score")
+_READ_STRONG_FACT_WORDS = frozenset(_rel_fold(w) for w in """
+    score scores σκορ result results winner winners νικητής νικήτρια νικητές deadline deadlines fee fees
+    πόσο πόση πόσα πόσοι πόσες standings βαθμολογία
+    """.split())
+#: word prefixes of the same (Greek inflects: τελευταία / τελευταίος / τελευταίες …)
+_READ_FACT_PREFIXES = tuple(_rel_fold(w) for w in ("τελευταί",))
+_READ_FACT_PHRASES_RE = re.compile(
+    r"\b(?:how (?:much|many|old|long ago)|who (?:won|wins|is winning)|what time|"
+    r"who is the (?:current |new )?(?:ceo|president|prime minister|head|owner|leader|current|chairman|"
+    r"chair|mayor|minister|coach|manager|director|governor|king|queen|pope)|"
+    r"ποι(?:οσ|α|οι|εσ) (?:κερδισε|κερδισαν|νικησε|νικησαν)|"
+    r"ποι(?:οσ|α) ειναι (?:ο|η) (?:νεοσ |νεα |σημερινοσ |σημερινη |τωρινοσ |τωρινη )?"
+    r"(?:προεδρ|πρωθυπουργ|διευθυν|επικεφαλ|ιδιοκτητ|αρχηγ|δημαρχ|υπουργ|προπονητ|βασιλ)\w*|"
+    r"τι ωρα|top (?:scorers?|speed|seed)|how fast|net worth|"
+    # last round: the salary nouns only — "μίσθωση" (a lease), "μισθωτήριο" are not a salary
+    r"μισθ(?:οσ|ου|ο|οι|ων|ουσ|ολογιο\w*)|"
+    # last round: no "event" ("next event loop iteration") and never the framework ("next js update")
+    r"next (?!js\b)(?:\w+ )?(?:meetings?|match|matches|game|games|elections?|release|update|launch|race|"
+    r"holidays?|eclipse|concert|season|episode|flight|train|ferry|bus|strike|draw|fixture|meet))\b")
+#: technical senses of fact words — removed before the words are read ("version control" is not a version)
+_READ_TECH_SENSES_RE = re.compile(
+    r"\b(?:version control|versioning|date format\w*|date ?time format\w*|rate limit\w*|"
+    r"score function\w*|schedule (?:library|module|package)|release notes? template|press release)\b")
+#: a question about learning, doing, comparing or choosing something — never a page read, whatever words
+#: it carries (r1: a false read costs up to 12 s, a missed one leaves the snippets as before)
+_READ_BROAD_HARD_RE = re.compile(
+    r"\b(?:how to|how do i|tutorials?|guides?|course|courses|learn|learning|install|installing|"
+    r"installation|fix|fixing|error|errors|vs|versus|best|top (?:\d+|rated|ten|five|three|twenty|picks?)|"
+    r"top-rated|summary|summarize|converter|convert|"
+    r"examples?|config|configure|configuration|setup|set up|ideas?|commands?|syntax|snippets?|"
+    r"cheat ?sheets?|recipes?|templates?|tips|advice|applications?|apply|negotiat\w*|"
+    r"πωσ να|οδηγοσ|οδηγιεσ|εκμαθηση|μαθημα|μαθηματα|εγκατασταση|συγκριση|καλυτερ\w*)\b")
+#: last round: a programming context — "next …" is then an API or a framework ("next update js"), never
+#: the next real-world meeting, match or release (a fact WORD such as "release" still reads)
+_READ_PROG_CONTEXT_RE = re.compile(
+    r"\b(?:js|javascript|typescript|python|java|rust|golang|node|nodejs|react|vue|svelte|nextjs|"
+    r"api|loop|iterator|iteration|function|method|async|await|generator|callback|hook)\b")
+#: "when" that asks for advice ("when to use asyncio"), not a date
+_WHEN_ADVICE_RE = re.compile(r"\bwhen (?:to|should|do (?:i|you|we)|is it (?:better|ok|okay|safe|too late))\b")
+
+
+def _page_reads_on() -> bool:
+    return os.environ.get("GHOST_SEARCH_READ_PAGES", "1").strip() != "0"
+
+
+def wants_page_read(query: str) -> bool:
+    """§4UN-read: does this query ask for ONE specific fact — a price, a version, a date, a result, a
+    role's holder, "the latest" — that the result PAGES hold better than their snippets? Table-driven and
+    conservative: a fact WORD or PHRASE is needed (r1: digits alone never read), and a "how to", install,
+    fix, comparison, "best"/"top" or tutorial question never reads. ``πότε`` counts only accented — an
+    unaccented or all-caps ``ποτε`` may be ``ποτέ`` ("never")."""
+    q = str(query or "")
+    if not q.strip():
+        return False
+    folded = _READ_TECH_SENSES_RE.sub(" ", _rel_fold(q))
+    toks = re.findall(r"\w+", folded)
+    raw_toks = re.findall(r"\w+", q.casefold())
+    # final check: a strong fact word wins over the how-to / comparison / "best" table — outside a
+    # programming context ("rust result unwrap error" stays a how-to)
+    if ((any(t in _READ_STRONG_FACT_WORDS for t in toks) or "πότε" in raw_toks)
+            and not _READ_PROG_CONTEXT_RE.search(folded)):
+        return True
+    if _READ_BROAD_HARD_RE.search(folded):
+        return False
+    return (any(t in _READ_FACT_WORDS or t.startswith(_READ_FACT_PREFIXES) for t in toks)
+            or any(not (m.group(0).startswith("next ") and _READ_PROG_CONTEXT_RE.search(folded))
+                   for m in _READ_FACT_PHRASES_RE.finditer(folded))
+            or "πότε" in raw_toks
+            or ("when" in toks and not _WHEN_ADVICE_RE.search(folded))
+            or ("current" in toks and _current_means_now(q)))
+
+
+#: a URL path that names a file, not a page (the fetcher refuses most binaries anyway; PDFs are left
+#: to deep_research, which reads them)
+_NOT_A_PAGE_RE = re.compile(
+    r"\.(?:pdf|docx?|xlsx?|pptx?|odt|ods|csv|zip|gz|tgz|bz2|xz|tar|rar|7z|exe|msi|dmg|pkg|deb|rpm|iso|apk|"
+    r"jpe?g|png|gif|webp|svg|mp3|mp4|m4a|wav|webm|mov|avi|mkv)$", re.I)
+
+
+def page_read_skip_reason(url: str) -> Optional[str]:
+    """Why a result cannot be read as a page — None when it can."""
+    u = str(url or "").strip()
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(u)
+        host = (parts.hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return "bad url"
+    if parts.scheme not in ("http", "https") or not host:
+        return "not a web address"
+    if host.endswith(".onion"):
+        return "onion"
+    if _junk_host(u):
+        return "not readable over Tor"
+    if is_video_page_url(u):
+        return "video page"
+    if is_search_results_url(u):
+        return "a search page"
+    if _NOT_A_PAGE_RE.search(parts.path or ""):
+        return "a file, not a page"
+    try:
+        from .host_memo import _dead_host_notice
+        if _dead_host_notice(u):
+            return "host failing recently"
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def page_read_candidates(rows: List[Dict], limit: int = WEB_READ_MAX_PAGES,
+                         scan: int = WEB_READ_SCAN) -> List[Dict]:
+    """The results to open: the first ``limit`` readable ones among the top ``scan`` (in rank order)."""
+    out: List[Dict] = []
+    seen = set()
+    for r in list(rows or [])[:scan]:
+        if not isinstance(r, dict):
+            continue
+        url = str(r.get("href") or r.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        if page_read_skip_reason(url) is None:
+            out.append(r)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def page_read_counts() -> Dict[str, int]:
+    """Outcomes of web_search's page reads in this process (read / failed / timeout / thin / off-topic)."""
+    return dict(_PAGE_READ_COUNTS)
+
+
+#: the lines of web_search's own grammar a page (or a snippet) must not start: the read section's head,
+#: its `[PAGE]` / `URL:` pair (what `web_read_urls` and link grounding read as a page READ)
+_READ_GRAMMAR_RE: List[Any] = []          # built on first use (`_GRAMMAR_LEAD` is defined further down)
+
+
+def quote_read_grammar(text: str) -> str:
+    """A line of outside text that starts like the read section's own lines is quoted ("> ")."""
+    t = str(text or "")
+    if not t:
+        return t
+    if not _READ_GRAMMAR_RE:
+        _READ_GRAMMAR_RE.append(re.compile(
+            r"(?im)^(?=" + _GRAMMAR_LEAD + r"(?:READ FROM PAGES|\[PAGE\]|URL:))"))
+    return _READ_GRAMMAR_RE[0].sub("> ", unify_line_breaks(t))
+
+
+_WEB_READ_PAIR_RE = re.compile(r"(?m)^\[PAGE\][^\n]*\nURL: (https?://\S+)[ \t]*$")
+
+
+def web_read_urls(text) -> List[str]:
+    """The URLs a web_search result says it READ — the `[PAGE]` + `URL:` pairs after its read head."""
+    t = str(text or "")
+    i = t.find("\n" + WEB_READ_HEAD)
+    if i < 0 and not t.startswith(WEB_READ_HEAD):
+        return []
+    out: List[str] = []
+    for m in _WEB_READ_PAIR_RE.finditer(t[max(i, 0):]):
+        if m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def without_read_section(text) -> str:
+    """A web_search result without its READ FROM PAGES section (the result list and its notes)."""
+    t = str(text or "")
+    if t.startswith(WEB_READ_HEAD):
+        return ""
+    i = t.find("\n" + WEB_READ_HEAD)
+    return t if i < 0 else t[:i]
+
+
+def _greek_text(text: str) -> bool:
+    """Mostly Greek letters (the query's or a page's script)."""
+    letters = [c for c in str(text or "")[:20000] if c.isalpha()]
+    return bool(letters) and sum(1 for c in letters if _GREEK_RE.match(c)) / len(letters) > 0.5
+
+
+def _topic_words(terms, query: str = "") -> List[str]:
+    """r1: the query words a page must share to be on topic — not a number, not a stopword, 3+ chars;
+    r2: plus the query's symbol names (``c++``, ``c#``, ``f#``), which the word tokens lose."""
+    out = []
+    for w in list(terms[0]) + list(terms[1]):
+        w = str(w or "")
+        if len(w) < 3 or w in _REL_STOPWORDS or re.fullmatch(r"[\d.,:/-]+", w):
+            continue
+        out.append(w)
+    for sym in re.findall(r"(?<![\w+#])([a-z]\w*(?:\+\+|#))", _rel_fold(query or "")):
+        if sym not in out:
+            out.append(sym)
+    return out
+
+
+_EN_SUFFIX = r"(?:s|es|ed|d|ing|er|ers|ly)?"
+
+
+_GREEK_ENDINGS = tuple(sorted({_rel_fold(e) for e in """
+    ματος ματα ματων ατος ατα ατων μα εων ιων ιες ιας ων ους ου ης ες ος ας οι αι εις ει ια ιο ιου η α ο ι ς
+    """.split()},
+    key=len, reverse=True))
+
+
+#: the query-side Greek endings — a bare final "σ" is not one ("τιμεσ" → "τιμε" is no stem)
+_GREEK_QUERY_ENDINGS = tuple(e for e in _GREEK_ENDINGS if e != _rel_fold("ς"))
+_GREEK_ENDINGS_RE = "(?:" + "|".join(re.escape(e) for e in _GREEK_ENDINGS) + ")?"
+
+
+def _query_stems(word: str) -> Tuple[str, ...]:
+    """last round: the stems of a QUERY word that the page may inflect, or ``()`` when it has none.
+    A stem is 4+ letters; a shorter one is no stem (the word then matches only as itself — "τιμεσ"
+    never reaches "τιμωρια", "news" never "new").
+
+    Greek: the longest of ``_GREEK_QUERY_ENDINGS`` that leaves 4+ letters ("ρευματοσ" → "ρευμ",
+    "βενζινησ" → "βενζιν"; "τιμεσ", "πολεισ", "νομοσ" → none). English: plurals only — "-ies" →
+    "-y" and "-ie" ("cities" → "city"; "movies" → "movie"), "-(x|ch|sh|z|ss)es" → drop "es" ("glasses" →
+    "glass"), else drop "s" ("rates" → "rate", "prices" → "price"); never for a word ending in ss/us/ws/is ("news",
+    "class", "status", "analysis") nor for a symbol name (``c++``)."""
+    if word.endswith(("+", "#")):
+        return ()
+    if _GREEK_RE.search(word):
+        for e in _GREEK_QUERY_ENDINGS:
+            if word.endswith(e) and len(word) - len(e) >= 4:
+                return (word[: -len(e)],)
+        return ()
+    if not word.endswith("s") or word.endswith(("ss", "us", "ws", "is")):
+        return ()
+    if word.endswith("ies"):
+        cands = [word[:-3] + "y", word[:-1]]
+    elif re.search(r"(?:x|ch|sh|z|ss)es$", word):
+        cands = [word[:-2]]
+    else:
+        cands = [word[:-1]]
+    return tuple(c for c in cands if len(c) >= 4)
+
+
+def _query_stem(word: str) -> str:
+    """The first of ``_query_stems`` — or the word itself when it has no stem."""
+    st = _query_stems(word)
+    return st[0] if st else word
+
+
+def _page_has_word(flat: str, word: str) -> bool:
+    """r2 + last round: ``word`` on the (folded) page as a WHOLE word — "act" is not in "actually".
+    (a) The word itself always counts, as before the stemming: English with an inflection
+    (``_EN_SUFFIX``: "release" → "released"), Greek with up to three more letters, a symbol name
+    (``c++``) with no right boundary ("C++23"). (b) A stem from ``_query_stems`` counts alone or with
+    ONE known ending — Greek ``_GREEK_ENDINGS`` ("ρευμ" → "ρευμα", "ρευματα"), English
+    ``_EN_SUFFIX`` ("city", "rated") — never with arbitrary letters."""
+    w = re.escape(word)
+    if word.endswith(("+", "#")):
+        pats = [r"(?<![\w+#])" + w]
+    elif _GREEK_RE.search(word):
+        pats = [r"(?<!\w)" + w + r"\w{0,3}(?!\w)"]
+        pats += [r"(?<!\w)" + re.escape(st) + _GREEK_ENDINGS_RE + r"(?!\w)" for st in _query_stems(word)]
+    else:
+        pats = [r"(?<!\w)" + w + _EN_SUFFIX + r"(?!\w)"]
+        pats += [r"(?<!\w)" + re.escape(st) + _EN_SUFFIX + r"(?!\w)" for st in _query_stems(word)]
+        if re.search(r"[^aeiou\W]y$", word):             # final check: "company" → "companies"
+            pats.append(r"(?<!\w)" + re.escape(word[:-1]) + r"ies(?!\w)")
+    try:
+        return any(re.search(p, flat) is not None for p in pats)
+    except re.error:
+        return word in flat
+
+
+def _bump_read(outcome: str, now: Optional[float] = None) -> None:
+    _PAGE_READ_COUNTS[outcome] = _PAGE_READ_COUNTS.get(outcome, 0) + 1
+    if outcome in ("read", "failed", "thin", "off-topic", "timeout"):        # §4UN-health: known outcomes only
+        _PAGE_READ_EVENTS.append((time.time() if now is None else float(now), outcome))
+
+
+async def read_top_pages(query: str, rows: List[Dict], tor_proxy: Optional[str],
+                         budget_s: Optional[float] = None) -> str:
+    """§4UN-read: open the top readable results of ``rows`` and return the READ FROM PAGES section
+    ("" when nothing was read). Never raises; a page that fails, times out, is thin, is a bot check or
+    never mentions the query is dropped (and logged)."""
+    try:
+        picks = page_read_candidates(rows)
+        if not picks:
+            return ""
+        budget = float(_WEB_READ_BUDGET_S if budget_s is None else budget_s)
+        terms = focus_terms(query)
+        words = _topic_words(terms, query)
+        q_greek = _greek_text(" ".join(words))
+        try:
+            from urllib.parse import urlparse as _urlparse
+            _qid = (_urlparse(tor_proxy).username or "") if tor_proxy else ""
+        except Exception:  # noqa: BLE001
+            _qid = ""
+        # r2: a SHORT salt — `socks_url_with_identity` keeps 32 chars of the tag, and a long anonymous
+        # identity cut the time bucket off its end (every read of the query then shared one circuit)
+        import hashlib as _hl
+        salt = ("r" + _hl.md5(_qid.encode()).hexdigest()[:3]) if _qid else "read"
+
+        async def _one(url: str):
+            t0 = time.monotonic()
+            proxy = _proxy_for_attempt(tor_proxy, url, 0, salt=salt)
+            try:
+                # r1: renew_identity=True allows the helper's own per-circuit retries — the §4QF
+                # plain-curl retry on 403/429 and the 429/503 rotation (no global NEWNYM is ever sent);
+                # the shared budget below bounds them
+                res = await helper_fetch_url_content(url, proxy_override=proxy, renew_identity=True,
+                                                     with_meta=True)
+            except Exception as e:  # noqa: BLE001
+                res = _FetchError(f"Error: {type(e).__name__}: {str(e)[:120]}")
+            return url, res, time.monotonic() - t0
+
+        t_start = time.monotonic()
+        tasks = {asyncio.ensure_future(_one(str(r.get("href") or r.get("url")))): r for r in picks}
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=budget)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+        for t in pending:
+            r = tasks[t]
+            url = str(r.get("href") or r.get("url"))
+            _bump_read("timeout")
+            pretty_log("Search Page Read", f"timeout {_result_host(r) or url[:60]} — not read within "
+                       f"{budget:g}s", level="INFO", icon=Icons.TOOL_PAGE_READ)
+        got: Dict[str, Tuple[Any, float]] = {}
+        for t in done:
+            try:
+                url, res, took = t.result()
+            except Exception:  # noqa: BLE001
+                continue
+            got[url] = (res, took)
+        blocks: List[str] = []
+        for r in picks:                                      # rank order, whatever finished first
+            url = str(r.get("href") or r.get("url"))
+            if url not in got:
+                continue
+            res, took = got[url]
+            host = _result_host(r)
+            ms = int(took * 1000)
+            if not isinstance(res, str) or isinstance(res, _FetchError):
+                _bump_read("failed")
+                pretty_log("Search Page Read", f"failed {host} in {ms} ms — {str(res)[:90]}",
+                           level="INFO", icon=Icons.TOOL_PAGE_READ)
+                continue
+            text = str(res)
+            if len(text.strip()) < RESEARCH_THIN_PAGE_CHARS or is_bot_check_page(text):
+                _bump_read("thin")
+                pretty_log("Search Page Read", f"thin {host} in {ms} ms — {len(text.strip())} chars "
+                           f"(a stub, consent or bot-check page)", level="INFO", icon=Icons.TOOL_PAGE_READ)
+                continue
+            flat = _rel_fold(text)
+            # r1: a page in another script than the query (a Latin page for a Greek question) cannot be
+            # judged by shared words — it is kept (it is one of the top-ranked results)
+            if words and _greek_text(text) == q_greek and not any(_page_has_word(flat, w) for w in words):
+                _bump_read("off-topic")
+                pretty_log("Search Page Read", f"off-topic {host} in {ms} ms — none of the query's words "
+                           f"on the page", level="INFO", icon=Icons.TOOL_PAGE_READ)
+                continue
+            focused = await asyncio.to_thread(focus_page_text, text, terms, WEB_READ_PAGE_CHARS)
+            body = quote_read_grammar(neutralise_report_grammar(_clean_for_cpp(focused))).strip()
+            if len(text) > WEB_READ_PAGE_CHARS:
+                body += "\n[…]"
+            meta = getattr(res, "meta", None)
+            blocks.append(f"{page_meta_line(str(r.get('title') or ''), meta if isinstance(meta, dict) else None)}"
+                          f"\nURL: {url}\n{body}")
+            _bump_read("read")
+            pretty_log("Search Page Read", f"read {host} in {ms} ms — {len(focused)} of {len(text)} chars",
+                       icon=Icons.TOOL_PAGE_READ)
+        if not blocks:
+            return ""
+        logger.info("web_search page reads: %d of %d in %.1fs", len(blocks), len(picks), time.monotonic() - t_start)
+        return WEB_READ_HEAD + "\n\n" + "\n\n".join(blocks)
+    except Exception:  # noqa: BLE001 — a read never costs the search
+        logger.warning("web_search page read skipped after an unexpected error", exc_info=True)
+        return ""
+
+
 async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, context=None, **kwargs):
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
+    _as_typed = query if isinstance(query, str) else None   # §4UN-web: casing the scrub removes
     # Stylometric egress scrubbing: under anonymous mode, normalise the
     # outbound query into a neutral keyword form so the agent's prose
     # style (politeness, first-person framing, punctuation habits) — a
@@ -1882,7 +3158,11 @@ async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_
     # §4PU: a past year the model added to a question about now
     query, _stale = _drop_stale_year_logged(query, "web_search")
     # Tavily support removed. Always using DDGS.
-    out = await tool_search_ddgs(query, tor_proxy)
+    _typed_tok = _QUERY_AS_TYPED.set((query, _as_typed) if _as_typed and _as_typed != query else None)
+    try:
+        out = await tool_search_ddgs(query, tor_proxy)
+    finally:
+        _QUERY_AS_TYPED.reset(_typed_tok)
     if _stale and isinstance(out, str):
         from .outcome import append_note
         out = append_note(out, "\n\n" + stale_year_note(_stale))
@@ -1920,6 +3200,24 @@ RESEARCH_MAX_SOURCES = 8
 #: Measured: 29% of 408 sources failed at fetch and the slot was simply lost.
 RESEARCH_MAX_RESERVES = 7
 RESEARCH_BACKFILL_PER_SLOT = 2
+#: §4UN-deep m8: a page with less text than this is not the document (a script-only shell, a consent wall,
+#: a stub) — a failed fetch, so its slot is backfilled
+RESEARCH_THIN_PAGE_CHARS = 200
+#: §4UN-deep m12: what a caller's deadline keeps back for putting the report together
+RESEARCH_ASSEMBLY_S = 3.0
+
+
+def _fetch_extra_kwargs(fetch) -> Dict[str, Any]:
+    """§4UN-deep: ``with_meta``/``read_pdf`` for a fetcher that takes them (a stand-in with a fixed
+    signature gets none)."""
+    try:
+        import inspect
+        params = inspect.signature(fetch).parameters
+        if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+            return {"with_meta": True, "read_pdf": True}
+        return {k: True for k in ("with_meta", "read_pdf") if k in params}
+    except (TypeError, ValueError):
+        return {}
 
 
 def is_search_results_url(url: str) -> bool:
@@ -1997,15 +3295,139 @@ def _research_eligible(results: List[Dict]) -> List[Dict]:
             and not is_video_page_url(r.get('href') or r.get('url') or '')]
 
 
+#: §4UN-deep m9: at most this many of the sources read come from one site (its registrable domain) while
+#: other sites are on offer — eight slots used to go to one forum's threads or one wiki's sub-pages
+RESEARCH_MAX_PER_DOMAIN = 2
+#: r2: the top-ranked site, a site the query names and an official one get more slots — not all of them
+RESEARCH_MAX_PER_FREE_DOMAIN = 4
+#: second-level labels under a country code that are not the site ("bbc.co.uk", "abc.net.au", "gov.gr")
+_SECOND_LEVEL_LABELS = frozenset({"co", "com", "org", "net", "gov", "ac", "edu", "gob", "go", "or", "ne",
+                                  "mil", "nic", "ltd", "plc", "sch", "nhs", "gv", "in"})
+
+
+#: r1: hosts where every sub-domain is a different site (a project's docs, a person's blog, an EU body)
+_MULTI_TENANT_SUFFIXES = ("readthedocs.io", "readthedocs.org", "github.io", "gitlab.io", "blogspot.com",
+                          "wordpress.com", "substack.com", "medium.com", "tumblr.com", "netlify.app",
+                          "vercel.app", "pages.dev", "herokuapp.com", "appspot.com", "web.app",
+                          "firebaseapp.com", "neocities.org", "europa.eu", "sourceforge.io", "itch.io")
+
+
+def registrable_domain(url: str) -> str:
+    """The site a URL belongs to: its host without ``www.``, cut to the last two labels — three under a
+    country code's second-level label (``news.bbc.co.uk`` → ``bbc.co.uk``). "" for no host; an IP is
+    itself."""
+    try:
+        from urllib.parse import urlsplit
+        host = (urlsplit(str(url or "").strip()).hostname or "").lower().rstrip(".")
+    except Exception:  # noqa: BLE001
+        return ""
+    if not host or re.fullmatch(r"[\d.]+|[0-9a-f]*:[0-9a-f:]*", host):
+        return host
+    labels = host.split(".")
+    if labels[0] == "www" and len(labels) > 2:
+        labels = labels[1:]
+    host = ".".join(labels)
+    for suf in _MULTI_TENANT_SUFFIXES:
+        if host.endswith("." + suf):
+            return host[: -len(suf) - 1].rsplit(".", 1)[-1] + "." + suf
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL_LABELS:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _research_pool(results: List[Dict]) -> List[Dict]:
+    """The results with one row per page (§4PD: http/https, a trailing "/" and a #fragment are one page)."""
+    pool = [r for r in (results or []) if isinstance(r, dict)]
+    _seen, _uniq = set(), []
+    for r in pool:
+        _k = re.sub(r"#.*$", "", str(r.get("href") or r.get("url") or "").strip()).rstrip("/").lower()
+        _k = re.sub(r"^http://", "https://", _k)
+        if _k and _k in _seen:
+            continue
+        _seen.add(_k); _uniq.append(r)
+    return _uniq
+
+
+_GENERIC_LABELS = frozenset({"www", "docs", "doc", "blog", "news", "wiki", "web", "site", "home", "info",
+                             "help", "support", "dev", "api", "app", "mail", "shop", "store", "forum", "com",
+                             "org", "net", "the", "and", "for"})
+
+
+def _uncapped_site(url: str, domain: str, named: set) -> bool:
+    """r1: a site the cap does not apply to — official-looking (a government, military or university host,
+    or a ``docs.``/``developer.`` host), or one the query/question NAMES ("python docs" → python.org)."""
+    try:
+        from urllib.parse import urlsplit
+        host = (urlsplit(str(url or "")).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        host = ""
+    labels = host.split(".")
+    if any(l in ("gov", "mil") for l in labels[1:]) or host.endswith((".edu", ".int")) \
+            or labels[0] in ("docs", "developer", "developers", "doc"):
+        return True
+    site_labels = [l for l in str(domain or "").split(".")[:-1] if len(l) >= 3 and l not in _GENERIC_LABELS]
+    return any(l in named for l in site_labels)
+
+
+def _research_split(results: List[Dict], limit: int, query: str = "",
+                    question: str = "") -> Tuple[List[Dict], List[Dict]]:
+    """(the sources read, the reserves) — both from ONE deduplicated pool, so a reserve is never a page
+    already read (§4UN-deep m7: the reserves were the raw list, duplicates and all). A site past
+    RESEARCH_MAX_PER_DOMAIN waits behind the other sites (m9), and fills a slot only when nothing else is
+    left; the reserves list the other sites first too."""
+    limit = max(1, int(limit))
+    pool = _research_pool(results)
+    kept = _research_eligible(pool)
+    base = kept or pool
+    chosen: List[int] = []
+    counts: Dict[str, int] = {}
+    # r1: the cap never applies to the TOP-ranked site, a site the query names, or an official one
+    named = set(_rel_tokens(f"{query or ''} {question or ''}"))
+    top = registrable_domain(base[0].get("href") or base[0].get("url") or "") if base else ""
+    free = {registrable_domain(r.get("href") or r.get("url") or "") for r in base
+            if _uncapped_site(r.get("href") or r.get("url") or "",
+                              registrable_domain(r.get("href") or r.get("url") or ""), named)}
+    free.add(top)
+    for i, r in enumerate(base):
+        if len(chosen) >= limit:
+            break
+        d = registrable_domain(r.get("href") or r.get("url") or "")
+        if d and counts.get(d, 0) >= (RESEARCH_MAX_PER_FREE_DOMAIN if d in free else RESEARCH_MAX_PER_DOMAIN):
+            continue
+        chosen.append(i)
+        counts[d] = counts.get(d, 0) + 1
+    for i in range(len(base)):                 # nothing else left: the site's further pages fill the slots
+        if len(chosen) >= limit:
+            break
+        if i not in chosen:
+            chosen.append(i)
+    chosen.sort()
+    picked = [base[i] for i in chosen]
+    if not kept:
+        return picked, []                      # the batch read as it came: no eligible reserve
+    counts = {}
+    for r in picked:
+        _d = registrable_domain(r.get("href") or r.get("url") or "")
+        counts[_d] = counts.get(_d, 0) + 1
+    _taken = set(chosen)
+    rest = [(i, r) for i, r in enumerate(base) if i not in _taken]
+    def _capped(r) -> bool:
+        d = registrable_domain(r.get("href") or r.get("url") or "")
+        return counts.get(d, 0) >= (RESEARCH_MAX_PER_FREE_DOMAIN if d in free else RESEARCH_MAX_PER_DOMAIN)
+    rest.sort(key=lambda p: (_capped(p[1]), p[0]))
+    return picked, [r for _, r in rest]
+
+
 def research_reserves(results: List[Dict], limit: int = RESEARCH_MAX_SOURCES,
-                      reserves: int = RESEARCH_MAX_RESERVES) -> List[Dict]:
+                      reserves: int = RESEARCH_MAX_RESERVES, query: str = "", question: str = "") -> List[Dict]:
     """§4NJ: the eligible results AFTER the ones `select_research_sources`
-    reads — the backfill queue for slots whose fetch failed."""
-    return _research_eligible(results)[max(1, int(limit)):max(1, int(limit)) + max(0, int(reserves))]
+    reads — the backfill queue for slots whose fetch failed (§4UN-deep: from
+    the same deduplicated pool, never a page already read)."""
+    return _research_split(results, limit, query, question)[1][:max(0, int(reserves))]
 
 
-def select_research_sources(results: List[Dict],
-                            limit: int = RESEARCH_MAX_SOURCES) -> List[Dict]:
+def select_research_sources(results: List[Dict], limit: int = RESEARCH_MAX_SOURCES,
+                            query: str = "", question: str = "") -> List[Dict]:
     """The results deep research will actually FETCH and distill.
 
     §4KS (2026-09-30, req ba2753bb): the first eight results were taken as
@@ -2020,23 +3442,36 @@ def select_research_sources(results: List[Dict],
     (§4IL: re-ranked, never dropped); a second rule that left off-topic
     results unread cut 16.6% of 1,750 replayed real batches and dropped
     primary sources whose title lacked the query's leading word (both FIA
-    regulation PDFs for an F1 query) — R1 review. Removed."""
-    pool = [r for r in (results or []) if isinstance(r, dict)]
-    _seen, _uniq = set(), []                            # §4PD: the same page ×3 (http/https, #frag) is ONE slot
-    for r in pool:
-        _k = re.sub(r"#.*$", "", str(r.get("href") or r.get("url") or "").strip()).rstrip("/").lower()
-        _k = re.sub(r"^http://", "https://", _k)
-        if _k and _k in _seen:
-            continue
-        _seen.add(_k); _uniq.append(r)
-    pool = _uniq
-    kept = _research_eligible(pool)
-    return (kept or pool)[:max(1, int(limit))]
+    regulation PDFs for an F1 query) — R1 review. Removed.
+
+    §4UN-deep m9: one site fills at most RESEARCH_MAX_PER_DOMAIN slots while
+    other sites are on offer (`_research_split`)."""
+    return _research_split(results, limit, query, question)[0]
 
 
+#: §4UN-deep r1: ONLY the sentinel, and refusals that say in so many words that no RELEVANT / HARD facts or
+#: no information ABOUT THE QUERY were found. A negative FACT ("No data was lost in the outage", "The
+#: document does not require a visa", "This page does not list any recall") is a fact: the broader r0 rule
+#: folded those into "nothing relevant" and lost them.
+_INFO_WORDS = r"(?:facts?|information|info|details|data|content)"
+#: r2: what may follow the info noun of a refusal — nothing (the end of the line), "was found (in the
+#: text)", or the query/topic named GENERICALLY. A concrete object ("data on 2024 sales") is a fact.
+_GENERIC_SUBJECT = r"(?:the|this|your|that) (?:query|topic|question|subject|search)"
+_REFUSAL_TAIL = (
+    r"(?:\s+(?:explicitly\s+)?(?:relevant|related|pertaining)\s+to\s+" + _GENERIC_SUBJECT + r")?"
+    r"(?:\s+(?:about|on|regarding|for)\s+" + _GENERIC_SUBJECT + r")?"
+    r"(?:\s+(?:(?:was|were|is|are|could be|can be)\s+)?(?:found|available|given|provided|present|identified))?"
+    r"(?:\s+(?:in|within)\s+(?:the|this)\s+(?:provided\s+)?(?:source\s+)?"
+    r"(?:text|page|source|document|article|content)(?:\s+text)?)?"
+    r"\s*[.!]?\s*$")
+_ADJ = r"(?:(?:any|relevant|hard|specific|explicit|explicitly|useful|pertinent)\s+)*"
 _NO_FACTS_RE = re.compile(
-    r"^\s*(?:No relevant|No hard facts|There (?:is|are) no (?:relevant|hard|information)|"
-    r"The (?:provided )?(?:source )?(?:text|page|source) does not|The source does not)", re.I)
+    r"^\s*(?:NONE\.?\s*$|"
+    r"No\s+" + _ADJ + _INFO_WORDS + r"\b" + _REFUSAL_TAIL + r"|"
+    r"There\s+(?:is|are)\s+no\s+" + _ADJ + _INFO_WORDS + r"\b" + _REFUSAL_TAIL + r"|"
+    r"(?:The|This)\s+(?:provided\s+)?(?:source\s+)?(?:text|page|source|document|article)\s+does\s+not\s+"
+    r"(?:contain|include|provide|have|mention|state)\s+" + _ADJ + _INFO_WORDS + r"\b" + _REFUSAL_TAIL + r"|"
+    r"I\s+(?:could|did|can)\s?not\s+find\s+" + _ADJ + _INFO_WORDS + r"\b" + _REFUSAL_TAIL + r")", re.I)
 #: r1: "The text does not state the date, but it reports …" carries facts —
 #: only a SHORT, unhedged refusal is "nothing relevant"
 _NO_FACTS_MAX_CHARS = 200
@@ -2056,7 +3491,8 @@ _GRAMMAR_LEAD = "(?:[^\\S\\n]|[\u200b-\u200d\u2060\ufeff]|[*_`~])*"
 _REPORT_GRAMMAR_RE = re.compile(
     r"(?im)^(?=" + _GRAMMAR_LEAD + r"(?:###\s*SOURCE:|###\s*\d+\.|\[⚠|---\s*(?:DEEP|DARK-WEB) RESEARCH|STATUS:|"
     r"FACT[^\S\n]+CHECK[^\S\n]+(?:COMPLETE|FAILED|PARTIAL)|SOURCES[^\S\n]+the[^\S\n]+verdict|"
-    r"\[Source:|\[Onion:|\[RAW,))")
+    r"\[Source:|\[Onion:|\[RAW,|\[PAGE\]|Loaded, nothing relevant|"
+    r"\[SOURCES:|\[SKIPPED URLS:|\[PAGE CUT OFF:))")       # §4UN-darkres: darkweb_research's count/skip lines
 
 
 def unify_line_breaks(text) -> str:
@@ -2084,11 +3520,44 @@ def neutralise_report_grammar(text: str) -> str:
     return _LEADING_ERROR_RE.sub("> ", t, count=1)
 
 
+#: §4UN-deep M2: the line under a source's head that says what the page says about itself — written by
+#: the research, never by a page (`neutralise_report_grammar` quotes a page line that starts with it)
+PAGE_META_MARK = "[PAGE]"
+
+
+def page_meta_line(title: str = "", meta: Optional[dict] = None) -> str:
+    """``[PAGE] Date: published …, updated … | Title: "<title>"`` — ``Date: undated`` when the page states
+    no date. r1: the date comes FIRST and the title is quoted, one flattened line of at most 160 chars with
+    its ``|`` and ``"`` replaced — a title "Old news | Date: published 2099-01-01" read as the page's date."""
+    m = meta if isinstance(meta, dict) else {}
+    t = " ".join(str(m.get("title") or title or "").split())
+    t = _fc_visible(t)[:160].replace("|", "/").replace('"', "'") if t else ""
+    pub, mod = str(m.get("published") or "")[:10], str(m.get("modified") or "")[:10]
+    if pub and mod and mod != pub:
+        date = f"published {pub}, updated {mod}"
+    elif pub or mod:
+        date = f"published {pub or mod}"
+    elif m.get("date"):
+        date = f"last modified {str(m.get('date'))[:10]} (server)"
+    else:
+        date = "undated"
+    kind = " (PDF)" if m.get("pdf") else ""
+    return f'{PAGE_META_MARK} Date: {date}{kind} | Title: ' + (f'"{t}"' if t else "(none)")
+
+
+def block_body(block: str) -> str:
+    """A ``### SOURCE`` block's body — after its head line and its `[PAGE]` line."""
+    parts = str(block or "").split("\n", 1)
+    body = parts[1] if len(parts) > 1 else ""
+    if body.startswith(PAGE_META_MARK):
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+    return body
+
+
 def distilled_block_has_facts(block: str) -> bool:
     """§4NJ: a ``### SOURCE`` block whose distilled facts are not the
     extractor's "nothing relevant" line (raw page text counts as content)."""
-    parts = str(block or "").split("\n", 1)
-    body = parts[1].strip() if len(parts) > 1 else ""
+    body = block_body(block).strip()
     if not body or body.startswith("Error:"):
         return False
     if not body.startswith("[EDGE EXTRACTED FACTS]"):
@@ -2096,6 +3565,8 @@ def distilled_block_has_facts(block: str) -> bool:
     facts = body[len("[EDGE EXTRACTED FACTS]"):].lstrip(":").strip()
     if not facts:
         return False
+    if "\n" in facts:
+        return True                      # r1: an extract of more than one line is never "nothing relevant"
     refusal = (_NO_FACTS_RE.match(facts) and len(facts) <= _NO_FACTS_MAX_CHARS
                and not _HEDGE_RE.search(facts))
     return not refusal
@@ -2130,7 +3601,7 @@ async def run_research_slots(urls, reserves, bounded, *, phase_deadline: float,
             except Exception:                                   # noqa: BLE001
                 pass
             block = await bounded(nxt)
-            if _NOT_ATTEMPTED_MARK in (block.split("\n", 2) + ["", ""])[1][:80]:
+            if _NOT_ATTEMPTED_MARK in block_body(block)[:80]:
                 if stats is not None:
                     stats["deadline_cut"] = stats.get("deadline_cut", 0) + 1
                 break           # r1: the deadline came while it queued — never attempted, not a failure
@@ -2169,14 +3640,226 @@ def research_no_facts(has_llm: bool, loaded, degraded, failed_slots: int, lost: 
 NO_FACTS_BANNER_HEAD = "[⚠ NO RELEVANT FACTS:"
 
 
-def extract_prompt(query: str, safe_text: str) -> str:
-    """The extractor's prompt — one text for deep_research and
-    darkweb_research. §4NK measured two looser variants on 72 judged pages:
-    both pulled 15–24× more "facts" from off-topic pages for no clear gain
-    on relevant ones, so it stays strict."""
-    return (f"Extract ONLY the hard facts explicitly relevant to this query: '{query}'. "
-            f"Ignore all other boilerplate. If no relevant info is found, state that.\n\n"
+def extract_prompt(query: str, safe_text: str, question: str = "") -> str:
+    """The extractor's prompt — one text for deep_research and darkweb_research (§4NK). It stays strict
+    ("ONLY the hard facts explicitly relevant": §4NK measured two looser variants on 72 judged pages, both
+    pulled 15–24× more "facts" from off-topic pages for no clear gain on relevant ones). §4UN-deep M3 added:
+    the question behind the search words when the caller gave one (M6), the source text as the only source
+    (numbers, names and dates copied exactly, nothing added), a fact's as-of date kept with it (M2), and ONE
+    exact answer for "nothing relevant" (`NONE`) instead of a refusal sentence in the worker's own words."""
+    q = " ".join(str(query or "").split())
+    ask = " ".join(str(question or "").split())
+    behind = f" (the question behind it: '{ask[:600]}')" if ask and ask != q else ""
+    return (f"Extract ONLY the hard facts explicitly relevant to this query: '{q}'{behind}. "
+            f"Use only the source text below: copy numbers, names and dates exactly as written there, and "
+            f"add nothing that is not in it. When the text says when a fact was true (an 'as of' date, a year, "
+            f"a version), keep that with the fact. One fact per line. Ignore all other boilerplate. "
+            f"If the text has nothing relevant, answer with exactly: NONE\n\n"
             f"Source text:\n{safe_text}")
+
+
+#: §4UN-deep M1: the window a long page is cut into before the windows that carry the query are chosen
+RESEARCH_WINDOW_CHARS = 1500
+_WINDOW_GAP = "\n[…]\n"
+
+
+def focus_terms(query: str, question: str = "") -> Tuple[List[str], List[str]]:
+    """(distinctive tokens, other content words) of the search words and the question, folded."""
+    both = f"{query or ''} {question or ''}"
+    dist = list(dict.fromkeys(distinctive_tokens(both)))
+    rest = [t for t in dict.fromkeys(_rel_tokens(both)) if t not in dist and not _YEAR_RE.fullmatch(t)]
+    return dist, rest
+
+
+def _folded_find(text: str, terms) -> int:
+    """r2: the offset in ``text`` of the first of ``terms`` (folded like `_rel_fold`: case and accents),
+    0 when none is there — "πυρκαγια" finds "πυρκαγιά"."""
+    folded, where = [], []
+    for i, c in enumerate(text):
+        f = _rel_fold(c)
+        folded.append(f)
+        where.extend([i] * len(f))
+    flat = "".join(folded)
+    hits = [flat.find(x) for x in terms if x and flat.find(x) >= 0]
+    return where[min(hits)] if hits and where else 0
+
+
+def _cut_at_space(t: str, start: int, end: int, floor: int) -> int:
+    """``end`` moved back to just after the last whitespace in ``t[floor:end]`` (unchanged when none)."""
+    if end >= len(t):
+        return len(t)
+    k = max(t.rfind(" ", floor, end), t.rfind("\t", floor, end))
+    return k + 1 if k > start else end
+
+
+def focus_page_text(text: str, terms, limit: int, window: int = RESEARCH_WINDOW_CHARS) -> str:
+    """§4UN-deep M1: at most ``limit`` chars of a page for the extractor — the page's LEAD window always,
+    then the windows that carry the most of the query's terms, joined in PAGE ORDER with a "[…]" between
+    windows that are not adjacent. A page that fits is returned whole; with no term anywhere past the lead
+    the head of the page is returned (what was sent before). ``terms`` is ``(distinctive, other)`` from
+    `focus_terms` (or a flat list, all distinctive). Until now a long page was cut at its first N chars,
+    and the answer was often further down (a table, a changelog entry, the 9th paragraph).
+
+    r1: the budget is always FILLED — after the scored windows, the unpicked ones nearest the lead (the
+    last one cut to fit), so the extractor never reads less than the old head cut gave it. Windows break
+    at a line end, else at whitespace (never inside a number)."""
+    t = str(text or "")
+    limit = int(limit)
+    if limit <= 0:
+        return ""
+    if len(t) <= limit:
+        return t
+    if isinstance(terms, tuple) and len(terms) == 2:
+        dist, other = list(terms[0] or []), list(terms[1] or [])
+    else:
+        dist, other = list(terms or []), []
+    if not dist and not other:
+        return t[:limit]
+    window = max(200, int(window))
+    spans: List[Tuple[int, int]] = []
+    i, n = 0, len(t)
+    while i < n:
+        j = min(n, i + window)
+        if j < n:
+            k = t.rfind("\n", i + window // 2, j)
+            j = k + 1 if k > i else _cut_at_space(t, i, j, i + window // 2)
+        spans.append((i, j))
+        i = j
+
+    def _score(sp):
+        f = _rel_fold(t[sp[0]:sp[1]])
+        return (sum(1 for x in dist if x in f), sum(1 for x in other if x in f),
+                sum(f.count(x) for x in dist) + sum(f.count(x) for x in other))
+    scored = [(_score(sp), k) for k, sp in enumerate(spans)]
+    if not any(sc[0] or sc[1] for sc, k in scored if k > 0):
+        return t[:limit]
+    picked: Dict[int, Tuple[int, int]] = {}
+
+    def _length(sel: Dict[int, Tuple[int, int]]) -> int:
+        total, prev, prev_full = 0, None, True
+        for k in sorted(sel):
+            a, b = sel[k]
+            if prev is not None and (k != prev + 1 or not prev_full or a != spans[k][0]):
+                total += len(_WINDOW_GAP)
+            total += b - a
+            prev, prev_full = k, b == spans[k][1]
+        return total
+    lead_end = spans[0][1] if spans[0][1] <= limit else _cut_at_space(t, 0, limit, limit // 2)
+    picked[0] = (0, lead_end)
+    if lead_end < spans[0][1]:
+        return t[:lead_end]
+    ranked = [k for sc, k in sorted(scored, key=lambda p: (-p[0][0], -p[0][1], -p[0][2], p[1]))
+              if k not in picked and (sc[0] or sc[1])]
+
+    def _room_for(k: int) -> int:
+        trial = dict(picked)
+        trial[k] = (spans[k][0] + 1, spans[k][0] + 1)       # an empty, cut span: gaps on both sides
+        return limit - _length(trial)
+
+    for k in ranked + [k for k in range(1, len(spans)) if k not in ranked]:
+        trial = dict(picked)
+        trial[k] = spans[k]
+        if _length(trial) <= limit:
+            picked = trial
+            continue
+        room = _room_for(k)
+        if k in ranked and room >= 200:
+            # the part of this scored window around its first term, cut to the room left
+            a0, b0 = spans[k]
+            hit = a0 + _folded_find(t[a0:b0], dist + other)
+            a = max(a0, min(hit - room // 3, b0 - room))
+            a = (t.find(" ", a, hit) + 1 or a) if a > a0 else a0
+            picked[k] = (a, _cut_at_space(t, a, min(b0, a + room), a + max(1, room - 80)))
+    # what is left of the budget: the head of the unpicked window nearest the lead
+    for k in range(1, len(spans)):
+        if k in picked:
+            continue
+        room = _room_for(k)
+        if room > 20:
+            a = spans[k][0]
+            picked[k] = (a, _cut_at_space(t, a, a + room, a + max(1, room - 40)))
+        break
+    out, prev, prev_full = [], None, True
+    for k in sorted(picked):
+        a, b = picked[k]
+        if prev is not None and (k != prev + 1 or not prev_full or a != spans[k][0]):
+            out.append(_WINDOW_GAP)
+        out.append(t[a:b])
+        prev, prev_full = k, b == spans[k][1]
+    return "".join(out)[:limit]
+
+
+#: §4UN-deep M3 (r1): a number in an extracted fact — a well-formed GROUPED number ("1 234 567", "1,234",
+#: "1.234,5") is ONE token; otherwise digits with at most one decimal part
+_FACT_NUMBER_RE = re.compile(
+    r"(?<![\w.,])(?:\d{1,3}(?:[ ,.\u00a0\u202f']\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?![\w])")
+#: a date or a time written in digits: only its year is checked (the extractor rewrites "7 October 2024"
+#: as "2024-10-07")
+_FACT_DATE_RE = re.compile(r"\b\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}\b|\b\d{1,2}:\d{2}(?::\d{2})?\b")
+#: a number followed by a scale or a percent is the extractor's arithmetic on the page ("4.5 billion" →
+#: "4,500 million", "0.61" → "61%"): never tagged
+_SCALE_AFTER_RE = re.compile(
+    r"\s*(?:%|‰|per\s?cent|percent|percentage|[kKmMbB](?:n|illion)?\b|thousand|million|billion|trillion|"
+    r"lakh|crore|χιλ|εκατ|δισ|τρισ|τοις)", re.I)
+NOT_IN_PAGE_TAG = "[not in page text]"
+
+
+def _digits_forms(num: str) -> List[str]:
+    """The ways a page may write a number: as written, without group separators, with the other decimal
+    mark."""
+    n = re.sub(r"[\u00a0\u202f' ]", "", num).strip(".,")
+    out = {num.strip(".,"), n}
+    if re.fullmatch(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?", n):
+        out.add(n.replace(",", ""))
+    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+(?:,\d+)?", n):
+        out.add(n.replace(".", "").replace(",", "."))
+    if re.fullmatch(r"\d+[.,]\d+", n):
+        out.add(n.replace(",", ".")); out.add(n.replace(".", ","))
+    return [x for x in out if x]
+
+
+#: r2: a number of fewer digits is never tagged ("25" for "twenty-five", "12" for "δώδεκα")
+NOT_IN_PAGE_MIN_DIGITS = 3
+
+
+def mark_unsupported_numbers(facts: str, page_text: str, context: str = "") -> str:
+    """§4UN-deep M3: a line of the extractor's output ends with "[not in page text]" when it holds a number
+    the PAGE does not — the number came from the worker, not the source.
+
+    r1 — conservative by rule (a missed tag is acceptable, a false tag discredits a correct fact): a number
+    is "on the page" when its digits appear ANYWHERE in the page's digits-only string, or any written form
+    of it (as written, group separators dropped, the other decimal mark) appears in the original text. Never
+    tagged: a number followed by a scale word or a percent (the extractor's arithmetic), a one-digit number,
+    and a date or a time — of those only the year is checked.
+
+    r2: only a number of NOT_IN_PAGE_MIN_DIGITS (3) or more digits is ever tagged — a page writes small
+    numbers in words, in any language — and never one that ``context`` (the query, the question, the claim
+    being checked) holds: the extractor repeats those to say the page disagrees."""
+    page = str(page_text or "")
+    page_digits = re.sub(r"\D", "", page)
+    context_digits = re.sub(r"\D", "", str(context or ""))
+
+    def _on_page(num: str) -> bool:
+        d = re.sub(r"\D", "", num)
+        if len(d) < NOT_IN_PAGE_MIN_DIGITS or d in page_digits:
+            return True
+        if d in context_digits:
+            return True
+        return any(f in page for f in _digits_forms(num))
+    out = []
+    for line in str(facts or "").split("\n"):
+        nums: List[str] = []
+        for m in _FACT_DATE_RE.finditer(line):
+            nums += re.findall(r"(?<!\d)(?:1[5-9]|20)\d{2}(?!\d)", m.group(0))
+        rest = _FACT_DATE_RE.sub(lambda m: " " * len(m.group(0)), line)
+        for m in _FACT_NUMBER_RE.finditer(rest):
+            if _SCALE_AFTER_RE.match(rest, m.end()):
+                continue
+            nums.append(m.group(0))
+        if line.strip() and nums and NOT_IN_PAGE_TAG not in line and not all(_on_page(x) for x in nums):
+            line = line.rstrip() + " " + NOT_IN_PAGE_TAG
+        out.append(line)
+    return "\n".join(out)
 
 
 #: §4NK: the least time left for a recheck extraction to be worth starting
@@ -2195,7 +3878,9 @@ class RecheckResult:
 async def recheck_all_none(page_contents: list, urls: list, texts: dict, query: str,
                            llm_client, model_name: str, *, deadline: float, slot_wait: float,
                            per_call_s: float = 65.0, fanout: int = 3,
-                           label: str = "web summary recheck") -> "RecheckResult":
+                           label: str = "web summary recheck",
+                           prompt_fn: Optional[Callable[[str, str], str]] = None,
+                           finish_fn: Optional[Callable[[str, str], str]] = None) -> "RecheckResult":
     """§4NK: when EVERY loaded source's extraction said "nothing relevant",
     re-extract the largest page once with the identical request. Facts on the
     recheck mean the first answers were a worker fault (10-10 19:4x: 6 calls
@@ -2206,7 +3891,12 @@ async def recheck_all_none(page_contents: list, urls: list, texts: dict, query: 
     ``per_call_s`` and started only while its plan fits before ``deadline``;
     a source is replaced only by an answer with facts. ``unchecked`` counts
     the sources left with a possibly-faulty "nothing relevant" (r1 MAJOR: the
-    caller must say so, and must not cache the report)."""
+    caller must say so, and must not cache the report).
+
+    §4UN-deep: ``prompt_fn(query, text)`` is the caller's extractor prompt
+    (default `extract_prompt`), ``finish_fn(content, url)`` its post-processing
+    of an answer; a rebuilt block keeps the original block's `[PAGE]` line."""
+    _prompt = prompt_fn or extract_prompt
     seen, idx = set(), []
     for i, c in enumerate(page_contents):
         if (isinstance(c, str) and not source_block_failed(c) and "[EDGE EXTRACTED FACTS]" in c
@@ -2231,12 +3921,18 @@ async def recheck_all_none(page_contents: list, urls: list, texts: dict, query: 
         budget = max(1.0, min(float(per_call_s), deadline - time.monotonic() - 2.0))
         # r3: a hard bound — `total_budget` alone has overshot before (R5)
         r = await _wait_for(llm_client.chat_completion(
-            {"model": model_name, "messages": [{"role": "user", "content": extract_prompt(query, safe_text)}],
+            {"model": model_name, "messages": [{"role": "user", "content": _prompt(query, safe_text)}],
              "temperature": 0.0, "max_tokens": tokens},
             use_worker=True, off_main_only=True, timeout=budget, slot_wait=slot_wait,
             total_budget=budget, task_label=label), budget + 2.0)
-        content = neutralise_report_grammar((r["choices"][0]["message"].get("content") or "").strip())
-        return f"### SOURCE: {urls[i]}\n[EDGE EXTRACTED FACTS]:\n{content}\n"
+        content = (r["choices"][0]["message"].get("content") or "").strip()
+        if finish_fn is not None:
+            content = await asyncio.to_thread(finish_fn, content, urls[i])      # r1: off the event loop
+        content = neutralise_report_grammar(content)
+        _orig = str(page_contents[i])
+        _meta = block_body(_orig) != (_orig.split("\n", 1) + [""])[1]
+        _meta_line = (_orig.split("\n", 2)[1] + "\n") if _meta else ""
+        return f"### SOURCE: {urls[i]}\n{_meta_line}[EDGE EXTRACTED FACTS]:\n{content}\n"
 
     # r3: the largest page whose plan fits — not all-or-nothing on the largest
     fits = [i for i in idx if deadline - time.monotonic() >= _needs(i)]
@@ -2328,7 +4024,88 @@ def record_loaded_sources(workspace_model, urls, page_contents, failed, *, sourc
     return n
 
 
+#: §4UN-deep: the line that lists the sources that loaded and held nothing for the query (one line, not one
+#: block each: eight "NONE" blocks read as eight sources consulted)
+NOTHING_RELEVANT_HEAD = "Loaded, nothing relevant"
+#: §4UN-deep: the closing guidance. It STARTS with the old trailer ("…Analyze the text above."), which is
+#: where `factcheck_sources` cuts the report (`_FC_REPORT_TRAILER`).
+RESEARCH_REPORT_TRAILER = (
+    "\n\nSYSTEM INSTRUCTION: Analyze the text above. Use only what the SOURCE blocks say, and name the "
+    "SOURCE URL each claim comes from. For anything current (a version, a price, a holder of an office, a "
+    "count) prefer the newest dated source and give its date; an undated page may be old. Where sources "
+    "disagree, say so and name both. A line tagged [not in page text] holds a number the page does not — "
+    "do not rely on it. Add nothing the blocks do not say; what they do not cover, say was not found.")
+
+
+def research_report_body(blocks, has_llm: bool) -> str:
+    """§4UN-deep M4: the report's source section — every block that failed or holds facts (or raw page
+    text) as it is, and the sources that LOADED but held nothing relevant on ONE line above them
+    (`Loaded, nothing relevant (N): <url> <url> …`), which `link_grounding` still counts as pages read."""
+    shown, empty = [], []
+    for c in blocks:
+        if (has_llm and not source_block_failed(c) and "[EDGE EXTRACTED FACTS]" in c
+                and not distilled_block_has_facts(c)):
+            m = re.match(r"###[ \t]*SOURCE:[ \t]*(\S+)", c)
+            if m:
+                if m.group(1) not in empty:
+                    empty.append(m.group(1))
+                continue
+        shown.append(c)
+    head = (f"{NOTHING_RELEVANT_HEAD} ({len(empty)}): {' '.join(empty)}\n\n" if empty else "")
+    return head + "\n\n".join(shown)
+
+
+def nothing_relevant_urls(report: str) -> List[str]:
+    """The URLs of a research report's `Loaded, nothing relevant` line (before its first source block)."""
+    head = re.split(r"(?m)^###[ \t]*SOURCE:", str(report or ""), maxsplit=1)[0]
+    m = re.search(r"(?m)^" + re.escape(NOTHING_RELEVANT_HEAD) + r" \(\d+\): (.*)$", head)
+    return [u for u in (m.group(1).split() if m else []) if re.match(r"https?://", u)]
+
+
 from ..utils.helpers import FetchError as _FetchError  # noqa: E402  (§4PD: typed fetch failures)
+
+
+def _keeps_meaning(query: str, form: str) -> bool:
+    """Every number (years aside: `query_numbers`) and every negation word of ``query`` is in ``form``."""
+    f_nums = set(query_numbers(form))
+    if any(n not in f_nums for n in query_numbers(query)):
+        return False
+    f_words = {_meaning_fold(w.strip(_TRAIL_PUNCT)) for w in str(form or "").split()}
+    return all(_meaning_fold(w.strip(_TRAIL_PUNCT)) in f_words
+               for w in str(query or "").split() if is_negation_word(w.strip(_TRAIL_PUNCT)))
+
+
+def _keyword_trim(query: str, n: int = 6) -> str:
+    """r1: at most ``n`` words of ``query`` in its order — its numbers, negations and distinctive words
+    first, then the other words from the start ("" when it has no more than ``n``)."""
+    words = [w for w in str(query or "").split() if w.strip(_TRAIL_PUNCT)]
+    if len(words) <= n:
+        return ""
+    dist = set(distinctive_tokens(query))
+    must = [i for i, w in enumerate(words)
+            if re.search(r"\d", w) or is_negation_word(w.strip(_TRAIL_PUNCT))
+            or _rel_fold(w.strip(_TRAIL_PUNCT)) in dist]
+    keep = list(dict.fromkeys(must))[:n]
+    for i, w in enumerate(words):
+        if len(keep) >= n:
+            break
+        if i not in keep and _rel_fold(w.strip(_TRAIL_PUNCT)) not in _REL_STOPWORDS:
+            keep.append(i)
+    return " ".join(words[i] for i in sorted(keep))
+
+
+def research_fallback_queries(query: str, limit: int = 2) -> List[str]:
+    """§4UN-deep: deep_research's retry queries when both search waves found nothing — the meaning-keeping
+    form (`reformulate_keeping_meaning`) first, then `_reformulate_query`'s forms that keep every number
+    and negation of the query (never "Python release date" for "Python 3.13 release date")."""
+    q = str(query or "").strip()
+    out: List[str] = []
+    _kept = list(reformulate_keeping_meaning(q))
+    for f in _kept + [_keyword_trim(_kept[0] if _kept else q)] + list(_reformulate_query(q)):
+        f = str(f or "").strip()
+        if f and f != q and f not in out and _keeps_meaning(q, f):
+            out.append(f)
+    return out[:max(1, int(limit))]
 
 
 async def tool_deep_research(query: Optional[str] = None, *args, **kwargs):
@@ -2336,17 +4113,33 @@ async def tool_deep_research(query: Optional[str] = None, *args, **kwargs):
     now dropped first (§4PU; `fact_check` reaches it through here)."""
     _stale = []
     if query:
+        # r3: the number check reads the query AS ASKED — a claim's year the stale rule drops here is the
+        # extractor's to repeat, never "not in page text"
+        kwargs.setdefault("number_context", str(query))
         query, _stale = _drop_stale_year_logged(query, "deep_research")
-    out = await _deep_research_core(query, *args, **kwargs)
+    _otok = _ONION_SEARCH.set({})                         # §4UN-onion: one onion-only wait per research
+    try:
+        out = await _deep_research_core(query, *args, **kwargs)
+    finally:
+        _ONION_SEARCH.reset(_otok)
     if _stale and isinstance(out, str):
         from .outcome import append_note
         out = append_note(out, "\n\n" + stale_year_note(_stale))
     return out
 
 
-async def _deep_research_core(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, workspace_model=None, source_titles: Optional[dict] = None, **kwargs):
+async def _deep_research_core(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, workspace_model=None, source_titles: Optional[dict] = None, question: Optional[str] = None, deadline_s: Optional[float] = None, number_context: Optional[str] = None, **kwargs):
+    """§4UN-deep: ``question`` — the question behind the search words (fact_check's claim, or the model's
+    own wording). It never reaches a search engine: it picks the parts of each page the extractor reads
+    and tells the extractor what is asked. ``deadline_s`` — the whole call's own bound in seconds: the
+    sources still running then are reported as not reached, and the report keeps every finished one
+    (fact_check used to cut the research from outside and lose all of them)."""
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
+    _call_t0 = time.monotonic()
+    question = " ".join(str(question or "").split())[:2000]
+    # r3: before the anonymous rewrite and the stale-year drop (see `tool_deep_research`)
+    _number_context = f"{number_context or ''} {query} {question}"
     # Stylometric egress scrubbing (stronger tier): deep-research is
     # already LLM-heavy and latency-tolerant, so under anonymous mode the
     # query is re-authored into a neutral keyword form by the local model
@@ -2397,18 +4190,26 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
             # source vanished and the model was told nothing. Same class
             # this file already fixes at :267, :599 and :916.
             urls = [(r.get('href') or r.get('url') or '')
-                    for r in select_research_sources(valid_results)]
+                    for r in select_research_sources(valid_results, query=query, question=question or "")]
             urls = [u for u in urls if u]
             _reserve_urls = [u for u in ((r.get('href') or r.get('url') or '')
-                                         for r in research_reserves(valid_results)) if u]
+                                         for r in research_reserves(valid_results, query=query, question=question or "")) if u]
             break
         if wave == 0:
             await asyncio.sleep(1)
     else:
-        # §4PD: both waves lost — try the reformulations web_search has, and
-        # SAY which query ran; the model used to get a bare CRITICAL and then
-        # run five or six web_searches itself
-        _refs = _reformulate_query(query); valid_results = []; _used_query = ""
+        # §4PD: both waves lost — try a reformulation, and SAY which query ran;
+        # the model used to get a bare CRITICAL and then run five or six
+        # web_searches itself. §4UN-deep: the form that keeps the query's
+        # MEANING first (`reformulate_keeping_meaning`), then the older forms
+        # only when they keep every number and negation of the query
+        # (`research_fallback_queries`): "Python 3.13 release date" broadened
+        # to "Python release date" read the OTHER versions' pages and handed
+        # them to fact_check as evidence. A dropped year is kept as a form
+        # (a name + year query is the usual no-hit, and the stale-year rule
+        # owns years).
+        _refs = research_fallback_queries(query)
+        valid_results = []; _used_query = ""
         for _ri, _rq in enumerate(_refs):
             pretty_log("Search Retry", f"deep_research: reformulated ‹{truncate_query(_rq)}›", icon=Icons.TOOL_SEARCH)
             valid_results = await _race_search_wave(_rq, tor_proxy, 10 + _ri, max_results=15)
@@ -2418,12 +4219,17 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         if not valid_results:
             return ("CRITICAL ERROR: Deep Research search phase failed — no engine answered the query "
                     "or its reformulations (transport or index). Try web_search with 2-4 plain keywords.")
-        urls = [u for u in ((r.get('href') or r.get('url') or '') for r in select_research_sources(valid_results)) if u]
+        urls = [u for u in ((r.get('href') or r.get('url') or '') for r in select_research_sources(valid_results, query=query, question=question or "")) if u]
         _reserve_urls = [u for u in ((r.get('href') or r.get('url') or '')
-                                     for r in research_reserves(valid_results)) if u]
+                                     for r in research_reserves(valid_results, query=query, question=question or "")) if u]
         _search_note = f"[Reformulated query: '{_used_query}' — the original found nothing]\n"
 
     if not urls: return "ERROR: No search results found. The internet might be blocking your request. Try a different query."
+    _result_titles: Dict[str, str] = {}               # §4UN-deep M2: the [PAGE] line's title when the page has none
+    for _r in valid_results:
+        _u, _t = (_r.get('href') or _r.get('url') or ''), _r.get('title')
+        if _u and isinstance(_t, str) and _t.strip():
+            _result_titles.setdefault(_u, _t)
     if isinstance(source_titles, dict):
         # §4TB: `fact_check` names the sources its verdict rested on; the report
         # carries URLs only, so the search results' titles are handed out here
@@ -2444,6 +4250,10 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
     _report_share_chars = max(
         _MIN_DISTILL_CHARS,
         int(int(max_context) * CHARS_PER_TOKEN * 0.4) // max(1, len(urls)))
+    # §4UN-deep m13: raw page text goes to the MAIN model unfiltered, so it is
+    # bounded by the source's share of the report too, not only by 10k
+    _raw_chars = max(1, min(_RAW_FALLBACK_CHARS, _report_share_chars))
+    _focus = focus_terms(query, question or "")          # §4UN-deep M1
 
     # Page-fetch concurrency. Raised 2→3 (2026-07-08): with a distinct Tor
     # circuit per URL (below) the fetches no longer share one exit, so more
@@ -2467,8 +4277,18 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
     # budget tests) can move it without editing this function.
     PER_URL_TIMEOUT = _PER_URL_TIMEOUT_S
     _phase_deadline = time.monotonic() + _RESEARCH_PHASE_TIMEOUT_S
+    try:
+        _ds = float(deadline_s) if deadline_s is not None else None
+    except (TypeError, ValueError):
+        _ds = None
+    if _ds is not None and _ds == _ds and _ds > 0:
+        # §4UN-deep m12: the caller's bound, less the time the report takes to put together
+        _phase_deadline = min(_phase_deadline, _call_t0 + _ds - RESEARCH_ASSEMBLY_S)
 
     _page_texts: dict = {}     # url -> (text sent to the extractor, max_tokens) — §4NK recheck
+    _page_meta: dict = {}      # url -> what the page says about itself (§4UN-deep M2)
+    _full_texts: dict = {}     # url -> the whole page text, for the number check (§4UN-deep M3)
+    _fetch_kw = _fetch_extra_kwargs(helper_fetch_url_content)
 
     async def _fetch_with_timeout(url):
         # Resilient per-URL fetch: each URL rides its OWN Tor circuit, and a
@@ -2495,7 +4315,7 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
             try:
                 res = await _cancel_safe_wait_for(      # §4TB: was asyncio.wait_for (drops a cancel on 3.10)
                     helper_fetch_url_content(url, proxy_override=proxy,
-                                             renew_identity=False),
+                                             renew_identity=False, **_fetch_kw),
                     # Outer budget ABOVE the client's own 20s timeout so the
                     # client returns its (cleaner) error first — previously
                     # 15s < 20s guillotined slow-but-live Tor fetches.
@@ -2511,7 +4331,21 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
                 # §4PD: a failure is the fetcher's TYPE (`FetchError`), never the
                 # page's first word — "Error handling in Python" is a page
                 if isinstance(res, str) and not isinstance(res, _FetchError):
-                    return res
+                    _thin = len(res.strip())
+                    if _thin < RESEARCH_THIN_PAGE_CHARS:
+                        # §4UN-deep m8: a script-only shell, a consent wall or a
+                        # stub is not the document — a failed fetch, so the slot
+                        # is backfilled (it was distilled to "nothing relevant").
+                        # r1: one fresh circuit first (consent walls vary by exit)
+                        last = (f"Error: page too thin to be the document ({_thin} chars of text — a "
+                                f"script-only, consent or stub page) at {url}")
+                        if attempt + 1 < _FETCH_ATTEMPTS:
+                            await asyncio.sleep(0.5)
+                        continue
+                    _m = getattr(res, "meta", None)
+                    if isinstance(_m, dict):
+                        _page_meta[url] = _m
+                    return str(res)
                 last = res if isinstance(res, str) else str(res)
                 if not _fetch_error_is_retryable(last):
                     break
@@ -2528,6 +4362,24 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
                 and not last.lstrip().startswith("Error:"):
             last = "Error: " + last.lstrip()
         return _FetchError(last)                           # §4PD: a failure is a TYPE downstream
+
+    def _extract_prompt(q, safe_text):
+        return extract_prompt(q, safe_text, question or "")
+
+    def _finish_extract(content, url):
+        """§4UN-deep: an onion address the page does not hold is dropped (the
+        worker writes them from memory); a number the page does not hold is
+        tagged on its line. Never costs the answer."""
+        try:
+            from .darkweb_search import keep_page_onions
+            content = keep_page_onions(content, _full_texts.get(url, ""))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            content = mark_unsupported_numbers(content, _full_texts.get(url, ""), context=_number_context)
+        except Exception:  # noqa: BLE001
+            pass
+        return content
 
     async def process_url(url, budget_s):
         # ⚠ THE DISTILL BUDGET IS WHAT THE CLOCK LEAVES, NOT A CONSTANT.
@@ -2570,14 +4422,18 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
             pretty_log("Research Source Failed", f"{short_url} — {text[:90]}",
                        level="INFO", icon=Icons.SKIP)
             return f"### SOURCE: {url}\n{text}\n"
+        _full_texts[url] = text
+        _head = f"### SOURCE: {url}\n{page_meta_line(_result_titles.get(url, ''), _page_meta.get(url))}\n"
 
         # ⚠ CLEAN THE RAW-TEXT FALLBACK TOO. Unscrubbed surrogates / control
         # chars in a fetched page can crash the downstream C++ JSON/grammar
         # parser — the exact thing `_clean_for_cpp` exists to prevent — and
         # this path used raw `text`. Built once here because BOTH degradation
         # routes below (declined plan, failed call) return it.
-        raw_preview = (_clean_for_cpp(text[:_RAW_FALLBACK_CHARS])
-                       + "\n[...truncated...]\n")
+        # §4UN-deep M1/m13: the windows that carry the query, within the source's share of the report
+        # (in a thread: a page can be megabytes, and every window is folded and scored)
+        raw_preview = (_clean_for_cpp(await asyncio.to_thread(focus_page_text, text, _focus, _raw_chars))
+                       + ("\n[...truncated...]\n" if len(text) > _raw_chars else "\n"))
         raw_preview = neutralise_report_grammar(raw_preview)        # §4PD: page text is content (every return site)
 
         # ⚠ SIZE THE REQUEST TO WHAT THE NODE CAN FINISH — not to a constant,
@@ -2639,7 +4495,7 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         if not _feasible:
             if plan is not None:
                 log_distill_plan(short_url, plan)
-            return f"### SOURCE: {url}\n{raw_preview}\n"
+            return f"{_head}{raw_preview}\n"
 
         # ⚠ CONSUMING THE PLAN MUST NOT BE ABLE TO LOSE THE URL EITHER.
         # `text[:plan.char_limit]` and the `max_tokens` field are the two
@@ -2658,15 +4514,16 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
                        f"{short_url}: unusable distill plan "
                        f"({type(_bad_plan).__name__}) — falling back to raw "
                        f"page text", level="WARNING", icon=Icons.WARN)
-            return f"### SOURCE: {url}\n{raw_preview}\n"
+            return f"{_head}{raw_preview}\n"
 
         # Sanitize text to remove surrogate unicode characters and raw control
         # characters that crash C++ JSON parsers.
-        safe_text = _clean_for_cpp(text[:_chars])
+        # §4UN-deep M1: the windows of the page that carry the query, not its first N chars
+        safe_text = _clean_for_cpp(await asyncio.to_thread(focus_page_text, text, _focus, _chars))
         _page_texts[url] = (safe_text, _tokens, getattr(plan, "predicted_s", 0.0))   # §4NK recheck
         payload = {
             "model": model_name,
-            "messages": [{"role": "user", "content": extract_prompt(query, safe_text)}],
+            "messages": [{"role": "user", "content": _extract_prompt(query, safe_text)}],
             "temperature": 0.0,
             "max_tokens": _tokens
         }
@@ -2720,8 +4577,18 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
                 llm_client.note_distill_density(len(safe_text), summary_data)
             except Exception:                                   # noqa: BLE001
                 pass
-            preview = "[EDGE EXTRACTED FACTS]:\n" + neutralise_report_grammar(
-                (summary_data["choices"][0]["message"].get("content") or "").strip())
+            _choice = summary_data["choices"][0]
+            _said = (_choice["message"].get("content") or "").strip()
+            if not _said:
+                # r1: an EMPTY answer (cut at the output limit, or none at all) is a worker
+                # fault, not "nothing relevant" — the source degrades to its raw text
+                raise ValueError(f"empty extract (finish_reason={_choice.get('finish_reason')!r})")
+            preview = "[EDGE EXTRACTED FACTS]:\n" + neutralise_report_grammar(await asyncio.to_thread(
+                _finish_extract, _said, url))
+            if str(_choice.get("finish_reason") or "") == "length":
+                # §4UN-deep m11: the worker hit its output limit mid-answer
+                preview += ("\n[extract cut: the extractor reached its output limit — later facts on "
+                            "this page may be missing]")
         except Exception as _sum_exc:
             # ⚠ SAY SO. This was a bare `except Exception:` with no
             # log at all, so every degradation here was invisible:
@@ -2756,7 +4623,7 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
                 pretty_log("Summary Degraded",
                            f"{short_url}: falling back to raw page text",
                            level="WARNING", icon=Icons.WARN)
-        return f"### SOURCE: {url}\n{preview}\n"
+        return f"{_head}{preview}\n"
 
     async def _bounded(url):
         # ⚠ THE PER-URL CLOCK STARTS WHEN THE URL STARTS, NOT AT `gather`.
@@ -2830,7 +4697,8 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         _recheck = await recheck_all_none(
             page_contents, urls, _page_texts, query, llm_client, model_name,
             deadline=_phase_deadline, slot_wait=_QUEUE_ALLOWANCE_S,
-            per_call_s=_WEB_SUMMARY_TIMEOUT_S, fanout=_DISTILL_FANOUT)
+            per_call_s=_WEB_SUMMARY_TIMEOUT_S, fanout=_DISTILL_FANOUT,
+            prompt_fn=_extract_prompt, finish_fn=_finish_extract)
         page_contents = _recheck.contents
         _recheck_line = recheck_note(_recheck)
     valid_contents = [c for c in page_contents if isinstance(c, str)]
@@ -2877,7 +4745,7 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
             f"{NO_FACTS_BANNER_HEAD} none of the {len(_loaded)} sources that loaded had facts "
             f"relevant to the query. Do not present an answer as researched: try a narrower or "
             f"differently worded query, open a specific page, or say what could not be found.]\n\n")
-    full_report = _banner + _recheck_line + "\n\n".join(valid_contents)
+    full_report = _banner + _recheck_line + research_report_body(valid_contents, bool(llm_client))
     # Workspace research dedup: record every URL we pulled so a later
     # research turn can ask "did I already see this?" via the workspace
     # tool. Non-fatal — must never break a successful research turn.
@@ -2910,8 +4778,7 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
     # inside the text already tells the model, and the reason_code below
     # keeps it visible to telemetry without lying to the strike ledger.
     from .outcome import ToolOutcome
-    _text = (f"--- DEEP RESEARCH RESULT ---\n{_search_note}{full_report}\n\n"
-             f"SYSTEM INSTRUCTION: Analyze the text above.")
+    _text = f"--- DEEP RESEARCH RESULT ---\n{_search_note}{full_report}{RESEARCH_REPORT_TRAILER}"
     _n_ok = len(valid_contents) - len(_failed)
     if urls and _n_ok == 0:
         return ToolOutcome.failed(_text, world_changed=False,
@@ -2953,6 +4820,176 @@ _FACTCHECK_TOTAL_S = _env_seconds("GHOST_FACTCHECK_TOTAL_S", 0.0)
 
 #: §4TB: the sources a verdict rested on, listed under it (bounded)
 FACTCHECK_MAX_SOURCES = 8
+
+#: §4UN-web: the engines get the claim's KEYWORDS (a whole sentence was the
+#: query — "every extra word lowers the chance a result matches"), the
+#: research its full text when the callable takes a ``question``.
+FACTCHECK_KEYWORDS_MAX = 8
+#: §4UN-web: a second, concurrent search for the claim's REFUTATION — the
+#: research read only what agreed with the claim's wording. Its snippets go to
+#: the verifier as leads, labelled; a counter-search that is not back when the
+#: research is gets this much longer, then is dropped.
+FACTCHECK_COUNTER_TERMS = "false debunked"
+FACTCHECK_COUNTER_MAX = 5
+FACTCHECK_COUNTER_WAIT_S = 8.0
+
+
+#: words about the CLAIM, not in it ("is it true that …")
+_CLAIM_FILLER = frozenset({"true", "false", "claim", "claims", "fact", "really", "correct", "whether",
+                           "verify", "check", "has", "have", "had", "been", "being", "αληθεια", "αληθευει", "ισχυει", "ισχυρισμοσ"})
+
+
+#: r3: a Greek comparative ("ψηλότερος", "μεγαλύτερη") is the comparison itself
+_GREEK_COMPARATIVE_RE = re.compile(r"τερ(?:οσ|ος|η|ο|οι|εσ|ες|α|ου|ων|ουσ|ους)$")
+#: r3: negations whose pair (negation + the word it negates) rides outside the cap
+FACTCHECK_FREE_NEGATIONS = 2
+
+
+def claim_search_keywords(claim: str, limit: int = FACTCHECK_KEYWORDS_MAX) -> str:
+    """The claim as engine keywords: function and question words go; past
+    ``limit`` CONTENT words the capitalised and numeric ones are kept first,
+    in the claim's order.
+
+    Negations (r1–r3): the first ``FACTCHECK_FREE_NEGATIONS`` negations and the
+    word each negates are kept outside the cap ("do not cause" is not
+    "cause"); a further negation and its word are ONE unit inside the cap,
+    ranked after the plain content words, kept or cut together (r3: uncapped,
+    six negations pushed out "Elena", "2019" and "elections"). Comparisons
+    (r2/r3): a comparison word (than, more, under, before, …) goes with the
+    word it compares — the one before "than", otherwise the next — and is
+    dropped when that word is cut; with no negation in the claim, that word
+    (and a Greek comparative) ranks like a name."""
+    items: List[List[Any]] = []                           # [pos, core, kind, rank]
+    for i, w in enumerate(str(claim or "").split()):
+        core = w.lstrip(_LEAD_PUNCT).rstrip(_TRAIL_PUNCT)
+        if not core:
+            continue
+        if is_negation_word(core):
+            items.append([i, core, "neg", 0])
+            continue
+        if is_meaning_word(core):
+            items.append([i, core, "cmp", None])
+            continue
+        fold = _rel_fold(core)
+        has_digit = bool(re.search(r"\d", core))
+        if not has_digit and (fold in _REL_STOPWORDS or fold in _QUESTION_WORDS or fold in _CLAIM_FILLER
+                              or len(fold) < 2):
+            continue
+        rank = 0 if (has_digit or (core[:1].isupper() and i > 0)) else (1 if core[:1].isupper() else 2)
+        items.append([i, core, "content", rank])
+    content_idx = [k for k, it in enumerate(items) if it[2] == "content"]
+    neg_idx = [k for k, it in enumerate(items) if it[2] == "neg"]
+
+    def _next_content(k: int) -> Optional[int]:
+        return next((c for c in content_idx if c > k), None)
+
+    def _partner(k: int) -> Optional[int]:
+        prev = next((c for c in reversed(content_idx) if c < k), None)
+        nxt = _next_content(k)
+        if _meaning_fold(items[k][1]) in _COMPARE_BACK_WORDS:
+            return prev if prev is not None else nxt
+        return nxt if nxt is not None else prev
+
+    if not neg_idx:                                       # r3: what is compared ranks like a name
+        for k, it in enumerate(items):
+            if it[2] == "cmp" and _partner(k) is not None:
+                items[_partner(k)][3] = 0
+            elif it[2] == "content" and _GREEK_COMPARATIVE_RE.search(_rel_fold(it[1]).replace("ς", "σ")):
+                it[3] = 0
+    free: set = set()                                     # kept, uncounted
+    units: List[Tuple[int, int, List[int]]] = []          # (rank, pos, members) inside the cap
+    claimed: set = set()
+    for n, k in enumerate(neg_idx):
+        tgt = _next_content(k)
+        tgt = tgt if tgt is not None and tgt not in claimed else None
+        if tgt is not None:
+            claimed.add(tgt)
+        members = [k] + ([tgt] if tgt is not None else [])
+        if n < FACTCHECK_FREE_NEGATIONS:
+            free.update(members)
+        else:
+            units.append((3, items[k][0], members))
+    units += [(items[c][3], items[c][0], [c]) for c in content_idx if c not in claimed]
+    kept = set(free)
+    slots = limit
+    for _rank, _pos, members in sorted(units, key=lambda u: (u[0], u[1])):
+        cost = sum(1 for m in members if items[m][2] == "content") + (1 if items[members[0]][2] == "neg" else 0)
+        if cost <= slots:
+            kept.update(members)
+            slots -= cost
+    out = []
+    for k, it in enumerate(items):
+        if k in kept or (it[2] == "cmp" and _partner(k) in kept):
+            out.append(it[1])
+    return " ".join(out)
+
+
+def _factcheck_proxy(kwargs: Dict) -> Tuple[Optional[str], bool]:
+    """(the request's Tor proxy, anonymous) — from the call, else the request
+    scope's context. (None, …) when neither names one: no search is sent."""
+    proxy = kwargs.get("tor_proxy")
+    anonymous = bool(kwargs.get("anonymous", False))
+    try:
+        from ..core.request_scope import current_scope
+        sc = current_scope()
+        ctx = getattr(sc, "context", None) if sc else None
+        if ctx is not None:
+            proxy = proxy or getattr(ctx, "tor_proxy", None)
+            anonymous = anonymous or bool(getattr(getattr(ctx, "args", None), "anonymous", False))
+    except Exception:  # noqa: BLE001
+        pass
+    return (proxy if isinstance(proxy, str) and proxy else None), anonymous
+
+
+async def factcheck_counter_search(keywords: str, proxy: Optional[str], anonymous: bool = False) -> List[Dict]:
+    """One race wave for "<keywords> false debunked", on topic for the
+    claim's keywords, at most ``FACTCHECK_COUNTER_MAX`` rows. [] on any failure."""
+    if not keywords or not proxy:
+        return []
+    try:
+        from ..utils.egress_guard import resolve_egress_proxy as _rep
+        proxy = _rep(proxy)
+        if proxy and "socks5://" in proxy and "socks5h://" not in proxy:
+            proxy = proxy.replace("socks5://", "socks5h://")
+        q = f"{keywords} {FACTCHECK_COUNTER_TERMS}"
+        if anonymous:
+            try:
+                from ..utils.stylometry import scrub_query
+                q = scrub_query(q) or q
+            except Exception:  # noqa: BLE001
+                pass
+        rows = await _race_search_wave(q, proxy, 0, max_results=10)
+        kept, _low = prune_off_topic(keywords, list(rows or []))
+        return kept[:FACTCHECK_COUNTER_MAX]
+    except Exception as exc:  # noqa: BLE001
+        pretty_log("Fact Check", f"counter-search failed: {str(exc)[:80]}", level="INFO", icon=Icons.SKIP)
+        return []
+
+
+def factcheck_counter_section(keywords: str, rows: List[Dict]) -> str:
+    """The counter-search rows as the verifier reads them — one line each,
+    outside text neutralised, labelled as snippets (not pages read)."""
+    if not rows:
+        return ""
+    lines = []
+    for r in rows[:FACTCHECK_COUNTER_MAX]:
+        title = " ".join(_clean_for_cpp(str(r.get("title") or "")).split())[:120]
+        body = " ".join(_clean_for_cpp(str(r.get("body") or "")).split())[:300]
+        href = str(r.get("href") or r.get("url") or "")[:200]
+        lines.append(neutralise_report_grammar(f"- {title} — {body} ({href})"))
+    # r1 MAJOR: "<claim> false debunked" finds debunkings of the claim AND of its
+    # opposite — the verifier is told so, and to judge each row on the exact wording
+    return (f"[COUNTER-SEARCH — search snippets for '{keywords} {FACTCHECK_COUNTER_TERMS}', not pages "
+            f"read; each may refute the claim OR debunk its opposite — judge each against the claim's "
+            f"exact wording (a negation changes which); leads, weaker than the research]:\n" + "\n".join(lines))
+
+
+def factcheck_today_line() -> str:
+    """§4UN-web: the verifier did not know the date — "X is the current CEO"
+    was judged by whichever source it read first."""
+    import datetime as _dt
+    return (f"Today is {_dt.date.today().isoformat()}. For a claim about the present (is, current, "
+            "now, latest), prefer the most recent dated evidence and say when the sources are older.")
 FACTCHECK_EVIDENCE_CHARS = 300
 FACTCHECK_TITLE_CHARS = 120
 FACTCHECK_URL_CHARS = 300
@@ -2961,7 +4998,9 @@ FACTCHECK_SOURCES_HEAD = "SOURCES the verdict rested on"
 #: (\s*: with or without a gap — a head written with a zero-width character
 #: for its space reads "FACTCHECK COMPLETE" once that character is removed)
 _FC_RESULT_HEAD_RE = re.compile(r"FACT\s*CHECK\s*(?:COMPLETE|FAILED|PARTIAL)|SOURCES\s*the\s*verdict", re.IGNORECASE)
-_FC_REPORT_TRAILER = "\n\nSYSTEM INSTRUCTION: Analyze the text above."
+_FC_REPORT_TRAILER = "\n\nSYSTEM INSTRUCTION: Analyze the text above."   # the head of RESEARCH_REPORT_TRAILER
+#: §4UN-deep m12: how long before fact_check's own research bound the research is asked to stop
+FACTCHECK_RESEARCH_MARGIN_S = 4.0
 _FC_LEADING_MARK_RE = re.compile(r"\A\s*\[EDGE EXTRACTED FACTS\]\s*:?\s*", re.IGNORECASE)
 
 
@@ -3055,7 +5094,7 @@ def factcheck_sources(report, titles: Optional[dict] = None) -> str:
         if url in seen:
             continue
         seen.add(url)
-        body = block.split("\n", 1)[1] if "\n" in block else ""
+        body = block_body(block)                              # §4UN-deep: after the [PAGE] line
         # the block's OWN leading marker goes; one inside the page text stays, for the neutraliser
         body = _FC_LEADING_MARK_RE.sub("", body, count=1)
         evidence = _fc_outside_line(body, FACTCHECK_EVIDENCE_CHARS)
@@ -3159,11 +5198,25 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
     # the search results' titles, for the sources section — only from a
     # research callable that says it hands them out (the registry's)
     _titles: dict = {}
+    # §4UN-web: keywords to the engines (the claim itself when the research
+    # cannot also take the question), and a concurrent counter-search
+    _keywords = claim_search_keywords(query_text)
+    _dr_kw: Dict[str, Any] = {}
+    if getattr(deep_research_callable, "accepts_source_titles", False) is True:
+        _dr_kw["source_titles"] = _titles
+    _research_query = query_text
+    if (getattr(deep_research_callable, "accepts_question", False) is True
+            and _keywords and _keywords != query_text):
+        _research_query, _dr_kw["question"] = _keywords, query_text
+    if getattr(deep_research_callable, "accepts_deadline", False) is True:
+        # §4UN-deep m12: the research stops ITSELF inside the bound and returns the
+        # sources it finished — cut from outside, it returned nothing at all
+        _dr_kw["deadline_s"] = max(1.0, min(_research_cap, _total) - FACTCHECK_RESEARCH_MARGIN_S)
+    _fc_proxy, _fc_anon = _factcheck_proxy(kwargs)
+    _counter_task = (asyncio.ensure_future(factcheck_counter_search(_keywords, _fc_proxy, _fc_anon))
+                     if _fc_proxy and _keywords else None)
     try:
-        if getattr(deep_research_callable, "accepts_source_titles", False) is True:
-            _research = deep_research_callable(query_text, source_titles=_titles)
-        else:
-            _research = deep_research_callable(query_text)
+        _research = deep_research_callable(_research_query, **_dr_kw)
         _research_task = asyncio.ensure_future(_research)
         # a research left behind at the bound (it did not stop when cancelled)
         # may still end with an error, which nobody awaits any more: read it,
@@ -3171,6 +5224,8 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
         _research_task.add_done_callback(lambda t: t.cancelled() or t.exception())
         _dr_raw = await _fc_wait_for(_research_task, max(0.05, min(_research_cap, _total)))
     except asyncio.TimeoutError:
+        if _counter_task is not None:
+            _counter_task.cancel()
         return ToolOutcome.failed(
             # (the text names the transient cause, like the no-source failure
             # below: §4GI r3 — a batch of these must not burn structural strikes)
@@ -3180,6 +5235,8 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
             f"web_search or deep_research directly.",
             world_changed=False, reason_code="factcheck_research_timeout")
     except Exception as exc:
+        if _counter_task is not None:
+            _counter_task.cancel()
         return (f"Error: fact_check research phase failed: {exc}. "
                 f"Try web_search or deep_research directly.")
     _dr = ToolOutcome.coerce(_dr_raw)
@@ -3189,6 +5246,8 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
     # to judge, and the judge used to "verify" a page of `Error:` lines and
     # book a second OK on top of the research call's.
     if _dr.status in (OutcomeStatus.FAILED, OutcomeStatus.REJECTED):
+        if _counter_task is not None:
+            _counter_task.cancel()
         return ToolOutcome.failed(
             f"FACT CHECK FAILED: no source could be fetched (timeout, block or "
             f"unreachable — a transient network failure), so the claim was "
@@ -3218,16 +5277,29 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
         dr_result = (dr_result[:evidence_cap]
                      + "\n…[evidence truncated to fit the verification context]")
 
+    _counter_rows: List[Dict] = []
+    if _counter_task is not None:
+        try:
+            _counter_rows = await _fc_wait_for(
+                _counter_task, max(0.05, min(FACTCHECK_COUNTER_WAIT_S, _deadline - time.monotonic() - _FACTCHECK_VERIFY_S)))
+        except Exception:  # noqa: BLE001 — a late or failed counter-search is dropped, never the check
+            _counter_task.cancel()
+            _counter_rows = []
+    _counter = factcheck_counter_section(_keywords, _counter_rows or [])
+    if _counter:
+        pretty_log("Fact Check", f"counter-search: {len(_counter_rows)} lead(s) for the verifier", icon=Icons.TOOL_DEEP)
     messages = [
         {"role": "system", "content": (
             "### ROLE: DEEP FORENSIC VERIFIER\n"
             "Judge the user's claim STRICTLY against the research evidence "
             "provided in the message. Open with a one-word verdict — TRUE, "
             "FALSE, PARTIALLY TRUE, or UNVERIFIABLE — then cite the key "
-            "evidence for it and note any disagreement between sources.")},
+            "evidence for it and note any disagreement between sources.\n"
+            + factcheck_today_line())},
         {"role": "user", "content": (
             f"CLAIM TO VERIFY:\n{query_text}\n\n[RESEARCH RESULTS]:\n{dr_result}\n\n"
-            f"Verify the claim precisely using these results.")},
+            + (f"{_counter}\n\n" if _counter else "")
+            + "Verify the claim precisely using these results.")},
     ]
     # §4TB: what the whole-call clock leaves. Under the default total this is
     # the verify call's own bound, unchanged; under a smaller total it is cut

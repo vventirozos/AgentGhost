@@ -17,6 +17,7 @@ And the circuit breaker could not see any of it: the 45s keepalive
 (`max_tokens=1`, "ok") closed the breaker 7s into a 60s cooldown while every
 real request was still failing.
 """
+from tests.onion_v3 import v3_label  # §4UN-dark: checksum-valid test addresses
 import asyncio
 import time
 import types
@@ -157,7 +158,7 @@ class TestARefusedPlanDegradesInsteadOfLosingTheURL:
     async def test_raw_fallback_is_capped_independently_of_the_plan(self):
         client = StubClient(_plan(feasible=False, reason="no budget"))
         out = await _run(client)
-        body = out.split("### SOURCE: https://a.com/1\n", 1)[1]
+        body = search_mod.block_body(out.split("### SOURCE: https://a.com/1", 1)[1])   # §4UN-deep: after [PAGE]
         raw = body.split("\n[...truncated...]", 1)[0]
         assert len(raw) <= search_mod._RAW_FALLBACK_CHARS
 
@@ -413,7 +414,7 @@ class TestTheQueueAllowance:
 # one, and the two modules have a documented history of drifting apart.
 from ghost_agent.tools import darkweb_search as dw_mod          # noqa: E402
 
-V3 = "a" * 56
+V3 = v3_label("a")
 
 
 def _onion_stub(html):
@@ -524,10 +525,12 @@ class TestTheFanOutIsDeclared:
         assert all(f == 3 for f in client.fanouts), client.fanouts
 
     @pytest.mark.asyncio
-    async def test_darkweb_declares_its_own_narrower_width(self):
+    async def test_darkweb_declares_its_own_fetch_width(self):
+        # §4UN-darkres: 4 onion pages at a time (was 2); the plans declare that width
         client = StubClient(_plan(chars=6_000, tokens=200))
         await _run_dw(client)
-        assert client.fanouts and all(f == 2 for f in client.fanouts), client.fanouts
+        assert client.fanouts and all(f == dw_mod._RESEARCH_FETCH_WIDTH == 4 for f in client.fanouts), \
+            client.fanouts
 
 
 class TestPlanDistillRaisesForBusyNodes:

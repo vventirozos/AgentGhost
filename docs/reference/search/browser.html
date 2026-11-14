@@ -142,6 +142,14 @@ MAIN_IMAGE_SOURCE: og:image — download it with file_system(operation="download
   <p>By default (<code>stop_on_error=false</code>) a failing sub-action is recorded and the sequence keeps going — so you get full visibility into which step is flaky. Pass <code>stop_on_error=true</code> to abort on first failure.</p>
   <p>The subprocess wall-clock budget for <code>interact</code> scales with action count (<code>timeout_ms × len(actions)</code>), so a 20-step flow doesn't hit the single-op default cap.</p>
 
+  <h2>Interstitials, downloads and the automation flag <span class="tag">2026-11-13 &sect;4UN-fetch</span></h2>
+  <ul>
+    <li>A page whose title is a self-passing interstitial (Cloudflare &ldquo;Just a moment&rdquo;, Anubis &ldquo;Making sure you're not a bot&rdquo;, DDoS-Guard, &ldquo;Checking your browser&rdquo;) gets up to 8&nbsp;s to move on before navigate/extract_text read it (<code>_await_challenge_pass</code> in the runner); the status reported is the page it moved to. The title is polled every 0.5&nbsp;s (a page that passes in 1&nbsp;s is read at 1&nbsp;s), and the wait is clipped to what is left of the op's own <code>timeout_ms</code> less 3&nbsp;s for reading the page (<code>_challenge_budget_s</code>), so it never pushes the op past its budget.</li>
+    <li>The challenge title list (<code>browser_routes._CHALLENGE_TITLE_RE</code>) also knows Anubis, the Google/YouTube EU consent wall (&ldquo;Before you continue&rdquo;, title only), Imperva/Incapsula (&ldquo;Request unsuccessful&rdquo;), &ldquo;One more step&rdquo;, &ldquo;Please wait while we verify&rdquo; and &ldquo;Pardon our interruption&rdquo;; the same list feeds <code>utils.content_check.challenge_reason</code>. A bare brand word (Cloudflare, CAPTCHA, Incapsula, DDoS-Guard) is a wall title only as the WHOLE title &mdash; &ldquo;Cloudflare outage takes down X&rdquo; is a story.</li>
+    <li>A navigation that is a download now gets the &ldquo;fetch it with file_system download&rdquo; advice for Playwright's newer wording (<code>Download is starting</code>) as well as <code>net::ERR_ABORTED</code>.</li>
+    <li>Chromium starts with <code>--disable-blink-features=AutomationControlled</code> (no <code>navigator.webdriver</code>). The user agent stays the browser's own: a hard-coded one would disagree with the real version.</li>
+  </ul>
+
   <h2>Session persistence</h2>
   <p>Cookies, <code>localStorage</code>, and auth tokens survive across tool calls via Chromium's <code>launch_persistent_context(user_data_dir=/workspace/.browser_profile)</code>. Each op opens → runs → closes cleanly; there is no long-lived subprocess to manage. Call <code>operation="close"</code> to wipe the profile (e.g. after logging out, or when switching user contexts).</p>
 
@@ -343,7 +351,7 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
     the URL rewritten to <code>/_ray/pow</code>. &sect;4HH keyed on 4xx statuses and a title list that lacked this wording, so the page
     read as a normal fetch five times in one turn; the model re-navigated, the no-progress breaker fired and forced the conclusion.
     The title pattern now includes <em>security check</em> (word-bounded &mdash; a "Security Checklist" article never matches),
-    <em>checking that you are not a robot</em>, <em>robot check</em>, <em>human verification</em>, <em>captcha</em>; the URL pattern
+    <em>checking that you are not a robot</em>, <em>robot check</em>, <em>human verification</em>, <em>captcha</em> (since &sect;4UN-fetch r1 only as the whole title); the URL pattern
     includes <code>/_ray/pow</code>. Corpus (September, 321 browser results): the new patterns hit exactly the five Hetzner results.
     Pinned in <code>tests/test_browser_blocked_page.py</code>.
   </p>

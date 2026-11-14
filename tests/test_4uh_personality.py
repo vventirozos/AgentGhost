@@ -1,8 +1,8 @@
-"""§4UH: the character moves from the agent's own days and from its own look at its replies; it has
-tastes; and it leans on how hard the events of a day land."""
+"""§4UH: the character moves from the agent's own days; it has tastes; and it leans on how hard the events
+of a day land. (Its daily look at its own replies, ``selfview``, is removed — §4UH-noself, 2026-11-14;
+`test_4uh_noself.py` pins that.)"""
 from __future__ import annotations
 
-import asyncio
 import datetime
 import json
 from pathlib import Path
@@ -13,9 +13,7 @@ import pytest
 from ghost_agent.core import agent as A
 from ghost_agent.selfhood import SelfModel
 from ghost_agent.selfhood import character as C
-from ghost_agent.selfhood import loop as LOOP
 from ghost_agent.selfhood import mood as M
-from ghost_agent.selfhood import selfview as V
 
 UTC = datetime.timezone.utc
 NOW = datetime.datetime(2026, 11, 12, 12, 0, tzinfo=UTC)
@@ -31,165 +29,6 @@ def _home(tmp_path) -> Path:
 def _fresh(monkeypatch):
     monkeypatch.delenv("GHOST_CHARACTER", raising=False)
     C._MEMO.clear()
-
-
-class _LLM:
-    def __init__(self, answer="0 1 -1", error=None):
-        self.answer, self.error, self.asked = answer, error, []
-
-    async def chat_completion(self, payload, **kw):
-        self.asked.append((payload, kw))
-        if self.error:
-            raise self.error
-        return {"choices": [{"message": {"content": self.answer}}]}
-
-
-def _replies(monkeypatch, n=4):
-    picked = [{"text": f"reply number {i} " + "x" * 100, "at": f"2026-11-12T0{i}:00:00Z"} for i in range(n)]
-    monkeypatch.setattr(LOOP, "pick_replies", lambda home, now=None, rng=None, after="": list(picked))
-    return picked
-
-
-# ── the look ────────────────────────────────────────────────────────────────
-
-def test_the_look_asks_for_three_numbers_and_never_shows_the_dials(tmp_path, monkeypatch):
-    home = _home(tmp_path)
-    C.set_dial(home, "humour", 2, now=NOW)
-    _replies(monkeypatch)
-    llm = _LLM("0 1 -1")
-    note = asyncio.run(V.look(home, llm, now=NOW))
-    assert note == "looked at 4 replies: warmth +0 (dial -1), humour +1 (dial +2), directness -1 (dial +0)"
-    prompt = llm.asked[0][0]["messages"][1]["content"]
-    assert "reply number 0" in prompt and "warmth: -2 dry and unsentimental" in prompt and "never to be kind" in prompt
-    assert C.sentence(C.load(home)["dials"]) not in prompt and "dial" not in prompt.lower()   # blind to its own dials
-    assert llm.asked[0][1]["is_background"] is True and llm.asked[0][0]["temperature"] == 0.0
-    row = V.rows(home)[-1]
-    assert row["observed"] == {"warmth": 0, "humour": 1, "directness": -1}
-    assert row["dials"] == {"warmth": -1, "humour": 2, "directness": 0} and row["replies"] == 4
-    assert row["date"] == C._mood_day(NOW)
-    assert asyncio.run(V.look(home, llm, now=NOW)) == "" and len(llm.asked) == 1            # once a day
-
-
-@pytest.mark.parametrize("raw,want", [
-    ("0 1 -1", (0, 1, -1)), ("+2, -2, 0.", (2, -2, 0)), ("  1/0/−1 ", (1, 0, -1)), ("warmth: 0 0 0", (0, 0, 0)),
-    ("1 2 3", None), ("0 1", None), ("0 1 -1 2", None), ("nice\n0 1 -1", None), ("", None), ("a little dry", None),
-    ("0.5 1 1", None), (None, None)])
-def test_only_three_whole_numbers_are_an_answer(raw, want):
-    got = V.parse_answer(raw)
-    assert got == (dict(zip(C.DIALS, want)) if want else None)
-
-
-def test_too_few_replies_no_model_or_a_bad_answer_write_nothing(tmp_path, monkeypatch):
-    home = _home(tmp_path)
-    _replies(monkeypatch, n=V.MIN_REPLIES - 1)
-    llm = _LLM()
-    assert asyncio.run(V.look(home, llm, now=NOW)) == "" and llm.asked == []
-    _replies(monkeypatch)
-    assert asyncio.run(V.look(home, None, now=NOW)) == ""
-    assert asyncio.run(V.look(home, _LLM("I think 1 and 2"), now=NOW)).startswith("no look — the answer was not")
-    assert V.rows(home) == [] and V.line(home) == "" and V.votes(home) == {}
-
-
-def test_a_look_votes_only_when_the_replies_are_far_from_the_dial():
-    # two steps off, or on the other side of 0: a vote toward what the replies showed
-    assert [V.vote(o, d) for o, d in ((0, 2), (2, 0), (-1, 1), (1, -1), (-2, 0))] == [-1, 1, -1, 1, -1]
-    # one step off, or the same: none — a mild trait is faint, and voting on it walks every dial to 0
-    assert [V.vote(o, d) for o, d in ((0, 1), (1, 0), (1, 2), (0, 0), (-1, -2), (2, 2))] == [0, 0, 0, 0, 0, 0]
-    assert V.vote("x", None) == 0 and V.vote(9, -9) == 1
-
-
-def test_votes_are_the_looks_against_the_dials_as_they_were(tmp_path, monkeypatch):
-    monkeypatch.setenv(V.VOTE_ENV, "1")              # §4UH-e2e: votes are behind a switch
-    home = _home(tmp_path)
-    for date, obs, then in (("2026-11-10", {"warmth": 1, "humour": 0, "directness": 0}, {"warmth": -1, "humour": 1, "directness": 0}),
-                            ("2026-11-11", {"warmth": 0, "humour": 0, "directness": 0}, {"warmth": 0, "humour": 2, "directness": 0}),
-                            ("2026-11-12", {"warmth": 0, "humour": 2, "directness": 1}, {"warmth": 0, "humour": 2, "directness": 0})):
-        V._append(home, {"at": date + "T10:00:00Z", "date": date, "observed": obs, "dials": then, "replies": 5})
-    V._append(home, {"at": "x", "date": "not a date", "observed": {"warmth": 2}, "dials": {}})
-    V._append(home, {"at": "x", "date": "2026-11-13", "observed": "nope"})
-    assert V.votes(home) == {"2026-11-10": {"warmth": 1}, "2026-11-11": {"humour": -1}}
-    assert V.line(home) == ("My own look at my replies on 2026-11-12 (5 replies): I meant to be neither diplomatic "
-                            "nor blunt and sounded straight about what I think. The rest matched.")
-    V._append(home, {"at": "2026-11-14T10:00:00Z", "date": "2026-11-14", "observed": {"warmth": 0, "humour": 2, "directness": 0},
-                     "dials": {"warmth": 0, "humour": 2, "directness": 0}, "replies": 6})
-    assert V.line(home) == "My own look at my replies on 2026-11-14: they sounded the way my dials say (6 replies)."
-
-
-def test_what_the_look_saw_is_in_the_view_and_the_introspect_line(tmp_path):
-    home = _home(tmp_path)
-    assert "My own look" not in C.view(home) and "My own look" not in C.line(home)
-    V._append(home, {"at": "2026-11-12T10:00:00Z", "date": "2026-11-12", "observed": {"warmth": 1, "humour": 1, "directness": 0},
-                     "dials": dict(C.START), "replies": 4})
-    assert "I meant to be a little dry and sounded quietly warm" in C.view(home)
-    assert "I meant to be a little dry and sounded quietly warm" in C.line(home)
-    assert "how my days go" in C.line(home) and "how your days go" in C.RULE
-
-
-def test_the_loop_a_run_of_looks_moves_a_dial_toward_what_the_replies_show(tmp_path, monkeypatch):
-    """dials → sentence → replies → the look → the dials."""
-    monkeypatch.setenv(V.VOTE_ENV, "1")              # §4UH-e2e: votes are behind a switch
-    monkeypatch.setattr(C, "day_pulls", lambda days: {})                # the days themselves say nothing
-    home = _home(tmp_path)
-    C.set_dial(home, "humour", 2, now=datetime.datetime(2026, 10, 1, 9, 0, tzinfo=UTC))
-    days = [{"date": f"2026-11-{d:02d}"} for d in (1, 2, 3, 4)]
-    for d in days[:3]:
-        V._append(home, {"at": d["date"] + "T10:00:00Z", "date": d["date"],
-                         "observed": {"warmth": -1, "humour": 0, "directness": 0}, "dials": C.load(home)["dials"], "replies": 5})
-    said = C.daily(home, days, now=NOW, votes=V.votes(home))
-    assert [x.split(":")[0] for x in said] == ["humour +2 → +1"]
-    assert "its own look at its replies counted on 3 of those days" in said[0]
-    # one step from the dial now: the same looks say nothing more, and the dial stays
-    V._append(home, {"at": "2026-11-05T10:00:00Z", "date": "2026-11-05",
-                     "observed": {"warmth": -1, "humour": 0, "directness": 0}, "dials": C.load(home)["dials"], "replies": 5})
-    assert V.votes(home).get("2026-11-05") is None
-
-
-@pytest.mark.asyncio
-async def test_the_idle_phase_looks_once_and_hands_the_votes_to_the_rule(tmp_path, monkeypatch):
-    home = _home(tmp_path)
-    _replies(monkeypatch)
-    llm = _LLM("0 0 0")
-    seen = {}
-    real = C.daily
-    monkeypatch.setattr(C, "daily", lambda h, days, **k: seen.update(votes=k.get("votes")) or real(h, days, **k))
-    agent = A.GhostAgent.__new__(A.GhostAgent)
-    ctx = SimpleNamespace(memory_dir=str(home / "system" / "memory"), llm_client=llm, args=None, self_model=None)
-    ran, notes = [], {}
-    await agent._character_phase(home, ran, notes, ctx)
-    assert len(llm.asked) == 1 and ran == ["character"] and notes["character"].startswith("looked at 4 replies")
-    assert seen["votes"] == {} and len(V.rows(home)) == 1
-    ran2, notes2 = [], {}
-    await agent._character_phase(home, ran2, notes2, ctx)
-    assert len(llm.asked) == 1 and ran2 == []                           # today's look is there
-
-
-@pytest.mark.asyncio
-async def test_a_deferred_or_failed_look_never_stops_the_days_or_the_rule(tmp_path, monkeypatch):
-    from ghost_agent.core.llm import BackgroundDeferred
-    home = _home(tmp_path)
-    _replies(monkeypatch)
-    agent = A.GhostAgent.__new__(A.GhostAgent)
-    agent._last_mirror_try_at = datetime.datetime.now()
-    ran, notes = [], {}
-    ctx = SimpleNamespace(memory_dir=str(home / "system" / "memory"), llm_client=_LLM(error=BackgroundDeferred("busy")),
-                          args=None, self_model=None)
-    await agent._character_phase(home, ran, notes, ctx)
-    assert "deferred" in notes["character"] and agent._last_mirror_try_at == datetime.datetime.min
-    ctx.llm_client = _LLM(error=RuntimeError("boom"))
-    ran, notes = [], {}
-    await agent._character_phase(home, ran, notes, ctx)
-    assert "the look failed (RuntimeError)" in notes["character"] and V.rows(home) == []
-
-
-@pytest.mark.asyncio
-async def test_with_the_character_off_nobody_looks(tmp_path, monkeypatch):
-    home = _home(tmp_path)
-    _replies(monkeypatch)
-    monkeypatch.setenv("GHOST_CHARACTER", "0")
-    llm = _LLM()
-    ctx = SimpleNamespace(memory_dir=str(home / "system" / "memory"), llm_client=llm, args=None, self_model=None)
-    await A.GhostAgent.__new__(A.GhostAgent)._character_phase(home, [], {}, ctx)
-    assert llm.asked == [] and V.rows(home) == []
 
 
 # ── tastes ──────────────────────────────────────────────────────────────────
@@ -459,31 +298,6 @@ def test_the_introspect_line_carries_liked_tastes_only(tmp_path):
     assert "rough" not in (I._self_image(str(home / "system" / "memory")) or "")
 
 
-def test_an_unreadable_answer_is_tried_at_most_twice_a_day_and_the_next_day_looks_again(tmp_path, monkeypatch):
-    home = _home(tmp_path)
-    _replies(monkeypatch)
-    llm = _LLM("I think warmth is 1")
-    for _ in range(4):
-        asyncio.run(V.look(home, llm, now=NOW))
-    assert len(llm.asked) == V.MAX_TRIES_A_DAY and V.rows(home) == [] and V.votes(home) == {}
-    llm.answer = "0 1 -1"
-    asyncio.run(V.look(home, llm, now=NOW + datetime.timedelta(days=1)))
-    assert len(V.rows(home)) == 1
-    asyncio.run(V.look(home, llm, now=NOW + datetime.timedelta(days=2)))
-    assert len(V.rows(home)) == 2                                        # a look a day, not one ever
-
-
-def test_a_later_look_of_the_same_day_with_no_vote_cancels_the_earlier_vote(tmp_path, monkeypatch):
-    monkeypatch.setenv(V.VOTE_ENV, "1")              # §4UH-e2e: votes are behind a switch
-    home = _home(tmp_path)
-    dials = {"warmth": -1, "humour": 1, "directness": 0}
-    V._append(home, {"at": "x", "date": "2026-11-05", "observed": {"warmth": 1, "humour": 1, "directness": 0},
-                     "dials": dials, "replies": 4})
-    assert V.votes(home) == {"2026-11-05": {"warmth": 1}}
-    V._append(home, {"at": "y", "date": "2026-11-05", "observed": dict(dials), "dials": dials, "replies": 4})
-    assert V.votes(home) == {}
-
-
 def test_the_handhelds_thumbs_count_for_tastes_and_a_scripts_do_not(tmp_path, monkeypatch):
     from ghost_agent.core import failure_census as FC
     home = _home(tmp_path)
@@ -515,24 +329,6 @@ def test_trouble_is_judged_on_the_turns_own_size_and_only_the_booking_leans(tmp_
 def test_a_turn_that_moves_only_energy_is_not_leaned():
     ev = M.Event(0.0, -0.3, "a long turn", M.KIND_TURN)
     assert C.lean(ev, {"warmth": 2, "humour": 2, "directness": 2}) is ev
-
-
-@pytest.mark.asyncio
-async def test_the_rule_runs_before_the_look(tmp_path, monkeypatch):
-    home = _home(tmp_path)
-    _replies(monkeypatch)
-    order = []
-    real_daily, real_look = C.daily, V.look
-    monkeypatch.setattr(C, "daily", lambda h, days, **k: order.append("rule") or real_daily(h, days, **k))
-
-    async def look(*a, **k):
-        order.append("look")
-        return await real_look(*a, **k)
-    monkeypatch.setattr(V, "look", look)
-    ctx = SimpleNamespace(memory_dir=str(home / "system" / "memory"), llm_client=_LLM("0 0 0"), args=None,
-                          self_model=None)
-    await A.GhostAgent.__new__(A.GhostAgent)._character_phase(home, [], {}, ctx)
-    assert order == ["rule", "look"]
 
 
 def _journal(home, rows):
@@ -618,27 +414,6 @@ def test_no_taste_until_there_are_twice_min_turns_in_all():
     assert T.standing(s)["liked"] == ["research"]
 
 
-
-def test_a_look_whose_call_fails_is_one_of_the_days_tries(tmp_path, monkeypatch):
-    from ghost_agent.core.llm import BackgroundDeferred
-    home = _home(tmp_path)
-    _replies(monkeypatch)
-    llm = _LLM(error=RuntimeError("timeout"))
-    for _ in range(4):
-        with pytest.raises(RuntimeError):
-            asyncio.run(V.look(home, llm, now=NOW))
-        if V.looked_today(home, NOW):
-            break
-    assert len(llm.asked) == V.MAX_TRIES_A_DAY
-    deferred = _LLM(error=BackgroundDeferred("busy"))
-    h2 = _home(tmp_path / "d")
-    for _ in range(3):
-        with pytest.raises(BackgroundDeferred):
-            asyncio.run(V.look(h2, deferred, now=NOW))
-    assert len(deferred.asked) == 3 and not V.looked_today(h2, NOW)     # a deferral is not a try
-
-
-
 @pytest.mark.asyncio
 async def test_the_rough_tastes_are_said_in_the_log_when_days_are_counted(tmp_path, monkeypatch):
     from ghost_agent.selfhood import days as D
@@ -666,43 +441,7 @@ def test_only_a_thumbs_outcome_counts(tmp_path):
     assert D.owner_thumbs(home, datetime.date(2026, 11, 10), tz=UTC) == (0, 0)
 
 
-# ── the `mirror` command shows the loop's path and the look (§4UH-m, §4UH-loop) ─
-
-def _sv_rows(home, rows):
-    p = home / "system" / "selfhood" / V.LOG_FILENAME
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-
-
-def test_the_mirror_command_shows_each_look_meant_against_sounded_and_its_pull(tmp_path, monkeypatch):
-    monkeypatch.setenv(V.VOTE_ENV, "1")              # §4UH-e2e: votes are behind a switch
-    from ghost_agent.selfhood import loop as MI
-    home = tmp_path
-    then = {"warmth": -1, "humour": 1, "directness": 0}
-    _sv_rows(home, [
-        {"at": "2026-11-12T03:00:00Z", "date": "2026-11-12", "failed": True, "replies": 4},     # a later look: hidden
-        {"at": "2026-11-12T04:00:00Z", "date": "2026-11-12", "observed": {"warmth": 1, "humour": 1, "directness": 0},
-         "dials": then, "replies": 4},
-        {"at": "2026-11-13T04:00:00Z", "date": "2026-11-13", "observed": {"warmth": 0, "humour": 0, "directness": 2},
-         "dials": then, "replies": 5},
-        {"at": "2026-11-14T03:00:00Z", "date": "2026-11-14", "failed": True, "replies": 3, "error": "TimeoutError"},
-        {"at": "2026-11-14T04:00:00Z", "date": "2026-11-14", "failed": True, "replies": 3},     # one line a day
-        {"date": "nonsense", "observed": {}},
-    ])
-    got = V.history_lines(home)
-    assert got == [
-        "- **2026-11-12** · 4 replies — warmth meant -1, sounded +1 · humour meant +1, sounded +1 · "
-        "directness meant 0, sounded 0 → votes warmth up",
-        "- **2026-11-13** · 5 replies — warmth meant -1, sounded 0 · humour meant +1, sounded 0 · "
-        "directness meant 0, sounded +2 → votes directness up",
-        "- **2026-11-14** · 3 replies — no look: the call failed"]
-    assert V.history_lines(home, limit=1) == got[-1:] and V.history_lines(home, limit=0) == []
-    b = MI.banner(home)
-    assert "**Now:** «" in b and "\n".join(got) in b and "**What I see when I look at my replies.**" in b
-    assert V.line(home) in b                                    # the latest look in words, under the list
-    assert "diary" not in b                                     # §4UH-loop: the Mirror's diary is removed
-    assert b.index("**Now:**") < b.index("**What I see when I look")
-    assert b.startswith("**The strange loop**")
+# ── the `mirror` command shows the loop's path (§4UH-m, §4UH-loop) ─────────
 
 
 def test_the_mirror_command_shows_no_diary_even_when_the_old_file_is_there(tmp_path):
@@ -713,7 +452,7 @@ def test_the_mirror_command_shows_no_diary_even_when_the_old_file_is_there(tmp_p
     p.write_text(json.dumps({"date": "2026-11-09", "sentence": "I am bright.", "replies": [], "rest": [1, -1]})
                  + "\n", encoding="utf-8")
     b = MI.banner(tmp_path)
-    assert "No look yet" in b and "I am bright." not in b and "Until 2026-11-09" not in b
+    assert "I am bright." not in b and "Until 2026-11-09" not in b
     assert "my mood rests" not in b                             # the starting dials rest even
 
 
@@ -726,102 +465,17 @@ def test_the_mirror_command_with_an_unreadable_character_says_so(tmp_path):
     assert "cannot be read" in b and "STARTING character" in b
 
 
-def test_a_broken_look_history_says_so_and_keeps_the_path(tmp_path, monkeypatch):
+def test_a_broken_path_says_so_and_keeps_now(tmp_path, monkeypatch):
     from ghost_agent.selfhood import loop as MI
     def boom(*a, **k):
         raise RuntimeError("x")
-    monkeypatch.setattr(V, "history_lines", boom)
+    monkeypatch.setattr(C, "log_rows", boom)
     b = MI.banner(tmp_path)
-    assert b.startswith("**The strange loop**") and "could not be read just now" in b and "diary" not in b
+    assert b.startswith("**The strange loop**") and "path could not be read just now" in b and "diary" not in b
     assert "**Now:**" in b                                      # the character's part still renders
-    monkeypatch.undo()
-    monkeypatch.setattr(C, "log_rows", boom)                    # … and the other way round
-    b = MI.banner(tmp_path)
-    assert "path could not be read just now" in b and "**What I see when I look" in b
 
 
-def test_the_mirror_command_shows_the_latest_seven_of_many(tmp_path):
-    from ghost_agent.selfhood import loop as MI
-    then = {"warmth": 0, "humour": 0, "directness": 0}
-    _sv_rows(tmp_path, [{"at": f"2026-10-{d:02d}T04:00:00Z", "date": f"2026-10-{d:02d}", "replies": True if d == 9 else 3,
-                         "observed": then, "dials": then} for d in range(1, 10)])
-    got = V.history_lines(tmp_path)
-    assert len(got) == V.SHOW_LAST == 7 and got[0].startswith("- **2026-10-03**") and got[-1].startswith("- **2026-10-09**")
-    assert "replies" not in got[-1] and "· 3 replies" in got[0]          # a bool count is not a count
-    assert "(some replies)" in V.line(tmp_path)                           # nor in the line under the list
-    b = MI.banner(tmp_path)
-    assert "\n".join(got) in b and "- **2026-10-02**" not in b
-
-
-def test_the_mirror_command_says_how_many_replies_a_first_look_needs(tmp_path, monkeypatch):
-    from ghost_agent.selfhood import loop as MI
-    monkeypatch.setattr(V, "MIN_REPLIES", 5)
-    assert "at least 5 replies" in MI.banner(tmp_path)
-
-
-def test_todays_failed_try_is_not_a_missed_day_while_a_second_may_come(tmp_path):
-    now = datetime.datetime(2026, 11, 14, 12, 0, tzinfo=datetime.timezone.utc)
-    day = C._mood_day(now)
-    _sv_rows(tmp_path, [{"at": "x", "date": day, "failed": True, "replies": 3}])
-    assert V.history_lines(tmp_path, now=now) == []
-    _sv_rows(tmp_path, [{"at": "x", "date": day, "failed": True, "replies": 3}] * V.MAX_TRIES_A_DAY)
-    assert V.history_lines(tmp_path, now=now) == [f"- **{day}** · 3 replies — no look: the answer could not be read"]
-
-
-def test_a_vote_on_a_pinned_dial_says_it_is_not_counted(tmp_path, monkeypatch):
-    monkeypatch.setenv(V.VOTE_ENV, "1")              # §4UH-e2e: votes are behind a switch
-    C.set_pin(tmp_path, "humour", True)
-    then = {"warmth": 0, "humour": 0, "directness": 0}
-    _sv_rows(tmp_path, [{"at": "2026-11-12T04:00:00Z", "date": "2026-11-12", "replies": 3,
-                         "observed": {"warmth": 2, "humour": -2, "directness": 0}, "dials": then}])
-    assert V.history_lines(tmp_path)[0].endswith("→ votes warmth up, humour down (pinned: not counted)")
-
-
-def test_the_picker_reads_a_looks_utc_stamp(tmp_path):
-    from ghost_agent.selfhood import loop as MI
-    # review: py3.10 refused the "Z" → 0.0 → the plain 48 h window, re-reading replies the last look rated
-    assert MI._look_epoch("2026-11-11T21:27:50Z") == datetime.datetime(2026, 11, 11, 21, 27, 50,
-                                                                        tzinfo=datetime.timezone.utc).timestamp()
-    assert MI._look_epoch("nonsense") == 0.0 and MI._look_epoch(None) == 0.0
-
-
-def test_a_vote_from_before_the_dials_last_change_says_it_is_not_counted(tmp_path, monkeypatch):
-    monkeypatch.setenv(V.VOTE_ENV, "1")              # §4UH-e2e: votes are behind a switch
-    then = {"warmth": 0, "humour": 0, "directness": 0}
-    _sv_rows(tmp_path, [{"at": f"2026-11-{d}T04:00:00Z", "date": f"2026-11-{d}", "replies": 3,
-                         "observed": {"warmth": 0, "humour": 2, "directness": 0}, "dials": then} for d in (10, 13)])
-    C.set_pin(tmp_path, "humour", True, now=datetime.datetime(2026, 11, 11, 12, tzinfo=datetime.timezone.utc))
-    C.set_pin(tmp_path, "humour", False, now=datetime.datetime(2026, 11, 12, 12, tzinfo=datetime.timezone.utc))
-    got = V.history_lines(tmp_path)
-    assert got[0].endswith("→ votes humour up (the dial changed since: not counted)")   # used up by the unpin
-    assert got[1].endswith("→ votes humour up")                                          # after it: counts
-
-
-def test_a_first_failed_try_today_says_a_second_one_comes(tmp_path):
-    from ghost_agent.selfhood import loop as MI
-    _sv_rows(tmp_path, [{"at": "x", "date": C._mood_day(), "failed": True, "replies": 5}])
-    b = MI.banner(tmp_path)
-    assert "one more try comes" in b and "at least 3 replies" not in b
-    _sv_rows(tmp_path, [{"at": "x", "date": C._mood_day(), "failed": True, "replies": 5}] * 2)
-    assert "one more try comes" not in MI.banner(tmp_path)
-
-
-# ── §4UH-e2e: the look is shown, not a vote; the dials set where the mood rests ─────────────────────
-
-def test_with_the_vote_off_a_look_leans_but_moves_nothing(tmp_path, monkeypatch):
-    from ghost_agent.selfhood import loop as MI
-    monkeypatch.delenv(V.VOTE_ENV, raising=False)
-    assert V.vote_enabled() is False
-    then = {"warmth": -1, "humour": 1, "directness": 0}
-    _sv_rows(tmp_path, [{"at": "2026-11-11T04:00:00Z", "date": "2026-11-11", "replies": 6,
-                         "observed": {"warmth": 1, "humour": 1, "directness": 1}, "dials": then}])
-    assert V.votes(tmp_path) == {}                                   # nothing reaches `character.propose`
-    assert V.history_lines(tmp_path)[0].endswith("→ leans warmth up (not a vote)")
-    b = MI.banner(tmp_path)
-    assert "This is shown, not counted" in b and "adds a vote" not in b
-    monkeypatch.setenv(V.VOTE_ENV, "1")
-    b = MI.banner(tmp_path)
-    assert V.votes(tmp_path) == {"2026-11-11": {"warmth": 1}} and "adds a vote" in b and "shown, not counted" not in b
+# ── §4UH-e2e: the dials set where the mood rests ─────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("dials, units", [
@@ -894,14 +548,6 @@ def test_rest_units_round_toward_zero_both_ways_and_a_broken_file_rests_even(tmp
     (tmp_path / C.SELFHOOD_REL / C.CHARACTER_FILENAME).write_text("{broken", encoding="utf-8")
     assert C.unreadable(tmp_path) and C.rest_units(C.dials(tmp_path)) != (0, 0)
     assert C.rest_pair(tmp_path) == (0.0, 0.0)                     # not the starting dials' rest
-
-
-def test_a_look_one_step_off_says_no_lean(tmp_path, monkeypatch):
-    monkeypatch.delenv(V.VOTE_ENV, raising=False)
-    then = {"warmth": -1, "humour": 1, "directness": 0}
-    _sv_rows(tmp_path, [{"at": "2026-11-11T04:00:00Z", "date": "2026-11-11", "replies": 6,
-                         "observed": {"warmth": 0, "humour": 1, "directness": 0}, "dials": then}])
-    assert V.history_lines(tmp_path)[0].endswith("→ no lean")
 
 
 def test_a_capitalised_owner_source_counts_as_the_mood_counts_it(tmp_path):

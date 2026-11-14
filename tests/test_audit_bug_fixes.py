@@ -460,9 +460,9 @@ def test_bug12_project_auto_done_when_all_tasks_done(tmp_path):
     store.update_task(t1, status="DONE")
     assert store.get_project(pid)["status"] == "ACTIVE"
 
-    # Mark second done — project auto-transitions to DONE.
+    # Mark second done — §4UM: the plan is finished, the project stays open ("ready"); only the owner closes it.
     store.update_task(t2, status="DONE")
-    assert store.get_project(pid)["status"] == "DONE"
+    assert store.get_project(pid)["status"] == "ACTIVE" and store.project_state(pid) == "ready"
 
 
 def test_bug12_failed_task_rolls_project_up_to_failed(tmp_path):

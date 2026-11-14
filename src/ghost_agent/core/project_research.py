@@ -249,6 +249,15 @@ def _first_line(text: str) -> str:
     return ""
 
 
+def _note_research_write(path) -> None:
+    """§4UM round 2 M2: the research mirror is the system's writing — never an owner change of the project."""
+    try:
+        from ..memory.projects import note_system_path
+        note_system_path(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _research_dir(store, project_id: str) -> Optional[Path]:
     ws = store.ensure_workspace(project_id)
     if ws is None:
@@ -435,6 +444,7 @@ def _write_index_md(store, project_id: str, rdir: Path) -> None:
         lines.append(f"- **{e.get('topic', '')}** → `{e.get('path', '')}`{prev}")
     try:
         from ..tools.file_system import write_text_nofollow_in_dir
+        _note_research_write(Path(rdir) / "INDEX.md")
         write_text_nofollow_in_dir(Path(rdir), "INDEX.md", "\n".join(lines) + "\n")
     except Exception:  # pragma: no cover
         logger.debug("research INDEX.md write skipped", exc_info=True)
@@ -664,6 +674,7 @@ def record_main_loop_findings(store, project_id: str, query: str, output: str,
         # atomic, and still never through a link: the temp file is written
         # nofollow, and rename REPLACES a link at the name, never its target
         _tmp = f".{MAIN_LOOP_FINDINGS_FILE}.tmp"
+        _note_research_write(path)
         write_text_nofollow_in_dir(rdir, _tmp, text)
         import os as _os
         _os.replace(rdir / _tmp, path)
@@ -908,6 +919,7 @@ async def _persist(context, project_id: str, topic: str, search_output: str, *,
     path = rdir / f"{slug}.md"
     try:
         from ..tools.file_system import write_text_nofollow_in_dir
+        _note_research_write(Path(rdir) / f"{slug}.md")
         write_text_nofollow_in_dir(rdir, f"{slug}.md", doc)
     except Exception as e:
         return ResearchResult(False, topic, slug=slug, error=f"write failed: {e}")

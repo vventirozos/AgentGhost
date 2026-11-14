@@ -70,12 +70,14 @@ async def test_web_search_reformulation_survives_total_primary_failure():
         # the query (not call order) because the racing engines consume
         # calls in nondeterministic thread order.
         def _text_by_query(q, **kwargs):
-            if q == "some very specific query 2024":
+            # (§4UN-web: the reworded form keeps the meaning — the question
+            # words go, the year stays)
+            if q == "what is the specific query for 2024":
                 raise Exception("Tor blocked")
             return [{"title": "Reformulated hit", "body": "b",
                      "href": "http://example.com/good"}]
         inst.text.side_effect = _text_by_query
-        result = await tool_search_ddgs("some very specific query 2024",
+        result = await tool_search_ddgs("what is the specific query for 2024",
                                         "socks5://127.0.0.1:9050")
     assert "Reformulated query" in result, result
 

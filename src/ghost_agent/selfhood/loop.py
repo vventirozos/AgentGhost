@@ -8,16 +8,18 @@ The loop, with every arrow real:
       → the day record (``days``) → the daily rule against the agent's own 21-day norm (``character.daily``)
       → a dial moves → a new sentence.
 
-Beside it, once a day, the agent LOOKS at a few of its own replies and says how they sound on the same
-dials (``selfview``). That look is shown, not counted (``GHOST_SELFVIEW_VOTE=1`` lets it vote): a model rating
-itself, never checked against blind readers.
+Beside it there was, from 2026-11-11, a daily self-look (``selfview``): the main model read six of its own
+replies and rated them on the same dials. It was removed on 2026-11-14 (§4UH-noself): a calibration rated 40
+samples of replies written with no character, with three different dial settings and with a strong "short and
+dry, blunt" sentence, and every pool came back about (+1, +1, +1), where blind readers had told those
+characters apart 75–97 %. The model rating itself cannot see the character, so the look carried nothing.
 
 Before this, the loop was the Mirror (§4SV–§4TZ): one sentence a day that the model rewrote from its own
 replies. Measured blind it changed nothing in them, the character replaced it on 2026-11-11, and on
 2026-11-12 the Mirror's code and diary were removed. What is here is the little the new loop still needs from
-it (where the home is, which replies a look may read, the resting point's unit and switch, a probe's
-self-image), and the reply to ``mirror``: the path the loop has taken — each sentence the character has had,
-what moved it, and what the agent sees in its own replies. Owner-only, answered by the system (§4PY).
+it (where the home is, the resting point's unit and switch, a probe's self-image), and the reply to
+``mirror``: the path the loop has taken — each sentence the character has had, and what moved it.
+Owner-only, answered by the system (§4PY).
 """
 
 from __future__ import annotations
@@ -26,10 +28,9 @@ import datetime
 import hashlib
 import logging
 import os
-import random
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 logger = logging.getLogger("GhostSelfhood")
 
@@ -42,95 +43,6 @@ def home_from_memory_dir(memory_dir) -> Optional[Path]:
     if not isinstance(memory_dir, (str, Path)) or not str(memory_dir):
         return None
     return Path(memory_dir).parent.parent
-
-
-def _mood_date(now: Optional[datetime.datetime] = None) -> datetime.date:
-    """The MOOD day of ``now`` (``mood.mood_day``: it ends at 04:00). A naive time is this machine's local time."""
-    from . import mood as _M
-    if now is not None and now.tzinfo is None:
-        now = now.astimezone()
-    return _M.mood_day(now)
-
-
-def _look_epoch(at) -> float:
-    """A stored "at" (local ISO, or UTC with "Z") as an epoch, or 0.0. py3.10's ``fromisoformat`` refuses "Z"."""
-    try:
-        return datetime.datetime.fromisoformat(str(at or "").replace("Z", "+00:00")).timestamp()
-    except (ValueError, OverflowError, OSError):
-        return 0.0
-
-
-# ── the replies a look may read (``selfview.look``) ────────────────────────
-
-#: how far back a reply may be picked from (days), when the last look is older or there is none
-REPLY_WINDOW_DAYS = 2
-#: replies shorter than this say too little about who wrote them ("Done.", "👍")
-MIN_REPLY_CHARS = 80
-#: replies shown per look: across different subjects, what they share is the manner
-REPLIES_PER_LOOK = 6
-#: how much of each reply the model sees (its start)
-REPLY_MAX_CHARS = 600
-#: a reply written under a mood at this intensity or more (or under a manner) is the mood talking, not the
-#: character: the look is never shown it
-STRONG_MOOD_MIN = 2
-
-#: a runtime abort marker (core/agent.py's _ABORT_MARKER_RE): the reply is the runtime talking
-_ABORT_RE = re.compile(r"\[ATTEMPT_ABORTED_[A-Z_]+\]")
-
-
-def pick_replies(home, now: Optional[datetime.datetime] = None,
-                 rng: Optional[random.Random] = None, after="") -> List[dict]:
-    """Up to REPLIES_PER_LOOK of the OWNER's delivered replies written since the previous look (``after``: its
-    "at") and never more than REPLY_WINDOW_DAYS back, at random, none written under a strong mood or a manner —
-    the census's own reader, so members', probes', replays' and jobs' turns are never picked.
-    [{"text", "at"}], empty when there is none. Trajectory day folders are UTC dates, so they are read in UTC
-    with one day to spare and the turns are kept by their own timestamp."""
-    pool = [{"text": text, "at": str(t.get("timestamp") or "")}
-            for t, text in _replies_since(home, now, after) if not written_under_strong_mood(t)]
-    return (rng or random).sample(pool, min(REPLIES_PER_LOOK, len(pool)))
-
-
-def _replies_since(home, now: Optional[datetime.datetime], after) -> List[Tuple[dict, str]]:
-    """The owner's delivered replies since the previous look and inside the window, with their text, before
-    the strong-mood filter. (turn, text) pairs; [] when unreadable."""
-    try:
-        from ..core.failure_census import _owner_turns, _window, _epoch
-    except Exception:  # noqa: BLE001
-        return []
-    now_utc = (now.astimezone(datetime.timezone.utc) if now is not None
-               else datetime.datetime.now(datetime.timezone.utc))
-    since = max(now_utc.timestamp() - REPLY_WINDOW_DAYS * 86400, _look_epoch(after))
-    try:
-        sysd = Path(home) / "system"
-        good, _bad = _owner_turns(sysd, _window(now_utc.date(), REPLY_WINDOW_DAYS + 1))
-    except Exception as e:  # noqa: BLE001
-        logger.debug("loop: owner turns unreadable: %s", e)
-        return []
-    out = []
-    for t in good:
-        text = str(t.get("final_response") or "").strip()
-        if len(text) < MIN_REPLY_CHARS or _ABORT_RE.search(text):
-            continue
-        if not (since < _epoch(t.get("timestamp")) <= now_utc.timestamp() + 60):
-            continue
-        out.append((t, text))
-    return out
-
-
-def written_under_strong_mood(turn: dict) -> bool:
-    """Was this reply written under a mood at ``STRONG_MOOD_MIN`` or more, or under a manner? Read off the turn
-    record's ``extra.mood_tone`` VALUES (``intensity``, ``manner_name``), never its sentences. A record with no
-    tone line, or one from before §4UD that holds only sentences, was written under no strong mood."""
-    try:
-        tone = (turn.get("extra") or {}).get("mood_tone")
-    except AttributeError:
-        return False
-    if not isinstance(tone, dict):
-        return False
-    if isinstance(tone.get("manner_name"), str) and tone["manner_name"].strip():
-        return True
-    n = tone.get("intensity")
-    return isinstance(n, int) and not isinstance(n, bool) and n >= STRONG_MOOD_MIN
 
 
 # ── the resting point's unit and switch (``character.rest_pair``) ───────────
@@ -264,7 +176,7 @@ def _step_line(step: Dict[str, object]) -> str:
 
 def banner(home) -> str:
     """The whole reply to ``mirror``: the loop in one paragraph, the path it has taken (each sentence and what
-    moved it), where it is now, and what the latest daily looks saw. No reply text, no tastes, no rough kinds.
+    moved it) and where it is now. No reply text, no tastes, no rough kinds.
     Never raises (a broken part is said, not thrown)."""
     from . import character as C
     head = ("**The strange loop** — my character is a sentence that every reply I write to you hears. What those "
@@ -309,27 +221,4 @@ def banner(home) -> str:
         logger.warning("loop: the character's path could not be shown", exc_info=True)
         parts.append("The character's path could not be read just now (see the agent log); type \"character\".")
     parts.append(now)
-    try:
-        from . import selfview as _selfview
-        looks = _selfview.history_lines(home)
-        how = ("Once a day I read a few of my latest replies to you, without my dials, and rate how they sound. "
-               "\"Meant\" is my dial then, \"sounded\" what the replies showed. ")
-        how += ("When they sit two steps from a dial, or across 0, that adds a vote to the day's pull."
-                if _selfview.vote_enabled() else
-                "This is shown, not counted: a model rating itself, never checked against blind readers.")
-        if looks:
-            body = "\n".join(looks)
-            seen = _selfview.line(home)
-            if seen:
-                body += "\n\n" + seen
-        elif _selfview.trying_today(home):
-            body = "No look yet — today's could not be read on the first try; one more try comes in an idle window."
-        else:
-            body = ("No look yet — the first happens in an idle window once there are at least "
-                    f"{_selfview.MIN_REPLIES} replies of mine to you to read (from the last two days, not short, "
-                    "not written under a strong mood or a manner).")
-        parts.append("**What I see when I look at my replies.** " + how + "\n\n" + body)
-    except Exception:  # noqa: BLE001
-        logger.warning("loop: the looks could not be shown", exc_info=True)
-        parts.append("My looks at my own replies could not be read just now (see the agent log).")
     return "\n\n".join(parts)

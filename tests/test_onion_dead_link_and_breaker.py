@@ -42,6 +42,7 @@ import pytest
 
 from ghost_agent.tools import browser as B
 from ghost_agent.tools import darkweb_search as D
+from tests.onion_v3 import v3_label  # §4UN-dark: checksum-valid test addresses
 
 _KEYBASE = ("http://keybase5wmilwokqirssclfnsqrjdsi7jdir5wy7y7iu3tanwmtp6oid"
             ".onion/undrgrndnews")
@@ -459,7 +460,7 @@ class TestABreakerSkippedSearchDoesNotBlameTheQuery:
         corroborating one the ranking silently degenerated to discovery
         order while still LOOKING ranked."""
         from ghost_agent.tools.darkweb_search import tool_darkweb_search
-        real = "a" * 56
+        real = v3_label("a")
         html = f'<a href="http://{real}.onion/">Result</a>'
 
         async def _fetch(url, proxy, timeout, **kw):
@@ -491,7 +492,7 @@ class TestConcurrentSearchesDoNotContaminateEachOther:
             self, monkeypatch):
         import asyncio as _aio
         from ghost_agent.tools.darkweb_search import tool_darkweb_search
-        real = "b" * 56
+        real = v3_label("b")
         html = f'<a href="http://{real}.onion/">R</a>'
 
         async def _fetch(url, proxy, timeout, **kw):
@@ -513,7 +514,7 @@ class TestConcurrentSearchesDoNotContaminateEachOther:
     async def test_a_search_that_CONTACTED_engines_never_claims_it_did_not(
             self, monkeypatch):
         from ghost_agent.tools.darkweb_search import tool_darkweb_search
-        real = "c" * 56
+        real = v3_label("c")
 
         async def _fetch(url, proxy, timeout, **kw):
             return (200, f'<a href="http://{real}.onion/">R</a>')
@@ -601,7 +602,7 @@ class TestTheNarrowedBannerIsNotCACHED:
     async def test_a_recovered_engine_stops_being_announced(self,
                                                             monkeypatch):
         from ghost_agent.tools.darkweb_search import tool_darkweb_search
-        real = "d" * 56
+        real = v3_label("d")
 
         async def _fetch(url, proxy, timeout, **kw):
             return ((200, f'<a href="http://{real}.onion/">R</a>')
@@ -869,7 +870,7 @@ class TestTheR3Majors:
         onions get deep-read and synthesised — and it was the one that
         never said corroboration had been weakened."""
         from ghost_agent.tools.darkweb_search import tool_darkweb_research
-        real = "g" * 56
+        real = v3_label("g")
 
         async def _fetch(url, proxy, timeout, **kw):
             return ((200, f'<a href="http://{real}.onion/">R</a>')

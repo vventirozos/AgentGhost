@@ -63,9 +63,9 @@ async def test_first_valid_winner_short_circuits_wave():
     siblings: the caller gets the winner's results immediately."""
     def by_engine(q, **kw):
         if kw["backend"] == "brave":
-            return [{"title": "Fast", "body": "b", "href": "http://fast-win.com/a"}]
+            return [{"title": "Fast another query", "body": "b", "href": "http://fast-win.com/a"}]
         time.sleep(1.5)
-        return [{"title": "Slow", "body": "b", "href": "http://slow-win.com/b"}]
+        return [{"title": "Slow another query", "body": "b", "href": "http://slow-win.com/b"}]
 
     mod, _ = _mock_ddgs_module(by_engine)
     t0 = time.monotonic()
@@ -125,7 +125,9 @@ async def test_failure_log_is_one_terse_categorized_line():
     line = warn_lines[0]
     # Terse: the boring empties are a count, yahoo's transport failure a
     # category — and the whole line stays short.
-    assert f"{len(_RACE_ENGINES) - 1} empty" in line
+    # §4UN-web: the empty engines are NAMED (which engine failed how is what
+    # the operator acts on), still in one short line
+    assert "empty" in line and all(e in line for e in _RACE_ENGINES)
     assert "yahoo conn-error" in line
     assert "‹some concurrent query›" in line
     assert "https://" not in line
@@ -154,7 +156,7 @@ async def test_winner_log_carries_query_tag():
     """The win line must carry the query tag too — several searches race
     concurrently in one turn and their log lines interleave."""
     def by_engine(q, **kw):
-        return [{"title": "Hit", "body": "b", "href": "http://hit-site.com/x"}]
+        return [{"title": "Hit tag me query", "body": "b", "href": "http://hit-site.com/x"}]
 
     mod, _ = _mock_ddgs_module(by_engine)
     with patch.dict("sys.modules", {"ddgs": mod}), \
@@ -180,5 +182,7 @@ async def test_stopiteration_from_engine_is_contained():
     assert "ZERO results" in result
     # The loop is still healthy: schedule and await something trivial.
     await asyncio.sleep(0)
-    # Waves + reformulation waves all raced the full set.
-    assert inst.text.call_count == 4 * len(_RACE_ENGINES)
+    # Waves + reformulation waves all raced the full set (§4UN-web: the
+    # meaning-keeping form only, none when nothing can be dropped).
+    from src.ghost_agent.tools.search import reformulate_keeping_meaning
+    assert inst.text.call_count == (2 + len(reformulate_keeping_meaning("doomed race query"))) * len(_RACE_ENGINES)

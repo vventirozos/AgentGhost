@@ -933,7 +933,7 @@ async def test_stopped_searches_are_not_counted_as_searches_or_observations(monk
     yields, actions = [], []
     real_y, real_a = StrikeLedger.note_search_yield, StrikeLedger.note_action
     monkeypatch.setattr(StrikeLedger, "note_search_yield",
-                        lambda self, f: (yields.append(f), real_y(self, f))[1])
+                        lambda self, f, *a, **k: (yields.append(f), real_y(self, f, *a, **k))[1])
     monkeypatch.setattr(StrikeLedger, "note_action",
                         lambda self, f, *a, **k: (actions.append(f), real_a(self, f, *a, **k))[1])
     _, _, seen, _ = await _turn_with_an_interrupt(monkeypatch, tmp_path, rid="web-ti-sy")

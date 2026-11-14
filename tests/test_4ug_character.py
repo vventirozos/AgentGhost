@@ -607,9 +607,10 @@ def test_with_the_character_off_the_command_is_not_one(tmp_path, monkeypatch):
 
 
 def test_the_mirror_banner_says_what_a_reply_hears_now(tmp_path, monkeypatch):
-    # §4UH-loop: `mirror` is the strange loop's path, with the sentence replies hear now and the daily look
+    # §4UH-loop: `mirror` is the strange loop's path, with the sentence replies hear now (§4UH-noself: and no
+    # daily look)
     b = LOOP.banner(tmp_path)
-    assert f"**Now:** «{C.sentence(C.START)}»" in b and "No look yet" in b
+    assert f"**Now:** «{C.sentence(C.START)}»" in b and "look" not in b.lower()
     monkeypatch.setenv("GHOST_CHARACTER", "0")
     b = LOOP.banner(tmp_path)
     assert "**Now:**" not in b and "switched off (GHOST_CHARACTER=0)" in b and "diary" not in b
@@ -1383,18 +1384,6 @@ def test_the_real_rule_moves_a_dial_from_a_run_of_better_days(tmp_path, monkeypa
     row = [r for r in C.log_rows(home) if r["kind"] == C.KIND_MOVE][0]
     assert row["days_up"] == ["2026-10-07", "2026-10-08", "2026-10-09"] and row["days_down"] == []
     assert "moves by itself" in C.view(home) and "manner" not in C.view(home).split("How it got here")[0]
-
-
-def test_a_vote_from_the_look_is_added_to_the_days_own_pull():
-    days = _days(["playful"], ["playful"], ["playful"])
-    start = {"dials": {"warmth": 0, "humour": -1, "directness": 0}, "pins": []}
-    against = {d["date"]: {"humour": -1} for d in days}
-    assert C.propose(days, start, [], "2026-11-03", against) == []          # the day says up, the look says down
-    look_only = {d["date"]: {"warmth": -1} for d in days}
-    moves = C.propose(days, start, [], "2026-11-03", look_only)
-    # the look alone is evidence too: three days of it move warmth, beside the days' own pull on humour
-    assert {m["dial"]: m["to"] for m in moves} == {"humour": 0, "warmth": -1}
-    assert "its own look at its replies counted on 3 of those days" in [m for m in moves if m["dial"] == "warmth"][0]["why"]
 
 
 def test_health_sends_the_shades_age_by_its_own_clock_and_null_without_one(tmp_path):

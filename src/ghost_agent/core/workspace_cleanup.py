@@ -595,6 +595,19 @@ def _keep_set(store, project_id: str) -> Optional[Set[str]]:
         norm = _normalize_rel(art.get("payload") or "", pid)
         if norm:
             keep.add(norm)
+    # §4UM: the owner's changes register their files (PROJECT_CHANGES.md, every path a change added or changed,
+    # and the ones a running request is still writing) — a sweep at "planned work finished" must keep them
+    _cf = getattr(store, "change_files", None)
+    if callable(_cf):
+        try:
+            for p in _cf(project_id) or ():
+                norm = _normalize_rel(str(p), pid)
+                if norm:
+                    keep.add(norm)
+        except Exception:
+            logger.warning("workspace cleanup: change log unreadable for %s; keeping all files",
+                           project_id, exc_info=True)
+            return None
     return keep
 
 
@@ -788,6 +801,7 @@ def sweep_project_workspace(store, project_id: str, *,
                 # unlinked — the sweep's suffix rules still lose real
                 # deliverables (.zip, fonts, audio, weights); a symlink is
                 # scratch and is only unlinked
+                _note_swept(fpath)          # §4UM round 2: the sweep's removal is not the owner's change
                 if not fpath.is_symlink() and _to_project_trash(store, project_id, root, fpath, rel, _trash_stamp):
                     _moved.append(rel)
                 else:
@@ -866,6 +880,14 @@ PROJECT_TRASH_KEEP_DAYS = 30
 def project_trash_dir(store) -> Optional[Path]:
     md = getattr(store, "memory_dir", None)
     return (Path(md).parent / PROJECT_TRASH_DIRNAME) if md else None
+
+
+def _note_swept(fpath) -> None:
+    try:
+        from ..memory.projects import note_system_path
+        note_system_path(fpath)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _to_project_trash(store, project_id: str, root: Path, fpath: Path, rel: str, stamp: str) -> bool:
@@ -1220,6 +1242,7 @@ def tidy_project_workspace(store, project_id: str, *,
             freed += size
             continue
         try:
+            _note_swept(fpath)              # §4UM round 2: the tidy's removal is not the owner's change
             fpath.unlink()
             deleted.append(rel)
             freed += size

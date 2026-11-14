@@ -443,7 +443,8 @@ def _chromium_args(proxy):
         it on hides local IPs from page JS. (The prior code disabled it, which
         was backwards — it exposed 192.168.x.x to a page.)
     """
-    args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    # §4UN-fetch: no `navigator.webdriver` automation flag — bot walls read it before anything else
+    args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
     if proxy:
         # `--host-resolver-rules` governs DNS RESOLUTION only. EXCLUDE
         # localhost keeps a bare "localhost" name from being NOTFOUND-mapped,
@@ -831,6 +832,75 @@ async def _body_excerpt(page, max_chars: int):
     return text, False, full_len
 
 
+#: §4UN-fetch: interstitials that pass on their own after a few seconds (Cloudflare's passive check, Anubis'
+#: proof-of-work, DDoS-Guard) — the runner waits for the page to move on before reading it. r1: a bare
+#: brand word only as the whole title (a "DDoS-Guard outage" story is not an interstitial)
+_PASSING_CHALLENGE_RE = re.compile(
+    r"^\s*(?:just a moment|checking your browser|making sure you(?:'|\u2019)?re not a bot|one moment, please|"
+    r"please wait|ddos-guard\s*$|security check\b|verifying)", re.I)
+CHALLENGE_WAIT_S = 8.0
+#: r1: the title is polled at this period (expect_navigation held the whole budget when no navigation came)
+CHALLENGE_POLL_S = 0.5
+#: the share of an op's timeout kept for reading the page after the wait
+_CHALLENGE_RESERVE_S = 3.0
+
+
+def _challenge_budget_s(timeout_ms, started: float) -> float:
+    """r1: the wait never pushes the op past its own ``timeout_ms`` — what is left of it (since ``started``,
+    a monotonic time), less a reserve for reading the page, capped at `CHALLENGE_WAIT_S`."""
+    try:
+        left = float(timeout_ms) / 1000.0 - (time.monotonic() - started) - _CHALLENGE_RESERVE_S
+    except (TypeError, ValueError):
+        left = CHALLENGE_WAIT_S
+    return max(0.0, min(CHALLENGE_WAIT_S, left))
+
+
+async def _await_challenge_pass(page, budget_s=CHALLENGE_WAIT_S):
+    """When the loaded page is a self-passing interstitial, wait up to ``budget_s`` for it to move on — the
+    title is polled every `CHALLENGE_POLL_S`. Returns the HTTP status of the document it moved to (the last
+    main-frame navigation response seen), or None. Never raises."""
+    try:
+        if budget_s <= 0 or not _PASSING_CHALLENGE_RE.match(await page.title() or ""):
+            return None
+    except Exception:
+        return None
+    seen = {}
+
+    def _on_response(r):
+        try:
+            if r.request.is_navigation_request() and r.frame == page.main_frame:
+                seen["status"] = r.status
+        except Exception:
+            pass
+    try:
+        page.on("response", _on_response)
+    except Exception:
+        pass
+    try:
+        deadline = time.monotonic() + budget_s
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return seen.get("status")
+            await asyncio.sleep(min(CHALLENGE_POLL_S, left))
+            try:
+                title = await page.title() or ""
+            except Exception:
+                continue                     # mid-navigation: the context is being replaced
+            if not _PASSING_CHALLENGE_RE.match(title):
+                try:
+                    await page.wait_for_load_state(
+                        "load", timeout=max(100, int((deadline - time.monotonic()) * 1000)))
+                except Exception:
+                    pass
+                return seen.get("status")
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
+
+
 async def op_navigate(op):
     url = op.get("url")
     if not url:
@@ -848,8 +918,12 @@ async def op_navigate(op):
     _write_last_url(op["profile_dir"], url)
 
     async def run(page):
+        _t_run = time.monotonic()
         resp = await page.goto(url, wait_until=wait_until)
         status = resp.status if resp else None
+        _passed = await _await_challenge_pass(page, _challenge_budget_s(op["timeout_ms"], _t_run))  # §4UN-fetch
+        if _passed is not None:
+            status = _passed
         final_url = page.url
         title = await page.title()
         _write_last_url(op["profile_dir"], final_url)
@@ -886,8 +960,12 @@ async def op_extract_text(op):
         # §4HH: keep the DOCUMENT's response status — a 403 challenge page
         # read as STATUS: OK for 12.8% of corpus fetches because this op
         # threw the response away (op_navigate never did).
+        _t_run = time.monotonic()
         resp = await page.goto(url, wait_until=wait_until)
         status = resp.status if resp else None
+        _passed = await _await_challenge_pass(page, _challenge_budget_s(op["timeout_ms"], _t_run))  # §4UN-fetch
+        if _passed is not None:
+            status = _passed
         if selector:
             el = await page.query_selector(selector)
             if not el:

@@ -35,7 +35,6 @@ import pytest
 from ghost_agent.core import agent as A
 from ghost_agent.core import feedback as F
 from ghost_agent.selfhood import SelfModel
-from ghost_agent.selfhood import loop as MI
 from ghost_agent.selfhood import mood as M
 from ghost_agent.selfhood import sentiment as SE
 from ghost_agent.selfhood import state as ST
@@ -1636,29 +1635,10 @@ def test_a_tone_share_that_has_worn_to_nothing_leaves_the_pair_too(tmp_path):
     assert pair[0] == pytest.approx(pair[1], abs=1e-9) and abs(pair[0][0] - (0.5 / 4096 + 0.01)) < 1e-9
 
 
-# ── R2-8. (§4UH-loop: the Mirror's skip record and stale note went with the Mirror) ──
-
-async def test_a_turn_record_from_before_the_values_is_not_read_as_a_strong_mood(tmp_path, monkeypatch):
-    """After a deploy the last two days' records hold the sentences only. Counting any mood in them as strong
-    could skip the look for two days; they are not read at all."""
-    import ghost_agent.core.failure_census as FC
-    now = dt.datetime.now()
-    old = {"final_response": "An old reply, long enough to be picked by the look. " * 3,
-           "timestamp": (dt.datetime.now(UTC) - dt.timedelta(hours=1)).isoformat(),
-           "extra": {"mood_tone": {"mood": "irritable, 3 of 3", "manner": "evil, 3 of 3"}}}
-    monkeypatch.setattr(FC, "_owner_turns", lambda sysd, days: ([old], []))
-    assert MI.written_under_strong_mood(old) is False
-    assert [p["text"] for p in MI.pick_replies(tmp_path, now)] == [old["final_response"].strip()]
-
+# ── R2-8. (§4UH-loop: the Mirror's skip record and stale note went with the Mirror; §4UH-noself: the
+# daily look's strong-mood filter went with the look) ──
 
 # ── R2-10. one day, everywhere ───────────────────────────────────────────────
-
-def test_the_look_counts_mood_days():
-    """A look at 02:00 belongs to the evening before (§4UH-loop: the Mirror's diary and lasting note, which
-    this test also dated, are removed)."""
-    assert MI._mood_date(dt.datetime(2026, 11, 10, 2, 0)) == dt.date(2026, 11, 9)
-    assert MI._mood_date(dt.datetime(2026, 11, 10, 4, 0)) == dt.date(2026, 11, 10)
-
 
 def test_a_stamp_prints_its_date_by_the_mood_day():
     now = _local(2026, 11, 10, 0, 10)
@@ -1672,8 +1652,9 @@ def test_a_stamp_prints_its_date_by_the_mood_day():
 
 def test_today_is_asked_of_mood_day_and_nowhere_else():
     """No calendar "today" in the mood's code: every `.date()` and `date.today()` in the selfhood modules and
-    in `introspect` is listed here — `mood_day` itself, and the one place that names UTC day FOLDERS."""
-    allowed = {("mood.py", "mood_day"), ("loop.py", "_replies_since")}
+    in `introspect` is listed here — `mood_day` itself (the one place that named UTC day FOLDERS,
+    `loop._replies_since`, went with the daily self-look, §4UH-noself)."""
+    allowed = {("mood.py", "mood_day")}
     found = set()
     for path in sorted((SRC / "selfhood").glob("*.py")) + [SRC / "tools" / "introspect.py"]:
         tree = ast.parse(path.read_text(encoding="utf-8"))

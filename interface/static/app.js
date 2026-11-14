@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=19.28';
+import * as matrixGraphFace from './matrix_graph.js?v=19.29';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
@@ -249,6 +249,7 @@ const ICON_CLASS = {
     '🐚': 'tool',     // TOOL_SHELL
     '🧰': 'tool',     // TOOL_DISPATCH
     '📥': 'tool',     // TOOL_DOWN / Docker pull
+    '📃': 'tool',     // TOOL_PAGE_READ — web_search read a result page (§4UN-read)
     '📨': 'accent',   // QUEUED_MSG — a message the user sent while the turn runs (§4RZ)
     '🎨': 'tool',     // IMAGE_GEN
     '📄': 'tool',     // REPORT_PDF

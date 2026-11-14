@@ -680,13 +680,13 @@ def _by_date(days: List[Dict[str, object]]) -> List[Dict[str, object]]:
 
 
 def propose(days: List[Dict[str, object]], state: Dict[str, object], rows: List[dict],
-            through: str, votes: Optional[Dict[str, Dict[str, int]]] = None) -> List[Dict[str, object]]:
+            through: str) -> List[Dict[str, object]]:
     """The moves the day records up to ``through`` (inclusive) ask for — pure. For each dial that is not
     pinned: over the last ``EVIDENCE_DAYS`` recorded days that came AFTER the dial's last change, the days
     that pulled it up (``day_pulls``) against the days that pulled it down; when one side leads by
     ``LEAD_IN`` (toward 0) or ``LEAD_OUT`` (away from 0), the dial moves ONE step that way, never past
-    ±``LIMIT``. ``votes`` ({date: {dial: ±1}}, the agent's look at its own replies — ``selfview``) are
-    added to the day's pull: a day counts for the side the sum falls on, and for neither when they cancel."""
+    ±``LIMIT``. Only the day records count (§4UH-noself, 2026-11-14: the daily self-look's votes are removed
+    — the main model rated every character it was shown as about (+1, +1, +1), so the look carried nothing)."""
     out = []
     ordered = [d for d in _by_date(days) if str(d.get("date")) <= through]
     pulls = day_pulls(ordered)
@@ -696,18 +696,15 @@ def propose(days: List[Dict[str, object]], state: Dict[str, object], rows: List[
             continue
         # the state's own stamp first (a mood day, written with the dials); the log for a file older than it
         since = _real_date((state.get("changed") or {}).get(dial)) or _last_change(rows, dial)
-        up, down, seen = [], [], 0
+        up, down = [], []
         for d in usable:
             date = str(d.get("date") or "")
             if since and date <= since:
                 continue
             own = int((pulls.get(date) or {}).get(dial, 0))
-            look = int(((votes or {}).get(date) or {}).get(dial, 0))
-            seen += 1 if look else 0
-            total = own + look
-            if total > 0:
+            if own > 0:
                 up.append(date)
-            elif total < 0:
+            elif own < 0:
                 down.append(date)
         lead = len(up) - len(down)
         if not lead:
@@ -720,14 +717,12 @@ def propose(days: List[Dict[str, object]], state: Dict[str, object], rows: List[
         ups, downs = (len(up), len(down)) if step > 0 else (len(down), len(up))
         out.append({"dial": dial, "from": old, "to": new,
                     "why": (f"{ups} days clearly {'better' if step > 0 else 'worse'} than its usual against {downs} "
-                            f"the other way, in {SIGNAL_WORDS[dial]}"
-                            + (f"; its own look at its replies counted on {seen} of those days" if seen else "")),
+                            f"the other way, in {SIGNAL_WORDS[dial]}"),
                     "days_up": up, "days_down": down})
     return out
 
 
-def daily(home, days: List[Dict[str, object]], *, now=None,
-          votes: Optional[Dict[str, Dict[str, int]]] = None) -> List[str]:
+def daily(home, days: List[Dict[str, object]], *, now=None) -> List[str]:
     """Apply the daily rule once per recorded day: nothing happens until a day newer than
     ``daily_through`` is recorded. The moves made, in words. Never raises."""
     try:
@@ -746,7 +741,7 @@ def daily(home, days: List[Dict[str, object]], *, now=None,
             if not dates or dates[-1] <= done:
                 return []
             through = dates[-1]
-            moves = propose(usable, state, log_rows(home), through, votes)
+            moves = propose(usable, state, log_rows(home), through)
             for mv in moves:
                 state["dials"][mv["dial"]] = mv["to"]
                 state["changed"][mv["dial"]] = through       # the evidence up to `through` is used up
@@ -818,13 +813,6 @@ def view(home) -> str:
            "how you talk to me, humour from how my own work goes, directness from how my answers are judged. "
            "Your commands set, hold or take back a dial whenever you want."]
     try:
-        from . import selfview as _selfview
-        seen = _selfview.line(home)
-        if seen:
-            out.append(seen)
-    except Exception:  # noqa: BLE001 — the view renders without the look
-        pass
-    try:
         from . import tastes as _tastes
         # review r2 (§4UH): this view is a system reply, and a reply goes back to the model as history —
         # the liked kinds only here too; what has been rough is in the agent's log (the idle window)
@@ -852,12 +840,11 @@ def line(home) -> str:
             "go — the owner types \"character\" to see or change them. How I am, not a report of work "
             "done and not a checked fact)")
     try:
-        from . import selfview as _selfview
         from . import tastes as _tastes
         # review r1 (§4UH): this line is a tool result the model reads mid-turn — the LIKED kinds only;
         # what has been rough is said in the agent's log only (review r2), never where a model reads
-        seen, likes = _selfview.line(home), _tastes.line(home, liked_only=True)
-        return text + (" " + seen if seen else "") + (" " + likes if likes else "")
+        likes = _tastes.line(home, liked_only=True)
+        return text + (" " + likes if likes else "")
     except Exception:  # noqa: BLE001
         return text
 

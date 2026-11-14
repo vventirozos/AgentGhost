@@ -56,6 +56,8 @@ _ACTIONS = {
     # project-level
     "create", "list", "get", "switch", "exit", "update", "delete",
     "archive", "resume", "status", "budget",
+    # §4UM: the owner's change log
+    "changes",
     # task-level
     "task_add", "task_update", "task_decompose", "task_next", "task_list",
     # artifacts / events / durable working memory
@@ -1195,7 +1197,11 @@ def _parse_advance_count(count) -> Optional[int]:
 
 
 _ADVANCE_STOP_BLURB = {
-    "project_done": "All tasks are complete — the project is done.",
+    # §4UM: only the user closes a project — a finished plan leaves it open ("ready") for changes
+    "project_done": ("All planned tasks are done — the project stays OPEN (ready) for changes; only the user "
+                     "closes it. Say what was built; do not call the project complete or closed."),
+    "project_closed": ("Not run: the user closed this project (DONE). A change written into its folder "
+                       "reopens it; tasks added to it reopen it too."),
     "project_failed": "Stopped: the project is in a FAILED state — one or "
                       "more tasks failed (see failed_tasks). NOTHING is "
                       "runnable until a failed task is fixed. Do NOT report "
@@ -1302,7 +1308,7 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
     # possible" — report and hand back; do NOT manually rebuild (that long
     # manual build thrashed ~700s and broke project scoping).
     stopped_early = batch.stop_reason in (
-        "failed", "repeated_failures", "budget_or_inactive", "needs_user",
+        "failed", "repeated_failures", "budget_or_inactive", "needs_user", "project_closed",
         "project_failed", "autopilot_paused", "autopilot_off", "busy", "step_crashed", "model_server_failed", "out_of_time",
         "in_progress", "open_but_waiting", "labs_down", "lab_capacity", "lab_gave_up", "lab_owner_hold")
     if batch.stop_reason == "model_experiment":
@@ -1939,17 +1945,83 @@ def _project_of_path(store, path) -> tuple:
     return _canon_id(rel.parts[0]), Path(*rel.parts[1:]).as_posix()
 
 
-def note_project_write(context, path) -> str:
-    """§4UL (2d): a file the owner's turn wrote into ``projects/<id>/`` is
-    work on that project, whatever the focus was. Call it after every
-    successful write (``path`` absolute, or relative to the sandbox root).
+def _owner_change_turn(context) -> bool:
+    """§4UM: the turn's writes are the OWNER's changes — the owner's own request, or a project task's turn it
+    runs; never a background / member / probe / simulated turn."""
+    if not (_owner_turn_now() or _owner_task_turn(context)) or getattr(context, "simulated", False):
+        return False
+    try:
+        from ..core.request_scope import ORIGIN_OWNER, current_scope
+        _sc = current_scope(context)
+        if _sc is not None and getattr(_sc, "origin", ORIGIN_OWNER) != ORIGIN_OWNER:
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def begin_request_watch(context, request_id: str, user_text: str) -> None:
+    """§4UM review M3: at an OWNER request's start — its message is the ask of every change it makes, and the
+    project focused now is watched (its folder snapshot, diffed at the request's end). Never raises."""
+    try:
+        store = _resolve_store(context)
+        if store is None or not _owner_change_turn(context):
+            return
+        from ..memory.projects import note_request_ask, watch_project
+        note_request_ask(request_id, user_text)
+        pid = getattr(context, "current_project_id", None)
+        proj = store.get_project(pid) if pid else None
+        if proj and str(proj.get("status") or "").upper() != "RELEASED":
+            watch_project(store, pid, rid=request_id, ask=user_text)
+    except Exception:  # noqa: BLE001
+        logger.debug("request watch not started", exc_info=True)
+
+
+def prepare_project_write(context, path=None, project_id: str = "", evidence: bool = False) -> None:
+    """§4UM review M3/M4: BEFORE a write / delete / move / command touches ``projects/<id>/`` (``path``, or the
+    project id itself), the owner's request snapshots that project's folder (once) so the flush can diff it.
+    Never raises."""
+    try:
+        store = _resolve_store(context)
+        if store is None:
+            return
+        pid = project_id or (_project_of_path(store, path)[0] if path else "")
+        if not pid:
+            return
+        if not _owner_change_turn(context):
+            # §4UM round 2: an unattended task turn on a ready project writes for its own entry (opened at its
+            # start) — mark it; nothing else is recorded outside the owner's turns
+            if not getattr(context, "simulated", False):
+                from ..memory.projects import mark_task_write
+                mark_task_write(store, pid, evidence=evidence)
+            return
+        proj = store.get_project(pid)
+        if not proj or str(proj.get("status") or "").upper() == "RELEASED":
+            return
+        from ..memory.projects import watch_project
+        # §4UM round 2: a writing tool is about to run here — only such a request's folder is diffed at its end
+        # round 4: ``evidence`` only from a command that names write targets — a pinned `pytest` diffs, but alone
+        # never makes an entry that lists no file
+        watch_project(store, pid, ask=" ".join(str(getattr(context, "last_user_content", "") or "").split())[:300],
+                      write=True, evidence=evidence)
+    except Exception:  # noqa: BLE001
+        logger.debug("project write not prepared for %s", path or project_id, exc_info=True)
+
+
+def note_project_write(context, path, reopen: bool = True) -> str:
+    """§4UM (living projects; was §4UL 2d): a file the OWNER's turn wrote (or removed) in
+    ``projects/<id>/`` is a change to that project, whatever the focus was.
+    Call it after every successful write (``path`` absolute, or relative to
+    the sandbox root).
 
     * nothing focused → this conversation's focus becomes that project;
-    * the project is DONE → it reopens with an IN_PROGRESS task
-      ``Change: <the owner's first words>`` and a ledger line (the DONE
-      close's constraints come back with the reopen — store.add_task);
-    * anything else (ACTIVE, a background/member/probe/simulated turn, a
-      path outside projects/) → nothing.
+    * the path is noted for the request's change-log entry (one entry per
+      request, written at its end — `memory.projects.flush_change_log`; the
+      folder diff there sees what the hooks did not);
+    * a project the owner closed (DONE) reopens to ACTIVE ("ready") — no task,
+      no question; the entry says "reopened by change #N";
+    * a background/member/probe/simulated turn, a RELEASED project or a path
+      outside projects/ → nothing.
 
     Returns a one-line note for the tool result when it reopened the
     project, else "". Never raises."""
@@ -1958,40 +2030,81 @@ def note_project_write(context, path) -> str:
         if store is None:
             return ""
         pid, rel = _project_of_path(store, path)
-        if not pid or not _owner_turn_now() or getattr(context, "simulated", False):
+        if not pid:
             return ""
-        try:
-            from ..core.request_scope import ORIGIN_OWNER, current_scope
-            _sc = current_scope(context)
-            if _sc is not None and getattr(_sc, "origin", ORIGIN_OWNER) != ORIGIN_OWNER:
-                return ""
-        except Exception:  # noqa: BLE001
-            pass
+        if not _owner_change_turn(context):
+            if not getattr(context, "simulated", False):
+                from ..memory.projects import mark_task_write
+                mark_task_write(store, pid)     # §4UM round 2: an unattended task turn's own entry
+            return ""                       # (a project task's turn run by the owner's request writes for it)
         proj = store.get_project(pid)
         if not proj:
             return ""
         if not getattr(context, "current_project_id", None):
             _set_current(context, pid)
-        if str(proj.get("status") or "").upper() != "DONE":
-            return ""
-        rid = _current_request_id()
-        # the close happened in THIS request (its last task closed, then the
-        # turn wrote its notes): that is the same work, not a change
-        # §4UL review M5: a project task's turn (`sub-ptask-…`) that ran inside THIS request closed it — its
-        # parent is this request (`memory.projects.request_root`)
-        from ..memory.projects import request_root as _rroot
-        if rid and any(_c and (_c == rid or _rroot(_c) == rid)
-                       for _c in (str(t.get("closed_req_id") or "") for t in (store.list_tasks(pid) or []))):
-            return ""
-        words = " ".join(str(getattr(context, "last_user_content", "") or "").split()[:10])
-        desc = f"Change: {words[:120] or rel[:80]}"
-        tid = store.add_task(pid, desc, status="IN_PROGRESS")
-        store.log_event(pid, tid, "project_write_reopen", {"path": rel[:200], "req": rid})
-        store.append_ledger(pid, f"REOPENED (request {rid or '?'}): {rel[:120]} was written — {desc}")
-        return (f"Project {pid} was DONE; writing {rel} reopened it with task {tid} ('{desc}'). "
-                f"Close it with task_update DONE when the change is done.")
+        st = str(proj.get("status") or "").upper()
+        if st == "RELEASED":
+            return ""                       # immutable: changes go to create_version
+        reopened = ""
+        # round 4: ``reopen=False`` — a write that may not be FOR the project (a render saved while it is focused)
+        # is logged, but only a file / command / lab write reopens a project the owner closed
+        if reopen and st == "DONE" and store.update_project(pid, status="ACTIVE"):
+            reopened = "DONE"
+        from ..memory.projects import note_change_write, watch_project
+        ask = " ".join(str(getattr(context, "last_user_content", "") or "").split())[:300]
+        # noted FIRST: a snapshot taken now (none before this write) is after it — the noted kind stands
+        note_change_write(store, pid, rel, ask=ask, reopened_from=reopened)
+        watch_project(store, pid, ask=ask, write=True)
+        if reopened:
+            return (f"Project {pid} was closed (DONE); this change reopened it — it stays open and the change "
+                    f"is recorded in its change log (PROJECT_CHANGES.md) at the end of this request. Nothing to close.")
+        return ""
     except Exception:  # noqa: BLE001
         logger.warning("project write not noted for %s", path, exc_info=True)
+        return ""
+
+
+def note_project_writes(context, paths) -> str:
+    """Round 4: `note_project_write` for a BATCH (a lab folder `get`): per project, its status read once, the
+    records and the pending file once (`memory.projects.note_change_writes`). Returns the notes. Never raises."""
+    try:
+        store = _resolve_store(context)
+        if store is None or not paths:
+            return ""
+        by_pid: Dict[str, List[str]] = {}
+        for p in paths:
+            pid, rel = _project_of_path(store, p)
+            if pid and rel:
+                by_pid.setdefault(pid, []).append(rel)
+        if not by_pid:
+            return ""
+        if not _owner_change_turn(context):
+            if not getattr(context, "simulated", False):
+                from ..memory.projects import mark_task_write
+                for pid in by_pid:
+                    mark_task_write(store, pid, evidence=True)
+            return ""
+        from ..memory.projects import note_change_writes, watch_project
+        ask = " ".join(str(getattr(context, "last_user_content", "") or "").split())[:300]
+        notes = []
+        for pid, rels in by_pid.items():
+            proj = store.get_project(pid)
+            if not proj:
+                continue
+            if not getattr(context, "current_project_id", None):
+                _set_current(context, pid)
+            st = str(proj.get("status") or "").upper()
+            if st == "RELEASED":
+                continue
+            reopened = "DONE" if st == "DONE" and store.update_project(pid, status="ACTIVE") else ""
+            note_change_writes(store, pid, rels, ask=ask, reopened_from=reopened)
+            watch_project(store, pid, ask=ask, write=True)
+            if reopened:
+                notes.append(f"Project {pid} was closed (DONE); this change reopened it — it stays open and the "
+                             f"change is recorded in its change log (PROJECT_CHANGES.md) at the end of this request.")
+        return "\n".join(notes)
+    except Exception:  # noqa: BLE001
+        logger.warning("project writes not noted", exc_info=True)
         return ""
 
 
@@ -2080,22 +2193,6 @@ def _lifecycle_target(context, store, project_id, title):
         return None, (f"the current project {cur} no longer exists — NOTHING was changed. "
                       f"Name the project (project_id or title).")       # review N9
     return (_canon_pid(cur) if cur else None), None
-
-
-def _lifecycle_would_refuse(store, act, rid, kwargs, context=None) -> bool:
-    """The action will refuse on its own and change nothing — no preview to
-    confirm (review m4: a preview for an ACTIVE project's release ended in
-    the owner's "yes" hitting "not DONE"). §4UI: a delete that an unreleased
-    human gate will refuse — the preview's token was spent before the gate
-    refused, so the owner's next "delete <task>" got a fresh preview and the
-    "yes" after it named no task: a loop."""
-    st = str((store.get_project(rid) or {}).get("status") or "").upper()
-    if act == "unrelease":
-        return st != "RELEASED"
-    if act == "release":
-        return (st != "DONE"
-                or len(" ".join(str(kwargs.get("directions") or "").split())) < 30)
-    return False
 
 
 async def _host_project_labs(context, project_id: str) -> Optional[list]:
@@ -2206,7 +2303,9 @@ async def tool_manage_projects_for_model(context, **kwargs):
             rid, rerr = _lifecycle_target(context, store, kwargs.get("project_id"), kwargs.get("title") or "")
             if rerr:
                 return _err(rerr)
-            if rid and not _lifecycle_would_refuse(store, act, rid, kwargs, context):
+            if rid:
+                # §4UM review M1: the who-may-act wall runs for EVERY release/unrelease/delete — a guess at
+                # "the action refuses by itself anyway" let a background turn release a ready project
                 _hl = await _host_project_labs(context, rid) if act == "delete" else None
                 _gate = _lifecycle_confirmation(store, act, rid, token, context, _hl)
                 if _gate is not None:
@@ -2944,6 +3043,16 @@ def _release_rehearsal(context, store: ProjectStore, project_id: str) -> Dict[st
             "detail": "; ".join(checks)}
 
 
+#: §4UM: what each project state means for the next request (status/get/switch briefings)
+_STATE_NOTE = {
+    "ready": ("All planned work is done. The project stays OPEN — it is a living app: make the user's changes "
+              "directly in its files (the system logs each change in the change log and PROJECT_CHANGES.md); add "
+              "tasks only for multi-step work. Only the user closes it (update status=DONE)."),
+    "working": "Planned tasks are still open (task_tree / next_ready).",
+    "done": "Closed by the user. A change written into its folder reopens it (and is logged).",
+}
+
+
 def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
     """Compact status snapshot suitable for a resume banner.
 
@@ -3031,14 +3140,29 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
         last_dream_digest = (_dd[0].get("payload") or {}) if _dd else None
     except Exception:
         last_dream_digest = None
+    # §4UM: a living project — its state (working / ready / done), the owner's changes, the files as they
+    # are on disk now, and where it is live (and which changes are not there yet)
+    from ..memory.projects import folder_layout, live_line, recent_change_lines
+    try:
+        _state = store.project_state(project_id, proj)
+    except Exception:
+        _state = str(proj.get("status") or "").lower()
+    _live = live_line(store, project_id)
     return {
         "project": {
             "id": proj["id"],
             "title": proj["title"],
             "kind": proj["kind"],
-            "status": proj["status"],
+            # §4UM live probe: a legacy auto-close (raw DONE, state "ready") read as "DONE and ready" — an
+            # open project shows ACTIVE; only the owner's close shows DONE
+            "status": ("ACTIVE" if _state == "ready" else proj["status"]),
+            "state": _state,
             "goal": proj["goal"],
         },
+        "state_note": _STATE_NOTE.get(_state, ""),
+        "recent_changes": recent_change_lines(store, project_id, 5),
+        "files": folder_layout(store, project_id, 40),
+        "live": _live or None,
         # Capped (2026-07-25 round 2): a 50-task project's full render blew
         # past 100KB into the tool result — the exact hazard task_list was
         # slimmed for.
@@ -3294,7 +3418,7 @@ async def tool_manage_projects(
     # short-circuits on a valid project_id and ignores the title.
     # NB: "update" is NOT here — its `title` arg is a RENAME value, not a
     # lookup key, so auto-filling `current` for a rename is correct.
-    _TITLE_RESOLVABLE = {"delete", "archive", "get", "switch", "resume",
+    _TITLE_RESOLVABLE = {"delete", "archive", "get", "switch", "resume", "changes",
                          "release", "create_version", "status", "autopilot",
                          # §4PE (P2): these looked up `title` too, and the auto-fill
                          # sent them to the CURRENT project (a constraint retired
@@ -3686,8 +3810,17 @@ async def tool_manage_projects(
                 if m.get("parent_project_id"):
                     bits.append(f"fork of {m['parent_project_id']}")
                 return f"  [{', '.join(bits)}]" if bits else ""
+            # §4UM: the state, not the raw status — an ACTIVE project whose planned work is done is "ready"
+            # (open for changes); ready ones after the ones still being worked on
+            def _st(p):
+                try:
+                    return store.project_state(p.get("id"), p)
+                except Exception:
+                    return str(p.get("status") or "").lower()
+            _states = {p.get("id"): _st(p) for p in projs}
+            projs.sort(key=lambda p: 1 if _states.get(p.get("id")) == "ready" else 0)
             lines = [
-                f"{p.get('id')}  {str(p.get('status') or ''):<9}  "
+                f"{p.get('id')}  {_states.get(p.get('id')) or '':<9}  "
                 f"{p.get('title')}{_fam(p)}"
                 + (f"  (created {p['created']})" if p.get("created") else "")
                 + ("   <- ACTIVE" if p.get("id") == current else "")
@@ -3706,7 +3839,9 @@ async def tool_manage_projects(
                     "ALWAYS show each project's id (first column of "
                     "'display') when presenting projects to the user — the "
                     "id is the only unambiguous reference for follow-up "
-                    "get/switch/update/delete calls."),
+                    "get/switch/update/delete calls. State: working = planned "
+                    "tasks open; ready = planned work done, still open for "
+                    "changes; done = closed by the user."),
             })
 
         if act == "get":
@@ -3734,16 +3869,19 @@ async def tool_manage_projects(
             # read actions (describe_file/ledger/config/artifact_list).
             _p = store.get_project(rid) or {}
             _m = _p.get("metadata") or {}
+            _b = _briefing(store, rid)
             return _ok({
                 "id": _p.get("id"), "title": _p.get("title"),
-                "kind": _p.get("kind"), "status": _p.get("status"),
+                # §4UM live probe: the open project's status, not the legacy auto-close's raw DONE
+                "kind": _p.get("kind"), "status": (_b.get("project") or {}).get("status", _p.get("status")),
+                "state": (_b.get("project") or {}).get("state"),
                 "goal": _p.get("goal"),
                 "version": _m.get("version", 1),
                 "parent_project_id": _m.get("parent_project_id"),
                 "workspace_dir": _p.get("workspace_dir"),
                 "created": _iso_date(_p.get("created_at")),
                 "updated": _iso_date(_p.get("updated_at")),
-                "briefing": _briefing(store, rid),
+                "briefing": _b,
             })
 
         if act == "switch":
@@ -3813,6 +3951,15 @@ async def tool_manage_projects(
                     if _other:
                         store.update_project(project_id, **_other)
                     return await tool_manage_projects_for_model(context, action="archive", project_id=project_id)
+                if str(status).upper() == "DONE":
+                    # §4UM: only the OWNER closes a project (a finished plan leaves it open, "ready") — a
+                    # background, scheduled or probe turn cannot (a probe its own throwaway project, yes)
+                    _pc = store.get_project(project_id) or {}
+                    if not (_owner_turn_now() or (_probe_turn_now()
+                                                  and (_pc.get("metadata") or {}).get("probe_created"))):
+                        return _err("NOT done: only the user closes a project (status=DONE), in their own "
+                                    "conversation — a background, scheduled or test turn cannot. Its planned "
+                                    "work being finished leaves it open (ready); nothing changed.")
                 fields["status"] = status
             if kind:
                 fields["kind"] = kind
@@ -3820,9 +3967,19 @@ async def tool_manage_projects(
                 fields["metadata"] = metadata
             if not fields:
                 return _err("no updatable fields provided")
+            _closing = (str(fields.get("status") or "").upper() == "DONE"
+                        and str((store.get_project(project_id) or {}).get("status") or "").upper() != "DONE")
             ok = store.update_project(project_id, **fields)
             if not ok:
                 return _err(f"update matched no rows for {project_id} — nothing was changed.")
+            if _closing:
+                # §4UM review: the close is the OWNER's act (prompt rule + the wall above) — said and logged
+                from ..utils.logging import request_id_context as _rc
+                store.log_event(project_id, None, "project_closed",
+                                {"by": "owner", "req": str(_rc.get() or "")})
+                return _ok({"updated": ok, "fields": list(fields.keys()),
+                            "note": "closed by the owner's request (DONE). A change written into its folder, or a "
+                                    "new task, reopens it."})
             return _ok({"updated": ok, "fields": list(fields.keys())})
 
         if act == "constraint_retire":
@@ -4031,6 +4188,35 @@ async def tool_manage_projects(
                 _b = {**_b, "workspace": f"projects/{project_id}",
                       "note": _note}
             return _ok(_b)
+
+        if act == "changes":
+            # §4UM: the owner's change log (system-written: what was asked, which files, live or not)
+            rid = project_id
+            if title and not project_id:
+                rid, rerr = _resolve_project_ref(store, None, title)
+                if rerr:
+                    return _err(rerr)
+            if not rid or not store.get_project(rid):
+                return _no_active_project(store) if not (project_id or title) else \
+                    _err(f"no project matches {(title or project_id)!r} — action=list shows the real ones")
+            try:
+                n = max(1, min(50, int(str(count or "").strip() or 10)))
+            except ValueError:
+                n = 10
+            try:
+                off = max(0, int((metadata or {}).get("offset") or 0))
+            except (TypeError, ValueError):
+                off = 0
+            from ..memory.projects import change_line, live_line
+            rows = store.list_changes(rid, limit=n, offset=off)
+            total = len(store.list_changes(rid))
+            return _ok({"project": rid, "state": store.project_state(rid),
+                        "live": live_line(store, rid) or None,
+                        "total": total, "offset": off,
+                        "changes": [change_line(e) for e in rows] or ["(no changes logged yet)"],
+                        "more": (f"metadata={{\"offset\": {off + len(rows)}}} for older entries"
+                                 if off + len(rows) < total else None),
+                        "file": f"projects/{rid}/PROJECT_CHANGES.md"})
 
         if act == "status":
             cur = getattr(context, "current_project_id", None)
@@ -5359,11 +5545,11 @@ async def tool_manage_projects(
                 return _ok({"status": "RELEASED",
                             "note": "already released",
                             "release": store.get_release(project_id)})
-            if _status != "DONE":
+            # §4UM: a project whose planned work is finished stays open ("ready") — that is releasable too
+            if _status != "DONE" and not store.planned_work_done(project_id):
                 return _err(
-                    f"project is {_status}, not DONE — finish it first "
-                    f"(all tasks closed, status rolled up to DONE), then "
-                    f"release.")
+                    f"project is {store.project_state(project_id)}, not ready — finish its planned "
+                    f"tasks first (all of them DONE), then release.")
             _dirs = " ".join((directions or "").split())
             if len(_dirs) < 30:
                 return _err(
@@ -5396,7 +5582,7 @@ async def tool_manage_projects(
                            icon=Icons.FAIL, level="WARNING")
                 _stop_project_services(context, project_id)
                 return _err(
-                    f"release rehearsal FAILED — project stays DONE. "
+                    f"release rehearsal FAILED — the project is not released (it stays {store.project_state(project_id)}). "
                     f"{reh.get('detail', '')}. Fix the issue (or register "
                     f"the missing deliverables) and retry.")
             # (3) compose the dossier from REHEARSED facts.
@@ -6243,7 +6429,7 @@ async def tool_manage_projects(
 #: callable (API, tests, an old habit) — none of them is named by a system
 #: message the model reads (every one that is, is here).
 _VISIBLE_ACTIONS = (
-    "create", "switch", "exit", "status", "get", "list", "update", "archive", "resume", "delete",
+    "create", "switch", "exit", "status", "get", "list", "changes", "update", "archive", "resume", "delete",
     "replan", "task_decompose", "task_add", "task_update", "task_delete", "task_list",
     "autoadvance", "autopilot", "budget", "ledger", "config", "describe_file",
     "unregister_file", "artifact_list", "research", "release", "unrelease", "create_version",
@@ -6271,7 +6457,11 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "release, unrelease and delete run at once when the user asks (no confirmation). Prefer archive "
             "(reversible) to delete when the user did not say delete. autopilot and budget only on the "
             "user's request. "
-            "Actions: create · switch · exit (leave the active project) · status · get · list · update · archive · resume · delete · "
+            "A project stays OPEN when its planned tasks are done (state ready: a living app — make changes "
+            "straight in its files; the system logs every change and deploy). Only the user closes it "
+            "(update status=DONE when they ask). "
+            "Actions: create · switch · exit (leave the active project) · status · get · list · "
+            "changes (the change log, newest first; count, metadata.offset) · update · archive · resume · delete · "
             "replan (subtasks = the NEW plan; keeps done tasks, their files and the research) · "
             "task_decompose (subtasks=[…]; task_id = break that task down; ANY list of 2+ tasks goes here in ONE call, not N task_add) · task_add (one task) · "
             "task_update (task_ids=[…] for many) · task_delete · task_list · autoadvance (count) · "

@@ -62,7 +62,7 @@ class _Resp:
 
 class _Session:
     """A curl_cffi-shaped AsyncSession. `responder(profile) -> resp/exc`
-    decides per attempt, where profile is "plain" or "chrome110"; every
+    decides per attempt, where profile is "plain" or the browser target; every
     constructor call is recorded with its impersonate/headers kwargs."""
     calls = 0
     sessions = []
@@ -104,17 +104,20 @@ CF_403 = _Resp(403, {"server": "cloudflare", "content-type": "text/html"})
 
 # --- the regression, and the remedy -------------------------------------
 
-def test_a_refused_browser_profile_is_retried_as_plain_curl_on_the_same_tor_circuit(tmp_path):
+def test_a_refused_browser_profile_is_retried_as_plain_curl_on_a_fresh_tor_circuit(tmp_path):
     """THE REMEDY. World where it fails: every attempt impersonates Chrome and
     Cloudflare refuses each one — the tool never tries the identity that
     the measurement showed gets through."""
     def responder(profile):
-        return CF_403 if profile == "chrome110" else _Resp(200, {"Content-Length": "5"}, b"%PDF-")
+        return CF_403 if profile == FS._DOWNLOAD_IMPERSONATE else _Resp(200, {"Content-Length": "5"}, b"%PDF-")
     out, calls, rotations = _run(responder=responder, sandbox=tmp_path)
     assert out.startswith("SUCCESS"), out
     assert calls == 2 and rotations == 0, (calls, rotations)      # no 5 s identity rotation spent
     profiles = [("plain" if k.get("impersonate") is None else k["impersonate"]) for k in _Session.sessions]
-    assert profiles == ["chrome110", "plain"], profiles
+    assert profiles == [FS._DOWNLOAD_IMPERSONATE, "plain"], profiles
+    # §4UN-fetch: the retry rides its own circuit (SOCKS-auth isolation), still the Tor proxy
+    _px = [str((k.get("proxies") or {}).get("https")) for k in _Session.sessions]
+    assert _px[0] != _px[1] and all("127.0.0.1:9050" in p for p in _px), _px
     assert _Session.sessions[1].get("headers", {}).get("User-Agent") == FS._PLAIN_PROFILE_UA
     assert (tmp_path / "dummy.pdf").read_bytes() == b"%PDF-"
 

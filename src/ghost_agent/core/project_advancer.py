@@ -1419,8 +1419,9 @@ async def _advance_once_body(
     for _dep in _deps:
         _dp = store.get_project(_dep)
         _dep_status = str((_dp or {}).get("status", "")).upper()
-        if _dep_status in ("DONE", "RELEASED"):
-            continue
+        if _dep_status in ("DONE", "RELEASED") or (_dep_status == "ACTIVE" and _dp is not None
+                                                    and store.planned_work_done(_dep)):
+            continue                         # §4UM: a dependency whose planned work is done ("ready") is met
         # A dependency that can NEVER become DONE must not block forever
         # (the inter-project mirror of the intra-project rule that treats an
         # unknown dep id as satisfied "so a bad reference can't deadlock the
@@ -2259,8 +2260,18 @@ def idle_candidates(store) -> list:
     `action=autopilot enabled=true`. A single web "advance" step does not
     opt in. Every ACTIVE project used to be, and that is how a released
     app's unasked fork got built."""
+    # §4UM: a "ready" project (every planned task done — it stays open for changes) has nothing to run
     return [p for p in (store.list_projects("ACTIVE") or [])
-            if (p.get("metadata") or {}).get("autopilot")]
+            if (p.get("metadata") or {}).get("autopilot")
+            and _project_state(store, p) != "ready"]
+
+
+def _project_state(store, proj) -> str:
+    fn = getattr(store, "project_state", None)
+    try:
+        return fn(proj.get("id"), proj=proj) if callable(fn) else "working"
+    except Exception:  # noqa: BLE001
+        return "working"
 
 
 # ------------------------------------------------------------------ §4MQ
@@ -3012,7 +3023,10 @@ async def advance_many(
             # rolled up (DONE if all done; FAILED if any task failed).
             pstatus = (store.get_project(project_id) or {}).get("status")
             if pstatus == "DONE":
-                stop_reason = "project_done"
+                # §4UM: a roll-up never sets DONE any more (finished plans stay ACTIVE, "ready") —
+                # a DONE project here was closed by the user, unless the old roll-up closed it (still ready)
+                stop_reason = ("project_done" if store.planned_work_done(project_id) is True
+                               else "project_closed")
             elif pstatus == "FAILED":
                 # NEVER "project_done" here. A batch invoked on an
                 # already-FAILED project used to fall through

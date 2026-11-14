@@ -137,8 +137,11 @@ def test_download_failclosed_under_guard(monkeypatch, tmp_path):
         )
     finally:
         u()
-    assert isinstance(proxies, dict) and "socks5h://127.0.0.1:9050" in proxies.values(), \
-        f"download leaked cleartext under --mandatory-tor: proxies={proxies!r}"
+    # §4UN-fetch: a retry rides its own SOCKS-isolated circuit (`tag:isolate@127.0.0.1:9050`) — still the Tor proxy
+    from urllib.parse import urlparse
+    assert isinstance(proxies, dict) and proxies and all(
+        str(v).startswith("socks5h://") and urlparse(v).hostname == "127.0.0.1" and urlparse(v).port == 9050
+        for v in proxies.values()), f"download leaked cleartext under --mandatory-tor: proxies={proxies!r}"
 
 
 def test_download_direct_without_guard(monkeypatch, tmp_path):

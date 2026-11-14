@@ -54,7 +54,10 @@ _CHALLENGE_TITLE_RE = re.compile(
     r"access (?:to this page has been )?denied|verify you are human|"
     r"are you a human|checking your browser|please enable cookies|"
     r"403 forbidden|401 authorization required|429 too many requests|"
-    r"cloudflare|ddos-guard|one moment, please|bot verification|"
+    r"one moment, please|bot verification|"
+    # §4UN-fetch r1: a bare BRAND word is a wall only as the WHOLE title — "Cloudflare outage takes down X"
+    # and "CAPTCHA farms are booming" are news stories
+    r"(?:cloudflare|ddos-guard|captcha|incapsula)\s*[.!]?\s*$|"
     # §4HV (2026-09-16, req d121dcc6): Hetzner's "Heray" gate — HTTP 200,
     # TITLE "Security Check", 211 chars, URL rewritten to /_ray/pow, body
     # "Checking that you are not a robot … Verifying…". Passed as a normal
@@ -62,7 +65,12 @@ _CHALLENGE_TITLE_RE = re.compile(
     # no-progress breaker forced the conclusion. Word-bounded so a real
     # "Security Checklist …" article never matches.
     r"security check\b|checking that you are not a robot|robot check\b|"
-    r"human verification|captcha\b)",
+    r"human verification|"
+    # §4UN-fetch: Anubis' proof-of-work gate, Google/YouTube's EU consent wall (Tor exits are often EU),
+    # Imperva/Incapsula, and the "one more step" / "please wait" interstitials
+    r"making sure you(?:'|\u2019)?re not a bot|before you continue(?: to (?:google|youtube)[\w ]*)?\s*$|"
+    r"request unsuccessful|one more step\b|please wait while we verify|"
+    r"pardon our interruption)",
     re.IGNORECASE)
 _CHALLENGE_URL_RE = re.compile(r"__cf_chl|/cdn-cgi/challenge|/_ray/pow\b", re.IGNORECASE)
 _BLOCKED_STATUSES = frozenset({401, 403, 407, 429, 451, 503})

@@ -64,6 +64,7 @@ from ..core.node_throughput import (
 # breaker 'worked' by accident, with its only observability dead.
 logger = logging.getLogger("GhostAgent")
 from ..utils.helpers import url_ssrf_reason, aclose_curl_response
+from ..utils.helpers import FetchError as _FetchErrorBase   # §4UN-darkres r1: `_FetchTimeout` subclasses it
 from . import search as _search      # §4NK: the shared slot/backfill/no-facts helpers
 from .search import (
     source_block_failed as _source_block_failed,
@@ -97,9 +98,36 @@ from . import search as _budgets
 # Tor hidden-service addresses are base32 (chars a-z, 2-7): v3 is 56 chars,
 # the legacy v2 was 16. Match either, optionally followed by a path.
 _ONION_RE = re.compile(                                   # §4PD: v3 only — v2 (16 chars) died in 2021
-    r"https?://[a-z2-7]{56}\.onion(?:/[^\s\"'<>]*)?",
+    # §4UN-dark r1: a subdomain (www.<v3>.onion — the v3 label is what's validated) and a :port are kept
+    r"https?://(?:[a-z0-9-]+\.)*[a-z2-7]{56}\.onion(?::\d{1,5})?(?:/[^\s\"'<>]*)?",
     re.IGNORECASE,
 )
+
+
+# §4UN-dark (review r1): the checksum lives in core (core must not import tools); re-exported here.
+from ..core.link_grounding import onion_v3_valid  # noqa: E402,F401
+
+
+#: §4UN-dark: any onion-looking address, garbled ones included (a non-base32 character, a wrong length), with
+#: an optional scheme and path — what a summary is scanned for
+_ANY_ONION_IN_TEXT_RE = re.compile(r"(?:https?://)?([a-z0-9]{10,}\.onion)(?:/[^\s\"'<>)\]]*)?", re.I)
+
+
+def keep_page_onions(summary: str, page_text: str) -> str:
+    """§4UN-dark: a worker's summary of an onion page keeps an onion address only when that address is
+    VERBATIM in the page it summarised and its v3 checksum holds; any other one is replaced by the link
+    guard's own mark. The summary is tool output — and an address in tool output passes every later guard."""
+    if not summary or ".onion" not in summary.lower():
+        return summary
+    from ..core.link_grounding import _ONION_MARK
+    page = str(page_text or "").lower()
+
+    def _sub(m: "re.Match") -> str:
+        host = m.group(1).lower()
+        if host in page and onion_v3_valid(host):
+            return m.group(0)
+        return _ONION_MARK
+    return _ANY_ONION_IN_TEXT_RE.sub(_sub, summary)
 
 # --------------------------------------------------------------------------
 # Onion search-engine registry
@@ -132,12 +160,14 @@ _DEFAULT_ONION_ENGINES: List[Dict[str, str]] = [
         "url": "https://ahmia.fi/search/?q={q}",
         "index": "ahmia",
         "form_token_from": "https://ahmia.fi/",
+        "result_selector": "li.result",                 # §4UN-dark: its results; the rest is page furniture
     },
     {
         "name": "ahmia-onion",
         "url": "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q={q}",
         "index": "ahmia",
         "form_token_from": "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/",
+        "result_selector": "li.result",
     },
     {
         # Torch, re-pointed 2026-07-29. The previous `torchdeed…` address was
@@ -258,6 +288,37 @@ _FORM_TOKEN_TIMEOUT = 12.0
 # content pages are slower still than the search engines; give them room.
 _ONION_PAGE_TIMEOUT = 35.0
 
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        v = float(os.environ.get(name) or default)
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# §4UN-darkres (req 212e6a8c): a hidden service that sends NOTHING back gives
+# up here instead of at `_ONION_PAGE_TIMEOUT` — six dead onions, two at a
+# time, each holding its slot for 35 s, were most of a 140 s run. A page that
+# answers (status + headers) keeps the full read time for its body.
+_ONION_FIRST_BYTE_S = _env_seconds("GHOST_ONION_FIRST_BYTE_S", 15.0)
+# darkweb_research: onion pages fetched at once. Each URL's budget is issued
+# when it STARTS (`_bounded`), so a wider gate no longer starves the later ones.
+_RESEARCH_FETCH_WIDTH = 4
+# The distiller's time kept back when a URL's fetch is capped: the fetch may
+# use what is left of the URL's budget minus this (never less than the first
+# byte + 5 s). 212e6a8c: "distill declined (only -5.6s of budget left)".
+# ≥ the 16 s queue allowance + a working distill.
+_DISTILL_RESERVE_S = 30.0
+# r1: the reserve never shortens the first-byte wait below this
+_FIRST_BYTE_FLOOR_S = 5.0
+# r2: the longest wait for a streamed response's close (abort + reap)
+_ACLOSE_WAIT_S = 2.0
+# dr2: the read a first-byte retry must still have time for (beside the wait + the distill reserve)
+_RETRY_READ_S = 10.0
+# The most pages a caller may hand darkweb_research in `urls`.
+_MAX_GIVEN_URLS = 8
+
 # Overall wall-clock deadline for a SINGLE engine (both attempts combined).
 # Because engines are queried concurrently, the whole search can only finish
 # once the SLOWEST engine returns — so a dead or hung engine that burns its
@@ -311,7 +372,32 @@ _ENGINE_BREAKER: Dict[str, Tuple[int, float]] = {}
 
 
 def _no_results_error(skipped: List[str], total: int,
-                      all_skipped: bool = False) -> str:
+                      all_skipped: bool = False,
+                      outcomes: Optional[Dict[str, str]] = None) -> str:
+    """The zero-results message plus, §4UN-dark, what each engine's query came to."""
+    msg = _no_results_error_text(skipped, total, all_skipped)
+    if outcomes and not all_skipped:
+        line = outcomes_line(outcomes)
+        # r1: an answer is results or "no match" — a page the parser could not read ("nothing parseable",
+        # layout drift) says nothing about the query
+        answered = [e for e, o in outcomes.items() if o in _ANSWERED]
+        if answered and len(answered) == len(outcomes) and not skipped:
+            # r1: the base text blames flaky engines or the query — wrong when every engine answered
+            return ("ERROR: dark-web search found no onion results: every engine asked "
+                    f"({', '.join(sorted(answered))}) ANSWERED with no match. That is a real negative for "
+                    "these indexes — not proof the topic is absent from the dark web (hidden services "
+                    "appear and vanish, and these indexes are partial). Do not repeat the same search; "
+                    "other plain keywords may still match, or say the indexes had nothing."
+                    + (f"\nEngines — {line}." if line else ""))
+        if line:
+            msg += f"\nEngines — {line}."
+        if not answered:
+            msg += " No engine answered: this says nothing about your query."
+    return msg
+
+
+def _no_results_error_text(skipped: List[str], total: int,
+                           all_skipped: bool = False) -> str:
     """The zero-results message, honest about what was actually asked.
 
     R4 CRITICAL: only the ALL-skipped case was handled, and the PARTIAL
@@ -373,7 +459,67 @@ def _narrowed_header(skipped: List[str]) -> str:
     )
 
 
-class _BreakerSkipped(list):
+#: §4UN-dark: what one engine query came to — said in the result and the empty-search error, because "torch
+#: and torgle answered: no match" is evidence and "everything timed out" is not
+OUTCOME_RESULTS = "results"
+OUTCOME_NO_MATCH = "answered, no match"
+OUTCOME_PARSER = "answered, nothing parseable"
+OUTCOME_REDIRECTED = "redirected away"
+OUTCOME_JS = "needs JavaScript"
+OUTCOME_UNREACHABLE = "unreachable"
+OUTCOME_TIMED_OUT = "timed out"
+OUTCOME_SKIPPED = "skipped (failure cooldown)"
+#: best first: an engine's outcome over several phrasings is its best one
+_OUTCOME_ORDER = (OUTCOME_RESULTS, OUTCOME_NO_MATCH, OUTCOME_PARSER, OUTCOME_REDIRECTED, OUTCOME_JS,
+                  OUTCOME_TIMED_OUT, OUTCOME_UNREACHABLE, OUTCOME_SKIPPED)
+#: an ANSWER about the query (r2: "nothing parseable" is layout drift — not an answer, not "reached")
+_ANSWERED = (OUTCOME_RESULTS, OUTCOME_NO_MATCH)
+#: r1: a page came back on some attempt — kept over a later attempt's timeout or error
+_PAGE_OUTCOMES = (OUTCOME_PARSER, OUTCOME_REDIRECTED, OUTCOME_JS)
+
+
+class _EngineRows(list):
+    """One engine's parsed rows, carrying what the query came to (``outcome``)."""
+
+    def __init__(self, rows=(), outcome: str = OUTCOME_RESULTS, engine_name: str = ""):
+        super().__init__(rows)
+        self.outcome = outcome
+        self.engine_name = engine_name
+
+
+class _Ranked(list):
+    """The fan-out's ranked rows plus ``outcomes`` {engine: outcome} — an empty one is still falsy."""
+
+    def __init__(self, rows=(), outcomes: Optional[Dict[str, str]] = None):
+        super().__init__(rows)
+        self.outcomes = dict(outcomes or {})
+
+
+def merge_outcomes(*maps: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """{engine: best outcome} over several phrasings."""
+    out: Dict[str, str] = {}
+    rank = {o: i for i, o in enumerate(_OUTCOME_ORDER)}
+    for m in maps:
+        for eng, o in (m or {}).items():
+            if eng not in out or rank.get(o, 99) < rank.get(out[eng], 99):
+                out[eng] = o
+    return out
+
+
+def outcomes_line(outcomes: Dict[str, str]) -> str:
+    """"results: ahmia, torgle; answered, no match: torch; timed out: ahmia-onion" (outcomes in order)."""
+    groups: Dict[str, List[str]] = {}
+    for eng, o in outcomes.items():
+        groups.setdefault(o, []).append(eng)
+    return "; ".join(f"{o}: {', '.join(sorted(groups[o]))}" for o in _OUTCOME_ORDER if o in groups)
+
+
+#: §4UN-dark r1: there is no learned "page furniture" list. It was read off no-hits pages and then dropped
+#: those URLs from every later query for a day, on-topic or not (a real hit vanished; Ahmia's sidebar link
+#: was lost as a real result). Off-topic rows (ads, "popular" links) rank last instead (`_rank_key`).
+
+
+class _BreakerSkipped(_EngineRows):
     """An empty result that also says WHICH engine was never contacted.
 
     A list subclass on purpose: every existing consumer keeps treating it
@@ -384,8 +530,14 @@ class _BreakerSkipped(list):
     """
 
     def __init__(self, engine_name: str):
-        super().__init__()
-        self.engine_name = engine_name
+        super().__init__((), OUTCOME_SKIPPED, engine_name)
+
+
+import contextvars as _contextvars                                    # noqa: E402
+
+#: §4UN-dark: the engines this tool call already charged a failure to (set by the search/research cores)
+_BREAKER_CALL: "_contextvars.ContextVar[Optional[set]]" = _contextvars.ContextVar("onion_breaker_call",
+                                                                                    default=None)
 
 
 def _breaker_should_skip(name: str) -> bool:
@@ -416,6 +568,13 @@ def _breaker_record(name: str, won: bool) -> None:
             pretty_log("Darkweb Engine", f"{name}: recovered — breaker cleared",
                        icon=Icons.TOOL_DARKWEB)
         return
+    _call = _BREAKER_CALL.get()
+    if _call is not None:
+        # §4UN-dark: ONE failure per engine per tool call — a 4-phrasing call queries each engine 4 times
+        # at once, and one bad Tor patch then benched it for 15 min in a single call
+        if name in _call:
+            return
+        _call.add(name)
     fails, opened = _ENGINE_BREAKER.get(name, (0, 0.0))
     fails += 1
     # Stamp `opened` on the transition so the cooldown measures from the
@@ -520,6 +679,8 @@ def _load_engines() -> List[Dict[str, str]]:
                 entry["form_token_from"] = str(token_from)
             if str(e.get("tier") or "") == "fallback":
                 entry["tier"] = "fallback"
+            if e.get("result_selector"):
+                entry["result_selector"] = str(e["result_selector"])
             engines.append(entry)
         return engines or [dict(e) for e in _DEFAULT_ONION_ENGINES]
     except Exception:
@@ -561,35 +722,89 @@ def _normalize_tor_proxy(tor_proxy: Optional[str]) -> str:
     return proxy
 
 
-def _extract_onion(s: str) -> Optional[str]:
-    """Pull a single ``.onion`` URL out of an href / redirect wrapper / text.
+def _extract_onion(s: str, engine_hosts: Optional[set] = None) -> Optional[str]:
+    """Pull a single ``.onion`` URL out of an href / redirect wrapper.
 
     Ahmia (and some others) wrap the real target in a redirect URL like
     ``/search/redirect?...&redirect_url=http%3A%2F%2F...onion``; we unwrap
-    that first, then fall back to a direct regex scan."""
+    that first, then fall back to a direct regex scan. §4UN-dark r1: a wrapper on the ENGINE's own onion
+    (``<torgle>.onion/redirect.php?url=<target>``, host in ``engine_hosts``) is unwrapped too. The href is
+    returned as BeautifulSoup decoded it — never entity-decoded again (``&section=2`` became ``§ion=2``)."""
     if not s:
         return None
+    _eng = {_onion_host(str(h)) for h in (engine_hosts or ())}
     try:
         pr = urlparse(s)
-        if pr.query:
+        _h = (pr.hostname or "").lower()
+        if pr.query and (not _h.endswith(".onion") or _onion_host(s) in _eng):
             qs = parse_qs(pr.query)
-            for key in ("redirect_url", "url", "u", "d"):
-                if key in qs and qs[key]:
-                    cand = unquote(qs[key][0])
-                    m = _ONION_RE.search(cand)
-                    if m:
+            # §4UN-dark: the known wrapper keys first, then ANY value that decodes to an onion URL
+            # (``?link=http%3A%2F%2F….onion`` lost the result)
+            keys = [k for k in ("redirect_url", "url", "u", "d") if k in qs] + \
+                [k for k in qs if k not in ("redirect_url", "url", "u", "d")]
+            for key in keys:
+                for v in qs.get(key) or ():
+                    m = _ONION_RE.search(unquote(v))
+                    if m and onion_v3_valid(m.group(0)):
                         return m.group(0)
     except Exception:
         pass
-    m = _ONION_RE.search(s)
-    return m.group(0) if m else None
+    for m in _ONION_RE.finditer(s):
+        if onion_v3_valid(m.group(0)):
+            return m.group(0)
+    return None
+
+
+def _clean_onion_url(url: str) -> str:
+    """§4UN-dark: a URL scanned out of page TEXT (the regex sweep — never an href): ``&amp;`` collapsed
+    (``&amp;amp;`` → ``&``) and trailing sentence punctuation dropped — one ended ``…&amp;amp;raw=1.`` and the
+    fetch got a 404. r1: only ``&amp;`` — a full unescape turned ``&section=2`` into ``§ion=2`` (legacy
+    entities without a semicolon) — and a closing ")" stays when the URL opened one (``/wiki/Foo_(bar)``)."""
+    u = str(url or "")
+    while "&amp;" in u.lower():
+        u = re.sub(r"(?i)&amp;", "&", u)
+    while u:
+        last = u[-1]
+        if last in ".,;:!?]}'\"":
+            u = u[:-1]
+        elif last == ")" and u.count(")") > u.count("("):
+            u = u[:-1]
+        else:
+            break
+    return u
+
+
+def _url_key(url: str) -> str:
+    """A result's identity: the site (`_onion_host`: www.<v3> and <v3> are one), the port (r2: :8080 is
+    another service), path and query; scheme and fragment dropped, trailing slash folded."""
+    try:
+        pr = urlparse(url)
+        path = (pr.path or "").rstrip("/")
+        try:
+            port = pr.port
+        except ValueError:
+            port = None
+        return (_onion_host(url) + (f":{port}" if port and port not in (80, 443) else "") + path
+                + (("?" + pr.query) if pr.query else ""))
+    except Exception:  # noqa: BLE001
+        return str(url or "").lower().rstrip("/")
+
+
+#: §4UN-dark: one site may hold several results (a forum's home and its threads) — at most this many paths
+_MAX_PATHS_PER_HOST = 3
 
 
 def _onion_host(url: str) -> str:
+    """The site: for an onion, its v3 label (r2: ``www.<v3>.onion`` and ``<v3>.onion`` are one site — for the
+    per-host cap, agreement and engine self-exclusion); any other host as is. A bare host works too."""
     try:
-        return (urlparse(url).hostname or url).lower()
+        raw = str(url or "")
+        h = (urlparse(raw if "://" in raw else "http://" + raw).hostname or raw).lower()
     except Exception:
-        return url.lower()
+        h = str(url or "").lower()
+    if h.endswith(".onion"):
+        return h[: -len(".onion")].rsplit(".", 1)[-1] + ".onion"
+    return h
 
 
 #: §4PD: anchors read per engine page (a result page has tens; a page built
@@ -597,73 +812,160 @@ def _onion_host(url: str) -> str:
 _PARSE_MAX_ANCHORS = 1500
 
 
-def _parse_onion_results(html: str, exclude_hosts: Optional[set] = None) -> List[Dict[str, str]]:
+def _parse_onion_results(html: str, exclude_hosts: Optional[set] = None,
+                         *, result_selector: str = "",
+                         rest: Optional[List[str]] = None) -> List[Dict[str, str]]:
     """Parse an onion search-engine result page into {url,title,snippet}.
 
-    Each engine renders differently, so the parse is deliberately generic
-    and tolerant: walk anchors to harvest (onion-url, title) pairs with a
-    nearby snippet, then a regex sweep of the whole document catches any
-    onion URL that appeared as plain text rather than a link. De-duped by
-    onion host within a single page. Hosts in ``exclude_hosts`` (typically
-    the engines' own onion addresses) are dropped so engine nav/footer
-    self-links never surface as results."""
-    results: List[Dict[str, str]] = []
-    seen: set = set(exclude_hosts or ())
-    if not html:
-        return results
+    Each engine renders differently, so the parse is tolerant: an engine with a known result container
+    (``result_selector``, e.g. Ahmia's ``li.result``) is read inside those containers only; otherwise every
+    anchor is walked, then a regex sweep catches onion URLs written as plain text. Hosts in
+    ``exclude_hosts`` (the engines' own) are dropped — a wrapper on one is unwrapped first.
 
+    §4UN-dark: results are per URL, not per host (a forum's ``/thread/123`` is the hit; the host's homepage
+    link before it kept only the homepage) — at most ``_MAX_PATHS_PER_HOST`` per host. A snippet is the text
+    of the LARGEST ancestor that holds this one result URL and no other: results sharing one container got
+    the whole list's text, so an unrelated row carried another row's "Acme breach…" and ranked on-topic.
+    Every address must pass the v3 checksum (`onion_v3_valid`). r1: only anchors that will be RESULTS count
+    toward "another result joins here" (the engine's own cached/report links made every snippet empty).
+
+    ``rest`` (a list, filled when given): the page's visible text with every result's OWN text cut out —
+    where an engine's "no documents match" answer is read (r1: a snippet saying "Unable to find your order?"
+    sank a 3-result page). A result's own text is its NEAREST block that holds this link and no other (else
+    just the link's text) — never a wrapper: r2, deleting the widest block took a banner that sat in the same
+    wrapper as an ad, and the ad was booked as a result. r3: built from the text nodes outside those
+    elements (nothing deleted, no string subtraction — an ad's text "No" cut the banner). Only
+    filled for a page of at most ``_NO_HITS_MAX_LINKS`` results (the only pages it is read for)."""
+    results: List[Dict[str, str]] = []
+    if not html:
+        if rest is not None:
+            rest.append("")
+        return results
+    skip_hosts = {_onion_host(str(h)) for h in (exclude_hosts or ())}
+    seen: set = set()
+    per_host: Dict[str, int] = {}
+
+    def _admit(onion: str) -> bool:
+        host = _onion_host(onion)
+        key = _url_key(onion)
+        if host in skip_hosts or key in seen:
+            return False
+        if per_host.get(host, 0) >= _MAX_PATHS_PER_HOST:
+            return False
+        seen.add(key)
+        per_host[host] = per_host.get(host, 0) + 1
+        return True
+
+    soup = None
+    own_nodes: List[Any] = []                           # each result's own block/link (``rest`` is read outside)
     try:
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(html, "html.parser")
-        # §4PD: `block.get_text()` per anchor re-walked the whole block for
-        # every anchor in it — quadratic, and SYNCHRONOUS on the event loop
-        # (8,000 anchors = 40 s frozen). One text per block, a bound on the
-        # anchors read, and the caller runs this in a thread.
-        _block_text: Dict[int, str] = {}
-        _anchors = 0
-        for a in soup.find_all("a", href=True):
-            _anchors += 1
-            if _anchors > _PARSE_MAX_ANCHORS:
-                break
-            onion = _extract_onion(a["href"])
-            if not onion:
+        containers = []
+        if result_selector:
+            try:
+                containers = soup.select(result_selector)
+            except Exception:  # noqa: BLE001 — a bad selector falls back to the generic walk
+                containers = []
+        scopes = containers or [soup]
+        # §4PD: a bound on the anchors read; the caller runs this in a thread
+        anchors: List[Tuple[Any, str, Any]] = []
+        for scope in scopes:
+            for a in scope.find_all("a", href=True):
+                if len(anchors) >= _PARSE_MAX_ANCHORS:
+                    break
+                onion = _extract_onion(a["href"], skip_hosts)
+                if onion and _onion_host(onion) not in skip_hosts:
+                    anchors.append((a, onion, scope if containers else None))
+        # which result URLs each block holds (block-level ancestors, a few levels up)
+        _BLOCKS = ("li", "div", "article", "section", "p", "dd", "dt", "td", "tr", "dl", "ul", "ol", "table")
+        holds: Dict[int, set] = {}
+        chains: Dict[int, List[Any]] = {}
+        for a, onion, _own in anchors:
+            key = _url_key(onion)
+            chain = []
+            for anc in a.parents:
+                if getattr(anc, "name", None) in ("body", "html", "[document]") or len(chain) >= 8:
+                    break
+                if anc.name in _BLOCKS:
+                    chain.append(anc)
+                    holds.setdefault(id(anc), set()).add(key)
+            chains[id(a)] = chain
+        _text: Dict[int, str] = {}
+        for a, onion, _own in anchors:
+            if not _admit(onion):
                 continue
             host = _onion_host(onion)
-            if host in seen:
-                continue
-            seen.add(host)
             title = " ".join(a.get_text(" ", strip=True).split())
-            # Snippet: text of the nearest block-level ancestor, minus the
-            # title. Best-effort — a missing snippet is fine.
             snippet = ""
-            block = a.find_parent(["li", "div", "article", "section", "p"])
+            chain = chains.get(id(a), [])
+            if _own is not None:
+                block = _own                            # the engine's own result container
+            else:
+                block = None
+                for anc in chain:
+                    if len(holds.get(id(anc), ())) == 1:
+                        block = anc                     # still only this result: widen
+                    else:
+                        break                           # another result joins here: stop
+            if rest is not None and len(own_nodes) <= _NO_HITS_MAX_LINKS:
+                # r2: the NEAREST block holding only this link (an ad's own div, not the wrapper that also
+                # holds the engine's "no documents match"); a link in a shared list: its own text only
+                _near = chain[0] if chain and len(holds.get(id(chain[0]), ())) == 1 else a
+                own_nodes.append(_near)
             if block is not None:
-                _bid = id(block)
-                if _bid not in _block_text:
-                    _block_text[_bid] = " ".join(block.get_text(" ", strip=True).split())[:4000]
-                btext = _block_text[_bid]
+                if id(block) not in _text:
+                    _text[id(block)] = " ".join(block.get_text(" ", strip=True).split())[:4000]
+                btext = _text[id(block)]
                 if title and title in btext:
                     btext = btext.replace(title, "", 1)
                 snippet = " ".join(btext.split())[:400]
-            results.append(
-                {"url": onion, "title": title or host, "snippet": snippet}
-            )
+            results.append({"url": onion, "title": title or host, "snippet": snippet})
     except Exception:
         # BeautifulSoup unavailable or blew up — fall through to regex sweep.
-        pass
+        soup = None
 
-    # Regex sweep for onion URLs not captured as anchors (plain text, JSON
-    # blobs, etc.). These get the host as the title.
-    for m in _ONION_RE.finditer(html):
-        onion = m.group(0)
-        host = _onion_host(onion)
-        if host in seen:
-            continue
-        seen.add(host)
-        results.append({"url": onion, "title": host, "snippet": ""})
+    # Regex sweep for onion URLs not captured as anchors (plain text, JSON blobs, etc.); the host is the
+    # title. Not with a known container: text outside the result list is page furniture.
+    if not result_selector or not results:
+        for m in _ONION_RE.finditer(html):
+            onion = _clean_onion_url(m.group(0))
+            if not onion_v3_valid(onion) or not _admit(onion):
+                continue
+            results.append({"url": onion, "title": _onion_host(onion), "snippet": ""})
 
+    if rest is not None and len(results) > _NO_HITS_MAX_LINKS:
+        rest.append("")                                 # only a page of ≤ _NO_HITS_MAX_LINKS links is read for it
+    elif rest is not None:
+        try:
+            if soup is None:
+                raise ValueError("no soup")
+            text = _tag_visible_text(soup, skip={id(n) for n in own_nodes})
+        except Exception:  # noqa: BLE001
+            text = " ".join(_visible_text(html).split())
+        rest.append(text)
     return results
+
+
+def _tag_visible_text(tag: Any, skip: Optional[set] = None) -> str:
+    """A tag's visible text, whitespace-folded: its strings outside script/style/template, comments,
+    doctypes and processing instructions — and (r3) outside any element whose ``id()`` is in ``skip`` (each
+    result's own block or link). Built from the text nodes, never by cutting strings out: r2's substring
+    removal cut a banner "No results found." wherever an ad's text ("results", "No") occurred in it."""
+    skip = skip or set()
+    from bs4.element import NavigableString, CData
+    parts: List[str] = []
+    for t in tag.find_all(string=True) if hasattr(tag, "find_all") else ():
+        if type(t) not in (NavigableString, CData):
+            continue                                    # Comment, Script, Stylesheet, TemplateString, Doctype…
+        if any(getattr(p, "name", None) in ("script", "style", "template") or id(p) in skip
+               for p in t.parents):
+            continue
+        v = t.strip()
+        if v:
+            parts.append(v)
+    return " ".join(" ".join(parts).split())
 
 
 def _parse_form_token(html: str) -> Optional[Tuple[str, str]]:
@@ -800,6 +1102,22 @@ def _apply_form_token(url: str, token: Optional[Tuple[str, str]]) -> str:
     return head + sep_frag + frag
 
 
+#: §4UN-dark: a page that says "no match" and holds at most this many onion links is a no-hits answer
+_NO_HITS_MAX_LINKS = 5
+_HIDDEN_BLOCK_RE = re.compile(r"(?is)<(script|style|template)\b.*?</\1\s*>")
+_COMMENT_RE = re.compile(r"(?s)<!--.*?-->")
+_TAG_RE = re.compile(r"<[^>]{0,2000}>")
+
+
+def _visible_text(body: str) -> str:
+    """§4UN-dark: the page's VISIBLE text — scripts, styles, templates and comments out. "No results" in a
+    script's message table or a hidden template hid a drifted layout as an ordinary no-hits answer, which
+    never trips the breaker nor the drift warning."""
+    t = _HIDDEN_BLOCK_RE.sub(" ", body or "")
+    t = _COMMENT_RE.sub(" ", t)
+    return _TAG_RE.sub(" ", t)
+
+
 def _diagnose_empty_body(body: str, requested_url: str,
                          final_url: Optional[str]) -> Tuple[str, str]:
     """Explain a 200-with-zero-parseable-results. Returns (kind, message).
@@ -827,7 +1145,7 @@ def _diagnose_empty_body(body: str, requested_url: str,
             "instead of results — the search endpoint changed or is rejecting "
             "the query (a missing/rotated form token does exactly this)"
         )
-    if _NO_HITS_RE.search(body):
+    if _NO_HITS_RE.search(_visible_text(body)):
         return "no-hits", (
             "the engine reports no matches for this query — it answered "
             "normally, so this is a query result, not a broken engine"
@@ -931,6 +1249,20 @@ def _cap_body(status: Optional[int], content_type: Optional[str],
     return status, text
 
 
+def _empty_body_reason(meta: Dict[str, Any]) -> str:
+    """§4UN-dark: why a 200 had no readable body — a binary file, one over the size cap, or an empty
+    page ("received status 200" read as a server error)."""
+    ct = str(meta.get("content_type") or "").split(";")[0].strip().lower()
+    if ct and ("application/pdf" in ct or "application/octet-stream" in ct):
+        return f"it is a file ({ct}), not a page this tool reads"
+    try:
+        if int(meta.get("content_length") or 0) > _MAX_ONION_BODY_BYTES:
+            return f"the page is larger than the {_MAX_ONION_BODY_BYTES // (1024 * 1024)} MB cap"
+    except (TypeError, ValueError):
+        pass
+    return "the server answered 200 with an empty page"
+
+
 def _record_final_url(meta: Optional[Dict[str, Any]], response: Any) -> None:
     """Stash the URL a response was actually served from into ``meta``.
 
@@ -948,7 +1280,9 @@ def _record_final_url(meta: Optional[Dict[str, Any]], response: Any) -> None:
 
 
 async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float,
-                          *, meta: Optional[Dict[str, Any]] = None) -> Tuple[Optional[int], str]:
+                          *, meta: Optional[Dict[str, Any]] = None,
+                          first_byte: Optional[float] = None,
+                          body_deadline: Optional[float] = None) -> Tuple[Optional[int], str]:
     """Fetch RAW HTML (tags intact) through the Tor SOCKS proxy.
 
     Unlike `helper_fetch_url_content`, this does NOT strip tags — the search
@@ -966,7 +1300,16 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float,
     ``final_url`` the body was actually served from — without it, a dead
     endpoint that 302s to a working homepage is indistinguishable from a live
     endpoint serving an unparseable page, which is exactly how the Ahmia
-    breakage stayed misdiagnosed for weeks."""
+    breakage stayed misdiagnosed for weeks.
+
+    ``first_byte`` (§4UN-darkres): seconds to wait for the status line and
+    headers; raises ``asyncio.TimeoutError`` past it. The body keeps
+    ``timeout``. (The httpx fallback can only bound the connect.)
+
+    ``body_deadline`` (§4UN-darkres r1, a ``time.monotonic()`` instant): the
+    body is read until then; a page still sending at the deadline — or one
+    whose transfer errors after bytes arrived — is returned PARTIAL with
+    ``meta["cut"] = True`` instead of being lost (curl_cffi path)."""
 
     # Read at most this many BYTES off the wire regardless of Content-Length.
     # An untrusted onion engine can send a chunked body with no (or a lying)
@@ -1008,7 +1351,11 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float,
         if creq is not None:
             async with creq.AsyncSession(impersonate="chrome110",
                                          proxies=proxies, timeout=timeout) as c:
-                r = await c.get(url, headers=headers, stream=True)
+                if first_byte:
+                    from ..utils.aio import wait_for as _wait_for
+                    r = await _wait_for(c.get(url, headers=headers, stream=True), first_byte)
+                else:
+                    r = await c.get(url, headers=headers, stream=True)
                 # Status and headers are parsed BEFORE the body streams, so
                 # read them now: the reaper below may abort the transfer, and
                 # a caller that reads them off a closed response is reading
@@ -1017,28 +1364,41 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float,
                 _ctype = r.headers.get("content-type")
                 _clen = r.headers.get("content-length")
                 _record_final_url(meta, r)
+                if meta is not None:                  # §4UN-dark: why a 200 can carry no readable body
+                    meta["content_type"], meta["content_length"] = _ctype or "", _clen
                 buf = bytearray()
                 try:
                     # aiter_content, NOT iter_content: on an AsyncSession
                     # response the sync iterator yields un-awaited
                     # Queue.get() COROUTINES, not bytes.
-                    async for chunk in r.aiter_content():
-                        if chunk:
-                            buf.extend(chunk)
-                            if len(buf) >= _STREAM_LIMIT:
-                                break
+                    if body_deadline is None:
+                        async for chunk in r.aiter_content():
+                            if chunk:
+                                buf.extend(chunk)
+                                if len(buf) >= _STREAM_LIMIT:
+                                    break
+                    else:
+                        await _read_until(r.aiter_content(), buf, _STREAM_LIMIT, body_deadline, meta)
                 finally:
                     # Abort + reap. Without this the cap break leaves the
                     # transfer running until the server or curl gives up —
                     # and on a cancellation (the per-engine deadline) the
                     # handle would go back to the pool mid-transfer.
-                    await aclose_curl_response(r)
+                    # §4UN-darkres r2: bounded — a close that hangs must not turn a page
+                    # already read into a timeout; the session's own close follows
+                    try:
+                        from ..utils.aio import wait_for as _wait_for
+                        await _wait_for(aclose_curl_response(r), _ACLOSE_WAIT_S)
+                    except asyncio.TimeoutError:
+                        pretty_log("Onion Close Slow", f"{str(url)[:60]} — response close took over "
+                                   f"{_ACLOSE_WAIT_S:.0f}s; left to the session", level="WARNING", icon=Icons.WARN)
                 return _cap_body(_status, _ctype, _clen,
                                  _decode(bytes(buf), _ctype))
 
         import httpx
 
-        async with httpx.AsyncClient(proxy=proxy, timeout=timeout,
+        _tmo = httpx.Timeout(timeout, connect=min(timeout, first_byte)) if first_byte else timeout
+        async with httpx.AsyncClient(proxy=proxy, timeout=_tmo,
                                      follow_redirects=True) as c:
             async with c.stream("GET", url, headers=headers) as r:
                 buf = bytearray()
@@ -1047,9 +1407,43 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float,
                     if len(buf) >= _STREAM_LIMIT:
                         break
                 _record_final_url(meta, r)
+                if meta is not None:
+                    meta["content_type"] = r.headers.get("content-type") or ""
+                    meta["content_length"] = r.headers.get("content-length")
                 return _cap_body(r.status_code, r.headers.get("content-type"),
                                  r.headers.get("content-length"),
                                  _decode(bytes(buf), r.headers.get("content-type")))
+
+
+async def _read_until(chunks: Any, buf: bytearray, limit: int, deadline: float,
+                      meta: Optional[Dict[str, Any]]) -> None:
+    """§4UN-darkres r1: drain ``chunks`` into ``buf`` until the stream ends, the
+    cap, or ``deadline`` (monotonic). Stopped by the deadline, or by a transfer
+    error after some bytes arrived: ``meta["cut"] = True`` and the bytes stay."""
+    from ..utils.aio import wait_for as _wait_for
+    it = chunks.__aiter__()
+    while len(buf) < limit:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            if meta is not None:
+                meta["cut"] = True
+            return
+        try:
+            chunk = await _wait_for(it.__anext__(), left)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            if meta is not None:
+                meta["cut"] = True
+            return
+        except Exception:  # noqa: BLE001 — a transfer error mid-body: keep what arrived
+            if not buf:
+                raise
+            if meta is not None:
+                meta["cut"] = True
+            return
+        if chunk:
+            buf.extend(chunk)
 
 
 def _strip_html(html: str) -> str:
@@ -1064,6 +1458,43 @@ def _strip_html(html: str) -> str:
         return " ".join(txt.split()) if txt else ""
     except Exception:
         return html
+
+
+class _FetchTimeout(_FetchErrorBase):
+    """§4UN-darkres r1: a fetch failure that IS a timeout — typed, so a URL path
+    holding the word "timeout" never reads as one."""
+
+
+class _FirstByteTimeout(_FetchTimeout):
+    """§4UN-darkres dr2: the page sent nothing within the first-byte wait — the one
+    failure darkweb_research retries (once, on a fresh circuit)."""
+
+
+class _CutPage(str):
+    """§4UN-darkres r1: page text read until the read time ran out (partial)."""
+
+
+class _RawPage(str):
+    """§4UN-darkres r2: the HTML of a research page fetch, returned UNSTRIPPED so the
+    caller strips it outside the fetch's timeout (a 2 MB page took 1.35 s);
+    ``cut`` says the body was cut at its read time."""
+    cut = False
+
+
+#: (first-byte seconds, body deadline as a monotonic instant) for the onion page
+#: fetch running in THIS task — set by darkweb_research per URL (a context var,
+#: so `_fetch_onion_text` keeps its two-argument shape)
+_PAGE_LIMITS: "_contextvars.ContextVar[Optional[Tuple[float, float]]]" = _contextvars.ContextVar(
+    "_onion_page_limits", default=None)
+
+
+def _is_timeout_exc(e: BaseException) -> bool:
+    """A transport timeout, by TYPE: asyncio/builtin, curl error 28, or a client's *Timeout* class."""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    if getattr(e, "code", None) == 28:                        # CURLE_OPERATION_TIMEDOUT
+        return True
+    return any("Timeout" in k.__name__ for k in type(e).__mro__)
 
 
 async def _fetch_onion_text(url: str, tor_proxy: str) -> str:
@@ -1085,14 +1516,25 @@ async def _fetch_onion_text(url: str, tor_proxy: str) -> str:
     if reason:
         return _FetchError(f"Error: {reason}")
     _meta: Dict[str, Any] = {}
+    _limits = _PAGE_LIMITS.get()
+    _fb = _limits[0] if _limits else _ONION_FIRST_BYTE_S
+    _kw: Dict[str, Any] = {"first_byte": _fb}
+    if _limits:
+        _kw["body_deadline"] = _limits[1]
     try:
-        status, html = await _fetch_raw_html(url, tor_proxy, _ONION_PAGE_TIMEOUT, meta=_meta)
+        status, html = await _fetch_raw_html(url, tor_proxy, _ONION_PAGE_TIMEOUT, meta=_meta, **_kw)
+    except asyncio.TimeoutError:
+        return _FirstByteTimeout(f"Error: no answer from {url} within {_fb:.0f}s (timed out)")
     except Exception as e:  # noqa: BLE001
         # "Error:" — the head every failure check reads (§4LV: "Error
         # reading" was summarised as page text, booked OK and cached)
+        if _is_timeout_exc(e):
+            return _FetchTimeout(f"Error: reading {url} failed: {e}")
         return _FetchError(f"Error: reading {url} failed: {e}")
     if not status:
         return _FetchError(f"Error: no response from {url}")
+    if status == 200 and not html:
+        return _FetchError(f"Error: {url} — {_empty_body_reason(_meta)}; not read")
     if status != 200 or not html:
         return _FetchError(f"Error: received status {status} from {url}")
     _final = str(_meta.get("final_url") or "")
@@ -1101,7 +1543,12 @@ async def _fetch_onion_text(url: str, tor_proxy: str) -> str:
         # clearnet, or to a different onion) — not this source; say so
         return _FetchError(f"Error: {url} redirected to {_display_target(_final)} — a page on another "
                            "host is not this onion; not read")
-    return await asyncio.to_thread(_strip_html, html)
+    if _limits:                 # research path: the caller strips it, outside its timeout (r2)
+        raw = _RawPage(html)
+        raw.cut = bool(_meta.get("cut"))
+        return raw
+    text = await asyncio.to_thread(_strip_html, html)
+    return _CutPage(text) if _meta.get("cut") else text
 
 
 async def _query_engine(
@@ -1113,14 +1560,18 @@ async def _query_engine(
     """Query one onion engine with per-attempt circuit rotation, under an
     overall wall-clock deadline (`_ONION_ENGINE_DEADLINE`) so one slow or dead
     engine can't dominate the concurrent gather. Returns its parsed results
-    (possibly empty); never raises."""
+    (possibly empty) as `_EngineRows`, whose ``outcome`` says what the query
+    came to (§4UN-dark); never raises."""
+    from ..utils.aio import wait_for as _wait_for
 
-    _diag = {"nohits": False}                      # §4PD: an engine that SAID 'no documents match' is not failing
+    _diag = {"nohits": False, "outcome": OUTCOME_UNREACHABLE}   # §4PD: an engine that SAID 'no documents match' is not failing
+    name = engine["name"]
+
     async def _attempts() -> List[Dict[str, str]]:
         base_url = engine["url"].format(q=quote_plus(query))
         token_from = engine.get("form_token_from")
         for attempt in range(2):
-            proxy = _proxy_for_attempt(tor_proxy, f"{engine['name']}:{query}", attempt)
+            proxy = _proxy_for_attempt(tor_proxy, f"{name}:{query}", attempt)
             # Re-read per attempt: a retry after a redirect-away has dropped
             # the cached token, so this is where a rotated one gets picked up.
             url = base_url
@@ -1128,36 +1579,44 @@ async def _query_engine(
             if token_from:
                 url = _apply_form_token(
                     base_url,
-                    await _form_token(token_from, proxy, engine["name"]))
+                    await _form_token(token_from, proxy, name))
                 token_applied = url != base_url
             try:
                 meta: Dict[str, Any] = {}
-                status, body = await _fetch_raw_html(
-                    url, proxy, _ONION_TIMEOUT, meta=meta)
-                if meta.get("final_url") and _redirected_away(url, str(meta.get("final_url"))):
-                    pretty_log("Darkweb Engine",                     # §4PD: credited to the engine, now said
-                               f"{engine['name']}: answered from {_display_target(str(meta.get('final_url')))} (redirected)",
-                               level="INFO", icon=Icons.SKIP)
-                if status == 200 and body:
-                    parsed = await asyncio.to_thread(_parse_onion_results, body, exclude_hosts)  # §4PD: off the loop
+                # §4UN-dark: a per-attempt CLOCK — curl's timeout is a low-speed limit, so a stalled first
+                # attempt could spend the whole engine deadline and the second circuit never ran
+                status, body = await _wait_for(
+                    _fetch_raw_html(url, proxy, _ONION_TIMEOUT, meta=meta), _ONION_TIMEOUT + 2.0)
+                _final = str(meta.get("final_url") or "")
+                _away = bool(_final) and _redirected_away(url, _final)
+                if status == 200 and body and not _away:
+                    _rest: List[str] = []
+                    parsed = await asyncio.to_thread(                 # §4PD: off the loop
+                        _parse_onion_results, body, exclude_hosts,
+                        result_selector=str(engine.get("result_selector") or ""), rest=_rest)
+                    if parsed and len(parsed) <= _NO_HITS_MAX_LINKS and \
+                            _NO_HITS_RE.search(_rest[0] if _rest else ""):
+                        # §4UN-dark: the engine SAYS nothing matched; the few links are its page furniture
+                        # (an ad, a sidebar) — the old parse listed them as the query's results. r1: the
+                        # phrase is read OUTSIDE every result block — a snippet's "Unable to find your
+                        # order?" is a result's text, not the engine's answer
+                        parsed = []
                     if parsed:
                         pretty_log(
                             "Darkweb Engine",
-                            f"{engine['name']}: {len(parsed)} onion result(s)",
+                            f"{name}: {len(parsed)} onion result(s)",
                             icon=Icons.TOOL_DARKWEB,
                         )
+                        _diag["outcome"] = OUTCOME_RESULTS
                         return parsed
-                    # 200 but ZERO parseable results. This was silent — a
-                    # broken engine looked identical to "no onion index has
-                    # this query," so the tool blamed the query. Name the
-                    # actual cause instead; see `_diagnose_empty_body` for
-                    # why the ordering of those causes matters.
-                    kind, detail = _diagnose_empty_body(
-                        body, url, meta.get("final_url"))
-                    if kind == "no-hits":
-                        _diag["nohits"] = True
-                    if (kind == "redirected" and token_applied
-                            and attempt == 0):
+                if status == 200 and body:
+                    # 200 but ZERO parseable results (or a page from somewhere else). This was silent — a
+                    # broken engine looked identical to "no onion index has this query," so the tool blamed
+                    # the query. Name the actual cause instead; see `_diagnose_empty_body` for why the
+                    # ordering of those causes matters. §4UN-dark: a page served from ANOTHER location is
+                    # never parsed as results (a homepage's "featured" onions became query matches).
+                    kind, detail = _diagnose_empty_body(body, url, _final or None)
+                    if kind == "redirected" and token_applied and attempt == 0:
                         # A token we DID send still got bounced: most likely
                         # rotated, so re-scrape on the retry. Gated on
                         # attempt 0 (a re-scrape after the last attempt only
@@ -1165,19 +1624,42 @@ async def _query_engine(
                         # one — otherwise any redirect, including a captcha
                         # or exit-ban page, throws away a good token.
                         _invalidate_form_token(token_from)
+                    if kind == "no-hits":
+                        # §4UN-dark: the engine ANSWERED — asking again on a new circuit only spends the
+                        # deadline (and a slow retry then charged the engine a failure).
+                        _diag["nohits"] = True
+                        _diag["outcome"] = OUTCOME_NO_MATCH
+                        pretty_log("Darkweb Engine", f"{name}: answered, no match", level="INFO",
+                                   icon=Icons.SKIP)
+                        return []
+                    _diag["outcome"] = {"redirected": OUTCOME_REDIRECTED, "js-only": OUTCOME_JS}.get(
+                        kind, OUTCOME_PARSER)
                     pretty_log(
                         "Darkweb Engine Empty",
-                        f"{engine['name']}: HTTP 200 but 0 parseable results "
+                        f"{name}: HTTP 200 but 0 parseable results "
                         f"— {detail}",
                         level="WARNING", icon=Icons.WARN,
                     )
+                elif status is not None:
+                    if _diag["outcome"] not in _PAGE_OUTCOMES:      # r1: a page read earlier says more
+                        _diag["outcome"] = OUTCOME_UNREACHABLE
+                    pretty_log("Darkweb Engine Skipped",
+                               f"{name}: attempt {attempt + 1} of 2 — HTTP {status}"
+                               + ("" if body else " (empty body)"),
+                               level="INFO", icon=Icons.SKIP)
             except Exception as e:  # noqa: BLE001
                 # §4NV: a network failure over Tor is routine (INFO); anything
                 # else is a defect in the parse path and must stand out
                 _net = _is_network_error(e)
+                if _diag["outcome"] in _PAGE_OUTCOMES:
+                    pass                                # r1: attempt 1's page ("nothing parseable") says more
+                elif isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+                    _diag["outcome"] = OUTCOME_TIMED_OUT
+                else:
+                    _diag["outcome"] = OUTCOME_UNREACHABLE
                 pretty_log(
                     "Darkweb Engine Skipped" if _net else "Darkweb Engine Error",
-                    f"{engine['name']}: attempt {attempt + 1} of 2 — "
+                    f"{name}: attempt {attempt + 1} of 2 — "
                     f"{type(e).__name__}: {str(e)[:160] or 'no detail'}",
                     level="INFO" if _net else "WARNING",
                     icon=Icons.SKIP if _net else Icons.WARN,
@@ -1200,9 +1682,9 @@ async def _query_engine(
     # shrinks the deadline still gets a proportionally small total.
     # Breaker check BEFORE any work — the whole point is to not pay the
     # deadline for an engine measured to be failing.
-    if _breaker_should_skip(engine["name"]):
-        logger.debug("onion engine %s skipped (breaker open)", engine["name"])
-        return _BreakerSkipped(engine["name"])
+    if _breaker_should_skip(name):
+        logger.debug("onion engine %s skipped (breaker open)", name)
+        return _BreakerSkipped(name)
     deadline = _ONION_ENGINE_DEADLINE
     if engine.get("form_token_from"):
         deadline += min(_FORM_TOKEN_TIMEOUT, _ONION_ENGINE_DEADLINE)
@@ -1212,21 +1694,23 @@ async def _query_engine(
         # an empty list every time is failing at the only thing it is for,
         # and 302-to-homepage (ahmia's pre-token shape) is exactly that.
         if _res or not _diag["nohits"]:
-            _breaker_record(engine["name"], bool(_res))
-        return _res
+            _breaker_record(name, bool(_res))
+        return _EngineRows(_res, _diag["outcome"] if not _res else OUTCOME_RESULTS, name)
     except asyncio.TimeoutError:
-        _breaker_record(engine["name"], False)
+        if not _diag["nohits"]:           # §4UN-dark: an engine that answered "no match" is not failing
+            _breaker_record(name, False)
         # The fetch is now an awaitable on THIS loop (§4GM), so cancelling
         # the await really does abort the transfer — it no longer orphans a
         # worker thread that runs on until curl's own timeout. `_onion_gate`
         # still bounds how many fetches run at once.
         pretty_log(
             "Darkweb Engine Skipped",
-            f"{engine['name']}: exceeded {deadline:.0f}s deadline — skipped",
+            f"{name}: exceeded {deadline:.0f}s deadline — skipped",
             level="INFO",
             icon=Icons.SKIP,
         )
-        return []
+        return _EngineRows((), OUTCOME_NO_MATCH if _diag["nohits"] else (
+            _diag["outcome"] if _diag["outcome"] in _PAGE_OUTCOMES else OUTCOME_TIMED_OUT), name)
 
 
 def _is_network_error(e: BaseException) -> bool:
@@ -1334,33 +1818,87 @@ async def _darkweb_search_raw(
     skipped = [r.engine_name for r in per_engine
                if isinstance(r, _BreakerSkipped)]
     all_skipped = bool(engines) and len(skipped) >= len(engines)
+    # §4UN-dark: what each engine's query came to (a fallback cut by its own deadline: timed out)
+    outcomes: Dict[str, str] = {}
+    for engine, res in zip(engines, per_engine):
+        o = getattr(res, "outcome", None) if isinstance(res, list) else (
+            OUTCOME_TIMED_OUT if isinstance(res, asyncio.TimeoutError) else OUTCOME_UNREACHABLE)
+        if isinstance(res, list) and res:
+            o = OUTCOME_RESULTS
+        outcomes = merge_outcomes(outcomes, {engine["name"]: o or OUTCOME_UNREACHABLE})
 
+    # §4UN-dark: merged per URL (a forum's thread is its own result), corroboration counted per URL and,
+    # as a weaker signal, per host
     merged: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
+    host_idx: Dict[str, set] = {}
     for engine, res in zip(engines, per_engine):
         if not isinstance(res, list):
             continue
         idx = engine.get("index") or engine["name"]
         for r in res:
-            host = _onion_host(r["url"])
-            if host not in merged:
-                merged[host] = {**r, "engines": {engine["name"]}, "indexes": {idx}}
-                order.append(host)
+            key = _url_key(r["url"])
+            host_idx.setdefault(_onion_host(r["url"]), set()).add(idx)
+            if key not in merged:
+                merged[key] = {**r, "engines": {engine["name"]}, "indexes": {idx}}
+                order.append(key)
             else:
-                merged[host]["engines"].add(engine["name"])
-                merged[host]["indexes"].add(idx)
+                merged[key]["engines"].add(engine["name"])
+                merged[key]["indexes"].add(idx)
                 # Keep the richest snippet/title seen.
-                if not merged[host].get("snippet") and r.get("snippet"):
-                    merged[host]["snippet"] = r["snippet"]
-                if merged[host].get("title") == host and r.get("title") and r["title"] != host:
-                    merged[host]["title"] = r["title"]
-
-    ranked = sorted(
-        (merged[h] for h in order),
-        key=lambda r: -len(r["indexes"]),
-    )
-    return (ranked[:max_results], sorted(set(skipped)), all_skipped,
+                if not merged[key].get("snippet") and r.get("snippet"):
+                    merged[key]["snippet"] = r["snippet"]
+                host = _onion_host(r["url"])
+                if merged[key].get("title") == host and r.get("title") and r["title"] != host:
+                    merged[key]["title"] = r["title"]
+    rows = [merged[k] for k in order]
+    _mark_on_topic(rows, query)
+    for r in rows:
+        r["host_indexes"] = len(host_idx.get(_onion_host(r["url"]), ()))
+    ranked = _per_host_cap(sorted(enumerate(rows), key=lambda ir: _rank_key(ir[1], ir[0])))
+    return (_Ranked(ranked[:max_results], outcomes), sorted(set(skipped)), all_skipped,
             len(engines))
+
+
+def _mark_on_topic(rows: List[Dict[str, Any]], query: str) -> None:
+    """§4UN-dark: ``on_topic`` on each row (a distinctive query token in its title, snippet or URL — the
+    web search's own check), set BEFORE the list is cut: research cut to max_sources*3 by engine agreement
+    first, so on-topic hits further down a 28-host page were never considered. No topic check: all on."""
+    try:
+        from .search import distinctive_tokens, result_on_topic
+        dist = distinctive_tokens(query)
+        for r in rows:
+            r["on_topic"] = bool(result_on_topic(
+                {"title": r.get("title"), "body": r.get("snippet"), "url": r.get("url")}, dist))
+    except Exception:  # noqa: BLE001
+        for r in rows:
+            r.setdefault("on_topic", True)
+
+
+def _rank_key(r: Dict[str, Any], i: int, n_queries: int = 0) -> tuple:
+    """On-topic first (an ad or a sidebar link two engines both show is off-topic), then independent
+    indexes for this URL, then for its host, then (multi-phrasing) how many phrasings found it, then
+    discovery order. r2: among OFF-topic rows a bare homepage ranks below a page with a path before agreement
+    counts — an ad (a homepage) two engines both show outranked an off-topic real hit."""
+    off = not r.get("on_topic", True)
+    bare = off and not urlparse(str(r.get("url") or "")).path.strip("/")
+    return (off, bare, -len(r.get("indexes") or ()), -int(r.get("host_indexes") or 0), -n_queries, i)
+
+
+def _per_host_cap(ranked_pairs) -> List[Dict[str, Any]]:
+    """At most `_MAX_PATHS_PER_HOST` rows per host: on-topic rows first, then a page with a path before the
+    bare homepage."""
+    rows = [r for _, r in ranked_pairs]
+    by_host: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        by_host.setdefault(_onion_host(r["url"]), []).append(r)
+    keep = set()
+    for rs in by_host.values():
+        # r1: on-topic first, then a page with a path before the bare homepage
+        pref = sorted(rs, key=lambda r: (not r.get("on_topic", True),
+                                         not urlparse(str(r.get("url") or "")).path.strip("/")))
+        keep.update(id(r) for r in pref[:_MAX_PATHS_PER_HOST])
+    return [r for r in rows if id(r) in keep]
 
 
 #: How many ADDITIONAL phrasings one `darkweb_search` call may carry (§4GN).
@@ -1382,31 +1920,43 @@ def _merge_across_queries(per_query: List[Tuple[str, List[Dict[str, Any]]]],
     MORE INDEPENDENT INDEXES ranks higher — extended with the phrasing that
     surfaced it. A host found under three different wordings is corroborated
     in a way one wording cannot show, and the row says which wordings, so a
-    reader can tell a broad hit from a lucky one.
+    reader can tell a broad hit from a lucky one. §4UN-dark: per URL, on-topic
+    (under any phrasing) first.
     """
     merged: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
+    host_idx: Dict[str, set] = {}
+    host_qs: Dict[str, set] = {}
     for q, rows in per_query:
         for r in rows:
+            key = _url_key(r["url"])
             host = _onion_host(r["url"])
-            if host not in merged:
-                merged[host] = {**r,
-                                "engines": set(r.get("engines") or ()),
-                                "indexes": set(r.get("indexes") or ()),
-                                "queries": [q]}
-                order.append(host)
+            host_idx.setdefault(host, set()).update(r.get("indexes") or ())
+            host_qs.setdefault(host, set()).add(q)
+            if key not in merged:
+                merged[key] = {**r,
+                               "engines": set(r.get("engines") or ()),
+                               "indexes": set(r.get("indexes") or ()),
+                               "queries": [q]}
+                order.append(key)
                 continue
-            cur = merged[host]
+            cur = merged[key]
             cur["engines"] |= set(r.get("engines") or ())
             cur["indexes"] |= set(r.get("indexes") or ())
+            cur["on_topic"] = bool(cur.get("on_topic", True) or r.get("on_topic", True))
             if q not in cur["queries"]:
                 cur["queries"].append(q)
             if not cur.get("snippet") and r.get("snippet"):
                 cur["snippet"] = r["snippet"]
             if cur.get("title") == host and r.get("title") and r["title"] != host:
                 cur["title"] = r["title"]
-    ranked = sorted((merged[h] for h in order),
-                    key=lambda r: (-len(r["indexes"]), -len(r["queries"])))
+    for k in order:                       # a site found under several phrasings / indexes is corroborated
+        h = _onion_host(merged[k]["url"])
+        merged[k]["host_indexes"] = len(host_idx.get(h, ()))
+        merged[k]["site_queries"] = [q for q, _rows in per_query if q in host_qs.get(h, ())]
+    ranked = _per_host_cap(sorted(
+        enumerate(merged[k] for k in order),
+        key=lambda ir: _rank_key(ir[1], ir[0], len(host_qs.get(_onion_host(ir[1]["url"]), ())))))
     return ranked[:cap]
 
 
@@ -1429,7 +1979,7 @@ def _format_results(results: List[Dict[str, Any]]) -> str:
         # The phrasing tag appears ONLY on a multi-query call, so a single
         # query's output is byte-identical to what it always was (the cache
         # and every caller downstream read this text).
-        qs = r.get("queries") or []
+        qs = r.get("site_queries") or r.get("queries") or []     # §4UN-dark: the phrasings that found the SITE
         via = f"(via {engs})" if len(qs) < 2 else \
             f"(via {engs}; matched: {'; '.join(qs)})"
         formatted.append(f"### {i}. {title}\n{body}[Onion: {r['url']}] {via}")
@@ -1522,10 +2072,11 @@ async def _darkweb_search_core(
     base_proxy = _normalize_tor_proxy(tor_proxy)
     pretty_log("Darkweb Search", " | ".join(queries), icon=Icons.TOOL_DARKWEB)
 
-    cache_key = "onion::" + "||".join(_norm_cache_key(q) for q in queries)
+    cache_key = f"onion::{max_results}::" + "||".join(_norm_cache_key(q) for q in queries)   # §4UN-dark: size too
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+    _BREAKER_CALL.set(set())                     # §4UN-dark: one breaker failure per engine for this call
 
     # Each phrasing gets its OWN identity-tagged circuit in anonymous mode —
     # the scrub is per query by design, and running the set on one circuit
@@ -1542,11 +2093,17 @@ async def _darkweb_search_core(
         return_exceptions=True,
     )
     per_query, _skipped_all, _all_skipped_all, _total = [], [], [], 0
+    _outcomes: Dict[str, str] = {}
+    _transient = False          # r2: any PHRASING with an engine timed out / unreachable (merged = best only)
     for (label, _sq, _pp), res in zip(plans, raw):
         if isinstance(res, BaseException):
             logger.warning("darkweb_search: phrasing %r failed: %s", label, res)
+            _transient = True
             continue
         _ranked, _skipped, _all_skipped, _tot = res
+        _po = getattr(_ranked, "outcomes", None) or {}
+        _transient = _transient or any(o in (OUTCOME_TIMED_OUT, OUTCOME_UNREACHABLE) for o in _po.values())
+        _outcomes = merge_outcomes(_outcomes, _po)
         per_query.append((label, _ranked))
         _skipped_all.extend(_skipped)
         _all_skipped_all.append(_all_skipped)
@@ -1562,10 +2119,14 @@ async def _darkweb_search_core(
         ranked = _merge_across_queries(
             per_query,
             min(max_results * len(queries), _MULTI_QUERY_RESULT_CEILING))
+    if _outcomes:
+        pretty_log("Darkweb Engines", outcomes_line(_outcomes), icon=Icons.TOOL_DARKWEB)   # §4UN-dark
     if not ranked:
-        return _no_results_error(_skipped, _total, _all_skipped)
+        return _no_results_error(_skipped, _total, _all_skipped, _outcomes)
 
-    reached = sorted({e for r in ranked for e in r.get("engines", [])})
+    # §4UN-dark: "reached" = the engines that ANSWERED (it was counted from the rows left after the cut)
+    reached = sorted(e for e, o in _outcomes.items() if o in _ANSWERED) or \
+        sorted({e for r in ranked for e in r.get("engines", [])})
     header = f"[Dark-web search — onion results, engines reached: {', '.join(reached)}]"
     if len(queries) > 1:
         header = (f"[Dark-web search — {len(queries)} phrasings "
@@ -1582,11 +2143,64 @@ async def _darkweb_search_core(
     # telling the operator an engine was "not consulted" long after it had
     # recovered — a stale claim about infrastructure, which is the class
     # of lie this whole change set exists to remove.
-    _cache_put(cache_key, cacheable)
+    _not_answered = {e: o for e, o in _outcomes.items() if o not in _ANSWERED and o != OUTCOME_SKIPPED}
+    _live = (f"\n[Engines — {outcomes_line(_not_answered)}: no answer was read from them this time.]"
+             if _not_answered else "")
     if _skipped:
-        return header + _narrowed_header(_skipped) + "\n\n" + \
+        # §4UN-dark: a run with engines in cooldown is not cached — the next call may reach them
+        return header + _narrowed_header(_skipped) + _live + "\n\n" + \
             _format_results(ranked)
+    if _transient:
+        # r1/r2: nor one where an engine timed out or was unreachable on ANY phrasing — the next call may
+        # get its index (decided per phrasing: the merged outcome is each engine's best)
+        return header + _live + "\n\n" + _format_results(ranked)
+    _cache_put(cache_key, cacheable)
+    if _live:
+        return header + _live + "\n\n" + _format_results(ranked)
     return cacheable
+
+
+def _fold(text: Any) -> str:
+    """Lower-case, Greek/Latin accents removed (νέα → νεα, ειδήσεις → ειδησεις)."""
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFD", str(text or "").lower())
+                   if unicodedata.category(c) != "Mn")
+
+
+#: §4UN-darkres: a query word that asks for news/articles/reports (folded: no accents)
+_NEWS_INTENT_WORDS = frozenset({
+    "news", "article", "articles", "report", "reports", "reporting", "blog", "blogs", "analysis",
+    "analyses", "headline", "headlines", "story", "stories", "journalism", "press",
+    "νεα", "ειδηση", "ειδησεις", "αρθρο", "αρθρα", "αναλυση", "αναλυσεις", "αναφορα", "αναφορες",
+    "ρεπορταζ", "ενημερωση"})
+#: ... and one that asks for markets or products — then shop pages ARE the answer
+_MARKET_INTENT_WORDS = frozenset({
+    "market", "markets", "marketplace", "marketplaces", "shop", "shops", "store", "stores", "vendor",
+    "vendors", "buy", "buying", "sell", "selling", "sale", "sales", "price", "prices", "pricing",
+    "product", "products", "listing", "listings", "carding",
+    "αγορα", "αγορες", "αγοραζω", "πωληση", "πωλησεις", "πουλαω", "τιμη", "τιμες", "προιον",
+    "προιοντα", "καταστημα"})
+#: a shop/product page: by its path, or by sale words / a price in its title or snippet
+# r1: a price or an amount alone is news ("Bitcoin falls below $60,000", "500 BTC stolen"), and
+# `/item?id=` is a forum thread as often as a shop row — neither counts
+_SHOP_PATH_RE = re.compile(r"/(?:products?|shop|store|cart|checkout|vendors?|listings?)(?:[/?#._-]|$)", re.I)
+_SHOP_TEXT_RE = re.compile(r"\bfor sale\b|\badd to cart\b|\bbuy now\b", re.I)
+
+
+def _news_not_market(query: Any) -> bool:
+    words = set(re.findall(r"\w+", _fold(query)))
+    return bool(words & _NEWS_INTENT_WORDS) and not (words & _MARKET_INTENT_WORDS)
+
+
+def _looks_like_shop(r: Dict[str, Any]) -> bool:
+    from urllib.parse import urlparse
+    try:
+        path = urlparse(str(r.get("url") or "")).path
+    except Exception:  # noqa: BLE001
+        path = ""
+    if _SHOP_PATH_RE.search(path):
+        return True
+    return any(_SHOP_TEXT_RE.search(str(r.get(k) or "")) for k in ("title", "snippet"))
 
 
 def rank_for_reading(ranked: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
@@ -1594,19 +2208,25 @@ def rank_for_reading(ranked: List[Dict[str, Any]], query: str) -> List[Dict[str,
     the title/snippet/url — the web search's own check) before off-topic, a
     page with a path before a bare homepage, engine agreement after that.
     §4LG: ranked by engine agreement alone, 32 of 36 pages read yielded "No
-    relevant information" — 25 of them site homepages."""
+    relevant information" — 25 of them site homepages.
+
+    §4UN-darkres: when the query asks for news/articles/reports (and NOT for
+    markets or products), a shop/product page goes after the others of its
+    topic group — demoted, never dropped (req 212e6a8c read "residence
+    permits for sale" for "the latest news on the dark web")."""
     from urllib.parse import urlparse
     try:
         from .search import distinctive_tokens, result_on_topic
         dist = distinctive_tokens(query)
     except Exception:  # noqa: BLE001 — no topic check: keep the engines' order
         return list(ranked)
+    demote = _news_not_market(query)
 
     def key(item):
         i, r = item
         on = result_on_topic({"title": r.get("title"), "body": r.get("snippet"), "url": r.get("url")}, dist)
         path = urlparse(str(r.get("url") or "")).path.strip("/")
-        return (not on, not path, i)
+        return (not on, demote and _looks_like_shop(r), not path, i)
     return [r for _, r in sorted(enumerate(ranked), key=key)]
 
 
@@ -1635,6 +2255,145 @@ def is_onion_reading_candidate(url: str, on_topic: bool = False) -> bool:
     return not _search.is_search_results_url(url)
 
 
+def _filter_block_onions(block: Any, url: str, page_texts: Dict[str, Any]) -> Any:
+    """`keep_page_onions` on the extracted-facts part of one source block (its SOURCE line stays)."""
+    mark = "[EDGE EXTRACTED FACTS]:"
+    if not isinstance(block, str) or mark not in block:
+        return block
+    head, _, facts = block.partition(mark)
+    page = (page_texts.get(url) or ("",))[0]
+    return head + mark + keep_page_onions(facts, f"{page} {url}")
+
+
+def _one_line(text: Any, limit: int = 120) -> str:
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= limit else t[: limit - 1] + "…"
+
+
+#: §4UN-darkres r1: a given URL holding any of these is refused whole — a newline in it
+#: forged a `### SOURCE:` block, a second count line and fake facts (review M1)
+_URL_JUNK_RE = re.compile(r"[\s\x00-\x1f\x7f\u0085\u00a0\u1680\u2000-\u200f\u2028-\u202f\u205f-\u2064\u3000\ufeff]")
+
+
+def onion_v3_problem(host: str) -> Optional[str]:
+    """§4UN-darkres dr2: which check a v3 onion host FAILS, in words, or None when it
+    is valid. The bare "not a valid onion address" made the model distrust it, write
+    its own (wrong) decoder and repeat its wrong findings (live dr2)."""
+    import base64
+    import hashlib
+    h = str(host or "").strip().lower().rstrip(".")
+    if not h.endswith(".onion"):
+        return "not an .onion address"
+    label = h[: -len(".onion")].rsplit(".", 1)[-1]
+    if len(label) != 56:
+        return f"wrong length: got {len(label)} characters, a v3 address has 56"
+    if not re.fullmatch(r"[a-z2-7]{56}", label):
+        return "not base32: a v3 address uses only the letters a–z and the digits 2–7"
+    raw = base64.b32decode(label.upper())
+    pub, chk, ver = raw[:32], raw[32:34], raw[34]
+    if ver != 3:
+        return f"wrong version byte: {ver}, a v3 address ends in version 3"
+    if hashlib.sha3_256(b".onion checksum" + pub + b"\x03").digest()[:2] != chk:
+        return ("the checksum does not match — at least one character is wrong "
+                "(a typo or a deliberately altered address)")
+    return None
+
+
+def _short_target(given: str) -> str:
+    """How a REFUSED given URL is named in the report: never whole. An onion-like
+    host shows the first 8 characters of its label then "….onion" (r1 M2: a
+    garbled address echoed in tool output made the verifier treat a reply citing
+    it as "seen in tool output" and only note it); another host shows its name."""
+    from urllib.parse import unquote
+    low = str(given or "")
+    for _ in range(3):                  # r3: "%2eonion" / "%252eonion" is an onion host too
+        low = unquote(low)
+    low = low.lower()
+    m = re.search(r"([a-z0-9]+)\.onion\b", low)
+    if m:
+        return m.group(1)[:8] + "….onion"
+    host = re.sub(r"^[a-z][a-z0-9+.-]*:(//)?", "", low).split("/", 1)[0].split("@")[-1]
+    host = re.sub(r"[^a-z0-9.:-]", "", host)[:60]
+    return host or "(no host)"
+
+
+def _fresh_circuit(tor_proxy: Optional[str]) -> Optional[str]:
+    """The same SOCKS proxy under a NEW identity: Tor isolates it on its own circuit.
+    r3 MAJOR: a live proxy already carries an identity (`--anonymous` is the default:
+    ``socks5h://<tag>:isolate@…``) and `socks_url_with_identity` returns such a proxy
+    UNCHANGED — the "fresh circuit" was the same one. `circuit_for_attempt` (§4UN-read)
+    folds the attempt into the existing identity; a proxy without one gets a random tag."""
+    if not tor_proxy:
+        return tor_proxy
+    try:
+        from urllib.parse import urlparse
+        from ..utils.helpers import circuit_for_attempt, socks_url_with_identity
+        if urlparse(tor_proxy).username:
+            return circuit_for_attempt(tor_proxy, 1) or tor_proxy
+        import secrets
+        return socks_url_with_identity(tor_proxy, "retry-" + secrets.token_hex(6)) or tor_proxy
+    except Exception:  # noqa: BLE001
+        return tor_proxy
+
+
+def _given_onion_urls(raw: Any) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """§4UN-darkres: the pages a caller handed darkweb_research in `urls` →
+    (urls to read, in order, deduplicated; [(how to name it, why skipped)]). Only
+    http(s) on a v3 onion whose checksum holds; a bare ``<56 chars>.onion/…``
+    gets ``http://``; at most `_MAX_GIVEN_URLS`. An invalid one is never fetched.
+    r1: a URL with whitespace or a control character is refused; a kept one is
+    REBUILT from its parts (scheme, lower-case host without a trailing dot,
+    port, path, query — no userinfo, no fragment), so two spellings of one page
+    are one URL and nothing but those parts reaches the report."""
+    from urllib.parse import urlsplit
+    if raw is None or raw == "":
+        return [], []
+    items = [raw] if isinstance(raw, str) else (list(raw) if isinstance(raw, (list, tuple)) else [raw])
+    keep: List[str] = []
+    skipped: List[Tuple[str, str]] = []
+    for item in items:
+        given = str(item if item is not None else "")
+        if not given.strip():
+            continue
+        given = given.strip()
+        if _URL_JUNK_RE.search(given):
+            skipped.append((_short_target(given), "contains whitespace or control characters"))
+            continue
+        url = given
+        if "://" not in url and re.match(r"^[a-z2-7]{56}\.onion\.?(?:[/:?#]|$)", url, re.I):
+            url = "http://" + url
+        try:
+            parts = urlsplit(url)
+            scheme = (parts.scheme or "").lower()
+            host = (parts.hostname or "").rstrip(".")
+            port = parts.port
+        except Exception:  # noqa: BLE001 — a bad port, an unparseable netloc
+            scheme, host, port, parts = "", "", None, None
+        if "://" in url and scheme and scheme not in ("http", "https"):
+            skipped.append((_short_target(given), "only http(s) onion pages are read"))
+            continue
+        if not (parts is not None and scheme in ("http", "https") and onion_v3_valid(host)):
+            _why = onion_v3_problem(host) if parts is not None and host else "no host"
+            skipped.append((_short_target(given), f"not a valid onion address: {_why or 'unreadable URL'}"))
+            continue
+        rebuilt = f"{scheme}://{host}" + (f":{port}" if port else "") + (parts.path or "/") \
+            + (f"?{parts.query}" if parts.query else "")
+        if rebuilt in keep:
+            continue
+        if len(keep) >= _MAX_GIVEN_URLS:
+            skipped.append((_short_target(rebuilt), f"over the {_MAX_GIVEN_URLS}-URL limit"))   # r2: never whole
+            continue
+        keep.append(rebuilt)
+    return keep, skipped
+
+
+def _skipped_line(skipped: List[Tuple[str, str]]) -> str:
+    """One report line naming each skipped given URL (already in its safe form) and why."""
+    if not skipped:
+        return ""
+    return "[SKIPPED URLS: " + "; ".join(f"{_one_line(u)} — {why}" for u, why in skipped) + "]"
+
+
 async def tool_darkweb_research(query: Optional[str] = None, *args: Any, **kwargs: Any) -> str:
     """darkweb_research, with the §4PU stale-year drop first."""
     from .search import _drop_stale_year_logged, stale_year_note
@@ -1657,16 +2416,26 @@ async def _darkweb_research_core(
     max_context: int = 8192,
     workspace_model=None,
     max_sources: int = 6,
+    urls: Any = None,
     **kwargs: Any,
 ) -> str:
     """Search .onion services, then fetch + distill the top results into a
-    synthesised report. The dark-web analogue of `tool_deep_research`."""
+    synthesised report. The dark-web analogue of `tool_deep_research`.
+
+    §4UN-darkres: ``urls`` (optional, ≤ 8) are onion pages the caller already
+    chose (e.g. darkweb_search's results) — read FIRST, in order; a query's
+    results fill the remaining slots, and without a query only they are read."""
     try:                                               # §4PD: a model-passed 'max_sources' as a string or a negative
         max_sources = max(1, min(12, int(max_sources)))          #       raised inside gather() and read as 'zero results'
     except (TypeError, ValueError):
         max_sources = 6
-    if not query:
-        return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
+    _given, _given_skipped = _given_onion_urls(urls)
+    if not query and not _given:
+        if _given_skipped:
+            return ("SYSTEM ERROR: none of the given 'urls' can be read, and there is no 'query' to "
+                    "search instead.\n" + _skipped_line(_given_skipped))
+        return ("SYSTEM ERROR: darkweb_research needs a 'query' (keywords to search .onion services) "
+                "or 'urls' (onion pages to read). You must specify one.")
 
     # Stronger anonymous tier: re-author the query with the local model (the
     # same posture deep_research takes), falling back to the lexical scrub.
@@ -1683,15 +2452,22 @@ async def _darkweb_research_core(
         except Exception:  # noqa: BLE001
             pass
         _, tor_proxy = _apply_anonymous_scrub(query, tor_proxy)
+    elif anonymous:         # urls only: still a per-call circuit identity
+        _, tor_proxy = _apply_anonymous_scrub("|".join(_given), tor_proxy)
 
-    query = _sanitize_query(query)
+    query = _sanitize_query(query) if query else ""
+    # what the extractor is asked about when the caller gave pages but no query
+    _topic = query or "the main facts and news this page reports"
     tor_proxy = _normalize_tor_proxy(tor_proxy)
-    pretty_log("Darkweb Research", query, icon=Icons.TOOL_DARKWEB)
+    pretty_log("Darkweb Research", (query + (f" + {len(_given)} given page(s)" if _given else ""))
+               if query else f"{len(_given)} given page(s)", icon=Icons.TOOL_DARKWEB)
 
     # The deep-read path is expensive (an onion fetch + LLM distill per source);
     # cache the synthesised report so a repeated identical research request
     # doesn't re-fetch every onion. Namespaced distinctly from the list search.
-    cache_key = "onion-research::" + (query or "").strip().lower()
+    cache_key = f"onion-research::{max_sources}::" + (query or "").strip().lower()   # r1: the size too
+    if _given or _given_skipped:
+        cache_key += "::urls::" + "|".join(_given) + "::skip::" + "|".join(u for u, _ in _given_skipped)
     cached = _cache_get(cache_key)
     if cached is not None:
         # ⚠ A CACHE HIT MUST CARRY THE SAME STATUS AS THE RUN IT CACHED
@@ -1711,14 +2487,18 @@ async def _darkweb_research_core(
                                   reason_code="darkweb_research_no_relevant_facts")
         return ToolOutcome.ok(cached, world_changed=False)
 
-    ranked, _skipped, _all_skipped, _total = await _darkweb_search_raw(
-        query, tor_proxy, max_results=max_sources * 3)
-    if not ranked:
+    _BREAKER_CALL.set(set())                     # §4UN-dark: one breaker failure per engine for this call
+    if query:
+        ranked, _skipped, _all_skipped, _total = await _darkweb_search_raw(
+            query, tor_proxy, max_results=max_sources * 3)
+    else:
+        ranked, _skipped, _all_skipped, _total = [], [], False, 0
+    if not ranked and not _given:
         # J1: this caller kept blaming the query after the sibling was
         # fixed — and it is the follow-up `darkweb_search`'s own tool
         # description recommends, so it is the one the model reaches for
         # after a thin result set.
-        return _no_results_error(_skipped, _total, _all_skipped)
+        return _no_results_error(_skipped, _total, _all_skipped, getattr(ranked, "outcomes", None))
 
     _ranked_rows = [r for r in rank_for_reading(ranked, query) if r.get("url")]
     _ordered = [r["url"] for r in _ranked_rows]
@@ -1733,8 +2513,12 @@ async def _darkweb_research_core(
     # while a real page is available; the rest after the first `max_sources`
     # is the backfill queue for sources that fail to load
     _eligible = [u for u in _ordered if is_onion_reading_candidate(u, _on.get(u, False))] or _ordered
-    urls = _eligible[:max_sources]
-    _reserve_urls = _eligible[max_sources:max_sources + _search.RESEARCH_MAX_RESERVES]
+    # §4UN-darkres: the caller's pages first, in order (never demoted or filtered); the
+    # search fills the remaining slots and the backfill queue
+    _eligible = [u for u in _eligible if u not in _given]
+    _fill = max(0, max(max_sources, len(_given)) - len(_given))
+    urls = _given + _eligible[:_fill]
+    _reserve_urls = _eligible[_fill:_fill + _search.RESEARCH_MAX_RESERVES]
 
     # ⚠ WHAT `max_context` ACTUALLY BOUNDS. It is the MAIN model's window, and
     # the assembled report is what gets read back into it — so this is a
@@ -1748,8 +2532,11 @@ async def _darkweb_research_core(
         _MIN_DISTILL_CHARS,
         int(int(max_context) * CHARS_PER_TOKEN * 0.4) // max(1, len(urls)))
 
-    sem = asyncio.Semaphore(2)
-    _DISTILL_FANOUT = 2      # == the semaphore width above
+    # §4UN-darkres: 4 at a time (was 2 — six dead onions held the two slots for
+    # most of 212e6a8c's 140 s). Each URL's budget is issued when it starts, so
+    # width no longer starves the later ones; the distill plans declare it.
+    sem = asyncio.Semaphore(_RESEARCH_FETCH_WIDTH)
+    _DISTILL_FANOUT = _RESEARCH_FETCH_WIDTH      # == the semaphore width above
     # One snapshot per call, from the single definition in search.py.
     _RESEARCH_PHASE_TIMEOUT_S = _budgets._RESEARCH_PHASE_TIMEOUT_S
     # ⚠ NOT THE CLEARNET FLOOR. That one is derived from the 22s clearnet fetch
@@ -1777,8 +2564,32 @@ async def _darkweb_research_core(
     _phase_deadline = time.monotonic() + _RESEARCH_PHASE_TIMEOUT_S
 
     _page_texts: dict = {}     # url -> (text sent to the extractor, max_tokens) — §4NK recheck
+    # §4UN-darkres: what became of each url — loaded / timeout / failed / skipped —
+    # set by this code (never parsed out of page text), for the report's count line
+    _outcome: Dict[str, str] = {}
+    _retried: set = set()
+    _given_set = set(_given)
 
-    async def _fetch_with_timeout(url: str) -> str:
+    def _retry_need() -> float:
+        return _ONION_FIRST_BYTE_S + _RETRY_READ_S + (_DISTILL_RESERVE_S if llm_client is not None else 0.0)
+
+    def _may_retry(url: str, url_deadline: float) -> bool:
+        """dr2: one retry after a first-byte timeout when the URL's time (and the
+        phase's) still covers a first-byte wait + a read + the distill reserve. A
+        given page qualifies on that alone; a search-filled one only while the phase
+        also covers a retry for every given page not yet settled (given first)."""
+        if url in _retried:
+            return False
+        now = time.monotonic()
+        need = _retry_need()
+        if min(url_deadline, _phase_deadline) - now - 2.0 < need:
+            return False
+        if url in _given_set:
+            return True
+        unsettled = sum(1 for g in _given if g not in _outcome)
+        return _phase_deadline - now >= need * (1 + unsettled)
+
+    async def _fetch_with_timeout(url: str, cap: float, proxy: Optional[str] = None) -> str:
         try:
             # ⚠ COERCE, as the clearnet sibling does. This returned the awaited
             # value verbatim while `process_url` guards it with
@@ -1788,16 +2599,28 @@ async def _darkweb_research_core(
             # but reporting an internal error is not the same as keeping the
             # page: coercing here is what preserves the raw-text fallback.
             _res = await asyncio.wait_for(
-                _fetch_onion_text(url, tor_proxy), timeout=_ONION_PAGE_TIMEOUT + 5
+                _fetch_onion_text(url, proxy if proxy is not None else tor_proxy), timeout=cap
             )
+            if isinstance(_res, _RawPage):
+                # r2: stripped here, outside the fetch's timeout
+                _cut = bool(getattr(_res, "cut", False))
+                _res = await asyncio.to_thread(_strip_html, str(_res))
+                _res = _CutPage(_res) if _cut else _res
+            if isinstance(_res, _FetchError):
+                # the fetcher's own error text (never page text): a timeout or another failure
+                _outcome[url] = "timeout" if isinstance(_res, _FetchTimeout) else "failed"   # r1: by type
+                return _res
             _res = _res if isinstance(_res, str) else str(_res)
             if _search.is_bot_check_page(_res):
                 # §4NK: a DDoS-guard interstitial is not the hidden service's page
+                _outcome[url] = "failed"
                 return _FetchError(f"Error: bot-check page from {url} (the service asked to verify a browser)")
             return _res
         except asyncio.TimeoutError:
-            return _FetchError(f"Error: Fetch of {url} timed out after {_ONION_PAGE_TIMEOUT}s")
+            _outcome[url] = "timeout"
+            return _FetchTimeout(f"Error: Fetch of {url} timed out after {cap:.0f}s")
         except Exception as e:  # noqa: BLE001
+            _outcome[url] = "failed"
             return _FetchError(f"Error: {e}")
 
     async def process_url(url: str, budget_s: float) -> str:
@@ -1818,7 +2641,31 @@ async def _darkweb_research_core(
         url = str(url)
         short_url = (url[:35] + "..") if len(url) > 35 else url
         pretty_log("Parsing Onion", url, icon=Icons.TOOL_DARKWEB)
-        text = await _fetch_with_timeout(url)
+        # §4UN-darkres r1: the distiller's reserve shortens only the wait for the FIRST
+        # byte (never below `_FIRST_BYTE_FLOOR_S`). A page that answered reads its body
+        # until the full read time or the URL's budget (- 2 s), whichever is first; one
+        # still loading then is KEPT, partial and marked (never-lose: review M3 — a page
+        # answering at 8 s and done at 30 s was cut at 28 s and booked a timeout).
+        async def _attempt(proxy: Optional[str] = None):
+            _left = _url_deadline - time.monotonic() - 2.0
+            _body_s = max(0.1, min(_ONION_PAGE_TIMEOUT + 5, _left))
+            _fb = _ONION_FIRST_BYTE_S
+            if llm_client is not None:
+                _fb = min(_fb, max(_FIRST_BYTE_FLOOR_S, _left - _DISTILL_RESERVE_S))
+            # r2: the body stops 4 s before the fetch's own timeout — room for the bounded close
+            # (`_ACLOSE_WAIT_S`) so a cut page comes back as a page, not as a timeout
+            _PAGE_LIMITS.set((min(_fb, _body_s), time.monotonic() + max(_body_s * 0.5, _body_s - 4.0)))
+            return await _fetch_with_timeout(url, _body_s, proxy)
+
+        text = await _attempt()
+        if isinstance(text, _FirstByteTimeout) and _may_retry(url, _url_deadline):
+            # dr2: the Tor Project's onion gave no first byte in 15 s and loaded in 2 s
+            # a minute later — retry ONCE, now, on a fresh circuit (new SOCKS identity)
+            _retried.add(url)
+            pretty_log("Onion Retry", f"{short_url} — no first byte; once more on a fresh circuit",
+                       icon=Icons.TOOL_DARKWEB)
+            _outcome.pop(url, None)                     # counted once: the retry's outcome stands
+            text = await _attempt(_fresh_circuit(tor_proxy))
 
         # ⚠ Same boundary as the clearnet sibling: a failed fetch is an
         # error STRING, and feeding it to a worker prompted "extract
@@ -1840,6 +2687,12 @@ async def _darkweb_research_core(
         raw_preview = (_clean_for_cpp(text[:_RAW_FALLBACK_CHARS])
                        + "\n[...truncated...]\n")
         raw_preview = _neutralise(raw_preview)        # §4PD: page text is content (every return site)
+        if isinstance(text, _CutPage):
+            # r1 M3: what arrived before the read time ran out — kept as raw text, said so
+            pretty_log("Onion Page Cut", f"{short_url} — still loading at its read time; partial text kept",
+                       level="WARNING", icon=Icons.WARN)
+            return (f"### SOURCE: {url}\n[PAGE CUT OFF: the read time ran out while this page was still "
+                    f"loading — partial, raw page text below]\n{raw_preview}\n")
 
         # ⚠ SIZE THE REQUEST TO WHAT THE NODE CAN FINISH. The arithmetic that
         # stood here derived the char limit from `max_context` — the MAIN
@@ -1862,6 +2715,12 @@ async def _darkweb_research_core(
             # the precise loss this rewrite exists to remove. Degrade to raw
             # text instead, and say so.
             try:
+                if _summary_budget - _QUEUE_ALLOWANCE_S <= 0:
+                    # r1: a page that used its whole read time leaves no distill — keep it raw,
+                    # never plan on a negative clock
+                    pretty_log("Summary Degraded", f"{short_url}: no time left to distil after the "
+                               f"page loaded — raw page text kept", level="WARNING", icon=Icons.WARN)
+                    return f"### SOURCE: {url}\n{raw_preview}\n"
                 plan = llm_client.plan_distill(
                     _summary_budget - _QUEUE_ALLOWANCE_S,
                     max_chars=_report_share_chars,
@@ -1916,7 +2775,7 @@ async def _darkweb_research_core(
         _page_texts[url] = (safe_text, _tokens, getattr(plan, "predicted_s", 0.0))   # §4NK recheck
         payload = {
             "model": model_name,
-            "messages": [{"role": "user", "content": _search.extract_prompt(query, safe_text)}],
+            "messages": [{"role": "user", "content": _search.extract_prompt(_topic, safe_text)}],
             "temperature": 0.0,
             "max_tokens": _tokens,
         }
@@ -1963,8 +2822,11 @@ async def _darkweb_research_core(
                 llm_client.note_distill_density(len(safe_text), summary_data)
             except Exception:                                   # noqa: BLE001
                 pass
-            preview = "[EDGE EXTRACTED FACTS]:\n" + _neutralise(
-                (summary_data["choices"][0]["message"].get("content") or "").strip())
+            # §4UN-dark: an onion address the summary holds must be VERBATIM in the page (and pass the
+            # checksum) — a worker copying an address and changing a letter put a fake one in tool output,
+            # which every later link guard then accepted as "seen"
+            preview = "[EDGE EXTRACTED FACTS]:\n" + _neutralise(keep_page_onions(
+                (summary_data["choices"][0]["message"].get("content") or "").strip(), f"{text} {url}"))
         except Exception as _sum_exc:
             # ⚠ SAY SO. This was a bare `except Exception:` with no
             # log at all, so every degradation here was invisible:
@@ -2008,19 +2870,24 @@ async def _darkweb_research_core(
             budget = min(_ONION_URL_CEILING_S,
                          _phase_deadline - time.monotonic())
             if budget < _MIN_URL_BUDGET_S:
+                _outcome[str(url)] = "skipped"
                 return (f"### SOURCE: {url}\nError: research phase deadline "
                         f"({_RESEARCH_PHASE_TIMEOUT_S:.0f}s) reached before "
                         f"this source could be fetched\n")
             try:
-                return await asyncio.wait_for(process_url(url, budget),
-                                              timeout=budget)
+                block = await asyncio.wait_for(process_url(url, budget),
+                                               timeout=budget)
+                _outcome.setdefault(str(url), "failed" if _source_block_failed(block) else "loaded")
+                return block
             except asyncio.TimeoutError:
                 # Say the BUDGET. Without it an onion killed on a starved
                 # window reads exactly like one that used its full ceiling —
                 # the confusion req 08766aa1 turned on.
+                _outcome[str(url)] = "timeout"
                 return (f"### SOURCE: {url}\nError: per-URL timeout exceeded "
                         f"({budget:.0f}s)\n")
             except Exception as _url_exc:                        # noqa: BLE001
+                _outcome[str(url)] = "failed"
                 # ⚠ THE NET. Anything that escapes reaches
                 # `gather(return_exceptions=True)` and is filtered out by
                 # `isinstance(c, str)` — a SOURCE SILENTLY DROPPED, invisible
@@ -2060,10 +2927,13 @@ async def _darkweb_research_core(
                                  [c for c in _pre_loaded if "[EDGE EXTRACTED FACTS]" not in c] if llm_client else [],
                                  _failed_slots, _lost):
         _recheck = await _search.recheck_all_none(
-            page_contents, urls, _page_texts, query, llm_client, model_name,
+            page_contents, urls, _page_texts, _topic, llm_client, model_name,
             deadline=_phase_deadline, slot_wait=_QUEUE_ALLOWANCE_S,
             per_call_s=_WEB_SUMMARY_TIMEOUT_S, fanout=_DISTILL_FANOUT, label="onion summary recheck")
         page_contents = _recheck.contents
+        # §4UN-dark: the recheck's summaries pass the same verbatim-address filter as the first ones
+        page_contents = [_filter_block_onions(c, u, _page_texts) for c, u in zip(page_contents, urls)] + \
+            list(page_contents[len(urls):])
     valid_contents = [c for c in page_contents if isinstance(c, str)]
     # ⚠ PORTED FROM THE CLEARNET SIBLING. Without a banner a partly-failed
     # onion run renders as a confident SHORT report and an all-failed one as
@@ -2073,13 +2943,21 @@ async def _darkweb_research_core(
     _degraded = [c for c in valid_contents
                  if not _source_block_failed(c)
                  and "[EDGE EXTRACTED FACTS]" not in c] if llm_client else []
+    # §4UN-darkres r1: the per-URL counts the [SOURCES:] line shows — one set of totals
+    _oc = list(_outcome.values())
+    _n_loaded, _n_to = _oc.count("loaded"), _oc.count("timeout")
+    _n_fail = _oc.count("failed") + _lost
+    _n_dskip = _oc.count("skipped")                      # the phase deadline never started it
+    _n_skip = _n_dskip + len(_given_skipped)
+    _n_tried = _n_loaded + _n_to + _n_fail
     _banner = ""
     if _failed_slots or _lost:
         _banner = (
-            f"[⚠ SOURCE FAILURES: {_failed_slots + _lost} of {_n_slots} "
-            f"hidden services could not be fetched (timeout, down, or "
-            f"unreachable). The sections below cover only the "
-            f"{len(valid_contents) - len(_failed)} that loaded. This is a "
+            f"[⚠ SOURCE FAILURES: {_n_to + _n_fail + _n_dskip} of {_n_tried + _n_dskip} "
+            f"hidden services could not be fetched (timed out {_n_to}, failed {_n_fail}"
+            + (f", not started before the deadline {_n_dskip}" if _n_dskip else "") +
+            f"). The sections below cover only the "
+            f"{_n_loaded} that loaded. This is a "
             f"COVERAGE limit, not evidence of absence — do not conclude a "
             f"claim is unsupported because a failed source did not support "
             f"it.]\n\n")
@@ -2099,7 +2977,16 @@ async def _darkweb_research_core(
             f"{_search.NO_FACTS_BANNER_HEAD} none of the {len(_loaded)} hidden services that loaded "
             f"had facts relevant to the query. Do not present an answer as researched: try a "
             f"narrower or differently worded query, or say what could not be found.]\n\n")
-    full_report = _banner + (_search.recheck_note(_recheck) if _recheck else "") + "\n\n".join(valid_contents)
+    # §4UN-darkres: exact counts at the head — tried = every fetch started (backfills
+    # included); skipped = a given URL refused + a source the phase deadline never started.
+    # From `_outcome` (set by this code), never from page text; a page line starting
+    # "[SOURCES:" is quoted by `_neutralise`.
+    _counts = (f"[SOURCES: tried {_n_tried}, loaded {_n_loaded}, timed out {_n_to}, "
+               f"failed {_n_fail}, skipped {_n_skip}]\n")
+    if _given_skipped:
+        _counts += _skipped_line(_given_skipped) + "\n"
+    full_report = (_counts + "\n" + _banner + (_search.recheck_note(_recheck) if _recheck else "")
+                   + "\n\n".join(valid_contents))
 
     # Workspace research dedup — record every onion we pulled. Non-fatal.
     if workspace_model is not None and getattr(workspace_model, "enabled", False):

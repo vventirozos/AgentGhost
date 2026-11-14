@@ -439,8 +439,7 @@ IDLE_JOB_PURPOSE = {
     "autoadvance": "one unattended step on a project you put on autopilot",
     "selfhood-narrative": "rewrites the agent's running diary",
     "workspace-narrative": "rewrites the running summary of the workspace",
-    "character": ("closes the day's record, lets the character's dials move from it, and once a day rates how "
-                  "its own replies sound"),
+    "character": "closes the day's record and lets the character's dials move from it",
 }
 
 
@@ -4011,8 +4010,26 @@ _STRUCK_BLOCK_CODES = frozenset({"tool_disabled", "tool_call_parse_error", "bad_
 #: it stays in DESIGNED_STOP_REASONS only to read rows already recorded.
 _DEAD_END_REFUSALS = frozenset({"not_owner_write", "forget_not_confirmed", "reset_not_confirmed"})
 
+def _user_text_kw(verifier, last_user_content) -> Dict[str, Any]:
+    """§4UN-dark r3: the user's whole message for ``verify_claim(user_text=…)`` (the onion guard's "typed by the
+    user" exemption; ``context`` is the judge's cut of the request) — only to a verifier that takes it."""
+    try:
+        import inspect
+        params = inspect.signature(verifier.verify_claim).parameters
+        if "user_text" in params or any(p.kind is p.VAR_KEYWORD for p in params.values()):
+            return {"user_text": str(last_user_content or "")}
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return {}
+
+
 #: §4UL: the request-end DONE sweeps still running (held so none is collected mid-run)
 _DEFERRED_SWEEP_TASKS: set = set()
+
+#: §4UM-s: the reply each request showed the owner (smoothed, before the digest and correction banners
+#: go on its head), by request id — `_finalize_and_return` puts it here, handle_chat's finally takes it for
+#: the change-log summary. A streamed reply never lands here: its drain fills the summary itself.
+_CHANGE_LOG_REPLIES: Dict[str, str] = {}
 
 
 def _defuse_tool_text(content) -> str:
@@ -7639,16 +7656,26 @@ def member_steer_caveat(text, blocked_names) -> str:
 MEMBER_REFUSAL_REPORT_AT = 3
 
 
-def member_search_yield_steer(run: int) -> str:
+def member_search_yield_steer(run: int, read_pages: bool = False) -> str:
     """§4KL: the search-yield steer for a channel member's turn — the
     answer-from-snippets half only; the owner's text sends the model to
-    `browser`, which a member cannot call."""
+    `browser`, which a member cannot call. §4UN-read: when a web_search of
+    the request opened pages itself (``read_pages``), that page text is
+    named too — snippets are not all the text there is."""
+    if read_pages:
+        have = ("On this request you cannot open pages yourself or download files: the "
+                "search snippets and the page text web_search read for you (under READ FROM "
+                "PAGES) are all the text you will get, and another query of the same kind "
+                "will not add any. Write your answer NOW from what you already have: state what "
+                "it supports, and name plainly each part of the question you could NOT ")
+    else:
+        have = ("On this request "
+                "you cannot open pages or download files, so search snippets are all the "
+                "text you will get, and another query of the same kind will not add "
+                "any. Write your answer NOW from the snippets you already have: state what "
+                "they support, and name plainly each part of the question you could NOT ")
     return (
-        f"SYSTEM ALERT: you have run {run} web searches in a row. On this request "
-        "you cannot open pages or download files, so search snippets are all the "
-        "text you will get, and another query of the same kind will not add "
-        "any. Write your answer NOW from the snippets you already have: state what "
-        "they support, and name plainly each part of the question you could NOT "
+        f"SYSTEM ALERT: you have run {run} web searches in a row. " + have +
         "confirm and what would be needed to confirm it. Keep each statement with "
         "the result it came from: a snippet from another site is that site's claim, "
         "not the content of a page the user linked. Do NOT run another "
@@ -12867,8 +12894,8 @@ def _mood_tone_block(context) -> str:
                 _MOOD_TONE_BY_REQ[req_id] = {
                     "mood": view.describe(), "manner": (f"{view.manner}, {view.manner_intensity} of 3"
                                                         if view.manner else ""),
-                    # §4UD (W2): the same as VALUES — readers (the daily look's strong-mood filter) take these,
-                    # never the two sentences above
+                    # §4UD (W2): the same as VALUES — readers take these, never the two sentences above (their
+                    # first reader, the daily look's strong-mood filter, is removed, §4UH-noself)
                     "label": view.label, "intensity": int(view.intensity),
                     "manner_name": view.manner, "manner_intensity": int(view.manner_intensity or 0),
                     "remarked": remarked, "audience": audience}
@@ -14203,7 +14230,7 @@ class GhostAgent:
     _STORE_HYGIENE_COOLDOWN = 7200
     _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
     _WORKSPACE_NARRATIVE_COOLDOWN = 3600  # 60 min between workspace-narrative consolidations (phase 2.9)
-    _SELF_TRY_COOLDOWN = 3600         # §4SV/§4UH: 1 h between tries of the character phase (one look a day)
+    _SELF_TRY_COOLDOWN = 3600         # §4SV/§4UH: 1 h between tries of the character phase (day close + daily rule)
     _WORKSPACE_TIDY_COOLDOWN = 21600  # 6 h between recurring workspace tidy passes (phase 2.7d)
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
     # Belt-and-braces guard for phase 1. The journal-empty self-disarm
@@ -14351,9 +14378,9 @@ class GhostAgent:
             logger.debug("autonomous-activity record skipped: %s", e)
 
     async def _self_phase(self, ctx, ran: list, notes: dict) -> None:
-        """§4UG/§4UH idle phase 2.8c: at most one try an hour — the day's close, the character's daily rule and
-        the daily look (``_character_phase``). The anchor keeps its persisted name, ``_last_mirror_try_at``
-        (idle_cooldowns.json). Never raises (a failure is booked on the Idle Cycle line)."""
+        """§4UG/§4UH idle phase 2.8c: at most one try an hour — the day's close and the character's daily rule
+        (``_character_phase``; the daily self-look is removed, §4UH-noself). The anchor keeps its persisted
+        name, ``_last_mirror_try_at`` (idle_cooldowns.json). Never raises (a failure is booked on the Idle Cycle line)."""
         if not hasattr(self, '_last_mirror_try_at'):
             self._last_mirror_try_at = datetime.datetime.min
         if (datetime.datetime.now() - self._last_mirror_try_at).total_seconds() \
@@ -14392,36 +14419,17 @@ class GhostAgent:
             from ..selfhood import tastes as _tastes
             tasted = await asyncio.to_thread(
                 lambda: _tastes.close_days(home, [d.get("date") for d in _days.load_days(home)]))
-            moves, looked = [], ""
+            moves = []
             if _character.enabled():
-                # §4UH: the look — once a day the agent says how its own replies sound, on its three dials
-                # (one background call on the main model); what it saw is a vote in the daily rule
-                from ..selfhood import selfview as _selfview
-                from .llm import BackgroundDeferred as _BgDeferred
-                # review r1 (§4UH): the rule FIRST, with the votes of the looks already taken — today's look
-                # then records the dials as they are after any move, and votes against those
-                votes = await asyncio.to_thread(_selfview.votes, home)
-                moves = await asyncio.to_thread(
-                    lambda: _character.daily(home, _days.load_days(home), votes=votes))
-                try:
-                    looked = await _selfview.look(
-                        home, getattr(ctx, "llm_client", None) if ctx is not None else None,
-                        model=str(getattr(getattr(ctx, "args", None), "model", "") or ""))
-                except _BgDeferred:
-                    self._last_mirror_try_at = datetime.datetime.min     # a request started: the next idle tick
-                    looked = "the look was deferred — a request started; it tries again on the next idle tick"
-                except Exception as e:  # noqa: BLE001 — the look is secondary: the days and the rule still run
-                    logger.warning("character: the look failed (%s: %s)", type(e).__name__, e)
-                    looked = f"the look failed ({type(e).__name__})"
-            if written or moves or looked or tasted:
+                # §4UH-noself (2026-11-14): the daily self-look is gone — the main model rated every
+                # character, even "short and dry, blunt", as about (+1, +1, +1); only the day records move a dial
+                moves = await asyncio.to_thread(lambda: _character.daily(home, _days.load_days(home)))
+            if written or moves or tasted:
                 ran.append("character")
                 notes["character"] = "; ".join(
                     ([f"day record written for {', '.join(written)}"] if written else [])
-                    + ([looked] if looked else [])
                     + ([f"tastes counted for {len(tasted)} day(s)"] if tasted else [])
                     + (moves if moves else (["no dial moved"] if _character.enabled() and written else [])))
-                if looked.startswith("looked at"):
-                    pretty_log("Character", looked, icon=Icons.MIRROR)
                 if tasted:
                     # §4UH review r2: the rough kinds are said HERE, in the log, and nowhere a model reads
                     _likes = await asyncio.to_thread(lambda: _tastes.line(home, liked_only=False))
@@ -15085,9 +15093,8 @@ class GhostAgent:
 
         # Phase 2.8c (§4UG/§4UH): the character — the strange loop's turn. The
         # days that are over are closed into day records, the character's daily
-        # rule lets a dial move from them (no model call), and once a day the
-        # agent rates how its own replies sound (one background call on the MAIN
-        # model; the conversation is saved first, §4RV). The sentence is one
+        # rule lets a dial move from them (no model call; the daily self-look on
+        # the main model is removed, §4UH-noself). The sentence is one
         # section of every private owner reply's state block (`_self_image_block`)
         # and one line of `introspect`; the owner's `mirror` command shows the
         # loop's path. Listed on the Idle Cycle line only when something happened.
@@ -19454,6 +19461,7 @@ class GhostAgent:
                             prior_evidence=_prior_turn_evidence(
                                 messages, tools_run_this_turn, last_user_content),
                             raw_sources=_raw_turn_sources(tools_run_this_turn),
+                            **_user_text_kw(verifier, last_user_content),   # §4UN-dark r3: uncut
                         )
             else:
                 with verify_purpose("turn gate"):
@@ -19467,6 +19475,7 @@ class GhostAgent:
                         prior_evidence=_prior_turn_evidence(
                             messages, tools_run_this_turn, last_user_content),
                         raw_sources=_raw_turn_sources(tools_run_this_turn),
+                        **_user_text_kw(verifier, last_user_content),   # §4UN-dark r3: uncut
                     )
         else:
             v_result = None
@@ -21600,7 +21609,12 @@ class GhostAgent:
                   if not self._REFUTE_TASK_ARTIFACT_RE.search(i)]
         if not issues:
             return
-        if status == "DONE":
+        _ready = False
+        try:
+            _ready = status == "ACTIVE" and store.planned_work_done(project_id) is True
+        except Exception:  # noqa: BLE001
+            _ready = False
+        if status == "DONE" or _ready:      # §4UM: a finished plan ("ready") shares the reopen budget
             # Same rolling-window budget as the user-report reopen path —
             # a refute-driven reopen is still a reopen.
             _now_ts = time.time()
@@ -26515,9 +26529,16 @@ class GhostAgent:
                                 continue
                         except Exception:  # noqa: BLE001
                             pass
+                        _sy_opened = False
+                        if _sy_meta[0] == "web_search":
+                            try:                                # §4UN-read: it read pages itself
+                                from ..tools.search import web_read_urls as _sy_wru
+                                _sy_opened = bool(_sy_wru(results[_sy_i]))
+                            except Exception:  # noqa: BLE001
+                                _sy_opened = False
                         _sy_run = strikes.note_search_yield(
                             "web_search" if _sy_member and _sy_meta[0] == "darkweb_search"
-                            else _sy_meta[0])
+                            else _sy_meta[0], opened=_sy_opened)
                     if (getattr(strikes, "search_total", 0) >= _sy_strk.SEARCH_TOTAL_STEER
                             and not strikes.search_total_steered
                             and not force_stop and not force_final_response):
@@ -26544,7 +26565,8 @@ class GhostAgent:
                                 "reader: steering to answer from the snippets (tools kept)",
                                 level="WARNING", icon=Icons.WARN)
                             messages.append({"role": "user",
-                                             "content": member_search_yield_steer(_sy_run)})
+                                             "content": member_search_yield_steer(
+                                                 _sy_run, read_pages=getattr(strikes, "search_read_any", False))})
                         else:
                             # §4MO operator decision (2026-10-08): the owner is
                             # steered at the same count as a member — the arm
@@ -27235,7 +27257,9 @@ class GhostAgent:
             if not pid or store is None:
                 return False
             proj = store.get_project(pid)
-            if not proj or str(proj.get("status", "")).upper() != "DONE":
+            _st_d = str((proj or {}).get("status", "")).upper()
+            # §4UM review: a ready project (planned work done, open) takes a defect report as a DONE one did
+            if not proj or not (_st_d == "DONE" or (_st_d == "ACTIVE" and store.planned_work_done(pid) is True)):
                 return False
             open_defects = [
                 t for t in store.list_tasks(pid)
@@ -28329,6 +28353,18 @@ class GhostAgent:
         # (The opt-in value-alignment gate, `--principle-gate`, is removed —
         # §4TB 2026-11-05: operating principles went with the `self_state`
         # tool, their only writer. The flag is still accepted and ignored.)
+
+        # §4UM-s: the change log's summary is this reply — smoothed (the narration written beside tool calls is
+        # gone), before the digests and the correction banner below go on its head. handle_chat's own
+        # `final_ai_content` is the text BEFORE smoothing (req 56dff518 logged "Now let me upgrade the test hook…")
+        if req_id:
+            if len(_CHANGE_LOG_REPLIES) > 256:                 # never grows: one per request, taken at its end
+                _CHANGE_LOG_REPLIES.clear()
+            _cl_reply = str(final_ai_content or "")
+            # review m2: the ~280-char turn-budget banner would fill the 300-char summary — one short mark
+            _cl_reply = re.sub(r"^\s*\[TURN BUDGET (?:REACHED|EXHAUSTED)\][^\n]*\n+",
+                               "Not finished (turn budget reached). ", _cl_reply, count=1)
+            _CHANGE_LOG_REPLIES[str(req_id)] = _cl_reply
 
         # Autonomous-progress digest — closes the user-facing half of
         # phase 2.95. If projects were advanced in the background (by
@@ -31767,6 +31803,14 @@ class GhostAgent:
                     # page the operator later for a promise nobody made.
                     # (Internal turns still FIRE an already-stored promise
                     # at finalize.)
+                    # §4UM review M3: the owner's message is the ask of every change this request makes;
+                    # the project focused now is watched (folder snapshot, diffed at the request's end)
+                    try:
+                        from ..tools.projects import begin_request_watch as _bw
+                        if not is_simulated_context(self.context):
+                            _bw(self.context, str(request_id_context.get() or ""), last_user_content)
+                    except Exception:  # noqa: BLE001
+                        logger.debug("change watch not started", exc_info=True)
                     if (_user_asked_for_notification(last_user_content)
                             and not _np_is_internal(
                                 request_id_context.get())
@@ -33814,6 +33858,18 @@ class GhostAgent:
             # call of the same request may still have needed the files
             try:
                 from ..memory import projects as _pj_mod
+                # §4UM: the request's change-log entries first (one per project it changed, with the
+                # final reply's first line) — the sweep below keeps the files a change touched.
+                # §4UM-s: the reply as shown (`_finalize_and_return` left it); never this method's own
+                # `final_ai_content` (before smoothing: the narration beside tool calls). None (a stream, a
+                # cancel, an error) → no summary here; a streamed reply's drain fills it.
+                _fin = ""
+                for _frid in dict.fromkeys((request_id_context.get(), req_id)):
+                    _fin = _CHANGE_LOG_REPLIES.pop(str(_frid or ""), "") or _fin
+                _flush_changes = getattr(_pj_mod, "flush_change_log", None)
+                if _flush_changes is not None:
+                    for _crid in dict.fromkeys((request_id_context.get(), req_id)):
+                        _flush_changes(_crid, reply=_fin)
                 _flush_sweeps = getattr(_pj_mod, "flush_deferred_sweeps", None)
                 if _flush_sweeps is not None:
                     for _srid in dict.fromkeys((request_id_context.get(), req_id)):
@@ -34061,7 +34117,7 @@ class GhostAgent:
                 # §4HY: a source "actually read" that no tool ever opened.
                 # The request TRIGGERS this rule, so it stands down with the
                 # other request rules once messages arrived mid-turn (§4RZ).
-                issues = refute_unread_source(claim, request_text or "", _names)
+                issues = refute_unread_source(claim, request_text or "", _names, tool_rows=tools_run or ())
                 reasoning = "reply-shape check (a source cited as read was never opened)"
             if not issues:
                 issues = refute_narration_only(
@@ -36096,6 +36152,14 @@ class GhostAgent:
                                        if _um_failed_stream else None),
                     req_id=req_id,
                 )
+
+                # §4UM review: the streamed reply is complete only here — handle_chat's finally already wrote
+                # the request's change-log entries, with no summary
+                try:
+                    from ..memory.projects import set_change_summary as _set_cs
+                    _set_cs(str(req_id or ""), _treated_content)          # what the owner was shown
+                except Exception:  # noqa: BLE001
+                    logger.debug("streamed change summary skipped", exc_info=True)
 
                 # Promised-notification backstop — streamed twin of the
                 # finalize wiring (same 2026-07-20 H1 rationale as the

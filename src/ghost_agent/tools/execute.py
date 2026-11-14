@@ -2764,8 +2764,9 @@ def _note_execute_project_writes(kwargs, result) -> str:
     the result. Advisory bookkeeping: a failed run, a pinned run or any
     error notes nothing."""
     try:
-        if kwargs.get("container_workdir"):
-            return ""           # pinned: the turn's own project, relative paths
+        _wpid = _project_id_from_workdir(kwargs.get("container_workdir"))
+        if kwargs.get("container_workdir") and not _wpid:
+            return ""           # pinned somewhere that is not a project
         st = getattr(getattr(result, "status", None), "value", None)
         if st is not None:
             if st not in ("ok", "partial"):
@@ -2776,18 +2777,43 @@ def _note_execute_project_writes(kwargs, result) -> str:
             if _code is not None and _code != 0:
                 return ""
         sandbox_dir = kwargs.get("sandbox_dir")
-        if sandbox_dir is None:
+        if sandbox_dir is None and not _wpid:
             return ""
         paths = []
         command = str(kwargs.get("command") or kwargs.get("cmd") or "")
-        if command:                         # §4UL review M6: the paths it WRITES, never ones it reads
-            for tgt in _shell_write_targets(command):
-                m = _PROJECT_PATH_RE.fullmatch(workspace_relative(tgt))
-                if m:
-                    paths.append(m.group(1))
         fname = str(kwargs.get("filename") or kwargs.get("file") or "")
-        if fname and (kwargs.get("content") or kwargs.get("code")) and _PROJECT_PATH_RE.fullmatch(fname):
-            paths.append(_PROJECT_PATH_RE.fullmatch(fname).group(1))
+        if _wpid:
+            # §4UM round 3: a PINNED run — its relative write targets (and an inline script) are the project's
+            # files, reported like the file tool's (the change log lists them even when the folder cannot be
+            # compared); only paths that exist after the run (a target after a `cd` may be elsewhere)
+            from ..core.request_scope import current_scope
+            _sc = current_scope()
+            _root = getattr(getattr(_sc, "context", None), "sandbox_dir", None) if _sc is not None else None
+            if not _root:
+                return ""
+            _pdir = Path(_root).resolve() / "projects" / _wpid
+            cands = list(_shell_write_targets(command)) if command else []
+            if fname and (kwargs.get("content") or kwargs.get("code")):
+                cands.append(fname)
+            for tgt in cands:
+                w = workspace_relative(str(tgt))
+                if w.startswith(f"projects/{_wpid}/"):
+                    full = Path(_root).resolve() / w
+                elif w.startswith(("/", "~", "$")) or ".." in Path(w).parts:
+                    continue
+                else:
+                    full = _pdir / (w[2:] if w.startswith("./") else w)
+                if full.is_file():
+                    paths.append(str(full))
+            sandbox_dir = _root
+        else:
+            if command:                     # §4UL review M6: the paths it WRITES, never ones it reads
+                for tgt in _shell_write_targets(command):
+                    m = _PROJECT_PATH_RE.fullmatch(workspace_relative(tgt))
+                    if m:
+                        paths.append(m.group(1))
+            if fname and (kwargs.get("content") or kwargs.get("code")) and _PROJECT_PATH_RE.fullmatch(fname):
+                paths.append(_PROJECT_PATH_RE.fullmatch(fname).group(1))
         if not paths:
             return ""
         from .file_system import note_project_write_hook
@@ -2798,10 +2824,50 @@ def _note_execute_project_writes(kwargs, result) -> str:
     return ""
 
 
+_PROJECT_ID_IN_RE = re.compile(r"(?:^|[\s'\"=:/(])(?:\./|/workspace/)?projects/([0-9a-f]{12})(?=/|\s|$|['\";|&)])")
+
+
+def _prepare_execute_project_writes(kwargs) -> None:
+    """§4UM review M3: BEFORE a command runs, snapshot each project it can change — the project a pinned run works
+    in (``container_workdir``), and every ``projects/<id>`` a root run names — so the request's end diffs the
+    folder: a heredoc, `sed -i`, `rm`, `mv`, a build's output, whatever wrote it. Advisory; never raises."""
+    try:
+        pids = []
+        _wpid = _project_id_from_workdir(kwargs.get("container_workdir"))
+        if _wpid:
+            pids.append(_wpid)
+        command = str(kwargs.get("command") or kwargs.get("cmd") or "")
+        pids += [m.group(1) for m in _PROJECT_ID_IN_RE.finditer(command)][:10]
+        fname = str(kwargs.get("filename") or kwargs.get("file") or "")
+        m = _PROJECT_ID_IN_RE.search(" " + fname)
+        if m:
+            pids.append(m.group(1))
+        if not pids:
+            return
+        from ..core.request_scope import current_scope
+        sc = current_scope()
+        ctx = getattr(sc, "context", None) if sc is not None else None
+        if ctx is None:
+            return
+        # round 4: real write evidence — the command names write targets, or an inline script is saved; a
+        # `pytest` / `ls` / `git status` diffs the folder, but alone never makes an entry that names no file
+        evidence = bool(command and _shell_write_targets(command)) or bool(
+            fname and (kwargs.get("content") or kwargs.get("code")))
+        if not evidence and command:            # round 5: rm, a mutating git, a formatter, patch, inline writes
+            from ..core.project_turns import shell_check_events
+            evidence = "w" in shell_check_events(command)
+        from .projects import prepare_project_write
+        for pid in list(dict.fromkeys(pids)):
+            prepare_project_write(ctx, project_id=pid, evidence=evidence)
+    except Exception:  # noqa: BLE001 — bookkeeping never breaks a run
+        logging.getLogger("GhostAgent").debug("execute project-write prepare skipped", exc_info=True)
+
+
 _tool_execute_impl = tool_execute
 
 
 async def _tool_execute_noting(*args, **kwargs):
+    _prepare_execute_project_writes(kwargs)
     res = await _tool_execute_impl(*args, **kwargs)
     _note = _note_execute_project_writes(kwargs, res)
     if _note:

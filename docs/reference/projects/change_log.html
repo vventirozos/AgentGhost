@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Living projects and the change log — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css?v=ab96635d7c">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <div class="subnav">
+      <a href="autonomous_activity.html">Autonomous activity (core.autonomous_activity)</a>
+      <a href="background_jobs.html">Background jobs</a>
+      <a class="current" href="change_log.html">Living projects and the change log</a>
+      <a href="cross_project_map.html">Cross-project map</a>
+      <a href="long_tasks.html">Long tasks</a>
+      <a href="planning.html">Planning (core.planning)</a>
+      <a href="project_advancer.html">Project autopilot (core.project_advancer)</a>
+      <a href="project_research.html">Project research (core.project_research)</a>
+      <a href="project_safety.html">Project safety (core.project_safety)</a>
+      <a href="project_store.html">Project store (memory.projects)</a>
+      <a href="project_turns.html">Project task turns (core.project_turns)</a>
+      <a href="projects_routes.html">Projects API (api.projects_routes)</a>
+      <a href="projects_tool.html">Projects tool (tools.projects)</a>
+      <a href="task_close.html">Closing tasks (core.task_close)</a>
+      <a href="task_kind.html">Task kinds (core.task_kind)</a>
+      <a href="task_wait.html">Waiting tasks (core.task_wait)</a>
+      <a href="tasks.html">Scheduled tasks (tools.tasks)</a>
+      <a href="triggers.html">Triggers (core.triggers)</a>
+    </div>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>Living projects and the change log</h1>
+  <p class="subtitle">&sect;4UM (2026-11-13): a project is an application the owner keeps changing. Finishing the plan leaves it open (&ldquo;ready&rdquo;); only the owner closes it; every change the owner asks for is one entry in the project's change log and the agent's own file <code>PROJECT_CHANGES.md</code> in its folder; every push to the project's kept lab is recorded with where it is live.</p>
+
+  <h2 id="why">Why it exists</h2>
+  <p>The owner built a webOS as a project, deployed it, then asked for a Tetris app. The work was done and pushed live (two <code>lab put</code>s into the kept lab), but the project had rolled up to DONE when its plan finished, and nothing about the Tetris request was stored on it: asked later what the project contained, the agent had no record of Tetris. &sect;4UL's fix (a write into a DONE project reopens it with a &ldquo;Change:&rdquo; task) recorded only the ask, ignored changes to ACTIVE projects, churned DONE &harr; reopened, and never said what went live.</p>
+
+  <h2 id="states">States</h2>
+  <div class="scroll"><table>
+    <tr><th>state</th><th>stored status</th><th>meaning</th></tr>
+    <tr><td><code>working</code></td><td>ACTIVE</td><td>planned tasks are open (or nothing is planned yet)</td></tr>
+    <tr><td><code>ready</code></td><td>ACTIVE</td><td>every planned task is DONE; the project stays open and live, ready for changes</td></tr>
+    <tr><td><code>done</code></td><td>DONE</td><td>closed by the owner (<code>update status=DONE</code> in the owner's own turn)</td></tr>
+    <tr><td><code>ready</code> (legacy)</td><td>DONE</td><td>closed by the pre-&sect;4UM roll-up: the latest status event is <code>project_auto_rollup</code> (<code>closed_by_rollup</code>). It reads <em>ready</em> everywhere; no data migration. The model-facing views (<code>status</code>/briefing, <code>get</code>, the focused-project TITLE line) show its status as <code>ACTIVE</code>, never the raw DONE (live probe 2026-11-13 answered &ldquo;DONE and ready&rdquo;)</td></tr>
+    <tr><td>others</td><td>NEEDS_USER, FAILED, ARCHIVED, RELEASED&hellip;</td><td>unchanged</td></tr>
+  </table></div>
+  <ul>
+    <li><code>ProjectStore.project_state(pid)</code> derives it; <code>planned_work_done(pid)</code> is <code>state == "ready"</code>.</li>
+    <li><strong>The roll-up never sets DONE.</strong> When the last task closes DONE with no failures, <code>_planned_work_finished</code> moves a waiting/failed project back to ACTIVE (guarded on the status it read, so a concurrent ARCHIVE wins), sets <code>metadata.planned_done_at</code> once, logs <code>project_auto_rollup {new_status: "READY"}</code>, retires the constraints (they come back with new tasks) and fires the old DONE hook (the clean-up sweep, the &ldquo;notify me when done&rdquo; promise). New open work clears <code>planned_done_at</code>, so the next finish fires again. <code>metadata.first_ready_at</code> / <code>first_ready_req</code> are never cleared: they say the first plan was built, and by which request.</li>
+    <li><strong>Only the owner closes.</strong> <code>manage_projects update status=DONE</code> is refused unless it is the owner's turn (a probe may close its own probe project). The close logs <code>project_closed {by: owner, req}</code>, and its result says &ldquo;closed by the owner's request (DONE)&rdquo; so a model that closes on its own reading is visible in the transcript and the log. A finished batch reports <code>project_done</code> with the text &ldquo;the project stays OPEN (ready)&rdquo;; a batch on a project the owner closed reports <code>project_closed</code>.</li>
+    <li><strong>The who-may-act wall</strong> (<code>_lifecycle_confirmation</code>) runs for every release, unrelease and delete, whatever the state: a background, scheduled or probe turn, or a request that read outside content, cannot release or delete a ready project.</li>
+    <li>Release, the digest (&ldquo;all planned work done (stays open for changes)&rdquo;), the notify promise (a ready project captures &ldquo;notify me when done&rdquo;: it fires when the plan finishes after the ask, or a change is made after it), the defect report (&ldquo;it's broken&rdquo; on a ready project adds a FIX task), the inter-project dependency gate and the verifier's reopen budget treat <em>ready</em> as DONE was treated. Idle autopilot skips ready projects.</li>
+  </ul>
+
+  <h2 id="changes">The change log</h2>
+  <p>Table <code>project_changes</code> (one row per entry): <code>kind</code> (<code>change</code> or <code>deploy</code>), <code>num</code> (changes only, 1, 2, &hellip; per project), <code>ts</code>, <code>req_id</code>, <code>ask</code>, <code>added</code> / <code>changed</code> / <code>removed</code> (project-relative paths), <code>summary</code>, <code>deployed</code>, <code>deployed_at</code>, <code>url</code>, <code>pushed</code>, <code>meta</code>.</p>
+  <ol>
+    <li><strong>Watch.</strong> An owner request watches a project from the moment it is in play: the focused project at the start of the request (<code>begin_request_watch</code> in <code>handle_chat</code>), and any other project the first time a hook names it. Watching takes a stat snapshot of the folder (path &rarr; size, mtime, ctime), skipping <code>PROJECT_MAP.md</code>, <code>PROJECT_CHANGES.md</code>, <code>.git</code>, <code>node_modules</code>, <code>.deps</code>, <code>__pycache__</code>, <code>.venv</code>/<code>venv</code>, <code>.tox</code> and dot-folders; <code>env/</code> only when it holds <code>pyvenv.cfg</code> and <code>target/</code> only when it holds <code>CACHEDIR.TAG</code> or <code>.rustc_info.json</code> (otherwise they are content, like <code>build/</code> and <code>dist/</code>). At most 5000 entries, files and folders both counted, and one second (5 s for the walk at the flush). Over either, or a folder that cannot be read: no comparison; the project is not walked again for an hour, and a writing request still gets its entry, with the tool-reported paths and <code>meta.folder_too_large</code> (&ldquo;files not all listed&rdquo;). An entry that names no file at all needs real write evidence (round 4, <code>write_evidence</code>): a reported path, or a command whose write targets are known (<code>_shell_write_targets</code>) or an inline script it saves &mdash; a pinned <code>pytest</code>, <code>ls</code> or <code>git status</code> diffs the folder but alone never makes an entry. Round 5: a command whose events include a write (<code>project_turns.shell_check_events</code>: <code>rm</code>, a mutating <code>git</code>, a formatter, <code>patch</code>, inline code that writes) is evidence too, and so is a folder that could be compared at the request's start and no longer can at its end (it grew past the cap). What is left: a generator (<code>make</code>, <code>npm run build</code>, <code>python gen.py</code>) on a project that was already too large to compare &mdash; no entry, one INFO line &ldquo;project X is too large to compare; a command ran that may have changed files &mdash; no change entry&rdquo;. The hooks snapshot <em>before</em> the write: the file tool before its operation (both the source and the destination of a move), <code>execute</code> before the command runs (the pinned project's folder, and every <code>projects/&lt;id&gt;</code> the command or filename names).</li>
+    <li><strong>Collect.</strong> <code>note_project_write</code> records the paths the tools report: the file tool's write, edit, delete, move, rename and download; <code>execute</code>'s shell write targets (a root run's <code>projects/&lt;id&gt;/&hellip;</code> paths, and, round 3, a pinned run's relative targets that exist after it); <code>generate_image</code>'s saved render (logged, but a render alone never reopens a closed project: it may not be for the project); the lab tool's <code>get</code> (file or folder &mdash; a folder is prepared and noted once as a batch, <code>note_change_writes</code>) and <code>screenshot</code> (<code>_ws_write</code>, <code>_ws_mkdir</code>). Each of them also prepares (snapshots) before it writes. The download's file name comes from <code>download_target_name</code>, shared with the download itself; an unreadable URL is refused. Who counts: the owner's own turn, and a project task's turn run inside the owner's request (both keyed by the root request). Background, member, probe and simulated turns record nothing, with one exception: an unattended task turn on a project whose first plan was already finished before it (autopilot after ready) is its own entry, keyed by the task turn, with ask <code>task: &lt;description&gt;</code> and <code>meta.source = "task"</code>. A RELEASED project records nothing (changes go to <code>create_version</code>).</li>
+    <li><strong>Only a request that wrote.</strong> The folder is diffed only when the request ran a writing tool on the project: the file tool's write/edit/delete/move (<code>prepare_project_write</code>, <code>note_project_write</code>) or <code>execute</code> for the pinned project or a project its command names. A lab put is not a folder write. A request that only read, searched or took a screenshot writes no entry and reopens nothing, whatever moved in the folder meanwhile.</li>
+    <li><strong>What is not the owner's.</strong> From the diff (never from a write tool's own noted path) the flush leaves out: files the system wrote or moved away (<code>note_system_path</code>: NEW browser screenshots and check files noted by <code>turn_scratch</code>, its trash moves, the workspace sweep and tidy, an image edit's joined reference picture, the research mirror &mdash; <code>research/INDEX.md</code>, <code>main-loop-findings.md</code>, briefs; a request's own registrations are kept apart from the global bounded list, so other requests' sweeps cannot evict them); a path another request's write tool noted during this request (a concurrent task turn); and anything that moved before this request's first writing tool (mtime/ctime, 1 s slack).</li>
+    <li><strong>Write at the request's end.</strong> <code>handle_chat</code>'s <code>finally</code> calls <code>flush_change_log(request_id, reply)</code> before the deferred sweeps. For every watched project it re-snapshots the folder and diffs: added, changed (size or mtime moved), removed; a removed folder whose files the snapshot listed is not listed again. That is unioned with the noted paths (a noted path gone since is removed, or dropped if this request added it; a path noted as added before the snapshot saw it stays added). One entry per project that changed: <code>ask</code> is always the owner's message of the outer request (never a task turn's prompt), <code>summary</code> the reply the owner was shown, as plain text (&le; 300 characters): &sect;4UM-s, <code>_finalize_and_return</code> leaves it in <code>_CHANGE_LOG_REPLIES</code> after reply smoothing and before the digests and the correction banner go on its head, and the <code>finally</code> takes it &mdash; never <code>handle_chat</code>'s own <code>final_ai_content</code>, which is the text before smoothing (req 56dff518's change #2 read &ldquo;Now let me upgrade the test hook&hellip;&rdquo;, the narration written beside tool calls). A request with no shown reply at the <code>finally</code> (a stream, an error, a cancel) writes an empty summary; <code>set_change_summary</code> at the end of a stream fills it and re-renders. The entry's <code>ts</code> is when the files' content last changed: a diffed file's mtime when it moved during the request, its ctime only for content older than the request's first write (a rename, a <code>cp -p</code>). ctime alone also moves on a metadata touch (an xattr written when the file is opened, such as macOS <code>com.apple.lastuseddate#PS</code>, or a <code>chmod</code>), so it does not date a fresh write (req 56dff518's entry read 12:19, <code>index.html</code>'s ctime, for files last written at 11:52). The exception keeps the live marks right: when a version of the project was cut between the content time and the ctime (<code>_push_times</code>, read once per flush: this request's pushes and another request's still pending, with a pending switch's <code>before_t</code>; a recorded deploy entry; a staged deploy in <code>metadata.staged_deploys</code>; unreadable counts as a cut), the file keeps the later time &mdash; content renamed into place after a push is not in that push, for <code>_covered</code> and <code>record_deploy</code> alike (both order changes by this time). Known limit: <code>stat</code> cannot tell a rename from a touch, so a file merely opened after a push in its window reads not live and is dated at the touch &mdash; wrong in the safe direction; the next push marks it. Whether a path is this request's at all still reads mtime or ctime. A DONE project reopens to ACTIVE with no task (<code>meta.reopened_from</code>) only at a write tool's noted path; a change only the diff saw is logged and the project stays DONE. An entry whose write fails stays pending (and on disk) and is retried at the next flush, three tries at most.</li>
+    <li><strong>A killed request.</strong> The accumulator (paths, pushes, ask; not the snapshots) is kept in <code>pending_changes.json</code> in the memory directory and cleared at the flush. At start-up <code>recover_pending_changes</code> writes what a killed process left, with <code>meta.recovered</code>; what the log already holds for that (project, request) &mdash; the change, the deploy, or both &mdash; is not written again, and the missing part is; the file goes only when every row was written (a failing row stays pending); a corrupt file is moved aside to <code>pending_changes.json.bad</code> with one warning.</li>
+    <li><strong>Not a change:</strong> the request that built the project's <em>first</em> plan (it created the project, or closed one of its tasks before the plan was ever finished). Once the first plan was finished by another request, a request that changes files is a change even when it adds and closes tasks for it.</li>
+    <li><strong>PROJECT_CHANGES.md</strong> is the agent's own file, starting with the line <code>&lt;!-- written by the agent: this project's change log (&sect;4UM). Edits here are overwritten. --&gt;</code>. It is rendered after every write: newest first, the last 200 entries (older ones: <code>action=changes</code>), a uniquely named temporary file then an atomic replace, no symlink followed. A file of that name without the header is the project's own and is never written over (a warning is logged; the store still has the log). A project's own <code>CHANGELOG.md</code> is ordinary content: editing it is a change like any file. Deploys leave PROJECT_CHANGES.md out (<code>DEPLOY_ARTEFACTS_TOP</code>), so the owner's words never ship to the live site. The clean-up sweep keeps every file a change added or changed, the files a running request is still writing, and PROJECT_CHANGES.md once the log has an entry.</li>
+  </ol>
+
+  <h2 id="live">Going live</h2>
+  <p><code>tools/labs.py</code> calls <code>_note_project_push</code> after a successful push into a <strong>kept</strong> lab whose owner is <code>project:&lt;id&gt;</code> (looked up once per lab with <code>GET /v1/labs/{id}</code>), from owner or autopilot turns (not probes, not simulated turns):</p>
+  <div class="scroll"><table>
+    <tr><th>action</th><th>marks live</th></tr>
+    <tr><td><code>lab put</code> of a file</td><td>its project-relative path, only when it goes into the app's member and under its workdir; a put anywhere else marks nothing</td></tr>
+    <tr><td><code>lab put</code> of a folder</td><td><code>"dir/"</code> (every file under it), same member/workdir rule</td></tr>
+    <tr><td><code>lab deploy</code> serving (ok or still starting)</td><td>the whole project &mdash; the project folder or any folder inside it &mdash; marks every change made before it live, including changes that only removed files</td></tr>
+    <tr><td><code>lab deploy</code> staged</td><td>nothing yet: its time is kept (<code>metadata.staged_deploys</code>)</td></tr>
+    <tr><td><code>lab switch</code></td><td>the changes made up to the staged version's deploy time; with no staged time known, nothing (the live URL is still recorded)</td></tr>
+    <tr><td>a push from a folder outside the project</td><td>nothing is marked; the deploy entry and the live URL are still recorded</td></tr>
+  </table></div>
+  <p>Inside a request the pushes collect with the writes; at the flush a change is <code>deployed</code> when every file it added or changed was covered by a push made after it was written (noted writes are ordered by sequence, diffed ones by mtime), and one <code>deploy</code> entry is written for the request's pushes. Outside a request (<code>record_deploy</code>) a whole push marks every undeployed change made before it; a file push adds to each change's <code>pushed</code> list and marks the change once all its files have gone. <code>metadata.live</code> = <code>{url, lab_id, app, at, how, through}</code>, never overwritten by an older deploy; <code>live_info</code> adds <code>behind</code>, the numbers of the changes not live yet. A <code>lab keep</code> ships no code and records nothing; a rollback is not recorded (the marks then overstate what is live).</p>
+
+  <h2 id="read">What the model reads</h2>
+  <ul>
+    <li><strong>The turn's briefing</strong> (<code>build_project_briefing</code>): a <em>ready</em> line (make changes straight in the files; the system logs them; tasks only for multi-step work; only the user closes), a <em>closed</em> line for DONE (a change reopens it), <code>RECENT CHANGES</code> (the last five entries), <code>LIVE AT</code> (with the changes it is behind) and <code>FILES (on disk now)</code>, generated from the folder each turn (&le; 40 paths; dotfiles, <code>node_modules</code>, caches and build folders left out).</li>
+    <li><strong><code>manage_projects</code></strong>: <code>status</code>/<code>get</code>/<code>switch</code> briefings carry <code>project.state</code>, <code>state_note</code>, <code>recent_changes</code>, <code>files</code> and <code>live</code>; <code>list</code> shows the state (ready after working); the read action <code>changes</code> pages the whole log (<code>count</code>, <code>metadata.offset</code>).</li>
+  </ul>
+
+  <h2 id="backfill">Backfill</h2>
+  <p><code>scripts/backfill_project_change.py</code> adds one past change (work done before the log existed). Every detail is an argument: <code>--project --ask --added --changed --removed --summary --ts "YYYY-MM-DD HH:MM" --req</code>, and <code>--deployed --url --how --lab-id</code> for a change that went live (a deploy entry at the same time, and <code>metadata.live</code>). <code>--deployed</code> without <code>--url</code> marks only that entry live. A project the old roll-up closed already reads <em>ready</em>, so <code>--reopen</code> is only for a project the owner closed (it is harmless otherwise). Dry run by default, with the database opened read-only; <code>--apply</code> writes, and refuses while the agent holds the memory directory (stop it, apply, start it). Idempotent: the same <code>--req</code>, or the same ask within 60 s of the same time, is reported as already there and nothing is written, unless <code>--force</code>. An older backfilled deploy never replaces a newer <code>metadata.live</code>.</p>
+
+  <h2 id="gaps">Known gaps</h2>
+  <ul>
+    <li>A change made by a command in a project that was not focused and that the command does not name (<code>projects/&lt;id&gt;</code>) is not watched. A screenshot the owner asked to keep in the project, or a research brief, is the system's writing and is not listed. A diff-only change leaves a closed project closed. A folder over 5000 files lists only the noted paths. A killed request's recovered entry has the noted paths only (snapshots are not kept on disk).</li>
+    <li>A rollback, or a deploy outside the agent, does not update which changes are live.</li>
+  </ul>
+
+  <h2 id="tests">Tests</h2>
+  <p><code>tests/test_4um_living_projects.py</code>, <code>tests/test_4um_review.py</code>.</p>
+</main>
+</body>
+</html>

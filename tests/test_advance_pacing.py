@@ -89,9 +89,13 @@ def test_parse_advance_count(raw, expected):
 # background batch now runs only on an autopilot project, under the gates).
 
 class _FakeStore:
-    def __init__(self, task_status=None, project_status="ACTIVE"):
+    def __init__(self, task_status=None, project_status="ACTIVE", ready=False):
         self.task_status = task_status or {}
         self.project_status = project_status
+        self.ready = ready
+
+    def planned_work_done(self, pid):            # §4UM: True for "ready" (incl. a legacy roll-up DONE)
+        return self.ready
 
     def get_task(self, tid):
         return {"status": self.task_status.get(tid)}
@@ -222,11 +226,16 @@ async def test_advance_many_blocked_budget_vs_done(monkeypatch):
     r = await advance_many(ctx, "p", owner_requested=True, max_tasks=None)
     assert r.stop_reason == "budget_or_inactive"
 
-    # blocked because the last task rolled the project to DONE → project_done
+    # §4UM: a roll-up never sets DONE — a DONE project was closed by the owner → project_closed
     ctx2 = SimpleNamespace(project_store=_FakeStore(project_status="DONE"))
     _script(monkeypatch, [AdvanceResult(True, None, "blocked", "project is DONE")])
     r2 = await advance_many(ctx2, "p", owner_requested=True, max_tasks=None)
-    assert r2.stop_reason == "project_done"
+    assert r2.stop_reason == "project_closed"
+    # §4UM review: a DONE the old roll-up set (not the owner) still reads ready → project_done
+    ctx3 = SimpleNamespace(project_store=_FakeStore(project_status="DONE", ready=True))
+    _script(monkeypatch, [AdvanceResult(True, None, "blocked", "project is DONE")])
+    r3 = await advance_many(ctx3, "p", owner_requested=True, max_tasks=None)
+    assert r3.stop_reason == "project_done"
 
 
 @pytest.mark.asyncio
@@ -292,7 +301,7 @@ async def test_tool_autoadvance_all_completes_research_project(context, stub_sub
     assert out["requested"] == "all"
     assert out["count"] == 2
     assert out["stop_reason"] == "project_done"
-    assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
+    assert store.project_state(pid) == "ready"          # §4UM: the finished plan stays open
 
 
 @pytest.mark.asyncio

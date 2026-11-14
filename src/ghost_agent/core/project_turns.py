@@ -66,7 +66,7 @@ _OWN_TASK_ACTIONS = frozenset({"task_update"})
 #: may also add a top-level follow-up) — another task's parts and the project's plan are the owner's turns
 _OWN_PARENT_ACTIONS = {"task_add": "parent_id", "task_decompose": "task_id"}
 #: what a turn may do on ANOTHER project: read it
-_READ_ACTIONS = frozenset({"get", "status", "list", "task_list", "task_next", "artifact_list", "event_log",
+_READ_ACTIONS = frozenset({"get", "status", "list", "changes", "task_list", "task_next", "artifact_list", "event_log",
                            "ledger", "describe_file", "file_history", "search", "research_list",
                            "verify_release"})
 #: §4UL re-review M1: what a turn may do on ANOTHER project — the pure reads (`ledger` / `describe_file` only in
@@ -1184,6 +1184,20 @@ async def run_task_turn_for_advance(context, store, project_id: str, nxt, classi
     reply = ""
     exit_kind = ""
     exc: Optional[BaseException] = None
+    _change_key = ""
+    try:
+        # §4UM review: what the turn changes is a change once the first plan was finished — inside the owner's
+        # request, part of that request's entry (the owner's message is its ask); unattended, an entry of its own
+        # (ask "task: …"), written when the turn ends
+        from ..memory.projects import _was_ready_before, request_root as _rroot, watch_project
+        if origin == "owner" and outer:
+            watch_project(store, project_id, key=_rroot(outer))
+        elif _was_ready_before(store, project_id, rid, time.time()):
+            _change_key = rid
+            watch_project(store, project_id, key=rid, ask=f"task: {str(nxt.description or '')}"[:300],
+                          source="task", task_id=str(tid))
+    except Exception:  # noqa: BLE001
+        logger.debug("task turn: change watch skipped", exc_info=True)
     try:
         reply = await run_leaf_turn(
             # review m1: the background lane (yield to every foreground request) only for idle autopilot — a
@@ -1221,6 +1235,12 @@ async def run_task_turn_for_advance(context, store, project_id: str, nxt, classi
         # turn's model calls are not background — an owner's request never aborts them, so it is the server.
         # The owner's own run too (round 7): reopened, never FAILED over a server error
         exit_kind = "aborted" if (not outer and _foreground_busy(context)) else "upstream"
+    if _change_key:
+        try:
+            from ..memory.projects import flush_change_log
+            flush_change_log(_change_key, reply=str(reply or ""))      # idempotent: the turn's own end may have
+        except Exception:  # noqa: BLE001
+            logger.debug("task turn: change log not flushed", exc_info=True)
     try:
         res = await _finish(reply, exit_kind, exc)
     except asyncio.CancelledError:
