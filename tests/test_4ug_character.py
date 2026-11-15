@@ -49,6 +49,7 @@ class _req:
 
 
 _REAL_DAY_PULLS = C.day_pulls
+_REAL_DAY_SHIFTS = C.day_shifts
 
 
 def _stated_pulls(days):
@@ -58,6 +59,15 @@ def _stated_pulls(days):
     return _REAL_DAY_PULLS(days)
 
 
+def _stated_shifts(days):
+    """§4UP: the same stated pulls, read as shifts of one spread each (±1.0) — a run of n such days reads √n, so
+    3 days reach ``SHIFT_IN`` (1.73 ≥ 1.5) and 4 reach ``SHIFT_OUT`` (2.0), the old leads of 3 and 4."""
+    if any(isinstance(d, dict) and "pulls" in d for d in days or []):
+        return {str(d["date"]): {k: float(v) for k, v in d["pulls"].items()} for d in C._by_date(days)
+                if d.get("pulls")}
+    return _REAL_DAY_SHIFTS(days)
+
+
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     monkeypatch.delenv("GHOST_CHARACTER", raising=False)
@@ -65,7 +75,8 @@ def _fresh(monkeypatch):
     # lead for both directions; the signals behind the pulls and the larger lead away from 0 are tested
     # on their own, below
     monkeypatch.setattr(C, "day_pulls", _stated_pulls)
-    monkeypatch.setattr(C, "LEAD_OUT", C.LEAD_IN)
+    monkeypatch.setattr(C, "day_shifts", _stated_shifts)
+    monkeypatch.setattr(C, "SHIFT_OUT", C.SHIFT_IN)
     C._MEMO.clear()
     A._SELF_IMAGE_BY_REQ.clear()
     A._MOOD_SHADE_BY_REQ.clear()
@@ -188,7 +199,9 @@ def test_a_dial_moves_one_step_when_the_days_lead_by_three(tmp_path):
     days = _days(["playful"], ["sarcastic"], [], ["playful"])
     moves = C.propose(days, C.load(home), [], "2026-11-04")
     assert [(m["dial"], m["from"], m["to"]) for m in moves] == [("humour", 1, 2)]
-    assert moves[0]["why"].startswith("3 days clearly better than its usual against 0 the other way, in how its own work went")
+    assert moves[0]["why"].startswith("3 days read better than its usual (1.7 of a day's spread; 3 clearly better, 0 the "
+                                      "other way), in how its own work went")
+    assert (moves[0]["shift"], moves[0]["days_read"]) == (1.73, 3)
     # two days are not enough; a day pulling the other way cancels one
     assert C.propose(days[:3], C.load(home), [], "2026-11-03") == []
     assert C.propose(_days(["playful"], ["playful"], ["playful"], ["formal"]), C.load(home), [], "2026-11-04") == []
@@ -219,7 +232,8 @@ def test_the_daily_rule_runs_once_per_recorded_day_and_logs_what_it_counted(tmp_
     home = _home(tmp_path)
     days = _days(["playful"], ["playful"], ["playful"])
     said = C.daily(home, days)
-    assert said and said[0].startswith("humour +1 → +2: 3 days clearly better than its usual against 0")
+    assert said and said[0].startswith("humour +1 → +2: 3 days read better than its usual (1.7 of a day's spread; 3 "
+                                       "clearly better, 0 the other way)")
     assert C.load(home)["dials"]["humour"] == 2 and C.load(home)["daily_through"] == "2026-11-03"
     assert C.daily(home, days) == []                           # the same days again: nothing
     row = [r for r in C.log_rows(home) if r["kind"] == C.KIND_MOVE][0]
@@ -555,6 +569,7 @@ def test_health_carries_the_dials_the_numbers_and_the_shade(tmp_path, monkeypatc
 async def test_the_idle_phase_closes_the_days_and_moves_a_dial_without_a_model(tmp_path, monkeypatch):
     home = _home(tmp_path)
     monkeypatch.setattr(C, "day_pulls", lambda days: {str(d["date"]): {"humour": 1} for d in C._by_date(days)})
+    monkeypatch.setattr(C, "day_shifts", lambda days: {str(d["date"]): {"humour": 1.0} for d in C._by_date(days)})
     today = M.mood_day()
     rows = []
     for back in (3, 2, 1):
@@ -1329,10 +1344,12 @@ def test_each_dial_listens_to_one_number_of_the_day():
     # a day with messages the emotion model read: warmth is their warm and annoyed counts, nothing else
     assert C.day_signals(_rec("d", msgs_rated=4, msgs_warm=2, msgs_cold=1, msgs_thanks=2, praise=2))["warmth"] == 0.0
     # … plus the thanks it did not read (Greek): praise beyond the gratitude it saw
-    assert C.day_signals(_rec("d", msgs_rated=4, msgs_warm=2, msgs_cold=1, msgs_thanks=2, praise=3))["warmth"] == 1.0
+    # §4UP: a SHARE of the messages read (that thanks is one more message: (3 − 2) / 5)
+    assert C.day_signals(_rec("d", msgs_rated=4, msgs_warm=2, msgs_cold=1, msgs_thanks=2, praise=3))["warmth"] == 0.2
     assert C.day_signals(_rec("d", msgs_rated=3))["warmth"] == 0.0           # read, and nothing warm: a 0, not None
-    assert C.day_signals(_rec("d", msgs_rated=9, msgs_warm=9))["warmth"] == C.WARMTH_CAP
-    assert C.day_signals(_rec("d", msgs_rated=9, msgs_cold=9))["warmth"] == -C.WARMTH_CAP
+    assert C.day_signals(_rec("d", msgs_rated=9, msgs_warm=9))["warmth"] == 1.0
+    assert C.day_signals(_rec("d", msgs_rated=9, msgs_cold=9))["warmth"] == -2.0
+    assert C.day_signals(_rec("d", msgs_rated=2, msgs_warm=2))["warmth"] is None   # too few messages to say
     assert C.day_signals(_rec("d", msgs_rated=0, praise=1))["warmth"] == 1.0  # none read: the older counts
     assert C.day_signals({"own": "x", "shades": 3, "thumbs_up": True, "praise": "2", "tone_up": None})["warmth"] == 2.0
     assert set(C.SIGNAL_WORDS) == set(C.DIALS)
@@ -1360,8 +1377,9 @@ def test_a_day_counts_only_against_the_agents_own_norm(monkeypatch):
 
 
 def test_a_step_away_from_zero_needs_a_longer_lead_than_a_step_back(monkeypatch):
-    monkeypatch.setattr(C, "LEAD_OUT", 4)
-    assert (C.LEAD_IN, C.MOVE_MIN_DAYS) == (3, 3)
+    monkeypatch.setattr(C, "SHIFT_OUT", 2.0)
+    # §4UP: one spread a day for n days reads √n — 3 days reach SHIFT_IN, 4 reach SHIFT_OUT, as the old leads did
+    assert (C.SHIFT_IN, C.SHIFT_OUT, C.SHIFT_MIN_DAYS) == (1.5, 2.0, 3)
     three = _days(["playful"], ["playful"], ["playful"])
     four = _days(["playful"], ["playful"], ["playful"], ["playful"])
     at = lambda h: {"dials": {"warmth": 0, "humour": h, "directness": 0}, "pins": []}   # noqa: E731
@@ -1374,7 +1392,8 @@ def test_a_step_away_from_zero_needs_a_longer_lead_than_a_step_back(monkeypatch)
 
 def test_the_real_rule_moves_a_dial_from_a_run_of_better_days(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "day_pulls", _REAL_DAY_PULLS)
-    monkeypatch.setattr(C, "LEAD_OUT", 4)
+    monkeypatch.setattr(C, "day_shifts", _REAL_DAY_SHIFTS)
+    monkeypatch.setattr(C, "SHIFT_OUT", 2.0)
     home = _home(tmp_path)
     now = datetime.datetime(2026, 11, 20, 9, 0, tzinfo=UTC)
     days = _run(*[_rec("d", msgs_rated=4, msgs_warm=1)] * 6, *[_rec("d", msgs_rated=4, msgs_warm=3)] * 3)

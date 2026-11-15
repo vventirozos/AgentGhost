@@ -1355,6 +1355,165 @@ def _delivers(jobs, job_id: str) -> bool:
         return False
 
 
+_JOB_LOG_PATH_RE = re.compile(r"(?:^|/)\.jobs/(job-[0-9a-f]{8})\.log$")
+
+
+_READ_HEAD_RE = re.compile(r"(?m)^--- .*? (?:(CONTENTS)|\(lines (\d+)-(\d+)\)) ---$")
+
+
+def _read_shows_the_end(shown: str, n_lines: int, last: str) -> bool:
+    """Did this `file_system read` result show the log through its final line? Judged from the read's OWN
+    header, never by finding the last line somewhere in the text — review: a last line `done` that also
+    ends line 1 (or `1`, matching the `(lines 1-1)` header) made a one-line read count as the whole log.
+    A whole read (`--- x CONTENTS ---`) returns the entire file or an error; a ranged one must reach the
+    last line, uncapped and uncut, and its final shown line must be that line."""
+    _h = _READ_HEAD_RE.search(shown[:800])
+    if not _h:
+        return False                                  # SAMPLE ONLY, refusals, anything unrecognised
+    body = shown[_h.end():]
+    if _h.group(1):
+        return last in body
+    if int(_h.group(3)) < n_lines or "[... range capped" in body or "-line cap;" in body \
+            or "[... line truncated: " in body:
+        return False
+    # the `N\t` prefix comes off BEFORE blank lines are dropped — `"5\t".strip()` is "5", so a log ending in
+    # blank lines never matched (review r2)
+    _shown = [t for t in (ln.split("\t", 1)[-1].strip() for ln in body.split("\n")) if t]
+    return bool(_shown) and _shown[-1] == last
+
+
+def finished_job_logs(sandbox_manager, text: str) -> frozenset:
+    """§4UO review r3: the job logs named in ``text`` (a path or a command) whose job had ALREADY FINISHED —
+    called BEFORE the read or the command runs. A view taken while a job still ran shows a log that may yet
+    change, or end in an OOM kill or a TTL with an exit code no log line carries; judging that view against the
+    finished log afterwards cancelled the wake that would have said so. Finished = the registry says terminal,
+    or the job's exit sentinel has landed (the registry lags until the 60 s sweep). Never raises."""
+    try:
+        ids = set(_JOB_LOG_IN_TEXT_RE.findall(str(text or "").replace("\\", "/")))
+        if not ids:
+            return frozenset()
+        from ..sandbox.jobs import STATE_RUNNING, get_job_supervisor
+        sup = get_job_supervisor(sandbox_manager)
+        if sup is None:
+            return frozenset()
+        out = set()
+        for jid in ids:
+            e = sup.get(jid)
+            if isinstance(e, dict) and str(e.get("state") or STATE_RUNNING) != STATE_RUNNING:
+                out.add(jid)
+            elif isinstance(e, dict) and sup._read_exit(jid) is not None:
+                out.add(jid)
+        return frozenset(out)
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def _deliver_if_seen(sandbox_manager, jid: str, seen, finished_before=frozenset()) -> Optional[str]:
+    """§4UO: stamp job ``jid`` delivered when ``seen(lines, last)`` says the model saw its log through the end.
+    The shared rules, whatever the reading tool: the host tracks the job and has not woken it; the job is
+    terminal (a read mid-run saw partial output, and the wake must still carry the end; a job that exited a
+    moment ago is landed first: the registry turns terminal only when `reap()` runs, every 60 s, and landing it
+    here is safe because reporting and waking drain durable markers, not reap's return value); the log is not
+    empty (the wake still carries the exit code); and this turn is the one the result belongs to (`_delivers`:
+    owner, or the job's starter). Returns the job id it stamped, else None. Never raises."""
+    try:
+        from ..sandbox.jobs import STATE_RUNNING, get_job_supervisor, valid_job_id
+        if not valid_job_id(jid) or jid not in (finished_before or ()):
+            return None                       # review r3: it was still running when the model looked
+        sup = get_job_supervisor(sandbox_manager)
+        if sup is None:
+            return None
+        entry = sup.get(jid)
+        if isinstance(entry, dict) and str(entry.get("state") or STATE_RUNNING) == STATE_RUNNING:
+            try:
+                sup.reap()
+            except Exception:  # noqa: BLE001
+                pass
+            entry = sup.get(jid)
+        if not isinstance(entry, dict) or str(entry.get("state") or STATE_RUNNING) == STATE_RUNNING:
+            return None
+        rec = (sup._load_launches() or {}).get(jid)
+        if not isinstance(rec, dict) or rec.get("woken"):
+            return None                       # never launched by this host, or already delivered
+        try:
+            # counted the way the reader numbers them (text-mode iteration), not `splitlines()`, which also
+            # breaks on \f, \x1c, \x85, \u2028 and so out-counts the read's `(lines a-b)` (review r2 nit)
+            with open(sup.host_dir / f"{jid}.log", "r", encoding="utf-8", errors="replace") as _f:
+                _lines = [ln.rstrip("\n") for ln in _f]
+        except OSError:
+            return None
+        last = next((ln.strip() for ln in reversed(_lines) if ln.strip()), "")
+        if not last or not seen(_lines, last):
+            return None
+        if not _delivers(sup, jid):
+            return None
+        sup.mark_woken(jid)
+        return jid
+    except Exception:  # noqa: BLE001
+        logger.debug("job log read: wake not marked", exc_info=True)
+        return None
+
+
+def mark_job_log_read(sandbox_manager, requested_path: str, shown_text: str,
+                      finished_before=frozenset()) -> Optional[str]:
+    """§4UO: a `file_system read` of a FINISHED job's log delivers it, like `run collect` does.
+
+    The promotion banner itself points the model at `.jobs/<id>.log` (file_system read). A model that read it
+    there got the result, but the wake was never stamped — so a second, autonomous turn re-reported the same
+    output as "the user has not seen this" (req 671eea0c, job-d36bc23e, 2026-11-14). Seen = the read's own
+    header shows the end (`_read_shows_the_end`); the rest is `_deliver_if_seen`."""
+    _m = _JOB_LOG_PATH_RE.search(str(requested_path or "").replace("\\", "/").strip())
+    if not _m:
+        return None
+    _shown = str(shown_text or "")
+    return _deliver_if_seen(sandbox_manager, _m.group(1),
+                            lambda lines, last: _read_shows_the_end(_shown, len(lines), last), finished_before)
+
+
+#: §4UO: how many of the log's last non-empty lines an output must carry, in order, to have shown its end
+JOB_TAIL_SEEN_LINES = 20
+_JOB_LOG_IN_TEXT_RE = re.compile(r"\.jobs/(job-[0-9a-f]{8})\.log\b")
+
+
+def _output_shows_the_tail(output: str, lines, k: int = JOB_TAIL_SEEN_LINES) -> bool:
+    """The log's last ``k`` non-empty lines (all of them, for a shorter log) appear in ``output`` as consecutive
+    non-empty lines, in order, compared stripped. A `tail -n 50`, a `cat` or the last page of a chunked read
+    passes; a `head`, a `grep` or a `tail -n 5` of a longer log does not (the wake still carries the end)."""
+    want = [ln.strip() for ln in lines if ln.strip()][-k:]
+    have = [ln.strip() for ln in str(output or "").splitlines() if ln.strip()]
+    if not want or len(have) < len(want):
+        return False
+    n = len(want)
+    return any(have[i:i + n] == want for i in range(len(have) - n + 1) if have[i] == want[0])
+
+
+def mark_job_log_output(sandbox_manager, command: str, output: str,
+                        finished_before=frozenset()) -> Optional[str]:
+    """§4UO (open item): an `execute` that printed a finished job's log — `tail -n 60 .jobs/<id>.log`, `cat …` —
+    delivers it like a `file_system read` does. The command must name exactly one job log; the output must show
+    the log's tail (`_output_shows_the_tail`). Returns the stamped job id, else None. Never raises."""
+    try:
+        ids = set(_JOB_LOG_IN_TEXT_RE.findall(str(command or "")))
+        if len(ids) != 1:
+            return None
+        _out = str(output or "")
+        return _deliver_if_seen(sandbox_manager, ids.pop(), lambda lines, last: _output_shows_the_tail(_out, lines),
+                                finished_before)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def mark_job_log_chunk(sandbox_manager, requested_path: str, chunk_text: str,
+                       finished_before=frozenset()) -> Optional[str]:
+    """§4UO (open item): the page of a `file_system read_chunked` that holds the log's tail delivers it."""
+    _m = _JOB_LOG_PATH_RE.search(str(requested_path or "").replace("\\", "/").strip())
+    if not _m:
+        return None
+    _txt = str(chunk_text or "")
+    return _deliver_if_seen(sandbox_manager, _m.group(1), lambda lines, last: _output_shows_the_tail(_txt, lines),
+                            finished_before)
+
+
 async def _collect(context, reg, row, origin) -> ToolOutcome:
     if row["lifetime"] != "job":
         return _refuse(f"{row['name']!r} is a {row['lifetime']} — `collect` reads a finished job; use `logs`")

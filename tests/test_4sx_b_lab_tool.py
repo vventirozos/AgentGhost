@@ -657,7 +657,8 @@ async def test_a_member_that_is_not_a_name_never_reaches_a_url(tmp_path, fake, s
     r = await L.tool_lab(c, action=action, lab_id=LAB, member=bad, cmd="x", op="stop",
                          sandbox_path="f", path="/f")
     assert r.status is OutcomeStatus.REJECTED and "needs member" in r
-    assert fake.calls == []
+    # req c9ea6238: a MISSING member looks the lab up (lab_id only, never the member) to name its members
+    assert [(x.method, x.path) for x in fake.calls] == ([("GET", f"/v1/labs/{LAB}")] if not bad else [])
 
 
 def test_only_an_exec_result_is_program_output():

@@ -417,7 +417,10 @@ def _render_summary(self_model, context=None, public: Optional[bool] = None) -> 
         parts.append("\n" + image)
 
     narrative = ""
-    if self_model.narrative is not None:
+    # §4UP: a diary that is no longer rewritten is not "how I am" — the summary leaves it out (the `narrative`
+    # action still shows the last entry, dated)
+    from ..selfhood import narrative as _narr
+    if self_model.narrative is not None and _narr.enabled():
         narrative = (self_model.narrative.latest() or "").strip()
     if narrative:
         parts.append("\nMy running first-person diary:")
@@ -1358,6 +1361,11 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None, 
                 if got is not None:
                     step_clear, level = got == 0, (got or level)
                     stepped_down = got < cur
+                    # §4UP review r1: an automatic "tired" may sit on the low-energy AXIS (since §4UP the axis
+                    # reads tired) — a step down there stays on the axis, it must not add the anchor's unpleasantness
+                    if (stepped_down and target[0] == "tired" and now_view.label == "tired"
+                            and abs(float(now_view.p)) < _M.AXIS_RATIO * abs(float(now_view.e))):
+                        target = ("tired", (0.0, -1.0))
                 elif down and not cur:
                     not_on.append(f"the mood is not '{target[0]}'")
                     target = None
@@ -1830,7 +1838,15 @@ async def tool_introspect(
             if self_model.narrative is None:
                 return "No narrative on file."
             text = (self_model.narrative.latest() or "").strip()
-            return text or "No narrative on file yet."
+            if not text:
+                return "No narrative on file yet."
+            from ..selfhood import narrative as _narr
+            if not _narr.enabled():
+                # §4UP: switched off — the last entry is old, and says so
+                when = self_model.narrative.written_on()
+                return (f"My diary is not being rewritten (it is switched off: {_narr.ENV} is not 1). Its last "
+                        f"entry{', from ' + when if when else ''}, may be old and may not describe me now:\n\n{text}")
+            return text
 
         if raw_action == "recent":
             _h = None

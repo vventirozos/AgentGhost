@@ -1854,7 +1854,8 @@ async def test_fd_a_screenshot_needs_a_member(tmp_path, fake, scope):
     for member in ("", "../app"):
         r = await L.tool_lab(c, action="screenshot", lab_id=LAB, member=member, sandbox_path="s.png")
         assert r.status is OutcomeStatus.REJECTED and "needs member" in r
-    assert fake.calls == []
+    # req c9ea6238: a MISSING member looks the lab up once to name its members; a malformed one calls nothing
+    assert [(x.method, x.path) for x in fake.calls] == [("GET", f"/v1/labs/{LAB}")]
 
 
 # ================================================================== battery survivors

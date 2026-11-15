@@ -149,8 +149,8 @@ def test_a_turn_that_closed_a_task_lifts_the_mood(tmp_path, owner):
     assert agent._mood_turn_signals(msgs, ASK, OWNER_RID).tasks_done == 1
     _record(agent, msgs)
     v = agent.context.self_model.mood()
-    # §4UB: the one clean call earns the small-turn reward (§4UH-e2e: all of 0.06) next to the task
-    assert (v.p, v.e) == (pytest.approx(0.15 + 0.06), pytest.approx(0.10))
+    # §4UB: the one clean call earns the small-turn reward next to the task (§4UP: a quarter of 0.06)
+    assert (v.p, v.e) == (pytest.approx(0.15 + 0.06 * M.CLEAN_TURN_SMALL_SHARE), pytest.approx(0.10))
     assert v.recent[-1]["cause"].startswith("finished 1 project task")
 
 

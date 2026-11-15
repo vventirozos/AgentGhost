@@ -521,15 +521,19 @@ class SelfModel:
             return ""
 
     def note_owner_sentiment(self, label: str, score: float, *, now=None, request_id: str = "",
-                             arrived: str = "") -> Tuple[Optional[MoodView], float, str]:
+                             arrived: str = "", emotions=None) -> Tuple[Optional[MoodView], float, str]:
         """§4TW: the tone of an owner's message (``mood.sentiment_event``). The caller decides that it was the
         OWNER's message. ``(mood after or None, pleasantness applied, why none)`` — §4TX: through the reaction
         ledger, and held (not applied) when the owner set the mood after the message ``arrived``.
 
         §4UB: what sentiment has in the pair (the state's tone shares) stays under
         ``mood.SENTIMENT_SHARE_MAX`` on each side — a tone gets the room left, and is held when there is none:
-        sentiment alone never makes a heard mood. §4UD: the fit is ``_react``'s (one for every path)."""
-        return self._react(M.sentiment_event(label, score), now=now, request_id=request_id, arrived=arrived)
+        sentiment alone never makes a heard mood. §4UD: the fit is ``_react``'s (one for every path).
+
+        §4UP: ``emotions`` — the emotion model's reading of the same message, when there is one — decides with
+        the score (``mood.sentiment_event``)."""
+        return self._react(M.sentiment_event(label, score, emotions), now=now, request_id=request_id,
+                           arrived=arrived)
 
     def thumb_was_taken_back(self, reply_id: str) -> bool:
         """§4UD-b M1: did the owner take back the thumb on this reply (since the agent started)? The feedback

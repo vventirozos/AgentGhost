@@ -130,11 +130,11 @@ def test_the_automatic_mood_has_no_cap_and_reaches_three(tmp_path):
 
 @pytest.mark.parametrize("p,e,label", [
     (0.6, 0.45, "cheerful"), (0.6, 0.0, "content"), (0.6, -0.45, "calm"),
-    (0.0, 0.6, "restless"), (0.0, -0.6, "bored"),
+    (0.0, 0.6, "restless"), (0.0, -0.6, "tired"),     # §4UP: the low-energy axis is tired
     (-0.6, 0.45, "irritable"), (-0.6, 0.0, "down"), (-0.45, -0.6, "tired"),
     # "near 0" is relative: the smaller under AXIS_RATIO of the larger
     (0.6, 0.23, "content"), (0.6, 0.25, "cheerful"), (0.6, -0.23, "content"), (0.6, -0.25, "calm"),
-    (0.23, 0.6, "restless"), (0.25, 0.6, "cheerful"), (-0.23, -0.6, "bored"), (-0.25, -0.6, "tired"),
+    (0.23, 0.6, "restless"), (0.25, 0.6, "cheerful"), (-0.23, -0.6, "tired"), (-0.25, -0.6, "tired"),
     (-0.6, 0.23, "down"), (-0.6, 0.25, "irritable"),
     (0.5, 0.5, "cheerful"), (-0.5, -0.5, "tired"), (0.5, -0.5, "calm"), (-0.5, 0.5, "irritable"),
     (0.0, 0.0, "neutral"),
@@ -144,9 +144,10 @@ def test_the_label_is_read_off_the_signs_and_the_relative_size(p, e, label):
     assert M.region(p, e) == label
 
 
-def test_every_region_is_one_of_the_eight_labels_and_all_eight_are_reachable():
+def test_every_region_is_one_of_the_labels_and_all_seven_are_reachable():
+    # §4UP: seven regions — "bored" is a label (the quiet's, the owner's word) but no region of the pair
     seen = {M.region(p / 10, e / 10) for p in range(-10, 11) for e in range(-10, 11)}
-    assert seen == set(M.LABELS[:8]) | {"neutral"}
+    assert seen == (set(M.LABELS[:8]) - {"bored"}) | {"neutral"}
     assert M.LABELS == ("cheerful", "content", "calm", "restless", "bored",
                         "irritable", "down", "tired", "curious")
 
@@ -1128,7 +1129,9 @@ def test_the_anchor_magnitudes_sit_inside_their_bands():
 def test_a_label_or_an_obvious_synonym_resolves(word, label):
     got = M.resolve_label(word)
     assert got is not None and got[0] == label
-    assert M.region(*got[1]) == ("cheerful" if label == "curious" else label)
+    # §4UP: the owner's "bored" anchor lies on the axis that reads tired — held by its label, it reads bored
+    assert M.region(*got[1]) == {"curious": "cheerful", "bored": "tired"}.get(label, label)
+    assert M.held_region(*got[1], label) == ("cheerful" if label == "curious" else label)
 
 
 def test_excited_is_cheerful_with_more_energy():

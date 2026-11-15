@@ -813,14 +813,54 @@ async def tool_lab(context, action: str = "", lab_id: str = "", template: str = 
                            reason_code="lab_not_allowed", world_changed=False)
     lab_id = str(lab_id or "").strip()
     if action not in ("templates", "create", "list") and not _LAB_ID_RE.match(lab_id):
-        return ToolOutcome(f"LAB ERROR (bad_request): `{action}` needs lab_id (like lab_3f2a9c01) — "
-                           "`lab list` shows yours.", status=OutcomeStatus.REJECTED,
+        # req 6043a546: name the project's own live lab, and for a deploy say EVERY missing piece at once (the
+        # model spent two calls finding lab_id, then params.folder)
+        # review: named only for actions that cannot harm it — a `destroy` told "live on lab_x" would take
+        # production and its data down on the obvious retry
+        live = _project_live_lab(context) if action in _LIVE_HINT_ACTIONS else ""
+        msg = (f"`{action}` needs lab_id (like lab_3f2a9c01) — "
+               + (f"this project is live on {live} (its KEPT production lab)." if live
+                  else "`lab list` shows yours."))
+        if action == "deploy":
+            p0, _e = _params_of({"params": params})
+            more = [_e] if _e else _deploy_param_problems(context, p0 or {})
+            if more:
+                msg += " Also: " + "; ".join(more) + "."
+        return ToolOutcome(f"LAB ERROR (bad_request): {msg}", status=OutcomeStatus.REJECTED,
                            reason_code="lab_bad_request", world_changed=False)
     member = str(member or "").strip()
     if action in _MEMBER_ACTIONS and not _MEMBER_RE.match(member):
-        return ToolOutcome(f"LAB ERROR (bad_request): `{action}` needs member — a member name like `db` "
-                           "(`lab status` lists them).", status=OutcomeStatus.REJECTED,
+        # req c9ea6238: name THIS lab's members (and the kept app's) instead of a generic `db`
+        # only when member is MISSING: a malformed one never makes the agent call the host (r1 CRIT pin)
+        det = await _lab_detail(context, origin, lab_id) if origin == "owner" and not member else None
+        names = [str(m.get("name")) for m in (det or {}).get("members") or [] if isinstance(m, dict) and m.get("name")]
+        app = (det or {}).get("app") if isinstance((det or {}).get("app"), dict) else {}
+        hint = (f"{lab_id}'s members: {', '.join(names[:8])}" if names else "a member name like `db`")
+        if app.get("member"):
+            hint += f" (the kept app runs on `{app['member']}`)"
+        return ToolOutcome(f"LAB ERROR (bad_request): `{action}` needs member — {hint}"
+                           + ("." if names else " (`lab status` lists them)."), status=OutcomeStatus.REJECTED,
                            reason_code="lab_bad_request", world_changed=False)
+    if action in ("put", "get") and origin == "owner" and str(path or "").strip() \
+            and not str(path).strip().startswith("/"):
+        # req c9ea6238: a relative member path for a kept lab — say where the app's files are (two exec calls
+        # went into finding /app)
+        det = await _lab_detail(context, origin, lab_id)
+        app = (det or {}).get("app") if isinstance((det or {}).get("app"), dict) else {}
+        if app and str(app.get("member") or "") == member:
+            wd = "/" + str(app.get("workdir") or "/app").strip("/")
+            rel = str(path).strip()
+            while rel.startswith("./"):
+                rel = rel[2:]
+            sub = str(app.get("subdir") or "").strip().strip("/")
+            if sub and rel.startswith(sub + "/"):
+                rel = rel[len(sub) + 1:]          # review: deploy ships folder/<subdir> INTO the workdir
+            # review: translate only a plain relative path; ~, .., drive letters and backslashes get no guess
+            plain = rel and rel not in (".",) and not rel.startswith(("~", "..")) and "\\" not in rel and ":" not in rel
+            where = f"the kept app serves from {wd} on `{member}`"
+            return ToolOutcome(f"LAB ERROR (bad_request): path must be absolute (a path on the member) — {where}"
+                               + (f", so {rel} is {wd.rstrip('/')}/{rel}." if plain else "."),
+                               status=OutcomeStatus.REJECTED, reason_code="lab_bad_request", world_changed=False)
     if origin == "autopilot":
         # §4SX D4 review r2 #1: unattended work (a leaf runs model output over build input) touches only labs of
         # ITS OWN owner — the host gets no owner, so it cannot tell
@@ -1103,6 +1143,46 @@ async def _end_app_runs(context, lab_owner: str, origin: str) -> None:
                 await _probed(context, reg, row, origin)
     except Exception:  # noqa: BLE001
         logger.warning("app runs not re-probed after a kept lab destroy", exc_info=True)
+
+
+#: the actions whose missing-lab_id error may name the project's live (KEPT) lab: deploying to it or reading it.
+#: Never destroy/extend/exec/member/keep/switch/rollback/restore — the hint must not invite a change to production.
+_LIVE_HINT_ACTIONS = frozenset({"deploy", "status", "logs", "backups"})
+
+#: keys a model invents for a per-file deploy (req 6043a546: params.files) — deploy has no file list
+_DEPLOY_FILE_LIST_KEYS = ("files", "paths", "file")
+
+
+def _project_live_lab(context) -> str:
+    """The lab the current project went live on (``ProjectStore.live_info``), or "" — named in an error that lacks
+    lab_id so the fix is one call, not a `lab list` round trip."""
+    try:
+        pid = getattr(context, "current_project_id", None)
+        store = getattr(context, "project_store", None)
+        info = store.live_info(pid) if isinstance(pid, str) and pid and store is not None else None
+        lid = str((info or {}).get("lab_id") or "")
+        if not _LAB_ID_RE.match(lid):
+            return ""
+        from ..memory.lab_inventory import inventory_for
+        inv = inventory_for(context)
+        row = inv.get(lid) if inv else None
+        return "" if row and row.get("destroyed_at") else lid   # review: metadata.live outlives a torn-down lab
+    except Exception:  # noqa: BLE001 — a hint only; a store without live_info names none
+        return ""
+
+
+def _deploy_param_problems(context, p: Dict[str, Any]) -> List[str]:
+    """What is wrong with a deploy's params, one sentence each (req 6043a546)."""
+    out = []
+    if not str(p.get("folder") or "").strip():
+        pid = getattr(context, "current_project_id", None)
+        out.append("deploy needs params.folder — the workspace folder holding the app"
+                   + (' (the project\'s own folder is ".")' if isinstance(pid, str) and pid else ""))
+    keys = [k for k in _DEPLOY_FILE_LIST_KEYS if k in p]
+    if keys:
+        out.append(f"params.{keys[0]} is not a deploy option — deploy ships the whole folder, there is no file list "
+                   "(params.subdir ships one subfolder such as dist)")
+    return out
 
 
 def _params_of(a) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -1450,6 +1530,17 @@ def _app_status_line(a: Dict[str, Any]) -> str:
     return "; ".join(bits)
 
 
+async def _lab_detail(context, origin: str, lab_id: str) -> Optional[Dict[str, Any]]:
+    """The host's view of one lab (members, kept app) for an error hint, or None. Never raises; short timeout."""
+    if not _LAB_ID_RE.match(str(lab_id or "")):
+        return None
+    try:
+        st, det = await _call(context, "GET", f"/v1/labs/{lab_id}", origin=origin, timeout=10)
+    except Exception:  # noqa: BLE001 — a hint only
+        return None
+    return det if st == 200 and isinstance(det, dict) else None
+
+
 async def _default_port(context, origin: str, lab_id: str, member: str) -> int:
     """§4UI-labs: the port `http`/`screenshot` use when none is given — the kept app's port on its member, else
     the member's first published port, else 80 (a python-app lab's kept site answers on 8080; probing 80 first
@@ -1657,7 +1748,8 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
     if action == "deploy":
         folder = str(p.get("folder") or "").strip()
         if not folder:
-            return bad("deploy needs params.folder — the workspace folder holding the app")
+            return bad("; ".join(_deploy_param_problems(context, p)))
+        _file_keys = sorted(k for k in _DEPLOY_FILE_LIST_KEYS if k in p)
         _root0, err = _sandbox_path(context, folder)
         if err:
             return bad(err)
@@ -1708,7 +1800,9 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
             return _service_reply(st, out, context, lab_id)
         probe = out.get("probe")
         shipped = f"{folder.rstrip('/')}/{subdir}" if subdir else folder
-        tail = ((f". Skipped (links/devices): {', '.join(_q(x) for x in skipped[:10])}" if skipped else "")
+        tail = ((f". Note: deploy ships the whole folder ({shipped}) — params.{', params.'.join(_file_keys)} is "
+                 "not a deploy option and was ignored" if _file_keys else "")
+                + (f". Skipped (links/devices): {', '.join(_q(x) for x in skipped[:10])}" if skipped else "")
                 + (f". Left out: {', '.join(_q(x) for x in flt.left_out[:12])}"
                    + (f" (+{len(flt.left_out) - 12} more)" if len(flt.left_out) > 12 else "")
                    + " (dotfiles, agent files; .deployignore / params.dotfiles change it)" if flt.left_out else "")

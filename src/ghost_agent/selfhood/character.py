@@ -33,6 +33,7 @@ import datetime
 import json
 import logging
 import os
+import math
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -83,21 +84,45 @@ RULE = ("(Your character: how you are with the owner, set by a few dials that mo
 SIGNAL_WORDS = {"warmth": "how the owner talked to it (thanks, praise and warmth in the messages, against annoyance)",
                 "humour": "how its own work went (clean turns, relief and pride against trouble)",
                 "directness": "how its answers were judged (thumbs up against thumbs down and corrections)"}
-#: one very good day counts no more than a good one
+#: one very good day counts no more than a good one (the older, counted scale: days before the emotion model)
 WARMTH_CAP = 3.0
+#: §4UP (evaluation 11-14: 11-12, 11-13 and 11-14 all read the cap 3.0 — three warm messages of 11 to 15 is a
+#: COUNT, so warmth measured how much the owner talked): on the emotion scale warmth is the SHARE of the day's
+#: messages that were warm (annoyed ones count twice against), from -2 to 1, and a day with fewer messages
+#: than this says nothing about it
+WARMTH_MIN_MSGS = 3
 #: a day says something about the work only with this many turns that did something
 WORK_MIN_TURNS = 3
 #: the days before a day that make "its own norm", and the fewest of them that carry the signal
 BASE_DAYS = 21
 BASE_MIN = 5
-#: how far from that norm (in its own standard deviations) a day must be to count
+#: how far from that norm (in its own standard deviations) a day must be to be SHOWN as pulling (the log line,
+#: ``days_up`` / ``days_down``) — the rule itself reads the size (``day_shifts``)
 BAND = 0.5
+#: §4UP: the smallest spread a norm is taken to have, on each dial's scale — a norm of identical days (every day
+#: all thumbs up) has none, and the old fallback of 1.0 made a scale-free number of it
+SPREAD_FLOOR = {"warmth": {"emotions": 0.15, "counts": 0.5}, "humour": 0.25, "directness": 0.4}
+#: §4UP: a day's shift (its distance from the norm, in spreads) counts at most this much either way. Review r1
+#: (MAJOR): at 3, ONE thumbs-down day among two ordinary ones read 3/√3 = 1.73 and undid an earned step — at 2.5 one
+#: day alone reaches 2.5/√3 = 1.44, short of ``SHIFT_IN`` (with ``SHIFT_MIN_PULLS`` besides). Simulated (40 × 120
+#: days): steady signal 0.3 moves a run, a real worsening caught 23/40 (2.0: 17/40)
+SHIFT_CLAMP = 2.5
 #: days of evidence the daily rule looks at for one dial, and never further back than that dial's last change
 EVIDENCE_DAYS = 14
-#: a step back toward 0 needs this lead of days; a step AWAY from 0 needs more — an extreme is earned
-LEAD_IN = 3
-LEAD_OUT = 4
-MOVE_MIN_DAYS = LEAD_IN
+#: §4UP (evaluation 11-14): the rule was a LEAD OF DAYS — days above the norm against days below. On a signal
+#: that is usually at its best (thumbs: almost every judged day is all up) the usual days sit a little above the
+#: mean and the rare bad day far below, so counting days moved a dial on nothing new: directness pulled up on 8
+#: of 9 judged days; on a simulated steady signal (12 % days with a thumbs-down, 120 days, 40 runs) the count
+#: rule moved the dial 3.1 times, this one 0.3. Now: the shifts since the dial's last change are summed and
+#: divided by √(their number) — how far the recent days sit from the norm, in the units of one day — and the dial
+#: steps toward 0 at ``SHIFT_IN``, away from 0 (an extreme is earned) at ``SHIFT_OUT``, with at least
+#: ``SHIFT_MIN_DAYS`` days read. A run of days one spread off moves it back after 3 and away after 4, as before
+SHIFT_IN = 1.5
+SHIFT_OUT = 2.0
+SHIFT_MIN_DAYS = 3
+#: §4UP review r1: … and at least this many of those days pull CLEARLY that way (``day_pulls``) — a move is never
+#: carried by one day, however the ordinary days around it lean
+SHIFT_MIN_PULLS = 2
 
 
 def day_signals(rec: Dict[str, object]) -> Dict[str, Optional[float]]:
@@ -124,8 +149,10 @@ def day_signals(rec: Dict[str, object]) -> Dict[str, Optional[float]]:
     if n("msgs_rated"):
         # review: thanks the emotion model did not read (Greek — it reads English only — or a miss) still count:
         # the praise check's thanks beyond the gratitude the model saw
-        good, bad = n("msgs_warm") + max(0, n("praise") - n("msgs_thanks")), n("msgs_cold")
-        warm = max(-WARMTH_CAP, min(WARMTH_CAP, float(good - 2 * bad)))
+        extra = max(0, n("praise") - n("msgs_thanks"))
+        good, bad, read = n("msgs_warm") + extra, n("msgs_cold"), n("msgs_rated") + extra
+        # §4UP: a share of the messages, not a count of them
+        warm = max(-2.0, min(1.0, (good - 2 * bad) / read)) if read >= WARMTH_MIN_MSGS else None
     else:
         good, bad = n("praise") + n("tone_up"), n("tone_down")
         warm = max(-WARMTH_CAP, min(WARMTH_CAP, float(good - 2 * bad))) if good + bad else None
@@ -148,20 +175,31 @@ def signal_scales(rec: Dict[str, object]) -> Dict[str, str]:
     return {"warmth": "emotions" if rated else "counts", "humour": "", "directness": ""}
 
 
+def day_shifts(days: List[Dict[str, object]]) -> Dict[str, Dict[str, float]]:
+    """§4UP: {date: {dial: shift}} — each day's distance from its norm in spreads (``_readings``), clamped to
+    ±``SHIFT_CLAMP``, for every day and dial that has a number and a norm (0.0 included: an ordinary day is
+    evidence too — it is what keeps a steady signal from moving a dial). What the daily rule reads."""
+    out: Dict[str, Dict[str, float]] = {}
+    for date, dial, _v, _mean, _pull, z in _readings(days):
+        out.setdefault(date, {})[dial] = max(-SHIFT_CLAMP, min(SHIFT_CLAMP, z))
+    return out
+
+
 def day_pulls(days: List[Dict[str, object]]) -> Dict[str, Dict[str, int]]:
     """{date: {dial: +1 | -1}} — for each day (in date order), which way it pulls each dial: its number
     against the mean of the same number over the ``BASE_DAYS`` before it, when at least ``BASE_MIN`` of them
     carry one and the day is more than ``BAND`` standard deviations off. A day with no pull is not listed."""
     out: Dict[str, Dict[str, int]] = {}
-    for date, dial, _v, _mean, pull in _readings(days):
+    for date, dial, _v, _mean, pull, _z in _readings(days):
         if pull:
             out.setdefault(date, {})[dial] = pull
     return out
 
 
 def _readings(days: List[Dict[str, object]]):
-    """(date, dial, the day's number, its norm's mean, pull ±1 or 0) for every day and dial that has a number and a
-    norm (``BASE_MIN`` days on its own scale among the ``BASE_DAYS`` before it) — ``day_pulls`` and the log line."""
+    """(date, dial, the day's number, its norm's mean, pull ±1 or 0, shift in spreads) for every day and dial that
+    has a number and a norm (``BASE_MIN`` days on its own scale among the ``BASE_DAYS`` before it) —
+    ``day_shifts``, ``day_pulls`` and the log line. §4UP: the spread is at least the dial's ``SPREAD_FLOOR``."""
     import statistics
     ordered = _by_date(days)
     sig = [day_signals(d) for d in ordered]
@@ -178,17 +216,20 @@ def _readings(days: List[Dict[str, object]]):
             if v is None or len(prev) < BASE_MIN:
                 continue
             mean = statistics.fmean(prev)
-            z = (v - mean) / (statistics.pstdev(prev) or 1.0)
-            yield str(d.get("date")), dial, v, mean, (1 if z > 0 else -1) if abs(z) > BAND else 0
+            floor = SPREAD_FLOOR[dial]
+            floor = floor.get(scale[i][dial] or "counts", 0.5) if isinstance(floor, dict) else floor
+            z = (v - mean) / max(statistics.pstdev(prev), floor)
+            yield str(d.get("date")), dial, v, mean, (1 if z > 0 else -1) if abs(z) > BAND else 0, z
 
 
 def pull_line(days: List[Dict[str, object]], date: str) -> str:
     """One log line for a closed day, in plain words: how each dial's day score compares with its usual (the
     mean of the days before it, on its own scale) and which way that pulls the dial, e.g.
     "2026-11-13 vs usual: warmth higher (3.0 vs 1.2), pulls up · humour about usual (0.8 vs 0.7) · directness no
-    signal today". A dial moves only when several days pull the same way. Never raises."""
+    signal today". A dial moves only when the days since its last change sit clearly off their usual together,
+    two of them at least clearly (``propose``). Never raises."""
     try:
-        got = {dial: (v, mean, pull) for d, dial, v, mean, pull in _readings(days) if d == date}
+        got = {dial: (v, mean, pull) for d, dial, v, mean, pull, _z in _readings(days) if d == date}
         day = next((d for d in _by_date(days) if str(d.get("date")) == date), None)
         sig = day_signals(day) if day else {}
         parts = []
@@ -682,43 +723,58 @@ def _by_date(days: List[Dict[str, object]]) -> List[Dict[str, object]]:
 def propose(days: List[Dict[str, object]], state: Dict[str, object], rows: List[dict],
             through: str) -> List[Dict[str, object]]:
     """The moves the day records up to ``through`` (inclusive) ask for — pure. For each dial that is not
-    pinned: over the last ``EVIDENCE_DAYS`` recorded days that came AFTER the dial's last change, the days
-    that pulled it up (``day_pulls``) against the days that pulled it down; when one side leads by
-    ``LEAD_IN`` (toward 0) or ``LEAD_OUT`` (away from 0), the dial moves ONE step that way, never past
-    ±``LIMIT``. Only the day records count (§4UH-noself, 2026-11-14: the daily self-look's votes are removed
+    pinned: over the last ``EVIDENCE_DAYS`` recorded days that came AFTER the dial's last change, the days'
+    shifts (``day_shifts``) summed and divided by the square root of how many there are; when that reaches
+    ``SHIFT_IN`` (toward 0) or ``SHIFT_OUT`` (away from 0) with at least ``SHIFT_MIN_DAYS`` days read, the dial
+    moves ONE step that way, never past ±``LIMIT`` (§4UP; it was a lead of days, which a steady signal at its
+    ceiling won). ``days_up`` / ``days_down`` name the days that pulled clearly (``day_pulls``), for the story. Only the day records count (§4UH-noself, 2026-11-14: the daily self-look's votes are removed
     — the main model rated every character it was shown as about (+1, +1, +1), so the look carried nothing)."""
     out = []
     ordered = [d for d in _by_date(days) if str(d.get("date")) <= through]
     pulls = day_pulls(ordered)
+    shifts = day_shifts(ordered)
     usable = ordered[-EVIDENCE_DAYS:]
     for dial in DIALS:
         if dial in state.get("pins", []):
             continue
         # the state's own stamp first (a mood day, written with the dials); the log for a file older than it
         since = _real_date((state.get("changed") or {}).get(dial)) or _last_change(rows, dial)
-        up, down = [], []
+        up, down, read = [], [], []
         for d in usable:
             date = str(d.get("date") or "")
             if since and date <= since:
                 continue
+            day = shifts.get(date) or {}
+            if dial in day:
+                try:
+                    z = float(day[dial])
+                except (TypeError, ValueError):
+                    continue
+                if z == z:                                   # NaN is no reading
+                    read.append(max(-SHIFT_CLAMP, min(SHIFT_CLAMP, z)))
             own = int((pulls.get(date) or {}).get(dial, 0))
             if own > 0:
                 up.append(date)
             elif own < 0:
                 down.append(date)
-        lead = len(up) - len(down)
-        if not lead:
+        if len(read) < SHIFT_MIN_DAYS:
             continue
-        step = 1 if lead > 0 else -1
+        shift = sum(read) / math.sqrt(len(read))
+        if not shift:
+            continue
+        step = 1 if shift > 0 else -1
         old = clamp(state["dials"].get(dial, 0))
         new = clamp(old + step)
-        if new == old or abs(lead) < (LEAD_OUT if abs(new) > abs(old) else LEAD_IN):
+        if new == old or abs(shift) < (SHIFT_OUT if abs(new) > abs(old) else SHIFT_IN):
             continue
         ups, downs = (len(up), len(down)) if step > 0 else (len(down), len(up))
+        if ups < SHIFT_MIN_PULLS:
+            continue
         out.append({"dial": dial, "from": old, "to": new,
-                    "why": (f"{ups} days clearly {'better' if step > 0 else 'worse'} than its usual against {downs} "
-                            f"the other way, in {SIGNAL_WORDS[dial]}"),
-                    "days_up": up, "days_down": down})
+                    "why": (f"{len(read)} days read {'better' if step > 0 else 'worse'} than its usual "
+                            f"({abs(shift):.1f} of a day's spread; {ups} clearly {'better' if step > 0 else 'worse'}, "
+                            f"{downs} the other way), in {SIGNAL_WORDS[dial]}"),
+                    "days_up": up, "days_down": down, "shift": round(shift, 2), "days_read": len(read)})
     return out
 
 
@@ -808,9 +864,10 @@ def view(home) -> str:
            "Dials (-2 to +2): " + describe(state["dials"]),
            ("Pinned (they do not move by themselves): " + ", ".join(state["pins"])) if state["pins"]
            else "Nothing is pinned.",
-           "Each dial moves by itself, one step at a time, when over two weeks the days that were clearly "
-           "better than my usual lead the days that were clearly worse (or the other way round): warmth from "
-           "how you talk to me, humour from how my own work goes, directness from how my answers are judged. "
+           "Each dial moves by itself, one step at a time, when the days since it last moved (two weeks at most) "
+           "sit clearly away from my own usual, taken together and by how far, with at least two days clearly "
+           "that way: warmth from how you talk to me, humour from how my own work goes, directness from how my "
+           "answers are judged. "
            "Your commands set, hold or take back a dial whenever you want."]
     try:
         from . import tastes as _tastes

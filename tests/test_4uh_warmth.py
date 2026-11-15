@@ -304,10 +304,11 @@ def test_a_new_day_is_judged_against_new_days():
 
 def test_thanks_the_model_did_not_read_still_count():
     """Greek thanks: the praise check counts them, the English-only emotion model does not."""
+    # §4UP: a share — the Greek thanks are messages too (3 of 1 + 3 read)
     greek_day = _rec(praise=3, msgs_rated=1, msgs_warm=0, msgs_thanks=0)
-    assert C.day_signals(greek_day)["warmth"] == 3.0
-    english_day = _rec(praise=2, msgs_rated=2, msgs_warm=2, msgs_thanks=2)     # the same thanks, read: once
-    assert C.day_signals(english_day)["warmth"] == 2.0
+    assert C.day_signals(greek_day)["warmth"] == 0.75
+    english_day = _rec(praise=2, msgs_rated=3, msgs_warm=2, msgs_thanks=2)     # the same thanks, read: once
+    assert C.day_signals(english_day)["warmth"] == pytest.approx(2 / 3)
 
 
 # ── review: the emotions never cost the sentiment ──────────────────────────
@@ -342,12 +343,12 @@ def test_the_pull_line_matches_the_rule_and_says_when_there_is_no_norm():
     days = _dated([_rec(msgs_rated=6, msgs_warm=1)] * 6 + [_rec(msgs_rated=6, msgs_warm=3)])
     line = C.pull_line(days, days[-1]["date"])
     assert line.startswith(days[-1]["date"] + " vs usual: ")
-    assert "warmth higher (3.0 vs 1.0), pulls up" in line and "directness no signal today" in line
+    assert "warmth higher (0.5 vs 0.2), pulls up" in line and "directness no signal today" in line
     assert C.day_pulls(days) == {days[-1]["date"]: {"warmth": 1}}
     first = C.pull_line(days, days[0]["date"])
-    assert "warmth 1.0, not enough days yet to compare (needs 5)" in first
+    assert "warmth 0.2, not enough days yet to compare (needs 5)" in first
     usual = C.pull_line(days, days[5]["date"])
-    assert "warmth about usual (1.0 vs 1.0)" in usual
+    assert "warmth about usual (0.2 vs 0.2)" in usual
 
 
 def test_the_pull_line_never_raises():

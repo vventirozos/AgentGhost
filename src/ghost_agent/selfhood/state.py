@@ -589,6 +589,11 @@ class SelfStateThread:
             o_label, o_n, _ = M.read_off(q_p, q_e, held_label=("" if shared else stored.label),
                                          held_intensity=(0 if shared else stored.intensity),
                                          novelty=stored.novelty)
+            # §4UP review r1: the low-energy axis reads "tired" on a fresh read, but the owner's "bored" is held
+            # there by its label — others hear the same NAME while the pair is still inside it (the level is
+            # still the fresh one: they never hear more than the owner does)
+            if o_n and stored.label == M.BORED and o_label == "tired" and M._still_in(q_p, q_e, M.BORED):
+                o_label = M.BORED
             base.update(p=_shown(q_p, rest[0]), e=_shown(q_e, rest[1]), recent=())
             if o_n == 0:
                 return MoodView(**base)

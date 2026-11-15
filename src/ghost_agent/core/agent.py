@@ -381,6 +381,12 @@ def _env_cooldown_s(name: str, default: int) -> int:
         return default
 
 
+def _selfhood_narrative_on() -> bool:
+    """§4UP: the one switch (``selfhood.narrative.enabled``) — the boot line and phase 2.8 read the same."""
+    from ..selfhood import narrative as _narr
+    return _narr.enabled()
+
+
 def _self_model_on(args, ctx) -> bool:
     _sm = getattr(ctx, "self_model", None)
     return _sm is not None and bool(getattr(_sm, "enabled", False))
@@ -410,7 +416,9 @@ IDLE_SCHEDULER_JOBS = (
     ("autoadvance", "project autoadvance (autopilot projects only)",
      lambda args, ctx: (getattr(args, "autoadvance_idle", False) is True
                         and getattr(ctx, "project_store", None) is not None)),
-    ("selfhood-narrative", "self narrative", _self_model_on),
+    # §4UP: the diary is off unless GHOST_SELFHOOD_NARRATIVE=1 — the boot line lists it only then
+    ("selfhood-narrative", "self narrative",
+     lambda args, ctx: _self_model_on(args, ctx) and _selfhood_narrative_on()),
     ("workspace-narrative", "workspace narrative", _workspace_model_on),
     ("character", "character (day record; with the character on, the daily dial rule and one look a day)",
      lambda args, ctx: True),
@@ -15062,7 +15070,9 @@ class GhostAgent:
                 cooldown_override = None
             cooldown = float(cooldown_override) if cooldown_override else float(self._NARRATIVE_COOLDOWN)
             since_last_narrative = (datetime.datetime.now() - self._last_narrative_at).total_seconds()
-            if since_last_narrative >= self._bio_cooldown(cooldown):
+            # §4UP: off unless GHOST_SELFHOOD_NARRATIVE=1 — nothing read the diary (selfhood.narrative.enabled)
+            from ..selfhood import narrative as _narrative_mod
+            if since_last_narrative >= self._bio_cooldown(cooldown) and _narrative_mod.enabled():
                 self_model = getattr(ctx, 'self_model', None)
                 if self_model is not None and getattr(self_model, 'enabled', False):
                     self._last_narrative_at = datetime.datetime.now()

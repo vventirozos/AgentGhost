@@ -597,6 +597,8 @@ def _sandbox_has_live_work(sandbox_mgr):
 
 
 _RESUMED_JOBS: set = set()
+# §4UO: jobs whose deferral was already logged (one line per job, not one per sweep)
+_DEFER_LOGGED: set = set()
 # A landed job is not allowed to start an unbounded chain of autonomous
 # turns. Each wake is one turn; a woken turn that promotes another job can
 # wake again, so the counter is the backstop on that recursion.
@@ -733,13 +735,19 @@ async def _resume_after_job(context, entry) -> bool:
     try:
         from .tools.tasks import should_defer_scheduled_task
         if should_defer_scheduled_task(getattr(context, "llm_client", None)):
-            pretty_log(
-                "Job Resume Deferred",
-                f"{jid} landed while a user or autonomous turn is in flight "
-                f"— leaving it "
-                f"for the next sweep rather than queueing behind the user.",
-                icon=Icons.REQ_WAIT)
+            # §4UO: said ONCE per job — the sweep retries every minute, and a 40-minute turn printed it 40 times
+            if jid not in _DEFER_LOGGED:
+                if len(_DEFER_LOGGED) > 256:      # a job delivered by a read never comes back to discard itself
+                    _DEFER_LOGGED.clear()
+                _DEFER_LOGGED.add(jid)
+                pretty_log(
+                    "Job Resume Deferred",
+                    f"{jid} landed while a user or autonomous turn is in flight "
+                    f"— leaving it for the next sweep rather than queueing behind the user "
+                    f"(retried each minute, not logged again; reading it in full or collecting it delivers it).",
+                    icon=Icons.REQ_WAIT)
             return False
+        _DEFER_LOGGED.discard(jid)
         # a PROBE's job is never woken (§4LZ A-F2): its wake turn ran with
         # owner rights; the result stays readable via jobs(action='collect').
         # r1: checked BEFORE the cap, which wrote an owner-visible record

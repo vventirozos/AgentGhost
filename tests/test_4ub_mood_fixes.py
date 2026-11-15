@@ -61,10 +61,11 @@ def _fresh():
 
 # ── 1. small turns count; the automatic mood still has no cap ───────────────
 
-@pytest.mark.parametrize("calls,dp", [(1, 0.06), (2, 0.08)])
+@pytest.mark.parametrize("calls,dp", [(1, 0.015), (2, 0.02)])
 def test_a_clean_turn_under_three_calls_earns_its_calls_reward(calls, dp):
-    # §4UH-e2e: the full share (was half) — the replay of 30 real days, see mood.CLEAN_TURN_SMALL_SHARE
-    assert M.CLEAN_TURN_SMALL_SHARE == 1.0
+    # §4UP: a quarter (§4UH-e2e had the full share): almost every turn is one, so at 1.0 the mood was an activity
+    # meter — see mood.CLEAN_TURN_SMALL_SHARE
+    assert M.CLEAN_TURN_SMALL_SHARE == 0.25
     evs = M.turn_events(M.TurnSignals(tool_calls=calls))
     assert [e.dp for e in evs] == [pytest.approx(dp)]
 

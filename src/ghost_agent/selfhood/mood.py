@@ -15,7 +15,9 @@ The mood is now a PAIR — pleasantness ``P`` and energy ``E``, each in
   moved (no background job);
 * the INTENSITY (0–3) is the magnitude ``max(|P|, |E|)`` against
   ``INTENSITY_THRESHOLDS``; below the first one there is no mood ("neutral");
-* the LABEL is the region the pair lies in (``region``): eight of them, by
+* the LABEL is the region the pair lies in (``region``): seven of them (§4UP: the low-energy axis is
+  "tired" with the unpleasant low-energy quarter; "bored" is no region — a long quiet shows it, the owner's word
+  holds it), by
   the signs of ``P`` and ``E`` and by whether the smaller of the two is
   "near 0" next to the larger (``AXIS_RATIO``). "curious" is a TAG, not a
   ninth region: a mood moved by a novelty event reads "curious" for as long
@@ -68,7 +70,7 @@ LEVEL_EPS = 1e-9
 
 #: the smaller of |P|, |E| divided by the larger: under this the smaller one
 #: is "near 0" and the label is an axis label (content / down / restless /
-#: bored); at or over it the label is a diagonal one (cheerful / calm /
+#: tired — §4UP, was bored); at or over it the label is a diagonal one (cheerful / calm /
 #: irritable / tired)
 AXIS_RATIO = 0.40
 #: a label already held is kept until the ratio is past ``AXIS_RATIO`` by this
@@ -78,7 +80,7 @@ NEUTRAL = "neutral"
 #: the tagged label: the P+ E+ region reached through a novelty event
 CURIOUS = "curious"
 _CURIOUS_BASE = "cheerful"
-#: the eight regions, then the tagged one
+#: the labels: the seven regions, "bored" (the quiet's and the owner's word, §4UP), then the tagged one
 LABELS = ("cheerful", "content", "calm", "restless", "bored",
           "irritable", "down", "tired", CURIOUS)
 
@@ -119,7 +121,11 @@ def region(p: float, e: float) -> str:
     if minor / major < AXIS_RATIO:
         if ap >= ae:
             return "content" if p > 0 else "down"
-        return "restless" if e > 0 else "bored"
+        # §4UP (evaluation 11-14: a 173-min, 60-call turn read "bored 1" and the next reply heard it): energy
+        # lost with no pleasantness either way is TIRED — the pair only loses energy to long work. "bored" comes
+        # from a long quiet (read-time, `boredom_level`) or from the owner's word (held, ``_still_in``), never
+        # from the pair
+        return "restless" if e > 0 else "tired"
     if p > 0:
         return "cheerful" if e > 0 else "calm"
     return "irritable" if e > 0 else "tired"
@@ -136,6 +142,10 @@ def _still_in(p: float, e: float, held: str) -> bool:
         return ap >= ae and (p > 0) == (held == "content") and ratio < AXIS_RATIO + AXIS_MARGIN
     if held in ("restless", "bored"):
         return ae >= ap and (e > 0) == (held == "restless") and ratio < AXIS_RATIO + AXIS_MARGIN
+    if held == "tired":
+        # §4UP: the low-energy axis (either side of P) and the unpleasant, low-energy quarter
+        return e < 0 and ((ae >= ap and ratio < AXIS_RATIO + AXIS_MARGIN)
+                          or (p < 0 and ratio >= AXIS_RATIO - AXIS_MARGIN))
     signs = {"cheerful": (True, True), "calm": (True, False),
              "irritable": (False, True), "tired": (False, False)}.get(held)
     if signs is None:
@@ -321,7 +331,11 @@ CLEAN_TURN_MIN_CALLS = 3
 #: §4UH-e2e (replay of 581 real owner turns over 30 days, turn events only, 10-min samples): at 0.5 the agent's
 #: own work held the mood off neutral 13.9 % of all hours; at 1.0, 19.4 % (content 1 most of the gain; the
 #: irritable/down hours unchanged). 279 of the 374 tool turns are 1–2 calls — most of what the agent does
-CLEAN_TURN_SMALL_SHARE = 1.0
+#: §4UP (evaluation 11-14, live data 11-11..11-14): at 1.0 the small turns made the mood an activity meter — 49 of
+#: 79 owner replies heard "content", none heard a negative mood, and "the owner wrote in the last 2 h" predicted
+#: 63 of 79. A clean 1–2-call turn is what almost every turn is; it earns a quarter (1 call +0.015, 2 calls +0.02),
+#: so a run of them alone stays under level 1 and they add to what thumbs, real work or trouble did
+CLEAN_TURN_SMALL_SHARE = 0.25
 CLEAN_TURN_BASE = 0.04
 CLEAN_TURN_PER_CALL = 0.02
 CLEAN_TURN_MAX = 0.16
@@ -354,6 +368,25 @@ EV_PRAISE = (+0.10, 0.0)
 EV_SENTIMENT_POSITIVE = (+0.08, +0.02)
 EV_SENTIMENT_NEGATIVE = (-0.08, -0.02)
 SENTIMENT_MIN_SCORE = 0.85
+#: §4UP (evaluation 11-14: of 23 messages that cleared 0.85, the greetings — "good morning ghost!" — were the
+#: owner's politeness, not a feeling; no unhappy message ever reached 0.85, the strongest was 0.70): when the
+#: answer carries the emotion model's reading, a tone counts only with an EMOTION ON ITS SIDE at
+#: ``SENTIMENT_EMOTION_MIN`` or more (warm for upbeat — the set the day record counts — and, for unhappy,
+#: ``SENTIMENT_UNHAPPY``: annoyance or the owner's own bad news). With that second witness an unhappy tone needs ``SENTIMENT_MIN_SCORE_BACKED``; an upbeat one keeps
+#: ``SENTIMENT_MIN_SCORE``. Rejected on the same data: the tone against the owner's own usual (z > 1) — all 10 of
+#: its "down" messages were portfolio questions, deletes and a bug report. With no emotion reading (the model is
+#: optional on the service) the old rule stands
+SENTIMENT_MIN_SCORE_BACKED = 0.60
+SENTIMENT_EMOTION_MIN = 0.5
+SENTIMENT_WARM = frozenset(("gratitude", "admiration", "approval", "joy", "caring", "love", "amusement",
+                            "excitement", "optimism", "pride", "relief"))
+SENTIMENT_COLD = frozenset(("annoyance", "anger", "disapproval", "disappointment", "disgust"))
+#: §4UP review r1 (MAJOR): what backs an UNHAPPY tone for the MOOD — annoyance and its kin, and also the owner's
+#: own bad news (sadness, grief, fear, nervousness, remorse, embarrassment): the mood feels WITH the owner (§4TW
+#: "option 1": "my flight got cancelled" lowers it). The warmth dial reads only ``SENTIMENT_COLD`` (how the owner is
+#: with Ghost, not the owner's news)
+SENTIMENT_UNHAPPY = SENTIMENT_COLD | frozenset(("sadness", "grief", "fear", "nervousness", "remorse",
+                                                "embarrassment"))
 #: §4UB (evaluation 11-10: sarcasm read +0.94, "delete the failed jobs" −0.87, three bad-news messages made the
 #: agent "down"): what the sentiment of the owner's messages has put in the pair, decayed, never exceeds this on
 #: either side — clearly under the first bound and its hold-down (0.20 − 0.04 = 0.16; review r3: at exactly 0.16
@@ -483,10 +516,33 @@ def reaction_event(kind: str) -> Optional[Event]:
     return None
 
 
-def sentiment_event(label, score) -> Optional[Event]:
-    """The tone of the owner's message as an event, or None: neutral, unknown, or below
-    ``SENTIMENT_MIN_SCORE``."""
-    if isinstance(score, bool) or not isinstance(score, (int, float)) or not score >= SENTIMENT_MIN_SCORE:
+def sentiment_backing(label, emotions) -> Optional[bool]:
+    """§4UP: does the emotion reading back the tone? None when there is no reading (a dict of label → score);
+    True when an emotion on the tone's side (``SENTIMENT_WARM`` for "positive", ``SENTIMENT_UNHAPPY`` for "negative") scores
+    ``SENTIMENT_EMOTION_MIN`` or more; False otherwise. Pure."""
+    if not isinstance(emotions, dict):
+        return None
+    side = SENTIMENT_WARM if label == "positive" else SENTIMENT_UNHAPPY if label == "negative" else frozenset()
+    for k, v in emotions.items():
+        if k in side and isinstance(v, (int, float)) and not isinstance(v, bool) and v >= SENTIMENT_EMOTION_MIN:
+            return True
+    return False
+
+
+def sentiment_gate(label, emotions=None) -> float:
+    """§4UP: the score a tone needs: ``SENTIMENT_MIN_SCORE_BACKED`` for an unhappy tone an unhappy emotion
+    backs, ``SENTIMENT_MIN_SCORE`` otherwise. Pure."""
+    if label == "negative" and sentiment_backing(label, emotions):
+        return SENTIMENT_MIN_SCORE_BACKED
+    return SENTIMENT_MIN_SCORE
+
+
+def sentiment_event(label, score, emotions=None) -> Optional[Event]:
+    """The tone of the owner's message as an event, or None: neutral, unknown, under its gate
+    (``sentiment_gate``), or — §4UP — with an emotion reading that does not back it (``sentiment_backing``)."""
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not score >= sentiment_gate(label, emotions):
+        return None
+    if sentiment_backing(label, emotions) is False:
         return None
     if label == "positive":
         return Event(EV_SENTIMENT_POSITIVE[0], EV_SENTIMENT_POSITIVE[1], "the owner's message sounded upbeat",
@@ -952,7 +1008,9 @@ def rest_label(rest) -> str:
     if not (rp or re_) or rp != rp or re_ != re_:
         return NEUTRAL
     got = region(rp, re_)
-    return "calm" if got == BORED else got
+    # §4UP: the low-energy axis reads "tired" now (it was "bored"); a resting point there is still only
+    # unhurried — on the pleasant side of it, or even, it is calm (a rest never leans unpleasant, `rest_units`)
+    return "calm" if got in (BORED, "tired") and rp >= 0 else got
 
 
 def face_label(label, intensity, rest=(0.0, 0.0)) -> str:

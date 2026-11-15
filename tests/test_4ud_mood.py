@@ -1702,6 +1702,7 @@ def test_every_introspect_action_is_classified_for_a_public_surface():
 
 async def test_an_action_missing_from_the_table_is_refused_on_a_public_surface(tmp_path, owner, monkeypatch):
     """Mutant M18: the DEFAULT. An action somebody adds and forgets to classify is private."""
+    monkeypatch.setenv("GHOST_SELFHOOD_NARRATIVE", "1")   # §4UP: the summary carries the diary only when it is on
     monkeypatch.setattr(I, "_VALID_ACTIONS", I._VALID_ACTIONS | {"stats2"})
     assert "stats2" not in I.ACTION_ON_PUBLIC
     sm = _full(tmp_path)

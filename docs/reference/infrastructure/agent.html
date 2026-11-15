@@ -1848,6 +1848,11 @@
         <li>longer segments;</li>
         <li>a reply that would end up empty or narration-only.</li>
       </ul>
+      &sect;4UO (2026-11-14): in a turn that also did work (any segment recorded beside a file, execute or project
+      batch, a <code>WorkSegment</code>), a lookup segment takes the work rule instead: up to 1,000 chars, and only
+      when what remains is at least 1.5 times its length. In a build, a <code>browser</code> check is a
+      verification step, not research. Req 671eea0c's reply opened with two notes of 571 and 566 chars written
+      beside such checks, which the 400-char cap kept. A lookup-only turn keeps the 400-char rule.
     The live web stream still shows the narration as progress. Live probe D2 opened "The known DuckDuckGo onion
     address didn't respond. Let me find the official one…". <code>GHOST_DROP_PRE_TOOL_TEXT=0</code> disables.</li>
     <li><strong>Links must come from what the turn read</strong> (<code>core/link_grounding.py</code>). On a turn

@@ -1945,10 +1945,87 @@ def _project_of_path(store, path) -> tuple:
     return _canon_id(rel.parts[0]), Path(*rel.parts[1:]).as_posix()
 
 
+def _owner_root_of_starter(starter: str, launches: dict, depth: int = 0) -> str:
+    """§4UO: the OWNER request a job's starter acts for, else "":
+      * an owner request → itself;
+      * another job's wake (`job-<8hex>`) → that job's own starter, followed (≤4 hops): a wake that starts a
+        job of its own is still the owner's request continued;
+      * a project task's turn (`sub-ptask-…`) → its root request when that is the owner's (`request_root`, the
+        in-memory parent map; after a restart it is gone and the answer is "", the safe direction);
+      * anything else (scheduled, sub-agent, probe, test) → ""."""
+    starter = str(starter or "")
+    if not starter or depth > 4:
+        return ""
+    from .memory import _not_the_user
+    if re.fullmatch(r"job-[0-9a-f]{8}", starter):
+        rec = launches.get(starter)
+        return _owner_root_of_starter(str((rec or {}).get("started_by") or ""), launches, depth + 1) \
+            if isinstance(rec, dict) else ""
+    try:
+        from ..core.project_turns import TASK_TURN_RID_PREFIX
+        if starter.startswith(TASK_TURN_RID_PREFIX):
+            from ..memory.projects import request_root
+            root = request_root(starter)
+            return root if root and root != starter and not _not_the_user(root) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+    return starter if not _not_the_user(starter) else ""
+
+
+def _job_wake_starter(context) -> str:
+    """§4UO: the OWNER request whose background job this turn is the wake of (`main._resume_after_job` runs it
+    as ``job-<8hex>``, the job's own id, or ``sub-job-<8hex>`` when a scheduled task, sub-agent, project task
+    turn or test started it), else "". The starter comes from the HOST's launch record, never from the job's
+    registry row (a sandbox command can rewrite that), and is resolved to the owner's request it acts for
+    (`_owner_root_of_starter`: a wake's own job, an owner-run task turn's job). Never raises."""
+    try:
+        from ..utils.logging import request_id_context
+        rid = str(request_id_context.get() or "")
+        _m = re.fullmatch(r"(?:sub-)?(job-[0-9a-f]{8})", rid)
+        if not _m:
+            return ""
+        from ..sandbox.jobs import get_job_supervisor
+        sup = get_job_supervisor(getattr(context, "sandbox_manager", None))
+        if sup is None:
+            return ""
+        launches = sup._load_launches() or {}
+        rec = launches.get(_m.group(1))
+        if not isinstance(rec, dict):
+            return ""
+        return _owner_root_of_starter(str(rec.get("started_by") or ""), launches)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _change_ask(context, store=None, pid: str = "") -> str:
+    """§4UO: the ask a change entry carries — the owner's message, or for a job's wake turn (whose "message"
+    is the system's job-finished prompt) what it is: an unattended follow-up of the owner's ask."""
+    starter = _job_wake_starter(context)
+    if not starter:
+        return " ".join(str(getattr(context, "last_user_content", "") or "").split())[:300]
+    from ..utils.logging import request_id_context
+    orig = ""
+    try:
+        if store is not None and pid:
+            orig = next((str(c.get("ask") or "") for c in store.list_changes(pid, limit=20) or []
+                         if str(c.get("req_id") or "") == starter and c.get("ask")), "")
+    except Exception:  # noqa: BLE001
+        orig = ""
+    _jid = re.sub(r"^sub-", "", str(request_id_context.get() or ""))
+    head = f"(unattended follow-up after background job {_jid} finished)"
+    return " ".join(f"{head} {orig}".split())[:300]
+
+
 def _owner_change_turn(context) -> bool:
     """§4UM: the turn's writes are the OWNER's changes — the owner's own request, or a project task's turn it
-    runs; never a background / member / probe / simulated turn."""
-    if not (_owner_turn_now() or _owner_task_turn(context)) or getattr(context, "simulated", False):
+    runs; never a background / member / probe / simulated turn. §4UO: the wake turn of a job the owner's
+    request started is that request's work continued, so its writes are logged too (req 671eea0c's wake
+    edited browser.js 4× with no entry); its ask says it was unattended (`_change_ask`)."""
+    if getattr(context, "simulated", False):
+        return False
+    if _job_wake_starter(context):
+        return True
+    if not (_owner_turn_now() or _owner_task_turn(context)):
         return False
     try:
         from ..core.request_scope import ORIGIN_OWNER, current_scope
@@ -1968,8 +2045,10 @@ def begin_request_watch(context, request_id: str, user_text: str) -> None:
         if store is None or not _owner_change_turn(context):
             return
         from ..memory.projects import note_request_ask, watch_project
-        note_request_ask(request_id, user_text)
         pid = getattr(context, "current_project_id", None)
+        if _job_wake_starter(context):
+            user_text = _change_ask(context, store, pid or "")     # §4UO: not the job-finished prompt
+        note_request_ask(request_id, user_text)
         proj = store.get_project(pid) if pid else None
         if proj and str(proj.get("status") or "").upper() != "RELEASED":
             watch_project(store, pid, rid=request_id, ask=user_text)
@@ -2040,18 +2119,19 @@ def note_project_write(context, path, reopen: bool = True) -> str:
         proj = store.get_project(pid)
         if not proj:
             return ""
-        if not getattr(context, "current_project_id", None):
-            _set_current(context, pid)
+        if not getattr(context, "current_project_id", None) and not _job_wake_starter(context):
+            _set_current(context, pid)      # §4UO: a wake turn has no conversation whose focus it may set
         st = str(proj.get("status") or "").upper()
         if st == "RELEASED":
             return ""                       # immutable: changes go to create_version
         reopened = ""
         # round 4: ``reopen=False`` — a write that may not be FOR the project (a render saved while it is focused)
         # is logged, but only a file / command / lab write reopens a project the owner closed
-        if reopen and st == "DONE" and store.update_project(pid, status="ACTIVE"):
+        # §4UO review: a wake turn is logged but never reopens — only the owner opens a project they closed
+        if reopen and st == "DONE" and not _job_wake_starter(context) and store.update_project(pid, status="ACTIVE"):
             reopened = "DONE"
         from ..memory.projects import note_change_write, watch_project
-        ask = " ".join(str(getattr(context, "last_user_content", "") or "").split())[:300]
+        ask = _change_ask(context, store, pid)
         # noted FIRST: a snapshot taken now (none before this write) is after it — the noted kind stands
         note_change_write(store, pid, rel, ask=ask, reopened_from=reopened)
         watch_project(store, pid, ask=ask, write=True)
@@ -2085,18 +2165,19 @@ def note_project_writes(context, paths) -> str:
                     mark_task_write(store, pid, evidence=True)
             return ""
         from ..memory.projects import note_change_writes, watch_project
-        ask = " ".join(str(getattr(context, "last_user_content", "") or "").split())[:300]
+        ask = _change_ask(context, store, next(iter(by_pid)))
         notes = []
         for pid, rels in by_pid.items():
             proj = store.get_project(pid)
             if not proj:
                 continue
-            if not getattr(context, "current_project_id", None):
+            if not getattr(context, "current_project_id", None) and not _job_wake_starter(context):
                 _set_current(context, pid)
             st = str(proj.get("status") or "").upper()
             if st == "RELEASED":
                 continue
-            reopened = "DONE" if st == "DONE" and store.update_project(pid, status="ACTIVE") else ""
+            reopened = ("DONE" if st == "DONE" and not _job_wake_starter(context)      # §4UO review: never a wake
+                        and store.update_project(pid, status="ACTIVE") else "")
             note_change_writes(store, pid, rels, ask=ask, reopened_from=reopened)
             watch_project(store, pid, ask=ask, write=True)
             if reopened:

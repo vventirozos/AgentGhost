@@ -1266,12 +1266,27 @@ def _when(ts) -> str:
         return "?"
 
 
+def _lab_via(m: Dict[str, Any]) -> str:
+    """The actions of a deploy entry as commands: "`lab put` and `lab deploy`" for a joined "put+deploy" (review:
+    "`lab put+deploy`" read as a command that does not exist)."""
+    parts = [x for x in str((m or {}).get("how") or "deploy").split("+") if x.strip()] or ["deploy"]
+    return " and ".join(f"`lab {x.strip()}`" for x in parts)
+
+
+def _lab_to(m: Dict[str, Any]) -> str:
+    """The " to lab_x" part of a deploy line, or "" when no lab was recorded."""
+    lid = str((m or {}).get("lab_id") or "").strip()
+    return f" to {lid}" if lid else ""
+
+
 def change_line(e: Dict[str, Any]) -> str:
     """One change-log entry as one line (§4UM)."""
     if e.get("kind") == "deploy":
         m = e.get("meta") or {}
-        what = "whole folder" if m.get("whole") else ", ".join((e.get("changed") or [])[:6]) or "files"
-        return (f"{_when(e['ts'])} LIVE ({m.get('how') or 'deploy'}: {what})"
+        what = "the whole folder" if m.get("whole") else "files: " + (", ".join((e.get("changed") or [])[:6]) or "?")
+        # req 6043a546: "LIVE (put: a.js, b.js)" read as deploy options (a per-file deploy) — name the action and
+        # the lab, and say a file list is what was pushed
+        return (f"{_when(e['ts'])} LIVE via {_lab_via(m)}{_lab_to(m)} ({what})"
                 + (f" → {e['url']}" if e.get("url") else "")
                 + (f", includes #{m['through']}" if m.get("through") else ""))
     files = []
@@ -2820,7 +2835,7 @@ class ProjectStore:
                 if e["kind"] == "deploy":
                     m = e.get("meta") or {}
                     what = "the whole folder" if m.get("whole") else (", ".join(e["changed"][:12]) or "files")
-                    lines.append(f"## Live · {when} · {m.get('how') or 'deploy'}"
+                    lines.append(f"## Live · {when} · {_lab_via(m).replace('`', '')}{_lab_to(m)}"
                                  + (f" → {e['url']}" if e.get("url") else ""))
                     lines.append(f"- Pushed: {what}"
                                  + (f" (includes change #{m['through']})" if m.get("through") else ""))

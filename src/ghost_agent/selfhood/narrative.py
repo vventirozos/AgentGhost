@@ -35,6 +35,19 @@ from .state import SelfStateThread
 logger = logging.getLogger("GhostSelfhood")
 
 
+#: §4UP (evaluation 2026-11-14): the diary was rewritten every day on the main model and read by nothing — only
+#: `introspect`'s "summary" and "narrative" show it, called 0 times in six days of owner turns; the selfhood
+#: wake-up prefix that was its reader has no caller; and its wording was the prompt's ("reach" in each of the last
+#: 30 entries, "slip" in 24, "loop" in 21). It is OFF unless this is "1"; the last entry stays on disk
+ENV = "GHOST_SELFHOOD_NARRATIVE"
+
+
+def enabled() -> bool:
+    """Is the diary rewritten in the idle window? Off unless ``GHOST_SELFHOOD_NARRATIVE`` is "1"."""
+    import os
+    return os.getenv(ENV, "").strip() == "1"
+
+
 NARRATIVE_FILENAME = "narrative.md"
 NARRATIVE_HISTORY_FILENAME = "narrative.history.jsonl"
 
@@ -159,6 +172,16 @@ class NarrativeSummariser:
             self._key_path().write_text(key, encoding="utf-8")
         except Exception:  # noqa: BLE001 — only costs one extra regeneration
             pass
+
+    def written_on(self) -> str:
+        """§4UP: the mood day (``mood.mood_day``: it ends at 04:00) the latest entry was written, or "" when there
+        is none."""
+        try:
+            import datetime as _dt
+            from .mood import mood_day
+            return mood_day(_dt.datetime.fromtimestamp(self.path.stat().st_mtime, _dt.timezone.utc)).isoformat()
+        except OSError:
+            return ""
 
     def latest(self) -> str:
         """Return the most recently written narrative, or empty string

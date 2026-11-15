@@ -282,9 +282,10 @@ async def test_tidy_counts_only_the_workspaces_it_checked():
 
 
 @pytest.mark.asyncio
-async def test_a_raising_narrative_is_listed_as_failed():
+async def test_a_raising_narrative_is_listed_as_failed(monkeypatch):
     """r2 m1: fails where the narrative's FAILED note never reached the
     line (the job was listed only on success)."""
+    monkeypatch.setenv("GHOST_SELFHOOD_NARRATIVE", "1")   # §4UP: the diary is off by default
     from tests.test_biological_watchdog import _make_agent
     from unittest.mock import AsyncMock
     agent = _make_agent(idle_seconds=1200, memory_ids=0)

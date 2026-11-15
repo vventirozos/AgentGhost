@@ -45,7 +45,8 @@ async def _tick(ctx):
     return agent
 
 
-async def test_narrative_phase_fires_when_wired_and_cooldown_elapsed():
+async def test_narrative_phase_fires_when_wired_and_cooldown_elapsed(monkeypatch):
+    monkeypatch.setenv("GHOST_SELFHOOD_NARRATIVE", "1")   # §4UP: the diary is off by default
     sm = MagicMock()
     sm.enabled = True
     sm.consolidate_narrative = AsyncMock(return_value="A diary entry.")
@@ -104,10 +105,11 @@ async def test_narrative_phase_respects_cooldown():
     sm.consolidate_narrative.assert_not_called()
 
 
-async def test_narrative_phase_anchor_advances_even_on_exception():
+async def test_narrative_phase_anchor_advances_even_on_exception(monkeypatch):
     """The anchor-before-await invariant: a crash during the LLM call
     must NOT leave the cooldown un-advanced (otherwise the failing
     consolidation re-fires every 60-second tick)."""
+    monkeypatch.setenv("GHOST_SELFHOOD_NARRATIVE", "1")   # §4UP: the diary is off by default
     sm = MagicMock()
     sm.enabled = True
     sm.consolidate_narrative = AsyncMock(side_effect=RuntimeError("boom"))
@@ -117,8 +119,9 @@ async def test_narrative_phase_anchor_advances_even_on_exception():
     assert agent._last_narrative_at > datetime.datetime.min
 
 
-async def test_narrative_phase_honours_cooldown_override():
+async def test_narrative_phase_honours_cooldown_override(monkeypatch):
     """Custom --self-narrative-cooldown is respected."""
+    monkeypatch.setenv("GHOST_SELFHOOD_NARRATIVE", "1")   # §4UP: the diary is off by default
     sm = MagicMock()
     sm.enabled = True
     sm.consolidate_narrative = AsyncMock(return_value="x")

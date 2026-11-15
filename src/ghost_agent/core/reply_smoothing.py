@@ -569,8 +569,16 @@ def drop_pre_tool_segments(text: str, segments) -> str:
     if not text or not segments:
         return text
     out = text
+    # §4UO: a note beside a lookup written AFTER the turn's first work batch (file/execute/project) is a
+    # verification step's narration — checking what was just built — not a research answer, so it takes the
+    # work rule (≤1000 chars, the rest must outweigh it). Req 671eea0c's reply opened with two 566/571-char
+    # notes written beside `browser` checks of the app it was building, kept by the 400-char lookup cap.
+    # Review: notes BEFORE the first work batch keep the lookup rule — "research X and save it" writes its
+    # findings beside the last fetch, then saves; those findings are the answer.
+    _after_work = False
     for seg in segments:
-        _is_work = isinstance(seg, WorkSegment)          # before .strip(): a str op returns a plain str
+        _is_work = isinstance(seg, WorkSegment) or _after_work   # before .strip(): a str op returns a plain str
+        _after_work = _after_work or isinstance(seg, WorkSegment)
         seg = (seg or "").strip()
         if not seg or len(seg) > (WORK_SEGMENT_MAX if _is_work else PRE_TOOL_SEGMENT_MAX):
             continue

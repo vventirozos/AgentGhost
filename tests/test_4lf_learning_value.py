@@ -73,9 +73,10 @@ async def test_inside_the_window_the_clock_is_left_alone():
 
 # ── experiments and graduated skills ─────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_a_rolled_window_reopens_the_mid_phases_on_the_next_tick():
+async def test_a_rolled_window_reopens_the_mid_phases_on_the_next_tick(monkeypatch):
     """The point of the roll: the 15–60 min phases run again an hour later
     instead of never."""
+    monkeypatch.setenv("GHOST_SELFHOOD_NARRATIVE", "1")   # §4UP: the diary is off by default
     from ghost_agent.core.agent import GhostAgent
     ctx = _tick_ctx(4000)
     from unittest.mock import AsyncMock

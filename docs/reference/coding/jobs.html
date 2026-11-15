@@ -216,6 +216,28 @@ STDOUT/STDERR:
   <strong>rate-capped at 12/hour</strong> — a woken turn can promote another
   job, which lands and wakes again, and the counter is the backstop on that
   recursion.</p>
+  <p><strong>A result the model already has is not woken again (&sect;4UO, 2026-11-14).</strong>
+  <code>run collect</code> and <code>jobs collect</code> mark a job delivered (<code>mark_woken</code>). So does a
+  <code>file_system read</code> of <code>.jobs/&lt;id&gt;.log</code>, the path the promotion banner gives
+  (<code>tools/runs.mark_job_log_read</code>, called from the read branch of <code>file_system</code>). A read
+  counts only when the job has <strong>finished</strong> (a read mid-run saw partial output), the text shown
+  contains the log's <strong>last non-empty line</strong> (a ranged or capped read that stopped early did not see
+  the result; an empty log is left to the wake, which carries the exit code), and the reading turn is the one the
+  result belongs to (<code>_delivers</code>: an owner turn or the job's starter). Before this, req 671eea0c read
+  job-d36bc23e's finished log there and the wake was still owed, so a second autonomous turn would have reported
+  the same output as "the user has not seen this".</p>
+  <p>The same delivery holds for an <code>execute</code> that printed the log (<code>tail -n 60 .jobs/&lt;id&gt;.log</code>,
+  <code>cat …</code>; <code>tools/runs.mark_job_log_output</code>, from <code>execute._note_job_log_printed</code>) and for
+  the <code>read_chunked</code> page holding its end (<code>mark_job_log_chunk</code>): the command must name exactly one
+  job log, and the output must carry the log's last 20 non-empty lines (all of a shorter log) consecutively, in
+  order. A <code>head</code>, a <code>grep</code> or a <code>tail -n 5</code> of a longer log leaves the wake.
+  <strong>All three require the job to have finished BEFORE the view</strong> (<code>finished_job_logs</code>, taken
+  before the read or the command runs: registry terminal, or its exit sentinel landed). A view of a running job
+  that then dies (an OOM kill, the TTL) must not cancel the wake that reports the death and its exit code, which no
+  log line carries (review r3).</p>
+  <p>A wake that defers is retried by every 60&nbsp;s sweep, but the <code>Job Resume Deferred</code> line is
+  logged <strong>once per job</strong> (<code>main._DEFER_LOGGED</code>). It used to print on every sweep, about 15
+  lines in one 40-minute turn.</p>
 
   <h2>The two rails</h2>
   <h3>1. Progress, not merely liveness</h3>

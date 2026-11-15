@@ -55,10 +55,9 @@ EMOTION_LABELS = frozenset((
 #: what the character's WARMTH reads (``days`` counts a message for a side when one of its labels is at
 #: ``EMOTION_COUNT_MIN`` or more): how the owner talks to it. Not curiosity or confusion (questions), not sadness,
 #: fear, grief or nervousness (the owner's own news, not how they are with Ghost)
-WARM_EMOTIONS = frozenset(("gratitude", "admiration", "approval", "joy", "caring", "love", "amusement",
-                           "excitement", "optimism", "relief", "pride"))
-COLD_EMOTIONS = frozenset(("annoyance", "anger", "disapproval", "disappointment", "disgust"))
-EMOTION_COUNT_MIN = 0.5
+#: §4UP: ONE list, owned by the mood (its tone gate reads the same sides at the same cut) — re-exported here
+from .mood import SENTIMENT_COLD as COLD_EMOTIONS, SENTIMENT_EMOTION_MIN as EMOTION_COUNT_MIN  # noqa: E402
+from .mood import SENTIMENT_WARM as WARM_EMOTIONS  # noqa: E402
 #: the log line shows emotions from here (weaker readings are noise); only EMOTION_COUNT_MIN ones are counted
 EMOTION_SHOWN_MIN = 0.2
 
@@ -294,6 +293,8 @@ HELD_NO_MOOD = "no mood to move"
 #: §4UB (evaluation: "great, you broke it again" scored positive 0.94; "delete the failed jobs" negative 0.87)
 HELD_SARCASM = "upbeat words about trouble (it may be sarcasm)"
 HELD_TASK = "the wording of a task, not a feeling"
+#: §4UP: the emotion model read the message and found no feeling on the tone's side ("good morning ghost!")
+HELD_UNBACKED = "no emotion backs the tone (politeness, not a feeling)"
 #: words that turn an upbeat score next to them into a doubtful one
 _TROUBLE_WORDS = re.compile(
     r"\b(?:broke|broken|breaks?|breaking|crash\w*|wrong|fail\w*|ruin\w*|wasted?|worse|worst|useless|"
@@ -352,14 +353,19 @@ def _feed_mood(answer: Dict[str, object], self_model, praised: bool, arrived: Op
     holds, or when the owner set the mood after this message arrived (the reasons are the state's own)."""
     from . import mood as M
     try:
-        ev = M.sentiment_event(answer.get("label"), answer.get("score"))
+        emotions = answer.get("emotions")
+        ev = M.sentiment_event(answer.get("label"), answer.get("score"), emotions)
         if ev is None:
             label = answer.get("label")
             if label == "unknown":
                 return 0.0, str(answer.get("reason") or "unknown")
             if label == "neutral":
                 return 0.0, "neutral"
-            return 0.0, f"below {M.SENTIMENT_MIN_SCORE:.2f}"
+            gate = M.sentiment_gate(label, emotions)
+            score = answer.get("score")
+            if isinstance(score, (int, float)) and not isinstance(score, bool) and score >= gate:
+                return 0.0, HELD_UNBACKED           # §4UP: confident, but no emotion on its side
+            return 0.0, f"below {gate:.2f}"
         if praised:              # "thanks, perfect" is already one praise event
             return 0.0, HELD_PRAISED
         if self_model is None:
@@ -374,7 +380,7 @@ def _feed_mood(answer: Dict[str, object], self_model, praised: bool, arrived: Op
         if doubt:
             return 0.0, doubt
         after, dp, why = self_model.note_owner_sentiment(
-            answer["label"], answer["score"], request_id=str(request_id or ""),
+            answer["label"], answer["score"], request_id=str(request_id or ""), emotions=emotions,
             arrived=(arrived.isoformat().replace("+00:00", "Z") if arrived is not None else ""))
         if why:
             return 0.0, why

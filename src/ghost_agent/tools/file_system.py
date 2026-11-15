@@ -8561,6 +8561,13 @@ async def _tool_file_system_impl(operation: str = None, sandbox_dir: Path = None
         if _end is None and _limit and _limit > 0:
             _end = (_start or 1) + _limit - 1
             _start = _start or 1
+        _jobs_done = frozenset()
+        if ".jobs/job-" in str(target_path):
+            try:                                                            # §4UO r3: finished BEFORE the read
+                from .runs import finished_job_logs
+                _jobs_done = await asyncio.to_thread(finished_job_logs, sandbox_manager, str(target_path))
+            except Exception:  # noqa: BLE001
+                pass
         _rd = await tool_read_file(target_path, sandbox_dir, max_context=max_context,
                                    read_budget=read_budget,
                                    start_line=_start, end_line=_end)
@@ -8575,6 +8582,16 @@ async def _tool_file_system_impl(operation: str = None, sandbox_dir: Path = None
                                    start=int(_shown.group(1)), end=int(_shown.group(2)))
                 elif _start is None and _end is None:
                     _mark_read(_get_safe_path(sandbox_dir, target_path), whole=True)
+            except Exception:  # noqa: BLE001
+                pass
+        if not str(_rd).startswith("Error"):
+            try:                                                            # §4UO: a read finished job log is delivered
+                from .runs import mark_job_log_read
+                _jid = await asyncio.to_thread(mark_job_log_read, sandbox_manager, str(target_path), str(_rd),
+                                               _jobs_done)
+                if _jid:
+                    pretty_log("Job Delivered", f"{_jid}: its log was read in full after it finished — no wake turn",
+                               icon=Icons.JOB_PROMOTE)
             except Exception:  # noqa: BLE001
                 pass
         return _rd
@@ -8597,10 +8614,27 @@ async def _tool_file_system_impl(operation: str = None, sandbox_dir: Path = None
                     f"({read_budget.spent / 1024:.1f} KB already read). Use "
                     f"operation='search', a ranged read, or an 'execute' "
                     f"digest script.")
+        _ck_done = frozenset()
+        if ".jobs/job-" in str(target_path):
+            try:                                                            # §4UO r3: finished BEFORE the read
+                from .runs import finished_job_logs
+                _ck_done = await asyncio.to_thread(finished_job_logs, sandbox_manager, str(target_path))
+            except Exception:  # noqa: BLE001
+                pass
         _ck = await tool_read_document_chunked(target_path, sandbox_dir, page=page, chunk_size=chunk_size, max_context=max_context)
         if isinstance(_ck, str) and not _ck.startswith("Error"):
             if read_budget is not None:
                 read_budget.charge(len(_ck))
+            if ".jobs/job-" in str(target_path):
+                try:                                                        # §4UO: the page with a job log's tail
+                    from .runs import mark_job_log_chunk
+                    _jid = await asyncio.to_thread(mark_job_log_chunk, sandbox_manager, str(target_path), _ck,
+                                                   _ck_done)
+                    if _jid:
+                        pretty_log("Job Delivered", f"{_jid}: the page holding its log's end was read — no wake turn",
+                                   icon=Icons.JOB_PROMOTE)
+                except Exception:  # noqa: BLE001
+                    pass
         if not str(_ck).startswith("Error"):
             try:                                                            # §4OE-2; §4OG-1 (h): one page = its byte range
                 _pg = max(1, int(page or 1))

@@ -2863,12 +2863,43 @@ def _prepare_execute_project_writes(kwargs) -> None:
         logging.getLogger("GhostAgent").debug("execute project-write prepare skipped", exc_info=True)
 
 
+async def _finished_job_logs_named(kwargs) -> frozenset:
+    """§4UO r3: the job logs the command names whose job had already finished before it ran."""
+    try:
+        command = str(kwargs.get("command") or "")
+        if ".jobs/job-" not in command:
+            return frozenset()
+        from .runs import finished_job_logs
+        return await asyncio.to_thread(finished_job_logs, kwargs.get("sandbox_manager"), command)
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+async def _note_job_log_printed(kwargs, result, finished_before=frozenset()) -> None:
+    """§4UO: a command that printed a finished job's log (`tail`/`cat .jobs/<id>.log`) delivered it — its wake
+    turn must not report it again (`tools.runs.mark_job_log_output`). Off the loop; never raises."""
+    try:
+        command = str(kwargs.get("command") or "")
+        if ".jobs/job-" not in command:
+            return
+        from .runs import mark_job_log_output
+        jid = await asyncio.to_thread(mark_job_log_output, kwargs.get("sandbox_manager"), command, str(result or ""),
+                                      finished_before)
+        if jid:
+            pretty_log("Job Delivered", f"{jid}: its log's tail was printed after it finished — no wake turn",
+                       icon=Icons.JOB_PROMOTE)
+    except Exception:  # noqa: BLE001 — bookkeeping never breaks a run
+        logging.getLogger("GhostAgent").debug("job log print not noted", exc_info=True)
+
+
 _tool_execute_impl = tool_execute
 
 
 async def _tool_execute_noting(*args, **kwargs):
     _prepare_execute_project_writes(kwargs)
+    _done_before = await _finished_job_logs_named(kwargs)        # §4UO r3: BEFORE the command runs
     res = await _tool_execute_impl(*args, **kwargs)
+    await _note_job_log_printed(kwargs, res, _done_before)
     _note = _note_execute_project_writes(kwargs, res)
     if _note:
         from .outcome import append_note

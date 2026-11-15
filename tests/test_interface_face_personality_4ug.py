@@ -229,7 +229,8 @@ def test_at_the_agents_anchor_points_the_blend_is_todays_look(lab):
         p, e = _anchor(label, n)
         # the anchors are where the engine's own rules say they are: this label's region, this level
         assert _level(p, e) == n, (label, n, p, e)
-        assert M.region(p, e) == ("cheerful" if label == M.CURIOUS else label), (label, p, e)
+        # §4UP: the owner's "bored" sits on the axis that reads tired — held by its label (what set_mood stores)
+        assert M.held_region(p, e, label) == ("cheerful" if label == M.CURIOUS else label), (label, p, e)
         q += [{"op": "at", "a": [p, e, label, n]}, {"op": "label", "a": [label, n]}, {"op": "at", "a": [p, e]}]
     got = _pure(lab, q)["answers"]
     for i, (label, n) in enumerate(cases):
