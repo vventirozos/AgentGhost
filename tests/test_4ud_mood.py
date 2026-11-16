@@ -1919,3 +1919,12 @@ def test_an_energy_only_move_also_ends_the_undo_point(tmp_path):
     s.set_owner_mood("down", M.ANCHOR_DIRECTION["down"], 1, hold=False)
     s.nudge(0.0, 0.3, "a long turn", M.KIND_TURN)
     assert not s.state.mood.prev
+
+
+@pytest.fixture(autouse=True)
+def _two_hour_half_life(monkeypatch):
+    """§4US: these tests count time in units of the 2 h half-life they were written for (0.8 after 2 h is
+    0.4); they test the decay's mechanics, not its length. The live value (4 h) is pinned in
+    tests/test_4us_mood_visible.py."""
+    from ghost_agent.selfhood import mood as _M
+    monkeypatch.setattr(_M, "HALF_LIFE_S", 7200.0)

@@ -447,7 +447,9 @@ async def _tool_jobs_impl(action: str = None, job_id=None, context=None,
             return "\n".join(out)
         job = _resolve_job(reg, job_id)
         if job is not None and not _mine(job):
-            return f"Error: job {job_id!r} was started by another request — it is not yours to read."
+            from .outcome import ToolOutcome      # §4UR-w r2: a who-may-act wall
+            return ToolOutcome.rejected(f"Error: job {job_id!r} was started by another request — it is not "
+                                        f"yours to read.", world_changed=False, reason_code="who_may_act")
         if job is None:
             return (f"Error: no job {job_id!r} (it may have been evicted — "
                     f"only the last {reg.max_retained} finished jobs are "
@@ -488,8 +490,10 @@ async def _tool_jobs_impl(action: str = None, job_id=None, context=None,
             return "Error: 'job_id' is required for cancel."
         job = _resolve_job(reg, job_id)
         if job is not None and not _mine(job):
-            return (f"Error: job {job_id!r} was started by another request — only the owner's "
-                    f"own turn may cancel it. Nothing was cancelled.")
+            from .outcome import ToolOutcome      # §4UR-w: a who-may-act wall
+            return ToolOutcome.rejected(f"Error: job {job_id!r} was started by another request — only the "
+                                        f"owner's own turn may cancel it. Nothing was cancelled.",
+                                        world_changed=False, reason_code="who_may_act")
         if job is not None and job.kind == SANDBOX_KIND \
                 and job.status == STATUS_RUNNING:
             # Kill the container process FIRST: marking the row cancelled

@@ -15,7 +15,7 @@
 import { initSessions } from './sessions.js?v=7.15';
 import { initNotifications } from './notifications.js?v=7.2';
 import { initStatus } from './status.js?v=8.4';
-import { initPalette } from './palette.js?v=7.6';
+import { initPalette } from './palette.js?v=7.9';
 
 const Core = window.GhostCore;
 

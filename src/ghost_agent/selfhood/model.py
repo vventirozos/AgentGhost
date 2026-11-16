@@ -773,10 +773,19 @@ class SelfModel:
                 self._inflight.move_to_end(key)
                 while len(self._inflight) > self.LEDGER_REPLIES:
                     self._inflight.popitem(last=False)
+        # §4US: how long the quiet was, read BEFORE the arrival stamps it closed
+        try:
+            # review r1: the OWNER's own absence — an owner job working through the night keeps the boredom away
+            # (§4UD F9), but the owner was still away
+            quiet = self.state.quiet_seconds(now=now, owner_only=True)
+        except Exception:  # noqa: BLE001
+            quiet = None
         try:
             self.state.owner_arrived(now=now)
         except Exception as e:
             logger.debug("mood owner-arrival skipped: %s: %s", type(e).__name__, e)
+        # §4US (operator 11-16): the owner back after a long quiet lifts the mood a little (leaned by warmth)
+        self._apply(M.return_event(quiet), now=now)
 
     def owner_turn_ended(self, *, now=None, request_id: str = "", conversation: str = "") -> None:
         """An owner's turn has ended: the next quiet is measured from here

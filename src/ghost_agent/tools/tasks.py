@@ -631,11 +631,14 @@ def _schedule_refusal(action, scheduler, task_name, cron_expression, interval_se
                                  ORIGIN_PROBE)
     from ..core.autonomous_activity import is_internal_request
     rid = str(request_id_context.get() or "")
+    from .outcome import ToolOutcome          # §4UR-w: these two are who-may-act walls
     if is_internal_request(rid):
-        return (f"Error: a scheduled or background run cannot {action.replace('_', ' ')} tasks — only the "
-                f"user can, in a conversation.")
+        return ToolOutcome.rejected(
+            f"Error: a scheduled or background run cannot {action.replace('_', ' ')} tasks — only the "
+            f"user can, in a conversation.", world_changed=False, reason_code="who_may_act")
     if is_probe_request_id(rid) or str(request_origin_context.get() or "") == ORIGIN_PROBE:
-        return "Error: a probe request does not create or stop scheduled tasks."
+        return ToolOutcome.rejected("Error: a probe request does not create or stop scheduled tasks.",
+                                    world_changed=False, reason_code="who_may_act")
     # a task is a STANDING instruction replayed as the owner's own message
     # (and a watch runs its command with no model at all): never from a
     # request whose content came from outside (§4MB)

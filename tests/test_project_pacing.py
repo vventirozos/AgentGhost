@@ -221,5 +221,96 @@ async def test_decompose_returns_stop_and_await_instruction(context):
     assert "3 task" in instr  # mentions the count
     # §4UI: defers to the one pacing rule (a split mid-work is not a new plan
     # to stop on)
-    assert "follow the PACING rule in the CURRENT" in instr
+    # §4UR: it points back at the decision made BEFORE the call — req
+    # fb249da8 re-read the rule after this result and flipped plan → build
+    assert "keep the go-ahead decision you made" in instr
+    assert "is not a reason to start work" in instr
+    assert "follow the PACING rule in the CURRENT" not in instr
     assert "STOP here" not in instr
+
+
+# ------------------------------------------------ §4UR plan-first wording
+
+def test_briefing_plan_first_wording_is_plan_only(store):
+    """req fb249da8: "Add a portfolio dashboard to <id>. First, analyze the
+    project. Scope it and decompose the tasks, and add the implementation
+    tasks" was read as a go-ahead on "add" and ran autoadvance count=all."""
+    pid = store.create_project("Web OS", goal="a browser desktop")
+    ProjectPlan(store, pid).add_task("task a")
+    b = build_project_briefing(store, pid)
+    assert "decide it ONCE, from the user's message, before you" in b
+    assert "keep that decision when the call returns" in b
+    # planning-as-this-step wording, even with the feature named
+    for phrase in ("'first analyze/scope it'", "'add the tasks'", "'break it down'",
+                   "even when it also names the feature to build"):
+        assert phrase in b, phrase
+    assert "with nothing limiting the turn to planning" in b
+    assert "Unsure → stop at the plan" in b
+    # the go-ahead case still exists (a build in the same message starts)
+    assert "that message IS the go-ahead" in b
+    assert "no 'shall I start?'" in b
+
+
+@pytest.mark.asyncio
+async def test_replan_result_keeps_the_decision_too(context):
+    await tool_manage_projects(context, action="create", title="Effort 3",
+                               subtasks=["one", "two"])
+    out = json.loads(await tool_manage_projects(
+        context, action="replan", subtasks=["three", "four"]))
+    assert "keep the go-ahead decision you made" in out["agent_instruction"]
+
+
+def test_tool_description_names_plan_first_as_plan_only():
+    from ghost_agent.tools.projects import MANAGE_PROJECTS_TOOL_DEF
+    desc = MANAGE_PROJECTS_TOOL_DEF["function"]["description"]
+    assert "a message that asks for the project AND the work is the go-ahead" in desc
+    assert "'first scope it, add the tasks' — is plan only" in desc
+
+
+# ------------------------------------------------ §4UR review r1 minors
+
+def test_briefing_r1_minor_wording(store):
+    pid = store.create_project("Web OS 2", goal="a browser desktop")
+    ProjectPlan(store, pid).add_task("task a")
+    b = build_project_briefing(store, pid)
+    assert "only a NEW message from the user changes it" in b              # m4 queued
+    assert "'first plan it, then build it' asks for both" in b               # m3
+    assert "A task turn's 'do this ONE task now' is the go-ahead" in b      # task turns
+
+
+def test_closed_project_banner_carries_plan_only(store):
+    """m1: a closed project hides PACING; its banner said only "make it HERE"."""
+    pid = store.create_project("Closed One", goal="g")
+    store.update_project(pid, status="DONE")
+    b = build_project_briefing(store, pid)
+    assert "CLOSED by the user" in b
+    assert "add them and stop (unsure → stop at the plan)" in b
+    assert "*** PACING" not in b
+
+
+@pytest.mark.asyncio
+async def test_create_with_subtasks_keeps_the_decision(context):
+    out = json.loads(await tool_manage_projects(
+        context, action="create", title="With Plan", subtasks=["one", "two"]))
+    instr = out["agent_instruction"]
+    assert "keep the go-ahead decision you made" in instr
+    assert "follow the PACING rule" not in instr
+
+
+def test_tool_description_decide_before_the_call():
+    from ghost_agent.tools.projects import MANAGE_PROJECTS_TOOL_DEF
+    desc = MANAGE_PROJECTS_TOOL_DEF["function"]["description"]
+    assert "unsure → plan only" in desc
+    assert "Decide it BEFORE create/task_decompose/replan" in desc
+    assert "is plan only, even when it names the feature" in desc
+    assert "'first plan it, then build it' asks for both" in desc
+
+
+def test_incident_wording_is_a_plan_only_example(store):
+    """r2 m1: fb249da8 said "add the implementation tasks"; the go-ahead list
+    has 'implement…' — the plan-only list must carry the incident's words."""
+    pid = store.create_project("Web OS 3", goal="g")
+    ProjectPlan(store, pid).add_task("task a")
+    b = build_project_briefing(store, pid)
+    assert "'add the implementation tasks'" in b
+    assert b.index("'add the implementation tasks'") < b.index("'implement…'")

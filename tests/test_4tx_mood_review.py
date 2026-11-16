@@ -1025,3 +1025,12 @@ async def test_less_calm_while_cheerful_changes_nothing(tmp_path, owner):
     assert before[0] == "cheerful"
     out = await _set(sm, mood="calm", step=-1)                           # the fallback is for unpleasant moods only
     assert str(out).startswith(I.STEP_NOTHING) and (sm.mood().label, sm.mood().intensity) == before
+
+
+@pytest.fixture(autouse=True)
+def _two_hour_half_life(monkeypatch):
+    """§4US: these tests count time in units of the 2 h half-life they were written for (0.8 after 2 h is
+    0.4); they test the decay's mechanics, not its length. The live value (4 h) is pinned in
+    tests/test_4us_mood_visible.py."""
+    from ghost_agent.selfhood import mood as _M
+    monkeypatch.setattr(_M, "HALF_LIFE_S", 7200.0)

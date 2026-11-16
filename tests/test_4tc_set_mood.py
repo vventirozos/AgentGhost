@@ -287,7 +287,8 @@ async def test_the_mood_action_says_what_why_since_when_and_today(tmp_path):
                         f"{_hm(0, 3)} cheerful 2 — the owner said so (set_mood) (Elena said Bruno is home)")
     assert lines[3] == f'{I.TONE_SNAPSHOT}"{M.tone_line("cheerful", 2)}"'
     assert lines[4] == I.MOOD_HOW_IT_MOVES and len(lines) == 5
-    assert "half every 2 hours" in lines[4] and "action='set_mood'" in lines[4]
+    assert "half every 4 hours" in lines[4] and "action='set_mood'" in lines[4]       # §4US: built at import
+    assert "coming back after a long quiet" in lines[4]
 
 
 async def test_the_mood_action_for_a_neutral_mood(tmp_path):
@@ -861,3 +862,12 @@ async def test_the_mood_view_shows_the_tone_line_the_reply_gets(tmp_path, monkey
     block = A._mood_tone_block(ctx)
     assert block.endswith("\n\n") and tone == f'{I.TONE_SNAPSHOT}"{block[:-2]}"'
     assert "irritable, 2 of 3" in tone and "sarcastic, 3 of 3" in tone
+
+
+@pytest.fixture(autouse=True)
+def _two_hour_half_life(monkeypatch):
+    """§4US: these tests count time in units of the 2 h half-life they were written for (0.8 after 2 h is
+    0.4); they test the decay's mechanics, not its length. The live value (4 h) is pinned in
+    tests/test_4us_mood_visible.py."""
+    from ghost_agent.selfhood import mood as _M
+    monkeypatch.setattr(_M, "HALF_LIFE_S", 7200.0)

@@ -109,6 +109,7 @@ class ReplyTap:
         self._qf_len = 0
         self._qf_seen = ""
         self._trims: List[str] = []   # §4TE: the reply through finalize's reported trims
+        self.progress_wanted = False  # §4UT: the client shows steps (`X-Ghost-Progress: 1`)
 
     def set_lead(self, text: str) -> None:
         """§4MU: the finalize prepends a staged block (a deferred correction
@@ -229,6 +230,16 @@ class ReplyTap:
         out.append(b"data: [DONE]\n\n")
         self.outcome = outcome
         return out
+
+    def progress(self, step: Dict[str, Any]) -> None:
+        """§4UT: a progress frame (a finished tool step, or its sentence) — never reply text: no choices,
+        ``ghost.progress`` first (``core.progress.frame_bytes``), so the route does not count it as the reply
+        having started and a retract never touches it. Never raises."""
+        try:
+            from .progress import frame_bytes
+            self.queue.put_nowait(frame_bytes(self.chunk_id, self.created, self.model, dict(step)))
+        except Exception as e:  # noqa: BLE001 — progress never breaks a reply
+            logger.debug("progress frame dropped: %s", e)
 
     def retract_before_stream(self) -> List[bytes]:
         """A forced final (or an error) follows: drop what was shown first."""

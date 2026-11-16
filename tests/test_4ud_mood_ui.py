@@ -1043,3 +1043,12 @@ def test_the_page_shows_no_mood_words_under_the_input():
     assert "#mood-text" not in (static / "style.css").read_text()
     js = (static / "status.js").read_text()
     assert "mood-text" not in js and "paintMood" not in js
+
+
+@pytest.fixture(autouse=True)
+def _two_hour_half_life(monkeypatch):
+    """§4US: these tests count time in units of the 2 h half-life they were written for (0.8 after 2 h is
+    0.4); they test the decay's mechanics, not its length. The live value (4 h) is pinned in
+    tests/test_4us_mood_visible.py."""
+    from ghost_agent.selfhood import mood as _M
+    monkeypatch.setattr(_M, "HALF_LIFE_S", 7200.0)

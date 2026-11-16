@@ -96,6 +96,7 @@
   refutes on <em>absence</em> of supporting memory is the false-negative trap this module already
   carries a truncation guard for. Pinned in
   <code>tests/test_correction_adjudication.py</code>.</p>
+  <p><strong>&sect;4US (2026-11-16): the correction judge never ruled.</strong> The judge on Nova answers <code>{"correct": true}</code> where the prompt asks for <code>"corrects"</code> (8 of 8 live cases: right verdict, wrong key). So <code>parse_adjudication</code> returned <code>None</code> every time and nothing was promoted or reached the mood since at least 10-07. It now reads the single boolean of an answer whose key starts with "correct"; two booleans, or another key, is still no ruling. The phrase gate also gained the direct forms ("you are wrong", "that is wrong", "you didn't…", "i told you", Greek "κάνεις λάθος") and a lead-in ("well, …"). Pinned in <code>tests/test_4us_mood_visible.py</code>.</p>
   <p><em>Correction to an earlier reading:</em> a single bootstrap of the live corpus suggested that
   same-mix growth at 2&times; would become resolvable. Across seeds that replicates about one time in
   three and is <strong>not</strong> a finding; only the confirm-only collapse is robust.</p>

@@ -78,7 +78,7 @@ APT_NO_DROP_CMD = "sh -c " + shlex.quote(_APT_NO_DROP_SH)
 #: against code that sets out to delete (`/bin/rm`, shutil.rmtree).
 SAFE_RM_SH = r"""#!/bin/sh
 # Ghost sandbox: a whole project / projects / uploads / the workspace is
-# deleted through manage_projects (it previews and asks the user), never rm.
+# deleted through manage_projects (in the user's own conversation, at once), never rm.
 # Case-insensitive (the macOS bind mount is), symlinks not followed (removing
 # a link is fine), and only paths under /workspace are examined.
 here=$(pwd | tr 'A-Z' 'a-z')
@@ -94,7 +94,7 @@ for a in "$@"; do
   lp=$(printf '%s' "$p" | tr 'A-Z' 'a-z')
   case "$lp" in
     /workspace|/workspace/|/workspace/projects|/workspace/uploads|/workspace/projects/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
-      echo "rm: refusing to remove '$a' — a whole project, projects/, uploads/ or the workspace is deleted with manage_projects (it shows the user a preview and asks). Nothing was removed." >&2
+      echo "rm: refusing to remove '$a' — a whole project, projects/, uploads/ or the workspace is deleted with manage_projects (it runs at once in the user's own conversation; a background or test turn cannot). Nothing was removed." >&2
       exit 1 ;;
   esac
 done

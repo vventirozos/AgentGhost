@@ -1,7 +1,8 @@
-import * as matrixGraphFace from './matrix_graph.js?v=19.29';
+import * as matrixGraphFace from './matrix_graph.js?v=19.32';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
-import { turnCaption } from './turn_caption.js?v=1.1';   // what the status line under the reply shows
+import { turnCaption } from './turn_caption.js?v=1.1';
+import { StepList } from './progress.js?v=1.2';   // §4UT: the agent's steps   // what the status line under the reply shows
 import { createBargeIn, isStopWord } from './bargein.js?v=1.5';   // talk over a spoken reply
 
 // --- Voice Globals ---
@@ -384,6 +385,8 @@ const _authedBlobInflight = new Map();
 const _autoOpenedImgSrcs = new Set();
 let currentChunkIndex = 0;
 let currentAgentMessageDiv = null;
+// §4UT: this reply's step list (progress.js) — made on its first progress frame, above the bubble
+let currentSteps = null;
 let currentAccumulatedContent = "";
 // The AGENT's request id for the in-flight turn (from the SSE frames'
 // "chatcmpl-<id>" envelope) — the handle /api/feedback labels ride on.
@@ -2077,6 +2080,7 @@ function _applyStreamRetract() {
     currentSpeechHold = false;
     _cancelScheduledStreamRender();
     if (currentAgentMessageDiv) currentAgentMessageDiv.innerHTML = "";
+    if (typeof currentSteps !== 'undefined' && currentSteps) currentSteps.resume();     // §4UT: the work goes on — so does the step list
     return true;
 }
 
@@ -2122,6 +2126,9 @@ function _renderStreamingContent() {
     // Rendering the empty string here is what blanked the bubble for the
     // whole thinking phase.
     if (!displayContent) return;
+    // §4UT: reply text on screen — the steps fold (r1: also after a retract, when the bubble is revealed already)
+    if (typeof currentSteps !== 'undefined' && currentSteps && !currentSteps.answering
+        && currentSteps.bubble === currentAgentMessageDiv) currentSteps.answer();
     if (_revealAgentBubble(currentAgentMessageDiv)) {
         // From here the reply itself is the story — the caption says so
         // until turn end.
@@ -2663,11 +2670,14 @@ async function reconcileFromSession(sid, handle) {
         // §4RN: the resume bubble may hold a PARTIAL reply (no `thinking`
         // class) and still carry the clock the recovery gave it.
         stopTurnTicker();
+        // §4UT r1 M1: the lost turn's step list stops pulsing — it folds, or goes with a bubble that is gone
         // A placeholder bubble that never streamed has nothing to show.
         if (currentAgentMessageDiv && currentAgentMessageDiv.classList.contains('thinking')) {
             currentAgentMessageDiv.remove();
             currentAgentMessageDiv = null;
         }
+        // §4UT r2: AFTER the bubble's fate — a list above a removed bubble goes with it, else it folds
+        if (typeof currentSteps !== 'undefined' && currentSteps) { currentSteps.answer(); currentSteps = null; }
         clearInflightHandle(handle);
         // §4RZ r6a2: the recovery ended this page's lost turn (guarded: the
         // recovery is also run on its own, extracted, by older suites)
@@ -4202,6 +4212,7 @@ async function sendMessage(isResume = false, queuedText = null) {
 
         currentTaskId = null;
         currentTurnStartedAt = Date.now();
+        currentSteps = null;
         currentChunkIndex = 0;
         currentAccumulatedContent = "";
         currentStreamPrefixLen = 0;
@@ -4418,6 +4429,21 @@ async function sendMessage(isResume = false, queuedText = null) {
                     // counter only — never reply text, speech or history.
                     if (data.ghost && data.ghost.usage) {
                         tokenCounter.note(data.ghost.usage);
+                        continue;
+                    }
+                    // §4UT: a step of the agent's work (or its sentence) — never reply text
+                    if (data.ghost && data.ghost.progress) {
+                        if (currentAgentMessageDiv) {
+                            if (!currentSteps || currentSteps.bubble !== currentAgentMessageDiv) {
+                                // r1 M1: a reconnect made a new bubble and replays the stream from the start —
+                                // the old list goes (it would stay above nothing, pulsing, beside a copy)
+                                if (currentSteps) currentSteps.remove();
+                                const _bubble = currentAgentMessageDiv;
+                                currentSteps = new StepList(() => _bubble, currentTurnStartedAt);
+                                currentSteps.bubble = _bubble;
+                            }
+                            currentSteps.note(data.ghost.progress);
+                        }
                         continue;
                     }
 
@@ -4753,6 +4779,7 @@ async function sendMessage(isResume = false, queuedText = null) {
         }
     } finally {
         if (currentThinkingInterval) { clearInterval(currentThinkingInterval); currentThinkingInterval = null; }
+        // (§4UT: the step list folds below, once the bubble's fate is known)
         // Cancel any throttled render still queued for a future frame —
         // otherwise it fires after this point and re-adds `streaming`.
         _cancelScheduledStreamRender();
@@ -4784,6 +4811,10 @@ async function sendMessage(isResume = false, queuedText = null) {
                 }
             }
         }
+
+        // §4UT: the turn is over — the step list folds (or goes, with a bubble that never got content).
+        // A resume coming continues the same turn: its list stays as it is.
+        if (currentSteps && !_turnStillLive) currentSteps.answer();
 
         // A resume is coming: it continues this half sentence, so it isn't said in halves.
         if (isTTSActive && ttsBuffer.trim().length > 0 && !_turnStillLive) {
@@ -7535,7 +7566,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=9.14').catch(e => {
+import('./workspace.js?v=9.17').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

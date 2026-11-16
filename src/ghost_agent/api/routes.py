@@ -1588,6 +1588,8 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             if not request_id:
                 request_id = str(uuid.uuid4())[:8]      # the agent's own format (handle_chat)
             _tap = ReplyTap(request_id, model, int(time.time()))
+            # §4UT: steps only for a client that shows them (the web console's proxy, the CLI)
+            _tap.progress_wanted = (request.headers.get("X-Ghost-Progress") or "").strip() == "1"
 
         async def stream_generator():
             # Track whether any real content chunk has shipped to the
@@ -1605,6 +1607,7 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
 
                 import contextvars as _cv
                 from ..core.reply_tap import reply_tap_context as _rtc
+                from ..core.progress import is_progress_frame as _is_progress
 
                 async def _turn_capturing_context():
                     _r = await agent.handle_chat(body, background_tasks, request_id=request_id)
@@ -1666,20 +1669,24 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                                 yield STREAM_KEEPALIVE_FRAME
                                 continue
                             if _get in _done:
-                                content_started = True
-                                yield _get.result()
+                                _f = _get.result()
+                                if not _is_progress(_f):      # §4UT: a progress step is not the reply
+                                    content_started = True
+                                yield _f
                             else:
                                 _get.cancel()
                             _get = None
                         if _get is not None and _get.done() and not _get.cancelled():
                             # review: the turn ended while a keepalive was being
                             # sent and the pending get had already taken a frame
-                            content_started = True
-                            yield _get.result()
+                            _f = _get.result()
+                            content_started = content_started or not _is_progress(_f)
+                            yield _f
                             _get = None
                         while not _tap.queue.empty():
-                            content_started = True
-                            yield _tap.queue.get_nowait()
+                            _f = _tap.queue.get_nowait()
+                            content_started = content_started or not _is_progress(_f)
+                            yield _f
                         if _turn.cancelled():
                             # §4MR: a HARD stop cancelled the turn task itself
                             # (the registry holds it now). Live text must not

@@ -1560,3 +1560,12 @@ def test_the_diarys_recall_query_is_the_label_of_the_days_last_step(tmp_path):
     assert n._derive_recall_query(s) == ""
     s.mark_owner_turn(now=dt.datetime.now(UTC) - dt.timedelta(hours=7))
     assert s.mood().label == "bored" and n._derive_recall_query(s) == ""
+
+
+@pytest.fixture(autouse=True)
+def _two_hour_half_life(monkeypatch):
+    """§4US: these tests count time in units of the 2 h half-life they were written for (0.8 after 2 h is
+    0.4); they test the decay's mechanics, not its length. The live value (4 h) is pinned in
+    tests/test_4us_mood_visible.py."""
+    from ghost_agent.selfhood import mood as _M
+    monkeypatch.setattr(_M, "HALF_LIFE_S", 7200.0)

@@ -211,6 +211,7 @@ COMPLETER = NestedCompleter.from_nested_dict({
     "/cancel": {"hard": None},
     "/interrupt": None,
     "/notify": None,
+    "/progress": {"on": None, "off": None},
     "/memory": {"fix": None, "rm": None},
     "/upload": PathCompleter(expanduser=True),
     "/download": None,
@@ -449,6 +450,93 @@ def strip_orphan_think_close(text):
     for i in range(len(fences) - 1, -1, -1):          # outer shields hold inner ones
         out = out.replace(f"\x00FENCE{i}\x00", fences[i])
     return out
+
+
+class _StepPrinter:
+    """§4UT: the agent's steps while it works, printed the way Claude Code prints them:
+
+        ● I read the portfolio app's styles and concluded no CSS changes are needed.
+          ⎿  Read a file
+
+    A step frame (``ghost.progress`` with ``summary``) comes first; its sentence (``text``, same ``seq``)
+    about a second later. The step is held until its sentence, the next step or the answer arrives — or
+    ``WAIT_S`` passes — so the sentence prints above its summary. A step that gets no sentence prints its
+    summary alone. Nothing prints after ``stop`` (the answer has started). Thread-safe."""
+
+    WAIT_S = 5.0
+
+    def __init__(self, emit):
+        self._emit = emit
+        self._pending: dict | None = None
+        self._timer: threading.Timer | None = None
+        self._lock = threading.Lock()
+        self._stopped = False
+        self.printed = 0
+
+    def on(self, progress: dict) -> None:
+        if not isinstance(progress, dict):
+            return
+        with self._lock:
+            if self._stopped:
+                return
+            seq = progress.get("seq")
+            if progress.get("summary"):
+                self._flush_locked()
+                self._pending = dict(progress)
+                self._timer = threading.Timer(self.WAIT_S, self._on_timer)
+                self._timer.daemon = True
+                self._timer.start()
+            elif progress.get("text") and self._pending is not None and self._pending.get("seq") == seq:
+                self._pending["text"] = str(progress["text"])
+                self._flush_locked()
+
+    def _on_timer(self) -> None:
+        with self._lock:
+            if not self._stopped:
+                self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        step, self._pending = self._pending, None
+        if not step:
+            return
+        summary = _safe(str(step.get("summary") or ""))
+        sentence = _safe(str(step.get("text") or ""))
+        from rich.table import Table
+        line = Table.grid(padding=0)              # a wrapped sentence stays under its first word
+        line.add_column(width=GUTTER + 2, no_wrap=True)
+        line.add_column(ratio=1)
+        bullet = Text(" " * GUTTER + "● ", style=PALETTE["ghost"])
+        if sentence:
+            line.add_row(bullet, Text(sentence))
+            if summary:
+                line.add_row(Text(""), Text("⎿  " + summary, style=PALETTE["mute"]))
+        else:
+            line.add_row(bullet, Text(summary, style=PALETTE["mute"]))
+        self.printed += 1
+        try:
+            self._emit(line)
+        except Exception:          # noqa: BLE001 — a step line is optional
+            pass
+
+    def discard(self) -> None:
+        """Ctrl-C: drop what is held, print nothing more."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._pending = None
+            self._stopped = True
+
+    def stop(self) -> None:
+        """The answer starts (or the turn ended): print what is held, then nothing more."""
+        with self._lock:
+            if self._stopped:
+                return
+            self._flush_locked()
+            self._stopped = True
 
 
 class _StreamPrinter:
@@ -1012,6 +1100,7 @@ HELP = """[bold]conversation[/]
   [you]/cancel[/] \\[hard]         cancel the turn the agent is running — any client's (hard = force-release)
   [you]/interrupt[/]             stop the tool this conversation's turn is running; the turn goes on
   [you]/notify[/]                show + ack pending autonomous-activity notifications
+  [you]/progress[/] \[on|off]      the agent's steps while it works [dim](bare = show)[/]
   [you]/memory fix[/] "old" "new"  correct one vector-memory fragment
   [you]/memory rm[/] "text"        delete one vector-memory fragment
 [bold]files[/]
@@ -1105,12 +1194,14 @@ class GhostAPI:
 
     # -- chat --------------------------------------------------------------
     def chat_stream(self, messages: list[dict], session_id: str,
-                    request_id: str, effort: str = "") -> requests.Response:
+                    request_id: str, effort: str = "", progress: bool = False) -> requests.Response:
         # §4SD: the read has no timeout, so tell the agent it may run as long as
         # it keeps making progress (same budget as the web page)
         headers = {"X-Request-ID": request_id, "X-Ghost-Client-Timeout": "inf"}
         if effort:                                  # §4RB: Default sends nothing
             headers["X-Ghost-Effort"] = effort
+        if progress:                                # §4UT: the agent's steps, as frames
+            headers["X-Ghost-Progress"] = "1"
         return self.http.post(
             self._url("/v1/chat/completions"),
             json={"messages": messages, "stream": True,
@@ -1281,6 +1372,8 @@ class GhostCLI:
         # §4RB: reasoning effort for this client's turns ("" = Default), and
         # whether the agent's switch is on (set by the banner's health probe).
         self.effort = ""
+        # §4UT: the agent's steps while it works, printed like Claude Code's ("● sentence" / "⎿ summary")
+        self.show_progress = os.environ.get("GHOST_CLI_PROGRESS", "1").strip() != "0"
         self._effort_switch = False
         self._effort_default = ""      # the server's own level (health), for Default's icon
         # The pinned status line's liveness segment, refreshed off-thread
@@ -1481,6 +1574,15 @@ class GhostCLI:
         saw_retract = False            # a hard stop's shape: retract, then no reply
         trim_hold = None               # §4TE: (tail_chars, the reply's chunks)
 
+        def _emit_step(line) -> None:
+            if busy is None:
+                console.print(line)
+            else:
+                with busy.lock:
+                    if not busy.detached:
+                        console.print(line)
+        steps = _StepPrinter(_emit_step) if self.show_progress else None   # §4UT
+
         def _release_trim(clean: bool) -> None:
             """§4TE: settle a held reply. The whole of it arrived: keep what
             is printed. It did not: as any retract, so nothing is lost."""
@@ -1523,10 +1625,13 @@ class GhostCLI:
                 waiting = False
             _release_trim(False)       # before the notice the caller prints
             printer.settle()
+            if steps is not None:      # §4UT r2: a held step never prints under an error line (the
+                steps.discard()        # normal end stops — prints — it before this runs)
 
         try:
             with self.api.chat_stream(self.history, self.session_id,
-                                      request_id, self.effort) as resp:
+                                      request_id, self.effort,
+                                      progress=self.show_progress) as resp:
                 if busy is not None:
                     busy.resp = resp
                 if resp.status_code != 200:
@@ -1555,7 +1660,7 @@ class GhostCLI:
                         obj = json.loads(data)
                     except json.JSONDecodeError:
                         continue
-                    if (set(obj.get("ghost") or {}) - {"usage", "labelable"}
+                    if (set(obj.get("ghost") or {}) - {"usage", "labelable", "progress"}
                             or (obj.get("choices") or [{}])[0].get("delta", {}).get("content")):
                         self._streamed["any"] = True   # the turn ran (r16)
                     if obj.get("error"):
@@ -1572,11 +1677,19 @@ class GhostCLI:
                     if isinstance(_usage, dict):
                         self._note_usage(_usage)
                         continue
+                    _progress = (obj.get("ghost") or {}).get("progress")
+                    if isinstance(_progress, dict):          # §4UT: a step of the agent's work
+                        if steps is not None:
+                            steps.on(_progress)
+                        continue
                     if (obj.get("ghost") or {}).get("retract") is True:
                         # §4MP: the agent dropped the text it streamed (a tool
                         # call followed, or the reply was rewritten). Printed
                         # lines cannot be taken back: mark it, start again.
                         saw_retract = True
+                        if steps is not None:   # §4UT: text taken back mid-work — the steps go on below it
+                            steps.stop()
+                            steps = _StepPrinter(_emit_step)
                         _release_trim(False)
                         _tail_chars = _trim_tail_chars(obj.get("ghost"))
                         if held is not None:
@@ -1600,11 +1713,15 @@ class GhostCLI:
                     if trim_hold is not None:
                         trim_hold[1].append(chunk)
                         continue
+                    if steps is not None:  # §4UT: the answer starts — the steps end above it
+                        steps.stop()
                     if waiting:            # first token: spinner down
                         status_spin.stop()
                         waiting = False
                     printer.feed(chunk)
         except KeyboardInterrupt:
+            if steps is not None:      # §4UT r1: a held step is not printed after the abort
+                steps.discard()
             _settle()
             self._turn_interrupted = "cancelled"
             self._abort_turn(request_id)
@@ -1617,6 +1734,8 @@ class GhostCLI:
             self._turn_interrupted = "error"
             note(f"✖ {type(e).__name__}: {e}", "err")
         finally:
+            if steps is not None:
+                steps.stop()
             if self._turn_interrupted or not saw_done:
                 held = None            # §4KP: never the unfiltered reasoning of a cut reply
             _release()
@@ -2774,6 +2893,15 @@ class GhostCLI:
                              else Text(_safe(val)))
             console.print(line)
 
+    def cmd_progress(self, args: list[str]) -> None:
+        """/progress [on|off] — §4UT: show the agent's steps while it works (bare = show the setting)."""
+        if args and args[0].lower() not in ("on", "off"):
+            self.notice("usage: /progress [on|off]", "err")
+            return
+        if args:
+            self.show_progress = args[0].lower() == "on"
+        self.notice(f"progress: {'on' if self.show_progress else 'off'}", "mute")
+
     def cmd_effort(self, args: list[str]) -> None:
         """/effort [level] — set (or, bare, show) the reasoning effort sent
         with this client's messages. Health is asked either way: while the
@@ -3111,6 +3239,8 @@ class GhostCLI:
                     self.cmd_interrupt()
                 case "/notify":
                     self.cmd_notify()
+                case "/progress" if len(args) <= 1:
+                    self.cmd_progress(args)
                 case "/memory" if args:
                     self.cmd_memory(args[0].lower(), args[1:])
                 case "/upload" if args:

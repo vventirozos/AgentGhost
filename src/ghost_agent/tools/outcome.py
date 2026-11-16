@@ -85,6 +85,31 @@ DESIGNED_STOP_REASONS = frozenset({"clarify_first", "subject_photo_missing", "co
                                    "project_not_requested", "forget_wait_shown", "reset_wait_shown"})
 
 
+#: §4UR-w (2026-11-16, probe-3f34a566): REJECTED outcomes that are a WHO-MAY-ACT
+#: wall — the refusal is about who asked (a background/scheduled/probe turn, a
+#: member, a request that read outside content, unattended work on a kept lab),
+#: never about the arguments. The loop's refusal advice ("the message names what
+#: is wrong with the arguments — re-issue the SAME tool with that one thing
+#: corrected") sent the model round a delete wall 4× in 7 minutes. These codes
+#: get the wall advice instead (core/agent.py). Every wall site sets one of them.
+WHO_MAY_ACT_REASONS = frozenset({
+    "who_may_act",                                   # manage_projects walls (tools/projects.py)
+    "lab_not_allowed", "run_not_allowed",            # labs / runs: unattended, probe, kept, another owner
+    "untrusted_content", "untrusted_egress",         # the request read outside content
+    "keep_not_asked", "keep_after_untrusted",        # knowledge_base keep
+    "forget_not_confirmed", "reset_not_confirmed",   # memory forget / reset_all walls
+    "owner_only",                                    # introspect set_mood / manner
+    "owner_write_not_owner_turn",                    # owner facts from a probe / background turn
+    "owner_data_blocked", "quarantine_owner_only",   # a channel member on the owner's data / quarantine
+})
+
+
+def is_who_may_act_wall(res) -> bool:
+    """Is this result a who-may-act wall (see ``WHO_MAY_ACT_REASONS``)?"""
+    return (getattr(res, "status", None) is OutcomeStatus.REJECTED
+            and str(getattr(res, "reason_code", "") or "") in WHO_MAY_ACT_REASONS)
+
+
 #: Statuses that imply the call changed NOTHING unless it says otherwise.
 #:
 #: REJECTED never touched anything by definition. FAILED and UNRESOLVED

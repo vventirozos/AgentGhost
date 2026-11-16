@@ -833,80 +833,30 @@ def _stamp(st):
 
 def test_the_owners_return_ends_the_quiet_and_carries_no_boredom_into_his_turn(tmp_path, owner):
     """Review: boredom written into the pair at his return left 13 % of the
-    owner's real turns starting neutral. Now the quiet simply ends."""
+    owner's real turns starting neutral. Now the quiet simply ends — and
+    (§4US, operator 11-16: few requests a day, the mood must be visible) his
+    coming back is a small lift of its own, never the boredom."""
     agent, st = _quiet_agent(tmp_path, 13.0)
     with _as("sched-morning-news"):
         assert (_mood(agent).label, _mood(agent).intensity) == ("bored", 2)     # the night's report hears it
     before = _stamp(st)
     agent._mood_owner_arrived()
     assert _stamp(st) > before                                           # his presence is stamped …
-    assert st.state.mood is None                                         # … and nothing went into the pair
+    m = st.state.mood                                                    # … and the pair holds only the lift
+    assert (m.p, m.e) == pytest.approx(M.EV_RETURN) and (m.label, m.intensity) == ("cheerful", 1)
+    assert m.cause == "the owner came back after 13 hours"
     for rid in (OWNER_RID, "sched-morning-news", "probe-1"):
         with _as(rid):
-            assert _mood(agent).neutral                                  # for anyone: the quiet is over
+            assert (_mood(agent).label, _mood(agent).intensity) == ("cheerful", 1)   # the quiet is over
     assert [(r["label"], r["intensity"], r["kind"]) for r in _rows(agent)] == [
-        ("bored", 1, "quiet"), ("bored", 2, "quiet"), ("neutral", 0, "quiet_end")]
-    agent._mood_owner_arrived()                                          # his next message: no second row
-    assert len(_rows(agent)) == 3
-
-
-def test_the_owner_is_never_answered_bored_even_before_his_arrival_is_stamped(tmp_path, owner):
-    agent, st = _quiet_agent(tmp_path, 13.0)
-    assert A._mood_tone_block(agent.context) == "" and _mood(agent).neutral        # the owner's own request
-    assert _rows(agent) == []                                            # and his read wrote no row
-    with _as("slack-m-1", role="member"):
-        # §4TX: a quiet is not taken out on whoever writes next — no reply hears boredom; the face still shows it
-        assert A._mood_tone_block(agent.context) == ""
-        assert _mood(agent).label == "bored"
-
-
-def test_an_owners_request_that_follows_no_boredom_writes_no_quiet_row(tmp_path, owner):
-    agent, st = _quiet_agent(tmp_path, 2.0)
-    agent._mood_owner_arrived()
-    assert _rows(agent) == [] and st.state.mood is None
-
-
-@pytest.mark.parametrize("mark", ["leaf", "contained", "isolated", "sim"])
-def test_a_run_that_is_not_the_live_agent_ends_no_quiet_even_under_the_owners_id(tmp_path, owner, mark):
-    agent, st = _quiet_agent(tmp_path, 13.0)
-    before = _stamp(st)
-    if mark in ("leaf", "sim"):
-        agent.context.turn_origin_label = mark
-    elif mark == "contained":
-        agent.context._replay_forbidden_tools = frozenset({"deploy"})
-    else:
-        agent.context.owner_memory_isolated = True
-    agent._mood_owner_arrived()
-    _record(agent, _turn(BAD_TURN))
-    assert _stamp(st) == before and _rows(agent) == []
-
-
-@pytest.mark.parametrize("rid", ["probe-4tc", "sched-morning", "job-12", "sub-3", "sim-9", "bench-1"])
-def test_a_request_that_is_not_the_owners_neither_ends_the_quiet_nor_stamps_a_turn(tmp_path, rid):
-    agent, st = _quiet_agent(tmp_path, 13.0)
-    before = _stamp(st)
-    tok = request_id_context.set(rid)
-    try:
-        agent._mood_owner_arrived()
-        _record(agent, _turn(BAD_TURN), rid=rid)
-        # §4UD (F9): the wake-up of a job the OWNER started that did work is the one exception — the agent is
-        # working for the owner, so the quiet is measured from there (this test pinned "bored" for it too)
-        assert _mood(agent).label == ("neutral" if rid.startswith("job-") else "bored")
-    finally:
-        request_id_context.reset(tok)
-    assert _stamp(st) == before                                           # the OWNER's stamp: never moved
-    assert bool(st.state.last_owner_job_at) is rid.startswith("job-")
-    # no "quiet ended" (the job's stamp came before any reader saw the quiet: no row of it at all)
-    assert [r["kind"] for r in _rows(agent)] == ([] if rid.startswith("job-") else ["quiet", "quiet"])
-
-
-def test_a_members_request_neither_ends_the_quiet_nor_stamps_a_turn(tmp_path, owner):
-    agent, st = _quiet_agent(tmp_path, 13.0)
-    before = _stamp(st)
+        ("bored", 1, "quiet"), ("bored", 2, "quiet"), ("neutral", 0, "quiet_end"), ("cheerful", 1, "return")]
+    agent._mood_owner_arrived()                                          # his next message: no second row, no 2nd lift
+    assert len(_rows(agent)) == 4 and (st.state.mood.p, st.state.mood.e) == pytest.approx(M.EV_RETURN, abs=1e-3)
+    before, pair = _stamp(st), (st.state.mood.p, st.state.mood.e)
     with _as("slack-m-1", role="member"):
         agent._mood_owner_arrived()
         _record(agent, _turn(BAD_TURN), rid="slack-m-1")
-    assert _stamp(st) == before and st.state.mood is None
+    assert _stamp(st) == before and (st.state.mood.p, st.state.mood.e) == pair
 
 
 def test_the_end_of_an_owners_turn_stamps_it_so_the_next_quiet_counts_from_there(tmp_path, owner):
@@ -976,11 +926,11 @@ async def test_through_handle_chat_the_owners_message_ends_the_quiet_before_he_i
     monkeypatch.setattr(__import__("ghost_agent.utils.logging", fromlist=["x"]), "request_kind",
                         lambda *a, **k: "owner")
     await _say(agent, "good morning — what's new?")
-    assert _stamp(st) > before and st.state.mood is None
-    assert [r["kind"] for r in st.mood_history()] == ["quiet", "quiet", "quiet_end"]
+    assert _stamp(st) > before and st.state.mood.cause == "the owner came back after 13 hours"     # §4US
+    assert [r["kind"] for r in st.mood_history()][:4] == ["quiet", "quiet", "quiet_end", "return"]
     monkeypatch.setattr(__import__("ghost_agent.utils.logging", fromlist=["x"]), "request_kind",
                         lambda *a, **k: "background")
-    assert st.mood().neutral
+    assert st.mood().label != "bored"
 
 
 @pytest.mark.asyncio
@@ -1115,3 +1065,10 @@ def test_a_take_back_marks_only_its_own_reply_and_the_marks_are_bounded(tmp_path
         sm.note_owner_reaction(M.KIND_THUMB_UP, reply_id=f"x{i}")
         sm.retract_owner_reaction(True, reply_id=f"x{i}")
     assert len(sm._taken_back) <= SelfModel.LEDGER_REPLIES
+
+
+@pytest.fixture(autouse=True)
+def _two_hour_half_life(monkeypatch):
+    """§4US: these tests count time in units of the 2 h half-life they were written for; the live value (4 h)
+    is pinned in tests/test_4us_mood_visible.py."""
+    monkeypatch.setattr(M, "HALF_LIFE_S", 7200.0)

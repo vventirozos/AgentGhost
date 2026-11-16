@@ -62,6 +62,7 @@ _CARRIER = {
     "status.js": "workspace.js",
     "notifications.js": "workspace.js",
     "palette.js": "workspace.js",
+    "progress.js": "app.js",        # §4UT: the step list (palette.js imports it too, same version)
     # §4PR: a CSS edit without a bump was caught only by literal pins
     "style.css": "index.html",
 }
@@ -79,6 +80,7 @@ _ANCESTORS = {
     "status.js": ["workspace.js", "app.js"],
     "notifications.js": ["workspace.js", "app.js"],
     "palette.js": ["workspace.js", "app.js"],
+    "progress.js": ["app.js"],
     "style.css": [],
 }
 

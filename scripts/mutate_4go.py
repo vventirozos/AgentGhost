@@ -78,8 +78,9 @@ AGENT_MUTANTS = [
      "    body = (final_ai_content or \"\").strip()\n    if body:\n        return final_ai_content\n    if not body:\n        return note"),
 
     ("M12 the strike cap keeps its own spelling",
-     "                        final_ai_content = _with_abort_note(\n                            final_ai_content,\n                            \"[ATTEMPT_ABORTED_STRIKE_CAP] I hit a hard limit after \"",
-     "                        final_ai_content = final_ai_content or (\n                            \"[ATTEMPT_ABORTED_STRIKE_CAP] I hit a hard limit after \""),
+     # §4UR-w: the cap now picks the wall note or the hard-limit note
+     "                        final_ai_content = _with_abort_note(\n                            final_ai_content,\n                            # §4UR-w r2 M1",
+     "                        final_ai_content = final_ai_content or _with_abort_note(\n                            \"\",\n                            # §4UR-w r2 M1"),
 
     ("M13 the note stacks on re-entry",
      "    if note[:48] in body:                      # idempotent across re-entry\n        return final_ai_content",

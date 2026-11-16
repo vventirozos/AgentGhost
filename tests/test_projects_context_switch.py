@@ -96,7 +96,9 @@ def test_briefing_in_the_creating_request_says_the_rest_is_still_to_do(store):
     try:
         pid = store.create_project("X")
         b = build_project_briefing(store, pid)
-        assert "Creating it is done; anything else the user asked for" in b
+        # §4UR r1 m2: neutral — no "building it … is still to do"
+        assert "Creating it is done; whether anything else in this message is still to do is decided by PACING" in b
+        assert "building it" not in b
         assert "has been fulfilled" not in b
         request_id_context.set("c0ffee02")              # the next request
         assert "has been fulfilled" in build_project_briefing(store, pid)

@@ -1,7 +1,7 @@
 {
   "app.js": {
-    "sha": "1fbd2daca31c4194",
-    "version": "19.29"
+    "sha": "3a495b70b401c672",
+    "version": "19.32"
   },
   "bargein.js": {
     "sha": "07e236cbbe833426",
@@ -13,15 +13,19 @@
   },
   "matrix_graph.js": {
     "sha": "aea8ab7652c792ac",
-    "version": "19.29"
+    "version": "19.32"
   },
   "notifications.js": {
     "sha": "487030a97676874f",
     "version": "7.2"
   },
   "palette.js": {
-    "sha": "9ee142144bae9067",
-    "version": "7.6"
+    "sha": "2f04e0934475aed0",
+    "version": "7.9"
+  },
+  "progress.js": {
+    "sha": "7d67c15d7a20939b",
+    "version": "1.2"
   },
   "sessions.js": {
     "sha": "2736937dcba53232",
@@ -32,8 +36,8 @@
     "version": "8.4"
   },
   "style.css": {
-    "sha": "bd11777c18ae5f92",
-    "version": "9.0"
+    "sha": "498dd1fa6a098770",
+    "version": "9.3"
   },
   "temperament.js": {
     "sha": "132b80099b19b9c0",
@@ -48,7 +52,7 @@
     "version": "1.1"
   },
   "workspace.js": {
-    "sha": "ce2636a3790d09fe",
-    "version": "9.14"
+    "sha": "868c2a6dd33160f6",
+    "version": "9.17"
   }
 }

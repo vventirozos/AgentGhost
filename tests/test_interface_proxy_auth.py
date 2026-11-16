@@ -58,7 +58,7 @@ async def test_chat_proxy_adds_auth_header_streaming(mock_client_class):
     # up front (contract: tests/test_interface_fix_first_2026_09_11.py);
     # 2026-09-21 (§4JP): and its own timeout, so the agent can reserve the
     # last minutes for a state report; nothing else may ride along.
-    assert set(kwargs["headers"]) == {"X-Ghost-Key", "X-Request-ID", "X-Ghost-Client-Timeout"}
+    assert set(kwargs["headers"]) == {"X-Ghost-Key", "X-Request-ID", "X-Ghost-Client-Timeout", "X-Ghost-Progress"}   # §4UT
     # §4SD: the streamed path's CHAT_TIMEOUT_S bounds the gap between bytes,
     # not the request — it tells the agent it waits as long as the build runs
     assert kwargs["headers"]["X-Ghost-Client-Timeout"] == "inf"

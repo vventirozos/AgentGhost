@@ -25,7 +25,7 @@ from ghost_agent.selfhood.state import MOOD_HISTORY_FILENAME
 
 UTC = datetime.timezone.utc
 T0 = datetime.datetime(2026, 11, 10, 12, 0, 0, tzinfo=UTC)
-H = M.HALF_LIFE_S
+# §4US: no module-level copy of M.HALF_LIFE_S — the autouse fixture pins it per test (7200)
 
 
 def _state(tmp_path, rest=None):
@@ -694,3 +694,12 @@ def test_battery_the_health_endpoint_carries_the_rest_region(tmp_path):
                                                     resolved_config={}))
     body = json.loads(asyncio.new_event_loop().run_until_complete(routes.api_health(req)).body)
     assert body["mood"]["rest"] == "calm" and body["mood"]["intensity"] == 0
+
+
+@pytest.fixture(autouse=True)
+def _two_hour_half_life(monkeypatch):
+    """§4US: these tests count time in units of the 2 h half-life they were written for (0.8 after 2 h is
+    0.4); they test the decay's mechanics, not its length. The live value (4 h) is pinned in
+    tests/test_4us_mood_visible.py."""
+    from ghost_agent.selfhood import mood as _M
+    monkeypatch.setattr(_M, "HALF_LIFE_S", 7200.0)

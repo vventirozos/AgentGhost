@@ -553,6 +553,12 @@ class StrikeLedger:
         self.persistent_failure_seen: bool = False
         self.persistent_warned_sigs: set = set()
         self.consecutive_clean_successes: int = 0
+        #: §4UR-w r2: the latest structural failure when it was a who-may-act
+        #: wall ("" otherwise) and how often that same wall has repeated — the
+        #: pivot and the strike cap read them (a wall's end is "tell the user
+        #: what has to come from them", not "rephrase it")
+        self.last_wall: str = ""
+        self.last_wall_count: int = 0
         # §4JJ: consecutive web searches with no result opened since; the
         # steer fires once per request when the run reaches SEARCH_YIELD_STEER.
         self.search_run: int = 0

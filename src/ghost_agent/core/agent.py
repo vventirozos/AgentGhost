@@ -10144,6 +10144,83 @@ def _output_ends(text, limit: int) -> str:
     return t[:h] + "\n...[middle cut]...\n" + t[-h:]
 
 
+def _is_wall(outcome) -> bool:
+    """§4UR-w: is this refusal a who-may-act wall (``outcome.WHO_MAY_ACT_REASONS``)?"""
+    try:
+        from ..tools.outcome import is_who_may_act_wall
+        return is_who_may_act_wall(outcome)
+    except Exception:  # noqa: BLE001 — a classifier never breaks a turn
+        return False
+
+
+#: §4UR-w (probe-3f34a566): what the model is told about a who-may-act wall.
+#: The generic refusal advice said the message "names exactly what is wrong
+#: with the arguments … re-issue the SAME tool with that one thing corrected
+#: … do NOT abandon the task" — the model read a delete wall as an argument
+#: puzzle and called it 4× (plus a file_system delete of the folder) in 7 min.
+_WALL_WHAT_TO_DO = (
+    "If the refusal itself names a different, narrower call this turn MAY make (its own lab, without "
+    "all_owners / all=true), that is a new call — make it once; otherwise stop trying and tell the "
+    "user in one line what the refusal says has to come from them (ask it in their own conversation, "
+    "or confirm it in a new message of their own, as the refusal says) — that reply is the right end "
+    "of this part of the work.")
+
+
+def _close_progress(narrator, req_id) -> None:
+    """§4UT: the request's step narration ends — no sentence after this — and its steps are kept for the
+    turn record (``extra.progress``). Idempotent; never raises."""
+    if narrator is None:
+        return
+    try:
+        narrator.close()
+        from .progress import keep_steps
+        keep_steps(req_id, narrator.steps)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _forget_wall(strikes) -> None:
+    """§4UR-w r4: a strike that is not a wall (a synthetic rejection, a
+    thinking loop, a stall) ends the "latest failure was a wall" story."""
+    if strikes is not None:
+        try:
+            strikes.last_wall, strikes.last_wall_count = "", 0
+        except Exception:  # noqa: BLE001 — a mock ledger
+            pass
+
+
+def _wall_cap_note(wall_text) -> str:
+    """§4UR-w r2 M1: the strike-cap reply when the turn ended on a wall."""
+    return ("[ATTEMPT_ABORTED_STRIKE_CAP] I could not do this from here — it was refused on who may "
+            f"do it, not on how it was asked: {str(wall_text or '')[:300]} Rephrasing will not change "
+            "that; it has to come from you directly, as the refusal says.")
+
+
+def _wall_diagnostic(tool_name, error_text) -> str:
+    """The per-failure diagnostic for a wall (replaces the generic one)."""
+    prefix = f"[Tool: {tool_name}] " if tool_name else ""
+    return (f"{prefix}NOT ALLOWED HERE — a who-may-act wall, not an argument error: "
+            f"{str(error_text or '')[:400]} Repeating it, rewording it, another tool or a file operation "
+            f"does not get past it in this turn. " + _WALL_WHAT_TO_DO)
+
+
+def _wall_steer(tool_name, count, error_preview) -> str:
+    """The repeat alert for a wall (the ×2 loop breaker)."""
+    return (f"SYSTEM ALERT: {tool_name} has now refused the same call {count} times on WHO may do it: "
+            f"{str(error_preview or '')[:160]}. Nothing has run and nothing has changed. This is not about "
+            f"the arguments — do NOT repeat it, reword it, or reach the same result another way (another "
+            f"tool, a file operation, a script). " + _WALL_WHAT_TO_DO)
+
+
+def _wall_pivot_message(tool_name, error_text) -> str:
+    """§4UR-w review M2: what the System-3 pivot says when the failures it
+    counts end on a wall — not "three different ways", which routes round it."""
+    return (f"SYSTEM ALERT (recovery): the repeated failures end on a who-may-act wall"
+            f"{f' in {tool_name}' if tool_name else ''}: {str(error_text or '')[:300]} There is no other "
+            f"approach to it in this turn — not another tool, a file operation or a script. "
+            + _WALL_WHAT_TO_DO)
+
+
 def _program_failed_on_its_own(tool_name, exit_code, result_text, is_rejection) -> bool:
     """§4UI: an `execute` that RAN the program and the program failed — a
     non-zero exit with its own output, not a refusal (three execute refusals
@@ -23911,6 +23988,7 @@ class GhostAgent:
                 nonlocal binding_failure_count
                 binding_failure_count += 1
                 strikes.reset_clean_streak()
+                _forget_wall(strikes)   # §4UR-w r4: the latest strike is not a wall
                 _snote = strikes.note_failure(_sfname, _sreason)
                 # (sig, count, is_persistent, is_first_warning) — read
                 # defensively: test doubles hand the loop a mock ledger.
@@ -24874,6 +24952,7 @@ class GhostAgent:
                         # repeats a call it cannot enter; without the
                         # increment the 6-strike backstop never fires on it.
                         execution_failure_count += 1
+                        _forget_wall(strikes)   # §4UR-w r4: the latest strike is not a wall
                         last_was_failure = True
                         # ...and tell the strike ledger, so the decay does
                         # not hand the strike straight back. The decay only
@@ -25107,6 +25186,9 @@ class GhostAgent:
                 # exempted from the breaker AND the decay freeze. Same two
                 # calls, opposite behaviour, decided by batch order.
                 failure_was_rejection = False
+                # §4UR-w: a refusal on WHO may act (outcome.WHO_MAY_ACT_REASONS) —
+                # no corrected argument passes it, so it gets the wall advice
+                failure_was_wall = False
                 # PARTIAL is neither: part of the work LANDED, so "STOP
                 # repeating it" is wrong for a different reason than it is
                 # wrong for a refusal. It gets its own steer below.
@@ -26333,6 +26415,7 @@ class GhostAgent:
                             # correction" — same class of call, opposite
                             # advice, decided by which tool it was.
                             failure_was_rejection = _outcome.is_rejection
+                            failure_was_wall = _is_wall(_outcome)
                             failure_was_partial = (
                                 _outcome.status is _OutcomeStatus.PARTIAL)
                             failure_was_program = _program_failed_on_its_own(
@@ -26492,6 +26575,7 @@ class GhostAgent:
                         last_error_res = str_res
                         failed_fname = fname
                         failure_was_rejection = _outcome.is_rejection
+                        failure_was_wall = _is_wall(_outcome)
                         # §4UI: the latest failure decides; a syntax-guard
                         # rollback is a fix-and-resend step like a red test
                         failure_was_program = (str(getattr(_outcome, "reason_code", "") or "")
@@ -26886,6 +26970,11 @@ class GhostAgent:
                     # mixed successes and failures across >=2 calls).
                     multi_op_summary = summarize_multi_op_outcomes(op_outcomes)
 
+                    # §4UR-w r3 M1: the remembered wall is the LATEST failure's or
+                    # nothing — cleared for every failure, set again only by the
+                    # structural wall branch below (a wall then 7 timeouts capped
+                    # on the transient arm and blamed the wall)
+                    _forget_wall(strikes)
                     if is_blocked_page_result(failure_text):
                         # §4HN: the site refused — no strike on either
                         # ledger. The result is still a declared failure
@@ -26932,7 +27021,8 @@ class GhostAgent:
                                        f"-> {last_error_preview[:100]}", icon=Icons.TOOL_BROWSER, level="INFO")
                         else:
                             pretty_log("Execution Fail", f"failure {execution_failure_count} — the turn stops at 6, or 8 counting temporary ones ({failure_class.value}) -> {last_error_preview[:150]}", icon=Icons.FAIL, level="WARNING")  # §LOG-5b; §4NV verify: no "Strike" jargon
-                        diagnostic_msg = format_failure_context(failure_text, failure_class)
+                        diagnostic_msg = (_wall_diagnostic(_fail_fname, failure_text) if failure_was_wall
+                                          else format_failure_context(failure_text, failure_class))
                         # Detect the SAME structural failure recurring.
                         # At ≥3 repeats: freeze the success-decay (so the
                         # cap can finally fire on this oscillating loop)
@@ -26952,9 +27042,13 @@ class GhostAgent:
                         # will not change the result" is the opposite of the
                         # truth for a message whose whole content is which
                         # argument to change. So only the steer branches.
+                        # §4UR-w: a wall warns at its 2nd identical refusal (the
+                        # 1st retry can be a real misread; the 3rd never is)
                         _sig, _cnt, _persist, _first_warn = strikes.note_failure(
-                            _fail_fname, last_error_preview
+                            _fail_fname, last_error_preview, threshold=(2 if failure_was_wall else 3)
                         )
+                        strikes.last_wall = str(last_error_preview or "")[:400] if failure_was_wall else ""
+                        strikes.last_wall_count = int(_cnt or 0) if failure_was_wall else 0
                         if _first_warn:
                             pretty_log(
                                 "Loop Breaker",
@@ -26975,6 +27069,8 @@ class GhostAgent:
                                     "that file; if some blocks of an edit applied and "
                                     "others did not, re-issue only the ones that failed."
                                 )
+                            elif failure_was_wall:
+                                _steer = _wall_steer(_fail_fname, _cnt, last_error_preview)
                             elif failure_was_rejection:
                                 _steer = (
                                     f"SYSTEM ALERT: {_fail_fname} has now REFUSED the same "
@@ -27072,17 +27168,28 @@ class GhostAgent:
                         # LLM, owner only) still rides along. No task-tree rewrite
                         # (§4PC: the evaluator once replaced the tree with a plan that
                         # named a tool that does not exist).
-                        _recovery_hint = await self._recovery_episodes_hint(last_error_res or "")
-                        messages.append({"role": "user", "content": pivot_steer_message(
-                            pivot_num, execution_failure_count, last_error_res,
-                            list((getattr(self, "available_tools", None) or {}).keys()),
-                            _recovery_hint, _request_sys3_prev_justification)})
+                        _wall_loop = bool(failure_was_wall and getattr(strikes, "last_wall_count", 0) >= 2)
+                        if _wall_loop:
+                            # §4UR-w r2 m2: only a wall that ITSELF repeated takes over
+                            # the pivot (one stray wall after 3 coding failures keeps
+                            # the ordinary pivot and its decay)
+                            # §4UR-w review M2: "lay out three DIFFERENT ways … then
+                            # ACT" after a wall is an order to route round it — the
+                            # wall advice instead, and no decay (the cap ends it)
+                            messages.append({"role": "user", "content": _wall_pivot_message(
+                                failed_fname, last_error_res)})
+                        else:
+                            _recovery_hint = await self._recovery_episodes_hint(last_error_res or "")
+                            messages.append({"role": "user", "content": pivot_steer_message(
+                                pivot_num, execution_failure_count, last_error_res,
+                                list((getattr(self, "available_tools", None) or {}).keys()),
+                                _recovery_hint, _request_sys3_prev_justification)})
                         _request_sys3_prev_justification = str(last_error_res or "")[:500]
                         # ONLY the first pivot decays the counter. The second must
                         # not, or the trigger re-arms for ever: 5 fires pivot #2, −2
                         # leaves 3, two more failures reach 5, and it fires again
                         # (11 pivots in 25 all-failing turns, the cap never reached).
-                        if pivot_num == 1:
+                        if pivot_num == 1 and not _wall_loop:
                             execution_failure_count = max(0, execution_failure_count - 2)
                         transient_failure_count = 0
                         last_was_failure = False
@@ -29737,6 +29844,7 @@ class GhostAgent:
                     msg["content"] = ""
                     msg["tool_calls"] = []
                     execution_failure_count += 1
+                    _forget_wall(strikes)   # §4UR-w r4: the latest strike is not a wall
                     thinking_cap_events += 1
                     note_guard_event(self.context, req_id, "thinking_loop")        # §4TC
                     messages.append({"role": "assistant", "content": (
@@ -30616,6 +30724,7 @@ class GhostAgent:
                         pretty_log("Agent Parser", "Model stalled after thinking. Forcing retry.", level="WARNING", icon=Icons.WARN)
                         messages.append({"role": "user", "content": "SYSTEM ALERT: You generated a thought process but stopped abruptly without outputting a valid XML <tool_call> or a response to the user. DO NOT STOP. If you need to use a tool, output the required XML <tool_call> block. If the task is fully complete, provide your final response to the user."})
                     execution_failure_count += 1
+                    _forget_wall(strikes)   # §4UR-w r4: the latest strike is not a wall
                     return "continue"
 
                 user_request_context = last_user_content.lower()
@@ -32195,6 +32304,13 @@ class GhostAgent:
                 # (see selfplay session, attempt 2: 5 identical failures).
                 consecutive_parse_errors = 0
                 tools_run_this_turn = []
+                # §4UT: live progress for an owner's streamed request — each tool batch becomes a step in the web
+                # console's and the CLI's step list, with one sentence about it from the worker node (Nova)
+                try:
+                    from .progress import ProgressNarrator as _PN
+                    _progress = _PN.for_request(self.context, last_user_content, req_id)
+                except Exception:  # noqa: BLE001 — progress never breaks a turn
+                    _progress = None
                 # Last dispatched tool name. Must be initialised here: the
                 # streaming metacog block references it from a closure, and on
                 # turns where no tool ran an unbound `fname` raises NameError
@@ -32371,8 +32487,18 @@ class GhostAgent:
                     if execution_failure_count >= 6 or total_failures >= 8:
                         pretty_log("Strike Cap", f"structural={execution_failure_count}, transient={transient_failure_count} — aborting turn loop.", icon=Icons.STOP, level="WARNING")
                         messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed."})
+                        # §4UR-w r3: only the STRUCTURAL arm on a wall that itself
+                        # repeated (one stray wall after 7 argument errors is not
+                        # what ended the turn); the transient arm never
+                        _cap_wall = (str(getattr(strikes, "last_wall", "") or "")
+                                     if execution_failure_count >= 6
+                                     and int(getattr(strikes, "last_wall_count", 0) or 0) >= 2 else "")
                         final_ai_content = _with_abort_note(
                             final_ai_content,
+                            # §4UR-w r2 M1: a turn that ends on a who-may-act wall is
+                            # told so — "rephrase it" was wrong advice for a refusal
+                            # no rewording passes
+                            _wall_cap_note(_cap_wall) if _cap_wall else
                             "[ATTEMPT_ABORTED_STRIKE_CAP] I hit a hard limit after "
                             "repeated failures and could not complete this task. "
                             "Please rephrase or break it into smaller steps.")
@@ -33652,6 +33778,7 @@ class GhostAgent:
                         break
                     # finally-repack: even if a tool path raises, this frame's locals
                     # match what the inline code would have left behind.
+                    _progress_rows = len(tools_run_this_turn)        # §4UT: this batch's rows start here
                     _ts = TurnState(
                         req_id=req_id,
                         repair_reentry_active=bool(_repair_reentry_active),
@@ -33691,6 +33818,10 @@ class GhostAgent:
                     )
                     try:
                         _dispatch_should_break = await self._dispatch_and_process_tool_batch(_ts)
+                        if _progress is not None:                    # §4UT: the batch as a step
+                            _progress.after_batch(list(_ts.tools_run_this_turn or [])[_progress_rows:],
+                                                  (msg.get("reasoning_content") if isinstance(msg, dict) else "") or "",
+                                                  ui_content if isinstance(ui_content, str) else "")
                     finally:
                         _constraint_steer_pending = _ts._constraint_steer_pending
                         _proj_task_closed_this_req = _ts._proj_task_closed_this_req
@@ -33737,6 +33868,7 @@ class GhostAgent:
                 # §4RZ: no step boundary comes after the loop — a message posted
                 # during finalize is refused (the client sends it normally)
                 _turn_reg.close_inbox(req_id, _active_turn)
+                _close_progress(_progress, req_id)                   # §4UT: the answer is next
                 # #5 step 3: the finalization chain lives in _finalize_and_return
                 # (verbatim extraction; FinalizeState is read-only inputs — see the
                 # method docstring). Its return IS the old inline return.
@@ -33772,6 +33904,7 @@ class GhostAgent:
             # RELEASED — which is the whole point of cancellation (#22 made
             # one wedged turn block the UI, Slack, and the idle loops alike).
             _turn_cancelled_reason = str(_tc.reason or "cancelled")       # §4OE-1: the state of work is kept
+            _close_progress(locals().get("_progress"), req_id)          # §4UT r1: before its record is written
             pretty_log("Turn Cancelled",
                        f"{req_id}: {_tc.reason}", icon=Icons.STOP)
             _partial = ""
@@ -33839,6 +33972,7 @@ class GhostAgent:
             raise
 
         finally:
+            _close_progress(locals().get("_progress"), req_id)          # §4UT r1: every exit (idempotent)
             _hw = locals().get("_hard_watch")
             if _hw is not None and not _hw.done():
                 _hw.cancel()                     # §4SD: the turn is over — no limit to watch
@@ -36931,7 +37065,9 @@ class GhostAgent:
             # the agent's OWN failure sentinels are failures whatever the
             # verdict path said (§4LA: 11 "[TURN BUDGET EXHAUSTED] … NOT a
             # finished result" / "I hit a hard limit" episodes said SUCCESS)
-            if re.search(r"\[TURN BUDGET EXHAUSTED\]|\bI hit a hard limit\b|NOT a finished result",
+            # (§4UR-w r2: the wall's cap note has its own words — the marker is shared)
+            if re.search(r"\[TURN BUDGET EXHAUSTED\]|\bI hit a hard limit\b|NOT a finished result"
+                         r"|\[ATTEMPT_ABORTED_STRIKE_CAP\]",
                          str(ai_text or "")[:2000]):
                 success = False
 
@@ -37694,6 +37830,13 @@ class GhostAgent:
         _lbr = loop_breaker_for(self.context, req_id)
         if _lbr:
             _extra["loop_breaker"] = _lbr
+        try:                                                     # §4UT: the step list the client was shown
+            from .progress import steps_of as _steps_of
+            _pg = _steps_of(req_id or "")
+            if _pg:
+                _extra["progress"] = _pg
+        except Exception:  # noqa: BLE001
+            pass
         # §4TX: the mood the reply was told to sound like (label, manner, remarked, audience — never the pair)
         _heard = mood_tone_heard(req_id or "")
         if _heard:

@@ -914,7 +914,10 @@ class TestARefusalDoesNotRewriteThePlan:
             efc += steps[turn - 1]
             ns = {"execution_failure_count": efc,
                   "_request_sys3_fired_once": fired,
-                  "transient_failure_count": tfc}
+                  "transient_failure_count": tfc,
+                  # §4UR-w: a wall's pivot does not decay — this models the
+                  # ordinary failures, where the bound below must hold
+                  "_wall_loop": False}
             if eval(trigger, {}, ns):
                 pivots += 1
                 ns["pivot_num"] = 2 if fired else 1

@@ -54,8 +54,11 @@ from typing import List, Optional, Tuple
 
 # ── the pair ────────────────────────────────────────────────────────────────
 
-#: both numbers halve in this many seconds
-HALF_LIFE_S = 2 * 3600.0
+#: both numbers halve in this many seconds. §4US (operator 11-16: "this is my own personal AI so i don't do a lot
+#: of requests each day. so the mood should be visible even if there is not a ton of requests"): 4 h, was 2 h —
+#: what a turn did is still there at the owner's next visit a few hours later. Replayed over 11-11..11-16 (79
+#: owner replies): 2 h → 47 heard, 4 h → 58, mostly content 1–2; 6 h and 8 h put a busy day at content 3
+HALF_LIFE_S = 4 * 3600.0
 
 #: ``max(|P|, |E|)`` at or above these → intensity 1, 2, 3; below the first
 #: there is no mood. The automatic mood has no cap: it can reach 3.
@@ -311,6 +314,7 @@ KIND_QUIET = "quiet"          # a reader first saw the boredom of a long quiet
 KIND_QUIET_END = "quiet_end"  # the owner came back
 KIND_DECAY = "decay"          # it wore off
 KIND_MANNER = "manner"        # §4TX: the owner set or cleared the manner (a history row, the pair untouched)
+KIND_RETURN = "return"        # §4US: the owner came back after a long quiet
 
 #: one failed tool call, or one time a loop guard stepped in
 EV_TROUBLE = (-0.12, +0.08)
@@ -360,6 +364,13 @@ EV_THUMB_UP = (+0.25, 0.0)
 EV_THUMB_DOWN = (-0.30, 0.0)
 EV_CORRECTION = (-0.20, 0.0)
 EV_PRAISE = (+0.10, 0.0)
+#: §4US (operator 11-16, a personal AI with few requests a day): the owner coming back after a quiet of at least
+#: ``RETURN_AFTER_S`` is a small lift — glad they are back, a little more awake: "cheerful, 1" on its own, wearing
+#: off within about an hour and a half unless the visit brings more. Replayed over 11-11..11-16 with the 4 h
+#: half-life: 73 of 79 owner replies heard a mood (58 without it); on the two quiet days 11-15/16, 10 of 12 (was 1)
+EV_RETURN = (+0.20, +0.10)
+#: the same quiet that makes the face read "bored" (``BOREDOM_AFTER_S``)
+RETURN_AFTER_S = 6 * 3600.0
 #: §4TW: the tone of any owner message, whatever it is about (operator 11-09: "option 1" — the mood feels WITH
 #: the owner: his good news lifts it, his bad news lowers it). A third of a thumb; confident scores only; a
 #: message the praise check already counted is not counted twice
@@ -514,6 +525,18 @@ def reaction_event(kind: str) -> Optional[Event]:
     if kind == KIND_PRAISE:
         return Event(EV_PRAISE[0], EV_PRAISE[1], "the owner said thanks", kind)
     return None
+
+
+def return_event(quiet_s) -> Optional[Event]:
+    """§4US: the lift of the owner coming back after ``quiet_s`` seconds of quiet, or None when the quiet was
+    shorter than ``RETURN_AFTER_S`` (or unknown). The cause names the quiet in whole hours."""
+    try:
+        q = float(quiet_s)
+    except (TypeError, ValueError):
+        return None
+    if not (q >= RETURN_AFTER_S) or q == float("inf"):
+        return None
+    return Event(EV_RETURN[0], EV_RETURN[1], f"the owner came back after {int(q // 3600)} hours", KIND_RETURN)
 
 
 def sentiment_backing(label, emotions) -> Optional[bool]:

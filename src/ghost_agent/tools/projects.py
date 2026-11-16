@@ -87,7 +87,7 @@ _ACTIONS = {
 }
 
 
-def _err(msg: str):
+def _err(msg: str, reason_code: str = "manage_projects_refused"):
     """A manage_projects refusal — and it says so.
 
     Its sibling `_ok` declares; this returned a bare `f"ERROR: {msg}"` that
@@ -96,8 +96,11 @@ def _err(msg: str):
     a corrected re-issue that keys identically on tool+target+op.
     """
     from .outcome import ToolOutcome
-    return ToolOutcome.rejected(f"ERROR: {msg}",
-                                reason_code="manage_projects_refused")
+    return ToolOutcome.rejected(f"ERROR: {msg}", reason_code=reason_code)
+
+
+#: §4UR-w: the reason code of a who-may-act wall (outcome.WHO_MAY_ACT_REASONS)
+_WALL = "who_may_act"
 
 
 # Cap on what the constraint judgment gate reads per task (it is one blocking
@@ -2327,7 +2330,7 @@ def _lifecycle_confirmation(store, act, rid, token, context=None, host_labs=None
     _rid_now = str(request_id_context.get() or "")
     if _rid_now and _not_the_user(_rid_now):
         return _err(f"NOT done: only the user's own conversation can {act} a project — a background, scheduled "
-                    f"or test turn cannot. Nothing changed.")
+                    f"or test turn cannot. Nothing changed.", _WALL)
     try:
         from ..utils.provenance import untrusted_seen
         _src = untrusted_seen(_rid_now) if _rid_now else []
@@ -2335,7 +2338,7 @@ def _lifecycle_confirmation(store, act, rid, token, context=None, host_labs=None
         _src = []
     if _src:
         return _err(f"NOT done: this request read outside content ({', '.join(_src[:3])}) — a {act} runs only "
-                    f"in a request that did not, so a page cannot order it. Nothing changed.")
+                    f"in a request that did not, so a page cannot order it. Nothing changed.", _WALL)
     return None
 
 
@@ -3805,8 +3808,13 @@ async def tool_manage_projects(
                     _link_task_in_graph(context, pid, tid, desc)
                 instruction = (
                     f"Project created WITH {len(created_task_ids)} task(s) from "
-                    "your subtasks. Pacing: follow the PACING rule "
-                    "in the CURRENT PROJECT block."
+                    # §4UR r1 m1: the decision was made from the tool
+                    # description before this call; the briefing's rule
+                    # confirms it, it is not a second decision
+                    "your subtasks. Pacing: keep the go-ahead decision you made "
+                    "from the user's message before this call (the PACING rule "
+                    "in the briefing states it) — this result is not a reason to "
+                    "start work or to stop it."
                 )
                 if _create_dropped:
                     instruction += (
@@ -4021,7 +4029,7 @@ async def tool_manage_projects(
                 if str(status).upper() == "ARCHIVED":
                     _tr = _teardown_refusal(context, store.get_project(project_id) or {}, "archive")
                     if _tr:
-                        return _err(_tr)                 # review r3 m6: before the other fields change
+                        return _err(_tr, _WALL)          # review r3 m6: before the other fields change
                     # §4PF (P6): archiving has side effects (services stopped,
                     # the binding stashed, the pointer forgotten) that a bare
                     # status flip skipped — apply the other fields, then run
@@ -4040,7 +4048,7 @@ async def tool_manage_projects(
                                                   and (_pc.get("metadata") or {}).get("probe_created"))):
                         return _err("NOT done: only the user closes a project (status=DONE), in their own "
                                     "conversation — a background, scheduled or test turn cannot. Its planned "
-                                    "work being finished leaves it open (ready); nothing changed.")
+                                    "work being finished leaves it open (ready); nothing changed.", _WALL)
                 fields["status"] = status
             if kind:
                 fields["kind"] = kind
@@ -4151,7 +4159,7 @@ async def tool_manage_projects(
             # writable state dirs ("no files left behind").
             _tr = _teardown_refusal(context, store.get_project(rid) or {}, "delete")
             if _tr:
-                return _err(_tr)
+                return _err(_tr, _WALL)
             # §4SX D2: everything the project owns stops first — runs, services, jobs, labs (kept ones too);
             # the row goes only when nothing it owns is left running (never a row-less orphan)
             _td = await _teardown_project(context, rid, hard=True, origin=_teardown_origin(context))
@@ -4198,7 +4206,7 @@ async def tool_manage_projects(
             # labs are production and stay up (review r1 H2) — named so the owner can decide
             _tr = _teardown_refusal(context, store.get_project(rid) or {}, "archive")
             if _tr:
-                return _err(_tr)
+                return _err(_tr, _WALL)
             _td = await _teardown_project(context, rid, hard=False, origin=_teardown_origin(context))
             ok = store.delete_project(rid, hard=False)
             if not ok:
@@ -4362,7 +4370,7 @@ async def tool_manage_projects(
             if _set:
                 if not _owner_turn_now():
                     return _err("only the owner's own turn changes a budget — a probe or "
-                                "background run cannot")
+                                "background run cannot", _WALL)
                 if "runtime_cap_hours" in _set:
                     # the UNATTENDED allowance between the owner's looks (r2
                     # M3: the lifetime runtime counted the owner's own work)
@@ -4378,7 +4386,7 @@ async def tool_manage_projects(
                             "turn autopilot on one project at a time — nothing changed")
             if not _owner_turn_now():
                 return _err("only the owner's own turn changes autopilot — "
-                            "a probe or background run cannot")
+                            "a probe or background run cannot", _WALL)
             _off = []
             for _p in store.list_projects() or []:
                 if (_p.get("metadata") or {}).get("autopilot"):
@@ -4415,7 +4423,7 @@ async def tool_manage_projects(
                 return _err(f"enabled must be true or false, got {enabled!r} — nothing changed")
             if not _owner_turn_now():
                 return _err("only the owner's own turn changes autopilot — "
-                            "a probe or background run cannot")
+                            "a probe or background run cannot", _WALL)
             # §4MQ: the owner's resume resets the unattended gates
             from ..core.project_advancer import resume_autopilot_metadata
             store.update_project(project_id, metadata=(resume_autopilot_metadata() if want
@@ -5328,8 +5336,9 @@ async def tool_manage_projects(
                             f"Plan created with {len(ids)} task(s). Tasks run in plan order "
                             "(a task waits while an earlier one waits or runs, unless it "
                             "declared depends_on; a failed one does not hold it). Pacing: "
-                            "follow the PACING rule in the CURRENT "
-                            "PROJECT block."
+                            "keep the go-ahead decision you made from the user's "
+                            "message before this call (PACING rule) — this result "
+                            "is not a reason to start work or to stop it."
                         )})
 
         if act == "task_next":
@@ -6531,7 +6540,10 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "with file_system, no project. Past similar projects in memory are NOT a reason to create one. Never create twice: if a CURRENT PROJECT is shown, work on it "
             "(replan for a new plan of the same project). "
             "PACING: once a project is active, its CURRENT PROJECT block gives the one pacing rule "
-            "(a message that asks for the project AND the work is the go-ahead). create takes "
+            "(a message that asks for the project AND the work is the go-ahead; one that makes "
+            "planning this turn's step — 'first scope it, add the tasks' — is plan only, even when it names "
+            "the feature; 'first plan it, then build it' asks for both; unsure → plan only). Decide it "
+            "BEFORE create/task_decompose/replan and keep it when the result comes back. create takes "
             "`subtasks` too, so create + plan is one call. "
             "A task is DONE only when its work is really complete; a refused close comes back in "
             "`refused` with the fix. "

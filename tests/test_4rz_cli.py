@@ -241,7 +241,7 @@ class _Harness:
         monkeypatch.setattr(g, "_busy_stdout", contextlib.nullcontext)
         stream_api = copy.copy(self.api)
 
-        def chat_stream(messages, session_id, request_id, effort=""):
+        def chat_stream(messages, session_id, request_id, effort="", progress=False):
             self.rid = request_id            # the agent keeps it as turn.req_id
             self.streams.append([m["content"] for m in messages])
             if sse is not None:

@@ -131,7 +131,9 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
              if _arch else
              f"*** This project was CLOSED by the user (id={project_id}). If they ask for a change, make it "
              "HERE, straight in its files — that reopens it and the system logs the change; add tasks "
-             "(task_add / task_decompose) only for multi-step work. ")
+             "(task_add / task_decompose) only for multi-step work — and when the message asks only to "
+             "plan it or add the tasks ('first scope it, add the tasks'), add them and stop (unsure → "
+             "stop at the plan). ")
             + "Do not create a new project for the same topic. ***")
     elif _state == "ready":
         # §4UM: planned work done, the project stays open — a living app the user keeps changing
@@ -151,9 +153,11 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         # request that created it — on a later request the old message is
         # fulfilled history (re-reading it started builds with no go-ahead)
         if _created_this_request(store, project_id):
-            _tail = ("Creating it is done; anything else the user asked for in "
-                     "this message (building it, a first task) is still to do — "
-                     "see PACING below.")
+            # §4UR r1 m2: neutral — "building it … is still to do" beside the
+            # feature name is the fb249da8 shape (text after the call naming
+            # the build as owed)
+            _tail = ("Creating it is done; whether anything else in this "
+                     "message is still to do is decided by PACING below.")
         else:
             _tail = ("DO NOT re-read the user's original 'start a new project' "
                      "message as if it were a fresh instruction; that request has "
@@ -212,15 +216,32 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             # §4UI (2026-11-12): THE pacing rule — the tool description and
             # every manage_projects result defer to it instead of restating
             # their own STOP (req 8646c6c8 spent 5 min weighing three).
+            # §4UR (2026-11-16, req fb249da8): "Add a portfolio dashboard …
+            # First, analyze … decompose … add the implementation tasks" —
+            # judged plan-only before task_decompose, re-judged after its
+            # result as a go-ahead on the verb "add", autoadvance count=all
+            # (ending in a live deploy). Decide once; planning-as-this-step
+            # wording is plan-only; unsure = plan-only.
             "*** PACING (the one rule; tool results defer to it): "
-            "GO-AHEAD — when you have just created, decomposed or replanned "
-            "the plan, look at the user's message that asked for it. If it "
+            "GO-AHEAD — decide it ONCE, from the user's message, before you "
+            "create, decompose or replan the plan, and keep that decision when "
+            "the call returns (its result is not a new reason to start); only "
+            "a NEW message from the user changes it. If it "
             "asked ONLY for a project or a plan, show the task list and stop "
             "there (no 'shall I start?' — they will say 'proceed', 'next task' "
-            "or 'continue' when they want the work). If that same "
-            "message ALSO asked for the work itself ('create a project and "
-            "build X', 'make it…', 'implement…'), that message IS the "
-            "go-ahead: show the plan in a line or two and start. "
+            "or 'continue' when they want the work). A message that makes "
+            "planning this turn's step — 'first analyze/scope it', 'decompose "
+            "it', 'break it down', 'add the tasks', 'add the implementation "
+            "tasks', 'plan it' — asked ONLY for "
+            "a plan, even when it also names the feature to build ('add X to "
+            "the project; first scope it and add the tasks'); 'first plan it, "
+            "then build it' asks for both. If that same "
+            "message ALSO asked for the work itself, with nothing limiting the "
+            "turn to planning ('create a project and build X', 'make it…', "
+            "'implement…'), that message IS the go-ahead: show the plan in a "
+            "line or two and start. Unsure → stop at the plan: 'proceed' costs "
+            "the user one word, an unasked unattended run cannot be taken back. "
+            "(A task turn's 'do this ONE task now' is the go-ahead for that task.) "
             "SCOPE — a go-ahead covers what the user asked for: 'proceed' / "
             "'next task' = the NEXT TASK shown below; 'do the next 3', "
             "'finish it', 'all remaining' = that many. Close each task when its "

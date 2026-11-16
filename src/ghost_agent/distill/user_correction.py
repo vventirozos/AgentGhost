@@ -109,7 +109,33 @@ _CORRECTION_PHRASES = (
     r"δεν\s+(?:δουλε[ύυ]ει|λειτουργε[ίι]|δο[ύυ]λεψε|λειτο[ύυ]ργησε)\s*(?:(?:ακ[όο]μα|ακ[όο]μη|π[άα]λι)\s*)?(?:$|[.!;,])",
 )
 
+#: §4US (evaluation 11-16: "well you are wrong. its only 160kn away" was no candidate — over 743 owner turns
+#: since 10-07 the gate passed 5, all "no, it's fine…", and missed every real correction: "you didn't generate an
+#: image", "i don't like it… i told you…", "well you are wrong"). The direct forms, said to the agent or about
+#: what it did; the judge (`adjudication_prompt`) still decides each one
+_CORRECTION_PHRASES_4US = (
+    r"you(?:[' ]?re|\s+are|\s+were)\s+(?:wrong|mistaken|incorrect|confused)\b",
+    r"(?:that|this|it)(?:[' ]?s|\s+is|\s+was)\s+(?:wrong|incorrect|not\s+(?:right|correct|true))\b",
+    r"not\s+(?:true|correct|right)\b",
+    r"you\s+(?:didn[' ]?t|did\s+not|haven[' ]?t|have\s+not|forgot|ignored|made\s+a\s+mistake)\b",
+    r"(?:it|this|that)\s+(?:still\s+)?(?:doesn[' ]?t|does\s+not|didn[' ]?t|did\s+not)\s+work\b",
+    r"i\s+(?:told|asked)\s+you\b",
+    r"i\s+don[' ]?t\s+like\s+(?:it|this|that)\b",
+    # Greek: you are wrong / you made a mistake / you didn't do it
+    r"(?:κ[άα]νεις|[έε]κανες|[έε]χεις)\s+λ[άα]θος\b",
+    r"δεν\s+(?:το\s+)?[έε]κανες\b",
+)
+#: §4US: what may come before the correction itself — "well, you are wrong", "but that's not right", "hmm no"
+_CORRECTION_LEAD = r"(?:(?:well|but|hmm+|uh+|um+|ok(?:ay)?|so|nah|sorry|ghost|ε+|ρε|μα|ωχ)[,.!…]*\s+)?"
+
 _CORRECTION_RE = re.compile(
+    r"^\s*" + _CORRECTION_LEAD + r"(?:" + "|".join(_CORRECTION_PHRASES + _CORRECTION_PHRASES_4US) + r")",
+    re.IGNORECASE,
+)
+#: §4US review r1: the openers that may promote WITHOUT a judge (`contradicts is None`: phrase + rephrase) are the
+#: ones from before §4US — the wider gate is for the JUDGE ("ok no worries, then search the weather tomorrow"
+#: rephrases the last request and would mark it FAILED on a judge timeout). Like the rebuttal clause: judge-only
+_CORRECTION_RE_LEXICAL = re.compile(
     r"^\s*(?:" + "|".join(_CORRECTION_PHRASES) + r")",
     re.IGNORECASE,
 )
@@ -381,6 +407,10 @@ def adjudication_prompt(*, prev_user_request: str,
     )
 
 
+#: §4US: the judge's spellings of ``corrects`` that are read as its ruling
+_RULING_KEYS = ("correct", "is_correction", "user_corrects_assistant", "user_correct_assistant")
+
+
 def parse_adjudication(text) -> Optional[bool]:
     """Read the judge's answer, or ``None`` when it did not give one.
 
@@ -397,10 +427,23 @@ def parse_adjudication(text) -> Optional[bool]:
     if not m:
         return None
     try:
-        val = _json.loads(m.group(0)).get("corrects")
+        obj = _json.loads(m.group(0))
     except Exception:  # noqa: BLE001 — a judge that malforms has not ruled
         return None
-    return bool(val) if isinstance(val, bool) else None
+    if not isinstance(obj, dict):
+        return None
+    if "corrects" in obj:
+        val = obj.get("corrects")
+        return val if isinstance(val, bool) else None
+    # §4US (evaluation 11-16): the judge on Nova (Gemma E4B) answers {"correct": true} — the key without its "s" —
+    # on EVERY call (8 of 8 live cases: right verdict, wrong key), so every ruling read None and no correction
+    # ever reached the mood (0 since 10-07). These spellings of the asked key are read; review r1: never
+    # "is_correct" / "correctness" / "correct_answer" — a small model's way of saying the ASSISTANT was right
+    hits = [obj[k] for k in _RULING_KEYS if k in obj]
+    if len(hits) != 1 or not isinstance(hits[0], bool) or sum(isinstance(v, bool) for v in obj.values()) != 1:
+        return None
+    val = hits[0]
+    return val
 
 
 def classify_user_correction(
@@ -470,7 +513,7 @@ def classify_user_correction(
     # happens to contain "no" mid-paragraph doesn't bleed into Signal
     # A; the regex is also start-anchored as a second-line defence.
     head = (cu or "").lstrip()[:240]
-    if head and _CORRECTION_RE.search(head):
+    if head and (_CORRECTION_RE if contradicts is not None else _CORRECTION_RE_LEXICAL).search(head):
         signals.append("phrase")
         confidence += 0.55
 

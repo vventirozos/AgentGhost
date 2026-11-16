@@ -7693,9 +7693,9 @@ async def tool_rename_file(old_name: str, new_name: str, sandbox_dir: Path):
     except Exception as e: return f"Error: {e}"
 
 def _protected_dir_refusal(sandbox_dir: Path, path: Path, filename: str):
-    """A whole PROJECT directory is deleted through manage_projects, which
-    previews and asks the user — `file_system delete projects/<id>` was a
-    one-call rmtree around that confirm (§4MB). After outside content entered
+    """A whole PROJECT directory is deleted through manage_projects (its
+    teardown and its who-may-act walls; no preview since §4UK) —
+    `file_system delete projects/<id>` was a one-call rmtree around them (§4MB). After outside content entered
     the request, the uploads folder and the projects root are refused too."""
     if not path.is_dir():
         return None
@@ -7715,7 +7715,8 @@ def _protected_dir_refusal(sandbox_dir: Path, path: Path, filename: str):
     if len(rel) == 2 and rel[0] == "projects" and re.fullmatch(r"[0-9a-f]{12}", rel[1]):
         return ToolOutcome.rejected(
             f"Error: '{filename}' is a whole project — delete it with manage_projects "
-            f"action='delete' (it shows the user a preview and asks). Nothing was deleted.",
+            f"action='delete' (it runs at once in the user's own conversation; a background, "
+            f"scheduled or test turn cannot delete a project). Nothing was deleted.",
             world_changed=False, reason_code="protected_dir")
     if rel in (("projects",), ("uploads",)):
         from ..utils.provenance import untrusted_seen, content_refusal

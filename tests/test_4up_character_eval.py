@@ -360,8 +360,12 @@ def test_others_hear_the_owners_bored_by_its_name(tmp_path):
     while the owner hears the "bored" they asked for. They hear the same name."""
     sm = _model(tmp_path)
     lab, direction = M.resolve_label("bored")
+    _set = datetime.datetime.now(datetime.timezone.utc)
     sm.state.set_owner_mood(lab, direction, 3)
-    later = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=10)   # the hold is over
+    # the hold lasts to the END OF THE MOOD DAY (next local 04:00), not a fixed
+    # span — "+10 h" was still inside it whenever the suite ran before ~18:00
+    # (§4UR: failed at 07:59). One minute past the hold's own end.
+    later = M.manner_ends_at(_set.isoformat()) + datetime.timedelta(minutes=1)
     assert sm.mood(now=later).label == "bored"
     _after, dp, why = sm.note_owner_sentiment("negative", 0.9, now=later, request_id="m1",
                                               emotions={"sadness": 0.9})

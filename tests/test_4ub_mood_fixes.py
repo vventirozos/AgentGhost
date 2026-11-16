@@ -923,3 +923,12 @@ def test_a_second_tone_on_a_reply_whose_tone_decayed_gets_its_full_size(tmp_path
     later = NOW + dt.timedelta(hours=1.36)                       # 0.08 → about 0.05
     sm.note_owner_sentiment("positive", 0.95, now=later, request_id="m2")
     assert _booked(sm, "B", later) == pytest.approx(0.08, abs=1e-4)
+
+
+@pytest.fixture(autouse=True)
+def _two_hour_half_life(monkeypatch):
+    """§4US: these tests count time in units of the 2 h half-life they were written for (0.8 after 2 h is
+    0.4); they test the decay's mechanics, not its length. The live value (4 h) is pinned in
+    tests/test_4us_mood_visible.py."""
+    from ghost_agent.selfhood import mood as _M
+    monkeypatch.setattr(_M, "HALF_LIFE_S", 7200.0)

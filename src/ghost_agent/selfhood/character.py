@@ -93,6 +93,11 @@ WARMTH_CAP = 3.0
 WARMTH_MIN_MSGS = 3
 #: a day says something about the work only with this many turns that did something
 WORK_MIN_TURNS = 3
+#: §4US (evaluation 11-16: 11-15 pulled humour down by −1.82 of a spread from THREE turns, one of them a single
+#: failed web call of four — as hard as a thirty-turn day): a day's humour shift counts in full from this many
+#: turns, and in proportion below it (3 turns → 0.3 of it); the owner makes few requests a day, so a thin day is
+#: the usual day, and the dial must move on what the days together say
+WORK_FULL_TURNS = 10
 #: the days before a day that make "its own norm", and the fewest of them that carry the signal
 BASE_DAYS = 21
 BASE_MIN = 5
@@ -196,6 +201,20 @@ def day_pulls(days: List[Dict[str, object]]) -> Dict[str, Dict[str, int]]:
     return out
 
 
+def _day_weight(rec: Dict[str, object], dial: str) -> float:
+    """§4US: how much of its shift a day carries for ``dial`` — humour in proportion to the day's turns that
+    did something, up to ``WORK_FULL_TURNS`` (full); every other dial in full. Pure, never raises."""
+    if dial != "humour":
+        return 1.0
+    try:
+        own = rec.get("own") if isinstance(rec.get("own"), dict) else {}
+        work = sum(max(0, int(own.get(k) or 0)) for k in ("clean_turns", "trouble")
+                   if not isinstance(own.get(k), bool))
+    except (TypeError, ValueError, AttributeError):
+        return 1.0
+    return max(0.0, min(1.0, work / float(WORK_FULL_TURNS)))
+
+
 def _readings(days: List[Dict[str, object]]):
     """(date, dial, the day's number, its norm's mean, pull ±1 or 0, shift in spreads) for every day and dial that
     has a number and a norm (``BASE_MIN`` days on its own scale among the ``BASE_DAYS`` before it) —
@@ -218,7 +237,7 @@ def _readings(days: List[Dict[str, object]]):
             mean = statistics.fmean(prev)
             floor = SPREAD_FLOOR[dial]
             floor = floor.get(scale[i][dial] or "counts", 0.5) if isinstance(floor, dict) else floor
-            z = (v - mean) / max(statistics.pstdev(prev), floor)
+            z = (v - mean) / max(statistics.pstdev(prev), floor) * _day_weight(d, dial)
             yield str(d.get("date")), dial, v, mean, (1 if z > 0 else -1) if abs(z) > BAND else 0, z
 
 
@@ -241,6 +260,9 @@ def pull_line(days: List[Dict[str, object]], date: str) -> str:
                                  f"pulls {'up' if pull > 0 else 'down'}")
                 else:
                     parts.append(f"{dial} about usual ({v:.1f} vs {mean:.1f})")
+                w = _day_weight(day or {}, dial)
+                if w < 1.0:                                     # §4US review r1: say why a thin day pulls less
+                    parts[-1] += f" (a thin day: counts {w:.1f})"
             elif sig.get(dial) is not None:
                 parts.append(f"{dial} {sig[dial]:.1f}, not enough days yet to compare (needs {BASE_MIN})")
             else:
@@ -390,13 +412,14 @@ def stamp(dials: Dict[str, int]) -> str:
 #: each step of a dial makes the events it bears on land this much harder or lighter — at most
 #: ``2 * LEAN_STEP`` (50 %) either way. Scaled ON ARRIVAL, before the mood books them, so the ledger, the
 #: tone shares and the history all hold what really moved; nothing is tilted when the mood is read.
-#: §4UH-lean (operator 2026-11-12, "make it stronger"): 0.1 → 0.25. Replayed over 30 real days (581 owner
+#: §4UH-lean (operator 2026-11-12, "make it stronger"): 0.1 → 0.25. (The hours below were measured at the 2 h
+#: half-life; at 4 h (§4US) every duration is about twice as long, the ratios the same.) Replayed over 30 real days (581 owner
 #: turns): at 0.1 the lean was ~invisible (humour +1: 4.0 h unpleasant → 3.5 h); at 0.25 humour +1 takes the
 #: bad turns' 4 h of unpleasant mood to none, humour −2 makes them ~25 h
 LEAN_STEP = 0.25
 #: warmth bears on what comes from the owner: a warm character feels a thumb, thanks, a correction or the
 #: tone of a message more, a dry one less — both ways, pleasant and unpleasant alike
-WARMTH_KINDS = ("thumb_up", "thumb_down", "correction", "praise", "sentiment")
+WARMTH_KINDS = ("thumb_up", "thumb_down", "correction", "praise", "sentiment", "return")   # §4US: the owner back
 #: humour bears on the agent's own setbacks: a playful character takes a bad turn lighter, a serious one
 #: heavier. Its good turns are not touched (humour is about how trouble lands, not about success)
 HUMOUR_KINDS = ("turn",)

@@ -1637,6 +1637,7 @@ async def chat_proxy(request: Request):
                     # until the end, so it really does hang up at CHAT_TIMEOUT_S.
                     _up_headers = {"X-Ghost-Key": GHOST_API_KEY,
                                    "X-Ghost-Client-Timeout": "inf",
+                                   "X-Ghost-Progress": "1",      # §4UT: the page shows the agent's steps
                                    **_effort}
                     if t.get("request_id"):
                         _up_headers["X-Request-ID"] = t["request_id"]

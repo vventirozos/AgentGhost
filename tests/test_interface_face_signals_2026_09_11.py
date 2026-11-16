@@ -440,9 +440,9 @@ def test_touched_modules_bumped():
     index = (_STATIC / "index.html").read_text()
     app = (_STATIC / "app.js").read_text()
     ws = (_STATIC / "workspace.js").read_text()
-    assert "app.js?v=19.29" in index and "style.css?v=9.0" in index   # 9.0: §4UJ composer toolbar
-    assert "matrix_graph.js?v=19.29" in app and "workspace.js?v=9.14" in app
-    assert "status.js?v=8.4" in ws and "palette.js?v=7.6" in ws
+    assert "app.js?v=19.32" in index and "style.css?v=9.3" in index   # 9.2: §4UT step list
+    assert "matrix_graph.js?v=19.32" in app and "workspace.js?v=9.17" in app
+    assert "status.js?v=8.4" in ws and "palette.js?v=7.9" in ws
 
 
 def test_the_chip_tooltip_names_the_mood_its_cause_and_the_manner(status_js):

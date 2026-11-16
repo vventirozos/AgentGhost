@@ -5,6 +5,8 @@
 //  by substring tokens, keyboard-first (arrows + Enter, Escape closes).
 // ═══════════════════════════════════════════════════════════════
 
+import { progressMode, setProgressMode } from './progress.js?v=1.2';
+
 export function initPalette(ctx) {
     const { Core, el, toast, toggleRail, toggleDensity, sessions, notifications } = ctx;
 
@@ -34,6 +36,15 @@ export function initPalette(ctx) {
             { label: 'Stop MY turn', hint: 'cooperative cancel of this tab\'s turn', run: () => Core.cancelOwnTurn(false) },
             { label: 'Toggle voice interrupt', hint: 'talk over spoken replies', run: () => Core.toggleBargeIn() },
             { label: 'Toggle density', hint: 'compact / comfortable', run: toggleDensity },
+            // §4UT: the agent's steps above a reply — live (the last few while it works) → folded (one line) → off
+            {
+                label: 'Agent steps: live / folded / off', hint: 'the steps shown while the agent works', run: () => {
+                    const next = { live: 'folded', folded: 'off', off: 'live' }[progressMode()] || 'live';
+                    setProgressMode(next);
+                    toast(next === 'live' ? 'Agent steps: shown while it works'
+                        : next === 'folded' ? 'Agent steps: folded to one line' : 'Agent steps: hidden');
+                },
+            },
             {
                 label: 'Copy last reply', hint: '', run: async () => {
                     const history = Core.getChatHistory();

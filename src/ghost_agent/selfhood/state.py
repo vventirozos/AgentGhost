@@ -434,7 +434,8 @@ class SelfStateThread:
         except Exception:  # noqa: BLE001 — the rest never costs the mood
             return 0.0, 0.0
 
-    def quiet_seconds(self, *, now: Optional[datetime.datetime] = None) -> Optional[float]:
+    def quiet_seconds(self, *, now: Optional[datetime.datetime] = None,
+                      owner_only: bool = False) -> Optional[float]:
         """How long the owner has been quiet, or None when nobody knows.
         Measured from the PERSISTED stamp of the last owner turn, so a
         restart does not change it; the in-memory clock of the process is
@@ -444,8 +445,9 @@ class SelfStateThread:
         # all day). A stamp too far ahead of the clock is not read (F3)
         when = _aware(now)
         ages = [max(0.0, (when - at).total_seconds())
-                for at in (M.sane_future(ts, now=when) for ts in (self._state.last_owner_turn_at,
-                                                                  self._state.last_owner_job_at))
+                for at in (M.sane_future(ts, now=when) for ts in (
+                    (self._state.last_owner_turn_at,) if owner_only      # §4US: the owner's own absence
+                    else (self._state.last_owner_turn_at, self._state.last_owner_job_at)))
                 if at is not None]
         if ages:
             return min(ages)
