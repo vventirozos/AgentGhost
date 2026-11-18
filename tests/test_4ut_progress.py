@@ -658,3 +658,17 @@ def test_worker_off_main_matches_the_clients_own_notion(main, nodes, want):
     llm = MagicMock()
     llm.upstream_url, llm.worker_clients = main, nodes
     assert P.worker_is_off_main(llm) is want
+
+
+def test_the_reply_stands_a_blank_line_below_the_steps():
+    from tests.test_4kp_think_split_and_clients import _cli
+    printed = []
+    sp = _cli()._StepPrinter(printed.append)
+    sp.on({"seq": 1, "summary": "Checked the portfolio"})
+    sp.stop(gap=True)
+    sp.stop(gap=True)
+    assert len(printed) == 2 and str(printed[1]) == "" and sp.printed == 1
+    none = []
+    sp2 = _cli()._StepPrinter(none.append)
+    sp2.stop(gap=True)                 # no steps: no blank line either
+    assert none == []

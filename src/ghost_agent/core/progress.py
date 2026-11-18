@@ -121,6 +121,7 @@ _VERBS = {
     "portfolio": ("checked the portfolio", "checked the portfolio {n} times"),
     "introspect": ("looked at its own state", "looked at its own state {n} times"),
     "labs": ("worked on a lab", "worked on a lab {n} times"),
+    "checklist": ("worked through the checklist", "worked through the checklist {n} times"),
 }
 
 
@@ -319,7 +320,7 @@ class ProgressNarrator:
                             s["text"] = line
                     try:
                         from ..utils.logging import pretty_log, Icons
-                        pretty_log("Progress", line, icon=getattr(Icons, "INFO", "ℹ️"))
+                        pretty_log("Progress", line, icon=Icons.PROGRESS)
                     except Exception:  # noqa: BLE001
                         pass
         finally:

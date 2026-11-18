@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=19.32';
+import * as matrixGraphFace from './matrix_graph.js?v=19.33';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';
@@ -313,6 +313,7 @@ const ICON_CLASS = {
     '🔗': 'plan',     // CONSTRAINT
 
     // --- raw thinking (the floor) ---
+    '👣': 'think',    // PROGRESS — a live step's sentence (§4UT)
     '🧠': 'think',    // BRAIN_SUM — the one that was drowning everything
     '🪫': 'think',    // EFFORT_LOW (§4RB)
     '🔋': 'think',    // EFFORT_MEDIUM

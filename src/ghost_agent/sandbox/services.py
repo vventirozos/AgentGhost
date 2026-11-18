@@ -1428,8 +1428,22 @@ class ServiceSupervisor:
             alive = sum(1 for k2, e2 in reg.items()
                         if k2 != key and self._entry_alive_or_unknown(e2))
             if alive >= _max:
-                return (f"Error: {_max} services already running — "
-                        f"stop one first (action='status' to list).")
+                # ft live 11-18 (w6_rest): the slots were other conversations' services, which this turn's
+                # `status` does not list — "stop one first (action='status')" was a dead end. Name them and
+                # give the routes that need no slot.
+                _names = [str(e2.get("name") or k2.rsplit(":", 1)[-1]) for k2, e2 in reg.items()
+                          if k2 != key and self._entry_alive_or_unknown(e2)][:_max]
+                try:                                   # review r1: a member never sees others' service names
+                    from ..utils.logging import requester_is_member as _member
+                    if _member():
+                        _names = ["…"]
+                except Exception:  # noqa: BLE001
+                    _names = ["…"]
+                return (f"Error: {_max} services already running ({', '.join(_names)}) — the cap. Stop one you own "
+                        f"(action='stop'); on the owner's own turn `run status all=true` lists every run with its id. "
+                        f"Or test without a long-lived server: the framework's test client (Flask "
+                        f"`app.test_client()`), or a bounded run in one execute "
+                        f"(`timeout 20 python3 app.py & sleep 2; curl -s localhost:5000/; kill %1`).")
 
             # Resolve + VALIDATE the workdir BEFORE anything launches
             # (2026-07-12). The launch below runs `cd <wd> && setsid …` inside

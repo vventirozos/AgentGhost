@@ -28,6 +28,7 @@
     <a href="../../features/coding.html">Coding &amp; sandbox</a>
     <div class="subnav">
       <a href="acquired_skills.html">Acquired skills (tools.acquired_skills)</a>
+      <a href="build_mechanics.html">Build mechanics (§4UU)</a>
       <a class="current" href="code_claims.html">Code claims (core.code_claims)</a>
       <a href="coding_executor.html">Coding executor (core.coding_executor)</a>
       <a href="coding_loop.html">Coding loop (core.coding_loop)</a>
@@ -89,9 +90,18 @@
   <h2>The reader's round (r3)</h2>
   <p>A fresh reader of the diff found the first cut over-eager in both directions, all reproduced and fixed: the detector matched mechanism prose ("This works <em>by</em> splitting…", "a regex <em>which</em> works on both") and honest reporting ("I ran the tests and 2 of 5 failed") &mdash; now `that|which` are not subjects, a mechanism preposition after "works" disqualifies, and "I ran/tested X" needs an outcome word; the ledger missed <code>python -m app</code>, <code>python -c 'import calc; …'</code>, <code>uvicorn main:app</code> and a load of the served root &mdash; now imports are read from the command, <code>-m</code> and <code>mod:app</code> targets map to <code>mod.py</code>, a root URL names <code>index.html</code>; and a collected job's banner (under the "Collected N finished job(s)" header) must still yield its exit code to <code>_exec_ok</code> (see <a href="../reliability/tool_failure.html#4ph">tool_failure</a>). One battery mutant proved equivalent (the "run before the last write" guard &mdash; a later write replaces the record) and the dead guard was removed.</p>
 
+  <h2>§4UU (2026-11-17): what counts as a run</h2>
+  <ul>
+    <li><strong>Segments.</strong> A command is split per line and on <code>&amp;&amp; || ; |</code>; each segment is a run, a <em>check</em> (syntax / lint: <code>node --check</code>, <code>py_compile</code>, <code>bash -n</code>, <code>tsc --noEmit</code>, linters) or a <em>read</em> (<code>cat grep head ls curl test echo</code> …). Only run segments credit a file; a check sets <code>checked</code>, and the note says "only syntax/lint-checked, never run". Before, any command naming the file counted (<code>node --check app.js</code> backed "it works").</li>
+    <li><strong>Page checks.</strong> A <code>file_system</code> row carrying the system's <code>[PAGE CHECK] ✓/✗ … Ran: …</code> line counts as a run (or a failed run) of every file listed, right after its own write.</li>
+    <li><strong>Checklist.</strong> A <code>checklist check</code> row counts as a run of the files its chosen items' checks ran.</li>
+  </ul>
+  <p>See <a href="build_mechanics.html">build mechanics</a>.</p>
+
   <h2>Residuals</h2>
   <ul>
     <li>Two files with the same basename in different directories share a key (a run of either backs both).</li>
+    <li><strong>A suite run behind a shell keyword</strong> (2026-11-18 live run) — <code>is_suite_command</code> reads lower-case <code>do</code> / <code>then</code> / <code>else</code> / <code>time</code> / <code>if</code> / <code>while</code> / <code>until</code>, <code>!</code> and <code>{</code> heads: <code>for i in 1..10; do python -m pytest -q test_tags.py | tail -1; done</code> (ten green runs) was "never run" and forced a repair round. Case-sensitive, so a capitalised sentence in a heredoc ("Then pytest …") is not a run.</li>
     <li>A run is identified by NAME: <code>python3 app.py</code> that imports a changed <code>util.py</code> backs <code>app.py</code> only; a suite run backs every non-web file written. A page is backed by any OK load of its basename.</li>
     <li>The detector reads English and a little Greek; a claim phrased some other way is not caught (fail-open: a missed note, never a false one on a backed file).</li>
   </ul>

@@ -1,7 +1,7 @@
 {
   "app.js": {
-    "sha": "3a495b70b401c672",
-    "version": "19.32"
+    "sha": "55b88645faed962a",
+    "version": "19.33"
   },
   "bargein.js": {
     "sha": "07e236cbbe833426",
@@ -13,7 +13,7 @@
   },
   "matrix_graph.js": {
     "sha": "aea8ab7652c792ac",
-    "version": "19.32"
+    "version": "19.33"
   },
   "notifications.js": {
     "sha": "487030a97676874f",

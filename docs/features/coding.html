@@ -29,6 +29,7 @@
     <a class="current" href="coding.html">Coding &amp; sandbox</a>
     <div class="subnav">
       <a href="../reference/coding/acquired_skills.html">Acquired skills (tools.acquired_skills)</a>
+      <a href="../reference/coding/build_mechanics.html">Build mechanics (§4UU)</a>
       <a href="../reference/coding/code_claims.html">Code claims (core.code_claims)</a>
       <a href="../reference/coding/coding_executor.html">Coding executor (core.coding_executor)</a>
       <a href="../reference/coding/coding_loop.html">Coding loop (core.coding_loop)</a>
@@ -120,6 +121,7 @@
 <p>Written for maintainers: every mechanism, its settings and its history.</p>
 <ul class="ref-list">
     <li><a href="../reference/coding/acquired_skills.html">Acquired skills (tools.acquired_skills)</a></li>
+    <li><a href="../reference/coding/build_mechanics.html">Build mechanics (§4UU)</a></li>
     <li><a href="../reference/coding/code_claims.html">Code claims (core.code_claims)</a></li>
     <li><a href="../reference/coding/coding_executor.html">Coding executor (core.coding_executor)</a></li>
     <li><a href="../reference/coding/coding_loop.html">Coding loop (core.coding_loop)</a></li>
@@ -140,6 +142,17 @@
     <li><a href="../reference/coding/workspace_track.html">Workspace tracking (tools.workspace_track)</a></li>
 </ul>
 <!-- /refs -->
+
+    <h2 id="build-4uu">Builds that check themselves (§4UU, 2026-11-17)</h2>
+  <p>Ghost fixes a bug well once it can see it. Most lost time came from not seeing it: big web apps written in one piece, testing by hand in the browser, and "done, tested" after only a syntax check. Five changes make the checking part of the work:</p>
+  <ul>
+    <li><strong>Every web write is loaded at once.</strong> After Ghost writes or edits a page, script or stylesheet, the page is opened headless and the write's result says <code>[PAGE CHECK] ✓</code> or <code>✗</code> with the JavaScript error. A page that throws is fixed before anything else. Off with <code>GHOST_PAGE_CHECK=0</code>.</li>
+    <li><strong>A checklist only a test can tick.</strong> For a build with several features Ghost keeps a <code>checklist</code>: one item per feature, each with a check that runs it. An item turns ✓ only when its check passes. While items are open Ghost sees <code>[CHECKLIST 2/5 passed · next: …]</code> after its tool calls, and "it's done" with unpassed items gets one more round. The list belongs to the project (or the conversation for a day) and is kept outside the sandbox.</li>
+    <li><strong>"Tested" means it ran.</strong> <code>node --check</code>, <code>py_compile</code>, <code>cat</code>, <code>grep</code>, <code>ls</code> or <code>curl</code> are not runs. A reply that says "tested, it works" after only those gets the "never run" note and a round to run it.</li>
+    <li><strong>A starter for web apps.</strong> “Build me a tetris app” can start from <code>template='web-app'</code>: a folder already split into <code>index.html</code>, <code>css/</code>, one <code>js/</code> file per feature and <code>tests/check_page.py</code>, a headless test with one check per feature (<code>python3 tests/check_page.py rotate</code>). It never writes into a folder that has files.</li>
+    <li><strong>Fewer dead ends.</strong> Lab templates are a fixed list; <code>lab http</code> / <code>screenshot</code> / <code>logs</code> pick the member when there is one obvious one; the browser refuses tailnet addresses at once and points to <code>lab http</code>; and once <code>su</code> / <code>sudo</code> / <code>setpriv</code> fails with "Operation not permitted", it is not retried in that request &mdash; Ghost is told to use a lab machine (labs give root).</li>
+  </ul>
+  <p>Reference: <a href="../reference/coding/build_mechanics.html">build mechanics</a>.</p>
 
     <h2 id="guards-4ui">Fewer brakes on a coding turn (§4UI, 2026-11-12)</h2>
   <p>The main model is now a dense model and codes much better than the MoE model many coding guards were written for. Guards that second-guessed the model were relaxed; guards that protect your data, honest "it works" claims and destructive commands stay.</p>

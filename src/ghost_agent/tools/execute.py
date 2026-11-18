@@ -106,6 +106,58 @@ def _daemonized_server_block(command: str):
     return None
 
 
+#: ft live (probe-75a957e4): `python3 -m http.server 8099` run in the FOREGROUND never exits, so the exec waited its
+#: whole 600 s budget and was killed — ten minutes of a coding turn for nothing. Only commands that are servers by
+#: definition (no exit of their own) are refused; a `timeout N` bound, a backgrounded/job-killed start (the §4G guard
+#: owns those) and `--help`/`--version` pass.
+_END = r"(?=\s|$|[;&|)])"
+_FG_SERVER_RE = re.compile(
+    r"^(?:sudo\s+(?:-[A-Za-z]\s+\S+\s+|-\S+\s+)*|env\s+(?:\S+=\S*\s+)*|nohup\s+|exec\s+|time\s+|nice\s+(?:-n\s*-?\d+\s+)?|[A-Za-z_]\w*=\S*\s+)*"
+    r"(?:python[\d.]*\s+-m\s+(?:http\.server|SimpleHTTPServer|flask\s+run|uvicorn|gunicorn)" + _END +
+    r"|flask\s+run" + _END + r"|uvicorn\s+(?!--version)|gunicorn\s+(?!--check-config|--version)|hypercorn\s"
+    r"|(?:npm|pnpm|bun)\s+(?:(?:--prefix|-C)\s+\S+\s+)?(?:run(?:-script)?\s+)?(?:start|dev|serve|preview)" + _END +
+    r"|pnpm\s+(?:start|dev|serve)" + _END + r"|yarn\s+(?:run\s+)?(?:start|dev|serve|preview)" + _END +
+    r"|streamlit\s+run" + _END + r"|(?:python[\d.]*\s+)?manage\.py\s+runserver" + _END + r"|php\s+-S" + _END +
+    r"|(?:npx\s+(?:-y\s+)?)?(?:serve|http-server|live-server)(?=\s|$)(?!\s+--?(?:h|help|v|version)\b)"
+    r"|(?:npx\s+(?:-y\s+)?)?vite(?:\s+(?:dev|serve|preview))?" + _END + r"(?!\s*(?:build|optimize))"
+    r"|(?:npx\s+)?next\s+(?:dev|start)" + _END + r"|jupyter\s+(?:notebook|lab)" + _END +
+    r"|hugo\s+server" + _END + r"|rails\s+s(?:erver)?" + _END + r")", re.I)
+_FG_SERVER_BLOCK_MSG = (
+    "SYSTEM BLOCK: this command starts a server in the FOREGROUND — NOT executed. A server never exits on its own, so "
+    "execute would wait its whole 600 s budget and then kill it. Start it with the `run` tool instead: "
+    "run action='start' lifetime='server' where='workspace' name='<name>' command='<the same command>' (it gets a "
+    "free port as $PORT and keeps running across turns), then request it with curl or the browser. For a one-off "
+    "smoke test bound it yourself: `timeout 15 <command>`."
+)
+
+
+def _foreground_server_block(command: str):
+    """Refusal message when a segment of the command runs a definite server in the foreground, else None."""
+    cmd = str(command or "")
+    if not cmd or (re.search(r"\bkill\s+%", cmd) and re.search(r"[^&]&(?!&)", cmd)):
+        return None
+    # final review: EVERY heredoc body is data to this guard (a python body's `serve = …` is not a shell line)
+    cmd = re.sub(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", "<<HEREDOC", cmd, flags=re.S)
+    for m in _SH_C_PAYLOAD_RE.finditer(cmd):            # `bash -c 'python3 -m http.server'` is a command too
+        inner = m.group(1) or m.group(2) or ""
+        if inner and _foreground_server_block(inner):
+            return _FG_SERVER_BLOCK_MSG
+    cmd = _QUOTED_RE.sub("''", cmd)          # final review: quoted text (a commit message, a README) is data
+    for seg in re.split(r"\n|;|&&|\|\|", cmd):
+        seg = seg.strip().lstrip("( ").rstrip(") ").strip()
+        if not seg or seg.endswith("&"):
+            continue                          # backgrounded: the §4G guard owns it
+        seg = seg.split("|", 1)[0].strip()    # `npm start | tee log` still never exits
+        seg = re.sub(r"^(?:cd\s+\S+\s*)", "", seg)
+        _usage = r"\s(?:--help|--version|-V)(?:\s|$)" if re.search(r"\bflask\s+run\b", seg) else \
+            r"\s(?:--help|-h|--version|-V)(?:\s|$)"                    # flask's `-h` is --host
+        if re.match(r"^(?:\S+=\S*\s+)*timeout\b", seg) or re.search(_usage, seg):
+            continue                          # bounded by the model itself / only prints its usage
+        if _FG_SERVER_RE.search(seg):
+            return _FG_SERVER_BLOCK_MSG
+    return None
+
+
 #: §4PI (R3-M5): the model CAN `pip install yt-dlp && yt-dlp <url>` in the
 #: sandbox (pip rides Tor) — without the agent's PO token every exit is
 #: bot-walled and the attempt becomes a 600 s promoted job (the 2026-08-11
@@ -247,6 +299,65 @@ _SELF_REPORTED_EXIT_RE = re.compile(
 _BASH_KILLED_RE = re.compile(r"(?m)^bash: line \d+:\s+\d+ Killed\b")
 
 
+def _status_echo_ends_the_run(command: str) -> bool:
+    """Is the last `$?` echo the run's summary — nothing after it but closers (`done`, `fi`) or more echoes?
+
+    ft live (req d6bff7a8): `… remove zebra 99; echo "exit=$?"; … remove zebra 2; … list; ls` tested the
+    error path ON PURPOSE and then went on; the mid-command `exit=1` was adopted as the whole run's status, the
+    run booked as a failure (effort raised, a failure banner the reply then had to explain away)."""
+    cmd = str(command or "")
+    i = max(cmd.rfind("$?"), cmd.rfind("${?}"))
+    if i < 0:
+        return False
+    q, k = None, 0
+    while k < i:                             # the quote state AT the `$?` (it usually sits inside "exit=$?")
+        c = cmd[k]
+        if c == "\\" and q != "'":
+            k += 2
+            continue
+        if q:
+            if c == q:
+                q = None
+        elif c in "'\"":
+            q = c
+        k += 1
+    j = i
+    while j < len(cmd):                      # the end of the segment holding the echo (quote-aware)
+        c = cmd[j]
+        if c == "\\" and q != "'":
+            j += 2
+            continue
+        if q:
+            if c == q:
+                q = None
+        elif c in "'\"":
+            q = c
+        elif c in ";\n" or cmd.startswith("&&", j) or cmd.startswith("||", j):
+            break
+        j += 1
+    closers = set(re.findall(r"<<-?\s*['\"]?(\w+)", cmd))           # heredoc delimiters
+    # final review: an allow-list of what may follow laundered real failures again (`; rm -f tmp`, `; deactivate`,
+    # `; cat out.log`). The live false alarm was a run that WENT ON RUNNING programs after the echo — so only a
+    # later member whose head is a runner (python, node, pytest, ./x, x.py, …) ends the echo's claim.
+    for member in re.split(r"&&|\|\||;|\n", cmd[j:]):
+        toks = member.strip().lstrip("({!").split()
+        while toks and (re.fullmatch(r"[A-Za-z_]\w*=.*", toks[0]) or toks[0] in _RUNNER_WRAPPERS
+                        or toks[0] in ("do", "then", "else")):
+            if toks[0] == "timeout":          # final review r2: `timeout -s KILL 5 python3 …` — skip its flags too
+                toks = toks[1:]
+                while toks and toks[0].startswith("-"):
+                    toks = toks[2:] if toks[0] in ("-s", "--signal", "-k", "--kill-after") else toks[1:]
+                toks = toks[1:]
+                continue
+            toks = toks[1:]
+        if not toks or toks[0].startswith("#") or (len(toks) == 1 and toks[0] in closers):
+            continue
+        head = toks[0] if toks[0].startswith("./") else toks[0].rsplit("/", 1)[-1]
+        if _RUNNER_HEAD_RE.match(head):
+            return False
+    return True
+
+
 def _self_reported_exit(command: str, exit_code, output: str = "") -> int:
     """Adopt the exit status the run REPORTED when the shell's is 0.
 
@@ -268,7 +379,7 @@ def _self_reported_exit(command: str, exit_code, output: str = "") -> int:
     if code != 0:
         return code
     text = str(output or "")
-    if "$?" in str(command or ""):
+    if ("$?" in str(command or "") or "${?}" in str(command or "")) and _status_echo_ends_the_run(str(command or "")):
         reported = [int(m.group(1)) for m in _SELF_REPORTED_EXIT_RE.finditer(text)]
         if reported and reported[-1] != 0 and reported[-1] <= 255:
             return reported[-1]
@@ -1235,6 +1346,48 @@ async def _kernel_alive(sandbox_manager, conn_file: str) -> bool:
     return pgrep_code == 0
 
 
+_SELF_OVERWRITE_MSG = (
+    "SYSTEM BLOCK: execute(filename='{filename}', content=…) would OVERWRITE '{filename}' with this script — and the "
+    "script itself loads '{base}', so it is a test of that file, not its new source. Nothing was written or run. Put "
+    "the test in its own file (filename='test_{base}') or omit `filename` to run it as a temporary script. (To "
+    "REWRITE '{base}' itself, use file_system write.)")
+
+
+def _self_loading_overwrite(filename, content, host_path) -> str:
+    """ft live 11-18 (w6_rest): `execute(filename='ft/app.py', content=<a test that loads ft/app.py>)` WRITES the
+    content to that filename before running it — the model's Flask app was replaced by its own test script. Refused
+    only when the new script loads that very file (names its path, or imports its module) AND the file exists with
+    other content: a script that tests a file is never meant to become it. The script text is read first, so a
+    plain rewrite-and-run never touches the disk here."""
+    new = str(content or "")
+    rel = str(filename).replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    base = rel.rsplit("/", 1)[-1]
+    stem = base.rsplit(".", 1)[0]
+    imports = base.endswith(".py") and re.search(
+        rf"^\s*(?:from\s+{re.escape(stem)}\s+import|import\s+{re.escape(stem)}\b)", new, re.M)
+    # final review: a usage string, argparse `prog=`, a log line or FLASK_APP naming the file is not a LOAD of it —
+    # only a loader call on that path is (importlib / runpy / exec(open) / SourceFileLoader)
+    _q = r"""['"](?:\./)?(?:[\w./-]*/)?""" + re.escape(base) + r"""['"]"""
+    loads = (re.search(r"(?:spec_from_file_location|run_path|SourceFileLoader|exec\s*\(\s*open|load_source)"
+                       r"\s*\([^)\n]*" + _q, new) or imports
+             or (base.endswith(".js") and re.search(r"""require\(\s*['"]\./""" + re.escape(stem) + r"""(?:\.js)?['"]""", new)))
+    if not loads:
+        return ""
+    if re.fullmatch(r"test_\w+\.py|\w+_test\.py|\w+\.(?:test|spec)\.js", base) and not imports:
+        return ""                 # review r1: a test file naming itself (`pytest.main(['test_app.py'])`) is its own run
+    try:
+        if not host_path.is_file():
+            return ""
+        old = host_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if not old.strip() or old.strip() == new.strip():
+        return ""
+    return _SELF_OVERWRITE_MSG.format(filename=filename, base=base)
+
+
 async def tool_execute(filename: str = None, content: str = None, sandbox_dir: Path = None, sandbox_manager=None, scrapbook=None, args: list = None, memory_dir: Path = None, stateful: bool = False, command: str = None, workspace_model=None, container_workdir: str = None, **kwargs):
     # When a project is active, run from /workspace/projects/<id> so files
     # written via file_system (also scoped) read back. Passed ONLY when set,
@@ -1678,7 +1831,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 _yb = _youtube_download_block(command)          # §4PI (R3-M5)
                 if _yb:
                     return ToolOutcome.rejected(_format_error(_yb), reason_code="youtube_download_blocked")
-                _db = _daemonized_server_block(command)
+                _db = _daemonized_server_block(command) or _foreground_server_block(command)
                 if _db:
                     # A refusal: the command is not run. Left as a string it
                     # classified OK, so a blocked daemon start booked a
@@ -1989,6 +2142,12 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         host_path = _get_safe_path(sandbox_dir, filename)
     except ValueError as ve:
         return _format_error(str(ve))
+
+    _clobber = _self_loading_overwrite(filename, content, host_path) if (content and not is_ephemeral) else ""
+    if _clobber:
+        pretty_log("Execution Blocked", f"'{filename}' would be overwritten by a script that loads it",
+                   level="WARNING", icon=Icons.SHIELD)
+        return ToolOutcome.rejected(_format_error(_clobber), reason_code="self_loading_overwrite")   # review r1
 
     is_new_code = True
     _probe_note = ""

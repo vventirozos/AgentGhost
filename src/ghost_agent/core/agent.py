@@ -754,6 +754,7 @@ _EDIT_CHURN_VERIFY_TOOLS = frozenset({
     "execute", "browser", "manage_services", "managed_services",
     "lab",      # §4SX B: a run on a lab machine verifies too
     "run",      # §4SX D5: a server's logs / url / a job's collect verify (manage_services' successor)
+    "checklist",  # §4UU: a `check` runs the checks (a view/set is harmless: it only resets the reminder)
 })
 
 # ── Meta-task ("checklist") nudge intent detection (§4BE, 2026-08-13) ──
@@ -4117,12 +4118,26 @@ def _starts_new_work(name, args) -> bool:
     """§4MF: would this call start new work? (refused on a status question
     while work is live). A lab / run READ does not (§4SX B review MAJOR 6; D5)."""
     return name in _WORK_TOOLS and not ((name == "lab" and _lab_is_read_call(args))
-                                        or (name == "run" and _run_is_read_call(args)))
+                                        or (name == "run" and _run_is_read_call(args))
+                                        or (name == "checklist" and not _checklist_runs_checks(args)))
+
+
+def _checklist_runs_checks(args) -> bool:
+    """§4UU: a `checklist check` runs shell checks; view / set / add / drop / clear only edit or show the list."""
+    a = args
+    if isinstance(a, str):                              # the raw call's arguments (JSON text)
+        try:
+            a = json.loads(a)
+        except ValueError:
+            a = {}
+    a = a if isinstance(a, dict) else {}
+    return str(a.get("action") or a.get("operation") or "").strip().lower() == "check"
 
 
 _WORK_TOOLS = frozenset({"execute", "browser", "web_search", "deep_research", "darkweb_search",
                          "darkweb_research", "image_generation", "deploy", "manage_services",
-                         "create_skill", "probe_model", "lab", "run"})
+                         "create_skill", "probe_model", "lab", "run",
+                         "checklist"})   # §4UU: a `check` runs shell checks (up to 600 s)
 
 
 def status_only_refusal_text() -> str:
@@ -7044,6 +7059,10 @@ def _batch_call_depends(name: str, args: dict, prev_name: str, prev_args: dict) 
     pa = prev_args if isinstance(prev_args, dict) else {}
     act = str(a.get("action") or "").strip().lower()
     pact = str(pa.get("action") or "").strip().lower()
+    if name == "checklist" or prev_name == "checklist":
+        # §4UU-2: a check runs the code an earlier execute/lab/run just built, and its list is one file: keep the
+        # model's order between them (other calls never wait for a checklist call, nor it for them)
+        return {name, prev_name} <= {"checklist", "execute", "lab", "run"}
     if name == "run" or prev_name == "run":
         return _run_call_depends(name, a, act, prev_name, pa, pact)
     if name == "execute":
@@ -7196,7 +7215,7 @@ def _wire_batch_waits(exec_coros, tool_call_metadata):
     seq = [(k, *_batch_as_run(tool_call_metadata[i][0],
                               tool_call_metadata[i][9] if len(tool_call_metadata[i]) > 9 else {}))
            for k, (i, _) in enumerate(out)
-           if tool_call_metadata[i][0] in ("execute", "lab", "run", "manage_services", "jobs")]
+           if tool_call_metadata[i][0] in ("execute", "lab", "run", "manage_services", "jobs", "checklist")]
     dep_of = {k: [pk for (pk, pn, pa) in seq[:j] if _batch_call_depends(nm, ar, pn, pa)]
               for j, (k, nm, ar) in enumerate(seq)}
     waited = {pk for v in dep_of.values() for pk in v}
@@ -7226,7 +7245,10 @@ def _shield_exit_banner(fname, full, shown):
 
 
 #: §4OG-5 (f): the tools whose batch can run long enough to eat the reserve
-_BATCH_WALL_TOOLS = frozenset({"browser", "deep_research", "darkweb_search", "darkweb_research",
+#: §4UU r2: folders that hold a page's scripts / styles — the page is the index.html one level up
+_WEB_ASSET_DIRS = frozenset({"js", "css", "scripts", "styles", "assets", "static"})   # not src/lib: backend code
+
+_BATCH_WALL_TOOLS = frozenset({"checklist", "browser", "deep_research", "darkweb_search", "darkweb_research",
                                "execute", "web_search", "image_generation", "vision_analysis",
                                "fact_check", "probe_model", "lab", "run"})      # §4PD; §4QA; §4SX B; D5
 
@@ -7350,8 +7372,12 @@ _FUTILITY_MODULE_RE = re.compile(r"(?<![\w-])-m\s+([\w.]+)")
 #: nose setup.cfg` are not suite runs (reader M4)
 _SUITE_CMD_RE = re.compile(
     r"(?:^|[;&|(]\s*|\n\s*)"
-    r"(?:(?:[A-Za-z_][\w]*=\S*\s+|env\s+|timeout\s+\d+[smh]?\s+|nohup\s+|xvfb-run\s+(?:-\S+\s+)*"
-    r"|uv\s+run\s+|poetry\s+run\s+|pipenv\s+run\s+|coverage\s+run\s+(?:-\S+\s+)*)*)"
+    # ft live 11-18 (w4_flaky): `for i in …; do python -m pytest …; done` ran the suite 10× green and the claim
+    # gate still said "never run" — shell keyword heads (`do`, `then`, `else`, `time`, `!`, `{`) lead into a command
+    # (review r2: the prefix spaces are `[ \t]+` — a `\s+` crossing newlines made `"\nenv "*8000` quadratic, 12 s)
+    r"(?:(?:(?-i:(?:do|then|else|elif|time|if|while|until)[ \t]+)|![ \t]+|\{[ \t]+|[A-Za-z_][\w]*=\S*[ \t]+|env[ \t]+"
+    r"|timeout[ \t]+\d+[smh]?[ \t]+|nohup[ \t]+|xvfb-run[ \t]+(?:-\S+[ \t]+)*"
+    r"|uv[ \t]+run[ \t]+|poetry[ \t]+run[ \t]+|pipenv[ \t]+run[ \t]+|coverage[ \t]+run[ \t]+(?:-\S+[ \t]+)*)*)"
     r"(?:(?:\S*/)?(?:python3?(?:\.\d+)?|py)\s+(?:-[A-Za-z]+(?:\s+\S+)?\s+)*-m\s+(?:pytest|unittest|nose2?|tox)\b"
     r"|(?:\S*/)?(?:pytest|py\.test|nose2?)\b(?!\s+--(?:co|collect-only|help|version|fixtures|markers)\b)"
     r"|tox\b(?!\s+-e\s+(?:lint|flake8|black|mypy|docs)\b)"
@@ -7360,10 +7386,25 @@ _SUITE_CMD_RE = re.compile(
     re.I)
 
 
+#: final review 11-18: a heredoc body is data unless it feeds a shell (`bash <<EOF`, `cat > x.sh <<EOF`)
+_NONSHELL_HEREDOC_RE = re.compile(r"^(?P<head>[^\n]*<<-?[ \t]*(['\"]?)(?P<tag>\w+)\2[^\n]*)\n.*?\n[ \t]*(?P=tag)[ \t]*(?=\n|$)",
+                                  re.S | re.M)
+_SHELL_HEREDOC_HEAD_RE = re.compile(r"(?:^|[\s;&|(])(?:ba|z|da)?sh(?:\s|$)|>\s*\S+\.sh\b")
+
+
+def _suite_text(blob: str) -> str:
+    def _heredoc(m):
+        return m.group(0) if _SHELL_HEREDOC_HEAD_RE.search(m.group("head")) else m.group("head")
+    text = _NONSHELL_HEREDOC_RE.sub(_heredoc, blob)
+    # quoted text is data (`echo 'x; pytest'`, a commit message) — except a `-c` payload, which is a command
+    return re.sub(r"(?<!-c )(?<!-c)'[^'\n]*'|(?<!-c )\"[^\"\n]*\"", "''", text)
+
+
 def is_suite_command(blob) -> bool:
     """§4OG-1 (a): a command that RUNS a test suite — it exercises every code
-    file written this request, whatever it names."""
-    return bool(_SUITE_CMD_RE.search(str(blob or "")))
+    file written this request, whatever it names. Heredoc bodies that do not feed a shell and quoted text are
+    data (final review 11-18: `python3 - <<EOF … if pytest:` credited every written file as run)."""
+    return bool(_SUITE_CMD_RE.search(_suite_text(str(blob or ""))))
 
 
 def futility_keys_in_command(blob, written_keys=()) -> set:
@@ -10225,7 +10266,9 @@ def _program_failed_on_its_own(tool_name, exit_code, result_text, is_rejection) 
     """§4UI: an `execute` that RAN the program and the program failed — a
     non-zero exit with its own output, not a refusal (three execute refusals
     carry `EXIT CODE: 1`), not the sandbox's time/memory kill (124/137)."""
-    if tool_name != "execute" or is_rejection:
+    if is_rejection:
+        return False
+    if tool_name != "execute":
         return False
     try:
         code = int(exit_code)
@@ -10234,6 +10277,33 @@ def _program_failed_on_its_own(tool_name, exit_code, result_text, is_rejection) 
     text = str(result_text or "")
     return (code not in (0, 124, 137) and "STDOUT/STDERR:" in text
             and "timed out / killed" not in text)
+
+
+#: console lines that say one of the page's OWN files never loaded (not a network fetch: those depend on Tor)
+_LOCAL_LOAD_FAIL_RE = re.compile(
+    r"^\s*• \[error\] (?:\S+\.(?:m?js|cjs)(?:[?#]\S*?)?(?::\d+)*(?::\d+)? — .*net::ERR_FILE_NOT_FOUND"   # a missing SCRIPT
+    r"|.*(?:from origin 'null' has been blocked|Failed to load module script|"
+    r"Cross origin requests are only supported)).*$", re.M)
+
+
+def _local_load_failures(browser_text) -> str:
+    """The console error lines of a page load that say a LOCAL script / stylesheet / module never loaded, as a
+    block the model can act on ("" when none)."""
+    lines = [m.group(0).strip() for m in _LOCAL_LOAD_FAIL_RE.finditer(str(browser_text or ""))][:6]
+    if not lines:
+        return ""
+    hint = ""
+    if any("origin 'null'" in ln or "module script" in ln or "Cross origin" in ln for ln in lines):
+        hint = ("\nA page opened from disk (file://) cannot load ES modules (type=\"module\" / import): use classic "
+                "<script src> tags (the web-app template does), or serve the folder and load it over http.")
+    return ("LOCAL FILES THAT DID NOT LOAD — the page's code never ran:\n" + "\n".join(lines) + hint)
+
+
+def _checklist_check_failed(result_text) -> bool:
+    """§4UU: a `checklist check` whose checks RAN and one failed (a ✗ row, not a "(not run in this call)" one) —
+    the program's own failure, like a red test through `execute`, not a broken call."""
+    return any(not m.group(0).endswith("(not run in this call)")
+               for m in re.finditer(r"^✗ #\d+ .*$", str(result_text or ""), re.M))
 
 
 _LAB_EXIT_RE = re.compile(r"^\[[^\]\n]*\bexit=(-?\d+)\b[^\]\n]*\]", re.M)
@@ -13206,6 +13276,23 @@ def _bounded_verdict(fn):
 def _int_or_none(v):
     """§4SO: a token count for a JSON meta — an int, else None."""
     return v if isinstance(v, int) else None
+
+def _probed_pages(paths) -> set:
+    """§4UU r3: the pages `_execute_web_artifact` loads for these written web files — the HTML files when any
+    was written, else the index.html of each script's page folder."""
+    html = {Path(str(p)).as_posix() for p in paths if str(p).lower().endswith((".html", ".htm"))}
+    if html:
+        return html
+    return {"index.html" if _page_folder(p) in ("", ".") else _page_folder(p) + "/index.html" for p in paths}
+
+
+def _page_folder(path) -> str:
+    """§4UU r2: the folder of the page a web file belongs to (an asset folder counts as its parent's)."""
+    p = Path(str(path or "")).parent
+    if p.name.lower() in _WEB_ASSET_DIRS:
+        p = p.parent
+    return p.as_posix()
+
 
 class GhostAgent:
     def _rebuild_available_tools(self):
@@ -18527,7 +18614,7 @@ class GhostAgent:
     # on vision alone, on a page that threw on load).
     _WEB_EXEC_SKIP_CONF_CAP = 0.6
 
-    def _locate_entry_page(self, candidates: list, sbx: Path, root: Path):
+    def _locate_entry_page(self, candidates: list, sbx: Path, root: Path, basename_fallback: bool = True):
         """Resolve a web entry-page name to an existing host file, or None.
 
         Searches the scoped sandbox AND the root mount by the EXACT named
@@ -18550,6 +18637,10 @@ class GhostAgent:
                 except Exception:
                     continue
         matches: list = []
+        if not basename_fallback:
+            # §4UU live: a page GUESSED for a script (`<its folder>/index.html`) is that folder's page or none —
+            # the freshest `index.html` anywhere was another request's page (a Node `hello.js` got its ✓)
+            return None
         for c in candidates:
             try:
                 matches.extend(m for m in root.rglob(Path(c).name) if m.is_file())
@@ -18713,6 +18804,100 @@ class GhostAgent:
             return project_scoped_sandbox(self.context)[0]
         return project_scoped_sandbox(self.context, stateful=True)[0]
 
+    def _checklist_status_for_batch(self, batch_meta, tools_run) -> str:
+        """§4UU-2: the `[CHECKLIST …]` line for the end of this tool batch — only while items are open, and only
+        when the request works with the checklist or this batch writes / runs code (an unrelated request in the
+        same project is not nagged)."""
+        if "checklist" not in (getattr(self, "available_tools", None) or {}):
+            return ""
+        names = {str(m[0]) for m in (batch_meta or []) if m}
+        coding = bool(names & {"file_system", "execute", "checklist"}) and any(
+            m and (m[0] == "checklist" or m[3]) for m in (batch_meta or []))
+        touched = any(isinstance(t, dict) and str(t.get("name", "")).lower() == "checklist"
+                      for t in (tools_run or []))
+        if not (coding or touched):
+            return ""
+        from ..tools.checklist import status_line
+        return status_line(self.context)
+
+    async def _page_check_after_write(self, result_text, i: int, batch_meta, batch_results=None) -> str:
+        """§4UU-1: after a successful file_system write of a web file, load its page headless and return the
+        note for the write's result ("" when nothing ran). Only the LAST web write of the batch probes (one load
+        covers the batch); a file still open for parts waits for its last part; a member's turn never probes
+        (as WEB-EXEC). The note names what the load ran — the claim arm reads it back from the row."""
+        from . import page_check as _pc
+        if not _pc.enabled() or requester_is_member():
+            return ""
+        from ..tools.file_system import OPEN_PART_NOTE, _PARTS_PENDING_NOTE
+        text = str(result_text or "")
+        if OPEN_PART_NOTE.strip() in text or _PARTS_PENDING_NOTE.strip() in text:
+            return ""
+        written = list(dict.fromkeys(p for p in _written_paths_from_confirmation(text) if _pc.is_web_path(p)))
+        if not written:
+            return ""
+        for j, later in enumerate(list(batch_meta or [])[i + 1:], start=i + 1):
+            try:
+                l_name = later[0]
+            except (IndexError, TypeError):
+                continue
+            if l_name != "file_system" or batch_results is None or j >= len(batch_results):
+                continue
+            l_res = batch_results[j]
+            l_text = str(l_res or "")
+            if getattr(l_res, "reason_code", None) == "written_but_syntax_failed":
+                continue                        # that write is not probed: it does not cover this one
+            l_web = [p for p in _written_paths_from_confirmation(l_text) if _pc.is_web_path(p)]
+            if OPEN_PART_NOTE.strip() in l_text or _PARTS_PENDING_NOTE.strip() in l_text:
+                continue
+            # a later write probes THIS one too only when its probe loads every page this write needs
+            if _probed_pages(written) <= _probed_pages(l_web):
+                return ""                       # the later write's probe loads this page
+        if (getattr(self, "available_tools", None) or {}).get("browser") is None:
+            return ""
+        from ..tools.browser_support import SYSTEM_PROBE_NAV
+        _nav_tok = SYSTEM_PROBE_NAV.set(True)   # the model's own url-less browser calls keep their page
+        try:
+            res = await self._execute_web_artifact(written)
+        finally:
+            SYSTEM_PROBE_NAV.reset(_nav_tok)
+        wrote_html = any(_pc.is_html_path(p) for p in written)
+        if res is not None:
+            sbx = Path(self._scoped_sandbox_for(_PROJECT_ID_UNCAPTURED))
+            root = sbx.parent.parent if sbx.parent.name == "projects" else sbx
+            pages, block = res
+            keys: set = set()
+            for rel in ([pages] if block else str(pages).split(", ")):
+                host = root / rel
+                keys |= _pc.loaded_names(host, root) if host.is_file() else {Path(rel).name.casefold()}
+            pretty_log("Page Check", (f"'{pages}' throws on load" if block else f"'{pages}' loaded clean")
+                       + f" — ran {len(keys)} file(s)", icon=Icons.VERIFIER_LAB,
+                       level="WARNING" if block else "INFO")
+            return _pc.note_for(res, wrote_html, keys)
+        note = _pc.note_for(res, wrote_html)
+        if note:                                  # skipped as fetch-backed: a fetch of its OWN data file fails from disk
+            try:
+                sbx = Path(self._scoped_sandbox_for(_PROJECT_ID_UNCAPTURED))
+                root = sbx.parent.parent if sbx.parent.name == "projects" else sbx
+                from ..tools.file_system import _get_safe_path
+                texts = []
+                for rel in written:
+                    if not _pc.is_web_path(rel):
+                        continue
+                    for base in (sbx, root):          # the write's own resolution (`/workspace/…`, `./x`, project)
+                        try:
+                            f = _get_safe_path(base, rel)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if f.is_file():
+                            texts.append(f.read_text(encoding="utf-8", errors="replace")[:200_000])
+                            break
+                extra = _pc.local_fetch_note(texts)
+                if extra:
+                    note = _pc.note_for(res, wrote_html, local_fetch=True) + extra
+            except Exception:  # noqa: BLE001 — an advisory must never break the write
+                pass
+        return note
+
     async def _execute_web_artifact(self, written: list,
                                     project_id=_PROJECT_ID_UNCAPTURED):
         """Headless-load EVERY html page written/edited this turn (cap
@@ -18741,14 +18926,20 @@ class GhostAgent:
         # container URL for) files written under either layout.
         root = sbx.parent.parent if sbx.parent.name == "projects" else sbx
         candidates = [f for f in written if f.lower().endswith((".html", ".htm"))]
-        if not candidates:
-            candidates = [str(Path(f).parent / "index.html") for f in written]
+        if candidates:
+            groups = [[c] for c in candidates]
+        else:
+            # §4UU r2: a script in an asset folder (`app/js/clock.js`) belongs to the page one level up
+            groups = [[str(Path(f).parent / "index.html")]
+                      + ([str(Path(f).parent.parent / "index.html")]
+                         if Path(f).parent.name.lower() in _WEB_ASSET_DIRS else [])
+                      for f in written]
         # Resolve each candidate independently so one located page can't
         # shadow the rest; dedupe by resolved host path.
         hosts: list = []
         seen: set = set()
-        for c in candidates[: self._WEB_EXEC_MAX_PAGES]:
-            host = self._locate_entry_page([c], sbx, root)
+        for g in groups[: self._WEB_EXEC_MAX_PAGES]:
+            host = self._locate_entry_page(g, sbx, root, basename_fallback=bool(candidates))
             if host is None:
                 continue
             key = str(host.resolve())
@@ -18859,6 +19050,11 @@ class GhostAgent:
             marker = "UNCAUGHT JS EXCEPTIONS"
             if marker in text:
                 return page_rel, text[text.index(marker):][:1200]
+            # §4UU review: a page whose own scripts never loaded throws nothing — a missing local file, or an ES
+            # module a file:// page cannot load — and read "clean" while none of its code ran
+            _local_fail = _local_load_failures(text)
+            if _local_fail:
+                return page_rel, _local_fail
             clean_pages.append(page_rel)
         if inconclusive or not clean_pages:
             return None
@@ -24457,7 +24653,8 @@ class GhostAgent:
                               (_cname == "run" and not _run_is_read_call(t_args)) or \
                               (_cname == "introspect" and _introspect_is_write_call(t_args)) or \
                               (_cname == "file_system" and t_args.get("operation") in ["write", "edit", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"]) or \
-                              (_cname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"])
+                              (_cname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"]) or \
+                              (_cname == "checklist" and str(t_args.get("action") or t_args.get("operation") or "view").strip().lower() != "view")
 
                 # --- IDEMPOTENCY GUARD (production loop fix) ---
                 # Pure setters with no value in repetition. Re-issuing
@@ -24575,7 +24772,8 @@ class GhostAgent:
                     _app_flag = t_args.get("append")
                     _finishing = isinstance(t_args.get("content"), str) and (   # r2: "" finishes, "\n" appends
                         _app_flag is True or str(_app_flag).strip().lower() in ("true", "1", "yes"))
-                    if op == "write" and not _finishing:   # §4SH r1: append=true, content='' finishes a parts file (the tool judges it)
+                    # §4UU-5: a template write has no content by design (the tool refuses one that has some)
+                    if op == "write" and not _finishing and not t_args.get("template"):   # §4SH r1: append=true, content='' finishes a parts file (the tool judges it)
                         content_val = t_args.get("content")
                         if not content_val or not str(content_val).strip():
                             # Allow empty writes for filenames that
@@ -24774,6 +24972,23 @@ class GhostAgent:
                             tools_run_this_turn.append(
                                 {**err_msg, "_synthetic": True},
                             )
+                            last_was_failure = True
+                            continue
+
+                    # §4UU-4: a privilege program the sandbox already refused in this request is not run
+                    # again under new arguments (req 09c9b24e: `su` EPERM at 12–13, retried at 41)
+                    if fname == "execute":
+                        try:
+                            from .env_limits import refusal as _env_refusal
+                            _env_msg = _env_refusal(request_id_context.get(), (t_args or {}).get("command"))
+                        except Exception:  # noqa: BLE001
+                            _env_msg = ""
+                        if _env_msg:
+                            pretty_log("Env Limit", _env_msg[:160], level="WARNING", icon=Icons.STOP)
+                            err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
+                                       "content": _TO.rejected(_env_msg, reason_code="env_limit_block")}
+                            messages.append(err_msg)
+                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
                             last_was_failure = True
                             continue
 
@@ -25369,6 +25584,24 @@ class GhostAgent:
                                 _fremember_failure(getattr(self.context, "_fetch_memo", None), _fk2, str_res)
                         except Exception:  # noqa: BLE001
                             pass
+                    if fname == "execute":
+                        try:                                              # §4UU-4: remember a privilege refusal
+                            from .env_limits import note_result as _env_note
+                            from ..tools.tool_failure import exec_exit_code as _eec
+                            _env_note(request_id_context.get(),
+                                      (_recorded_args if isinstance(_recorded_args, dict) else {}).get("command"),
+                                      str_res, _eec(str_res))
+                            from .env_limits import capability_note as _cap_note    # ft live: never fake the effect
+                            _cn = _cap_note(request_id_context.get(),
+                                            (_recorded_args if isinstance(_recorded_args, dict) else {}).get("command"),
+                                            str_res, _eec(str_res))
+                            if _cn:
+                                from ..tools.outcome import with_text as _with_text
+                                str_res = str(str_res) + _cn
+                                _outcome = _with_text(_outcome, str_res)
+                                pretty_log("Sandbox Limit", _cn.strip()[:160], icon=Icons.WARN, level="INFO")
+                        except Exception:  # noqa: BLE001
+                            pass
                     if fname == "file_system" and not _res_is_error and not _res_unresolved:
                         try:                                              # §4OG-3 (d): links in a written document
                             _lc_note = document_link_check_note(
@@ -25381,6 +25614,42 @@ class GhostAgent:
                                            icon=Icons.WARN, level="WARNING")
                         except Exception:  # noqa: BLE001
                             pass
+                    if fname in ("file_system", "execute") and getattr(
+                            getattr(_outcome, "status", None), "value", None) != "rejected":
+                        try:                                              # §4UU-2: passed items must be re-checked
+                            # what was WRITTEN decides, not the call's status (a syntax-broken write, a heredoc
+                            # whose run then failed — the code changed all the same); a refused call wrote nothing
+                            from ..tools.checklist import note_code_changed as _cl_changed, \
+                                exempt_ids_after as _cl_exempt_after
+                            if fname == "file_system":
+                                _cl_written = _written_paths_from_confirmation(str(str_res))
+                            else:
+                                from .code_claims import _exec_written as _cl_exec_written
+                                _cl_written = _cl_exec_written({"content": str(str_res)}, _recorded_args or {})
+                            _cl_exempt = _cl_exempt_after(fname, i, tool_call_metadata, results)
+                            if _cl_written:
+                                _cl_changed(self.context, _cl_written, exempt_ids=_cl_exempt)
+                        except Exception as _cl_exc:  # noqa: BLE001
+                            logger.debug("checklist stale mark skipped: %s", _cl_exc)
+                    if (fname == "file_system" and not _res_is_error and not _res_unresolved
+                            and getattr(_outcome, "reason_code", None) != "written_but_syntax_failed"):
+                        try:                                              # §4UU-1: load the page right after the write
+                            _pc_note = await self._page_check_after_write(str_res, i, tool_call_metadata, results)
+                            if _pc_note:
+                                from ..tools.outcome import with_text as _with_text
+                                str_res = str(str_res) + _pc_note
+                                _outcome = _with_text(_outcome, str_res)
+                        except Exception as _pc_exc:  # noqa: BLE001
+                            logger.debug("page check after write failed: %s", _pc_exc)
+                    if i == len(results) - 1 and not requester_is_member():
+                        try:                                              # §4UU-2: the open checklist, once per batch
+                            _cl_line = self._checklist_status_for_batch(tool_call_metadata, tools_run_this_turn)
+                            if _cl_line and _cl_line.strip() not in str(str_res):
+                                from ..tools.outcome import with_text as _with_text
+                                str_res = str(str_res) + _cl_line
+                                _outcome = _with_text(_outcome, str_res)
+                        except Exception as _cl_exc:  # noqa: BLE001
+                            logger.debug("checklist status line skipped: %s", _cl_exc)
                     # ⚠ NO unanchored `"Traceback" in str_res` arm. It lived
                     # in the old WIDE rebind, where it fed only the work log
                     # and the no-progress ledger; collapsing the three
@@ -25663,7 +25932,9 @@ class GhostAgent:
                     # request_state — per-request, no TurnState churn.
                     if (fname == "file_system" and is_mutating and not _res_is_error
                             and not _intr                                       # §4RZ step 5: not written
-                            and not _is_parts_continuation(_recorded_args)):     # §4RI
+                            and not _is_parts_continuation(_recorded_args)       # §4RI
+                            and "\n[PAGE CHECK] ✓" not in str(str_res) and "\n[PAGE CHECK] ✗" not in str(str_res)):
+                        # (§4UU: a write the system's page check loaded was rendered — not an unverified edit)
                         _churn = getattr(request_state, "_edit_churn", None)
                         # isinstance, not None-check: a mocked request_state
                         # auto-fabricates attributes, and the counters must
@@ -25699,7 +25970,16 @@ class GhostAgent:
                                 "verify before further edits",
                                 icon=Icons.WARN, level="WARNING",
                             )
+                    elif (fname == "file_system" and not _intr and ("\n[PAGE CHECK] ✓" in str(str_res)
+                                                                    or "\n[PAGE CHECK] ✗" in str(str_res))):
+                        # §4UU: the system's page check loaded the page — its web files were rendered (only theirs)
+                        _churn = getattr(request_state, "_edit_churn", None)
+                        if isinstance(_churn, dict):
+                            for _ck in [k for k in _churn["counts"]
+                                        if str(k).lower().endswith((".html", ".htm", ".js", ".mjs", ".css"))]:
+                                _churn["counts"].pop(_ck, None)
                     elif (fname in _EDIT_CHURN_VERIFY_TOOLS and not _intr      # §4RZ step 5: not a run
+                            and not (fname == "checklist" and not _checklist_runs_checks(_recorded_args))
                             and not getattr(_outcome, "is_rejection", False)):
                         # §4OA (probe-oa-py): a run that FAILED is still a
                         # verification — debugging is mostly failing runs.
@@ -26580,7 +26860,9 @@ class GhostAgent:
                         # rollback is a fix-and-resend step like a red test
                         failure_was_program = (str(getattr(_outcome, "reason_code", "") or "")
                                                == "syntax_regression_rolled_back"
-                                               or _lab_program_failed(fname, _outcome, str_res))
+                                               or _lab_program_failed(fname, _outcome, str_res)
+                                               or (fname == "checklist" and not _outcome.is_rejection
+                                                   and _checklist_check_failed(str_res)))
                         failure_was_partial = (
                             _outcome.status is _OutcomeStatus.PARTIAL)
                         last_error_preview = str_res.replace("Error:", "").strip()
@@ -26986,7 +27268,7 @@ class GhostAgent:
                                    f"{last_error_preview[:100]}",
                                    icon=Icons.VERDICT_NOTE, level="INFO")
                         diagnostic_msg = format_failure_context(failure_text, failure_class)
-                    elif (failure_was_program and _fail_fname in ("execute", "file_system", "lab", "run")
+                    elif (failure_was_program and _fail_fname in ("execute", "file_system", "lab", "run", "checklist")
                           and not _program_fail_repeats(strikes, failure_text)):
                         # §4UI (coding review A1): a write-and-run batch whose
                         # test is still red is how debugging goes — counting it
@@ -30964,6 +31246,15 @@ class GhostAgent:
                         _claim_directive = unbacked_claim_directive(_judge_text, tools_run_this_turn)
                     except Exception as _cc_exc:  # noqa: BLE001
                         logger.debug("code-claim arm skipped: %s", _cc_exc)
+                    if not _claim_directive and not requester_is_member():
+                        try:                                  # §4UU-2: "done" while checklist items have not passed
+                            from ..tools.checklist import checklist_directive
+                            _claim_directive = checklist_directive(_judge_text, tools_run_this_turn, self.context)
+                            if _claim_directive:
+                                pretty_log("Checklist", "the answer says done with items not passed — one repair "
+                                           "round", icon=Icons.VERIFIER_LAB, level="WARNING")
+                        except Exception as _cl_exc:  # noqa: BLE001
+                            logger.debug("checklist arm skipped: %s", _cl_exc)
                     try:
                         from .verifier import VerifyVerdict as _VV
                         if self._critic_async_enabled():

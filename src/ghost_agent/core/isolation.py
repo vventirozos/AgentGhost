@@ -820,6 +820,8 @@ REPLAY_FORBIDDEN_TOOLS = frozenset({
     "lab", "run",
     # §4TI: the owner's holdings
     "portfolio",
+    # §4UU-2: runs shell checks and page loads, and keeps its list in the host data dir
+    "checklist",
     # `jobs` reaches the shared registry directly (cancel/collect on the
     # operator's live delegates). The registry itself is detached — this
     # is the belt.
@@ -880,6 +882,8 @@ def restrict_tool_surface(agent, forbidden=None) -> frozenset:
         from ..tools.registry import TOOL_DEFINITIONS, YOUTUBE_TRANSCRIBE_INNER_TOOL
         if YOUTUBE_TRANSCRIBE_INNER_TOOL in forbidden:
             forbidden.add("youtube_transcribe")
+        if forbidden & {"execute", "browser"}:
+            forbidden.add("checklist")          # §4UU-2: its checks run through both
         advertised = {t["function"]["name"] for t in TOOL_DEFINITIONS}
         advertised |= set(agent.available_tools or {})
         keep = advertised - forbidden

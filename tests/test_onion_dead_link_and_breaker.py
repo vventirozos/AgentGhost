@@ -1232,7 +1232,9 @@ class TestTheRunnerIsARealFileNotAString:
         # 1650 → 1700 on 2026-10-04: §4LG wired the clearnet host memory (its
         # body lives in tools/host_memo.py), the opt-in timeout retry and the
         # BLOCKED strike — tool code again, the runner still separate.
-        assert len(src.splitlines()) < 1700, (
+        # 1700 → 1720 on 2026-11-17: §4UU-4 refuses tailnet URLs (5 lines here; the rule lives in
+        # tools/browser_tailnet.py) — tool code, the runner still separate.
+        assert len(src.splitlines()) < 1720, (
             "browser.py grew back toward its pre-extraction size")
 
     def test_the_module_scope_is_now_UNAMBIGUOUS(self):

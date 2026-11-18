@@ -351,9 +351,17 @@ def _runner_failure_hint(err: str) -> str:
     return " ".join(parts) or "Read the error above — an identical retry usually fails the same way."
 
 
+#: §4UU-1: set while a SYSTEM probe (the page check after a write) navigates — its visits go to a throwaway sidecar,
+#: so the model's own url-less browser calls keep re-opening the page the MODEL last visited
+import contextvars as _cv  # noqa: E402
+SYSTEM_PROBE_NAV = _cv.ContextVar("ghost_browser_system_probe_nav", default=False)
+
+
 def _last_url_filename() -> str:
     """The sidecar this REQUEST's url-less ops read (§4LN): `.last_url.<req>`,
     or the shared `.last_url` outside a request (background flows)."""
+    if SYSTEM_PROBE_NAV.get():
+        return ".last_url.sysprobe"
     try:
         from ..utils.logging import request_id_context
         rid = re.sub(r"[^A-Za-z0-9_-]", "", str(request_id_context.get() or ""))[:24]
@@ -569,6 +577,8 @@ def _last_url_conv_filename() -> str:
     """§4PC: the CONVERSATION's sidecar (`.last_url.c<key>`): a url-less op
     in a follow-up turn of the same conversation re-opens its page; another
     conversation's page is never re-opened. "" outside a conversation."""
+    if SYSTEM_PROBE_NAV.get():
+        return ""
     try:
         from ..utils.logging import conversation_key_context
         key = re.sub(r"[^A-Za-z0-9_-]", "", str(conversation_key_context.get() or ""))[:24]

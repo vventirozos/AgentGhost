@@ -138,7 +138,8 @@ from test_4sx_d3_kept import _det  # noqa: E402
 async def test_missing_member_names_this_lab_s_members_and_the_app_member(ctx, fake, scope):
     scope(ctx)
     fake.on("GET", f"/v1/labs/{LAB}", (200, _det(app=_app(), members=[{"name": "web"}, {"name": "db"}])))
-    s = str(await _lab(ctx, action="http", lab_id=LAB, port=8080, path="/"))
+    # §4UU-4: http/screenshot/logs now default the member (the kept app's) — exec still needs one named
+    s = str(await _lab(ctx, action="exec", lab_id=LAB, cmd="ls"))
     assert f"{LAB}'s members: web, db" in s and "(the kept app runs on `web`)" in s and "like `db`" not in s
 
 

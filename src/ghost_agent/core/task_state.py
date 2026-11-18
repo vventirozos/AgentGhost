@@ -267,6 +267,55 @@ def _exercised_pages(url: str, pages) -> set:
     return set()
 
 
+def _check_page_folders(cmd: str, cwd: str = "") -> List[str]:
+    """The app folders a command runs `tests/check_page.py` for (`cd 'my app' && timeout 60 python3
+    tests/check_page.py x`, `(cd app && python3 tests/check_page.py)`, `bash -c '…'`), workspace-relative
+    ("" = the workspace root). Only a check whose exit code IS the command's counts: the last command, or
+    followed only by `&&` — not `; echo done`, `| tee log`, `&`, `|| true`."""
+    import posixpath
+    import shlex
+    text = str(cmd or "")
+    if "check_page.py" not in text:
+        return []
+    try:
+        lex = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=";&|()")
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return []
+    segs, seg = [], []
+    for tok in toks:
+        if tok in ("(", ")"):
+            continue                                   # a subshell: its exit code is its last command's
+        if tok and set(tok) <= set(";&|"):
+            segs.append((seg, tok))
+            seg = []
+        else:
+            seg.append(tok)
+    segs.append((seg, ""))
+    segs = [(w, op) for w, op in segs if w or op]
+    out = []
+    for n, (words, op) in enumerate(segs):
+        if words[:1] == ["cd"] and len(words) > 1:
+            cwd = words[1] if words[1].startswith("/") else posixpath.normpath(posixpath.join(cwd or ".", words[1]))
+            continue
+        if words[:1] and words[0].rsplit("/", 1)[-1] in ("bash", "sh", "zsh") and "-c" in words[:-1]:
+            inner = words[words.index("-c") + 1]
+            found = _check_page_folders(inner, cwd)
+        else:
+            script = next((w for w in words if w.endswith("check_page.py")), "")
+            if not script:
+                continue
+            full = script if script.startswith("/") else posixpath.normpath(posixpath.join(cwd or ".", script))
+            folder = posixpath.dirname(posixpath.dirname(full))
+            found = [_page_key(folder if folder not in (".", "") else "")]
+        last = not any(w for w, _o in segs[n + 1:])
+        if found and ((last and op in ("", ";")) or
+                      (op == "&&" and all(o in ("&&", "") for _w, o in segs[n:]))):
+            out.extend(found)
+    return out
+
+
 def untested_pages(tools_run) -> List[str]:
     """§4OJ: .html pages this request wrote with a script and never EXERCISED
     after their last change — no successful browser click/fill/evaluate on
@@ -299,6 +348,20 @@ def untested_pages(tools_run) -> List[str]:
             if ok and uses:
                 for p in _exercised_pages(url, changed):
                     tested[p] = i
+            continue
+        if n in ("execute", "checklist"):
+            # §4UU: the web-app template's own click test — `cd app && python3 tests/check_page.py` exit 0,
+            # or a passed checklist item whose check is that run — exercises the pages in its folder
+            if n == "execute":
+                runs_ok = [str(a.get("command") or "")] if re.search(r"EXIT CODE:\s*0\b", body[:400]) else []
+            else:
+                runs_ok = [m.group(1) for m in re.finditer(r"^✓ #\d+ .*? — check: (.+?)$", body, re.M)
+                           if not m.group(0).endswith("(not run in this call)")]
+            for cmd in runs_ok:
+                for folder in _check_page_folders(cmd):
+                    for pg in changed:
+                        if folder == "" or pg == folder or pg.startswith(folder + "/"):
+                            tested[pg] = i
             continue
         if n != "file_system":
             continue
@@ -450,8 +513,9 @@ def render_task_state(tools_run, *, ask: str = "", turn: int = 0, note: str = ""
         _ut = []
     _ut_line = ("Pages with scripts NOT exercised since their last change (loaded at most — no click or "
                 "interact): " + ", ".join(f"`{p}`" for p in _ut[:3]) + ". Loading a page does not test it: "
-                "before calling it working, use browser interact to click a control and check what changes, "
-                "or say plainly in the reply that it is untested.") if _ut else ""
+                "before calling it working, run its click check (a web-app template's `python3 <folder>/tests/check_page.py`) "
+                "or use browser interact to click a control and check what changes, or say plainly in the reply that "
+                "it is untested.") if _ut else ""
     if note:
         lines.append(note)
     if facts["files"]:

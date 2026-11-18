@@ -150,7 +150,8 @@ def test_the_prompt_tells_the_truth_about_the_sandbox():
     text = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "execute")["function"]["description"]
     assert "SANDBOX: Python 3.11" in text and "pytest" in text and "python-chess" in text and "already installed" in text
     assert "`pip install python-chess` in the sandbox if missing" not in text
-    assert "--import-mode=importlib" in text
+    # ft live 11-18: importlib mode broke a flat `from ratelimit import …` run from /workspace (w2_async, w1_status)
+    assert "cd <folder> && python -m pytest -q" in text and "do not add `--import-mode=importlib`" in text
 
 
 def test_the_other_whole_file_paths_honour_the_gate_and_the_right_reads_stamp(tmp_path):

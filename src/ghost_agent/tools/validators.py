@@ -46,9 +46,13 @@ _SHELL_DENY: tuple = (
     # and an `f` flag in the rm invocation before the target.
     re.compile(
         # long options too (fresh review: `rm --recursive --force /…` passed)
-        r"\brm\b(?=[^|;&]*\s(?:-\w*r|--recursive))(?=[^|;&]*\s(?:-\w*f|--force))[^|;&]*\s+"
-        r"(?:/(?:\s|$|\*|\w[^\s'\"]*)|~(?:\s|$|/)|\$\{?HOME\}?"
-        r"|['\"]\s*(?:/[^'\"]*|~[^'\"]*|\$\{?HOME\}?)['\"])",
+        # final review: the rule stops at a newline (a later line's absolute path is not an rm target) and a
+        # redirect target (`> /dev/null`) is not one either
+        r"\brm\b(?=[^|;&\n]*\s(?:-\w*r|--recursive))(?=[^|;&\n]*\s(?:-\w*f|--force))[^|;&\n]*(?<![<>])\s+"
+        # ft live 11-18: a subfolder of /tmp is scratch; /tmp itself, a glob of it and `..` stay blocked. Absolute
+        # /workspace/… stays DENIED — top-level workspace folders hold the owner's data (projects/, §4KW-r4)
+        r"(?:/(?!tmp/(?![\w\-./]*\.\.)[\w\-][\w\-./]*(?:\s|$))(?:\s|$|\*|\w[^\s'\"]*)|~(?:\s|$|/)|\$\{?HOME\}?"
+        r"|['\"]\s*(?:/(?!tmp/(?![\w\-./ ]*\.\.)[\w\-][\w\-./ ]*['\"](?:\s|$))[^'\"]*|~[^'\"]*|\$\{?HOME\}?)['\"])",
         re.IGNORECASE,
     ),
     # dd to a raw device
@@ -116,6 +120,9 @@ def validate_shell(cmd: str) -> Tuple[bool, str]:
     # Deny list
     for pat in _SHELL_DENY:
         if pat.search(s):
+            if pat is _SHELL_DENY[0]:          # ft live: the raw regex told the model nothing it could act on
+                return False, ("deny-listed pattern: `rm -r -f` of an absolute or home path. Delete your own scratch "
+                               "with a path RELATIVE to the workspace (`rm -rf tb_src`) or under /tmp (`rm -rf /tmp/x`)")
             return False, f"deny-listed pattern: {pat.pattern[:60]}"
     return True, ""
 

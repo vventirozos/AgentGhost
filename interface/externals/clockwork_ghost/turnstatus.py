@@ -164,6 +164,7 @@ ICON_CLASS = {
     "🔗": "plan",
 
     # --- raw thinking (the floor) ---
+    "👣": "think",    # PROGRESS — a live step's sentence (§4UT)
     "🧠": "think",
     "🪫": "think",    # EFFORT_LOW (§4RB)
     "🔋": "think",    # EFFORT_MEDIUM

@@ -483,7 +483,7 @@ class TestRemoteAccessHint:
         for i in range(MAX_SERVICES):
             assert "RUNNING" in sup.start(f"s{i}", "cmd")
         out = sup.start("one-too-many", "cmd")
-        assert "already running — stop one first" in out.replace("services", "services")
+        assert "already running (" in out and "Stop one you own" in out   # ft live 11-18: names the services
         assert f"{MAX_SERVICES} services" in out
 
     def test_stop_kills_process_group(self, tmp_path):

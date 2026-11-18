@@ -530,13 +530,20 @@ class _StepPrinter:
             self._pending = None
             self._stopped = True
 
-    def stop(self) -> None:
-        """The answer starts (or the turn ended): print what is held, then nothing more."""
+    def stop(self, gap: bool = False) -> None:
+        """The answer starts (or the turn ended): print what is held, then nothing more.
+        ``gap`` (the answer starts): a blank line after the steps, so the reply stands
+        apart from them — once, and only when a step was printed."""
         with self._lock:
             if self._stopped:
                 return
             self._flush_locked()
             self._stopped = True
+            if gap and self.printed:
+                try:
+                    self._emit(Text(""))
+                except Exception:      # noqa: BLE001 — a step line is optional
+                    pass
 
 
 class _StreamPrinter:
@@ -1713,8 +1720,8 @@ class GhostCLI:
                     if trim_hold is not None:
                         trim_hold[1].append(chunk)
                         continue
-                    if steps is not None:  # §4UT: the answer starts — the steps end above it
-                        steps.stop()
+                    if steps is not None:  # §4UT: the answer starts — the steps end above it, a blank line between
+                        steps.stop(gap=True)
                     if waiting:            # first token: spinner down
                         status_spin.stop()
                         waiting = False

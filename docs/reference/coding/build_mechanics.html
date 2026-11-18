@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build mechanics (§4UU) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css?v=ab96635d7c">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <div class="subnav">
+      <a href="acquired_skills.html">Acquired skills (tools.acquired_skills)</a>
+      <a class="current" href="build_mechanics.html">Build mechanics (§4UU)</a>
+      <a href="code_claims.html">Code claims (core.code_claims)</a>
+      <a href="coding_executor.html">Coding executor (core.coding_executor)</a>
+      <a href="coding_loop.html">Coding loop (core.coding_loop)</a>
+      <a href="docker.html">Docker sandbox (sandbox.docker)</a>
+      <a href="execute.html">Running code (execute) (tools.execute)</a>
+      <a href="experiment_gate.html">Experiment gate (core.experiment_gate)</a>
+      <a href="file_system.html">File system tool (tools.file_system)</a>
+      <a href="jobs.html">Sandbox jobs (sandbox.jobs)</a>
+      <a href="probe_model.html">Probe-model experiments (tools.probe_model)</a>
+      <a href="probe_transcripts.html">Probe transcripts (core.probe_transcripts)</a>
+      <a href="quarantine.html">Quarantine (tools.quarantine)</a>
+      <a href="runs.html">Runs (tools.runs)</a>
+      <a href="services.html">Sandbox services (sandbox.services)</a>
+      <a href="skill_acquisition.html">Skill acquisition</a>
+      <a href="workspace.html">Workspace tool (tools.workspace)</a>
+      <a href="workspace_cleanup.html">Workspace cleanup (core.workspace_cleanup)</a>
+      <a href="workspace_continuity.html">Workspace Continuity</a>
+      <a href="workspace_track.html">Workspace tracking (tools.workspace_track)</a>
+    </div>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>Build mechanics (§4UU) — make the model's coding loop do the checking</h1>
+  <p class="subtitle">Five mechanical changes to how a coding turn runs (2026-11-17): a headless page load after every web write, a checklist ticked only by checks, a strict definition of "ran it", hints for labs / the tailnet / privilege refusals, and a web-app starter project.</p>
+
+  <h2>Why it exists</h2>
+  <p>A study of 38 owner coding turns (10-25 → 11-17) found the model fixes bugs it can see well (median one fix cycle, no same-error loops). The cost was elsewhere: monolithic web builds (the web OS 11 times from scratch, 10.2 h, 41 % of owner coding time), browser-driven UI testing (120 calls, 27 failed), "done / tested" claims after only a syntax check or a read (37 of 38 replies claimed done; about 5 turns ran the program after the last write), lab misuse (32 failures: no member 6&times;, invented templates) and environment limits retried (tailnet through the Tor browser 9&times;, <code>su</code> after EPERM). Each item below closes one of those, without a model call.</p>
+
+  <h2>1 &middot; Page check after a web write (<code>core/page_check.py</code>)</h2>
+  <p>A successful <code>file_system</code> write / edit of <code>.html .htm .js .mjs .css</code> &mdash; the LAST web write of its tool batch, not a file still open for parts, not a syntax-refused write, never in a member's turn &mdash; loads its page headless through <code>GhostAgent._execute_web_artifact</code> (the WEB-EXEC probe: the page itself, or the <code>index.html</code> next to an edited script; served through a running sandbox service when it calls the network). The result is appended to that write's tool result:</p>
+  <ul>
+    <li><code>[PAGE CHECK] ✓ loaded '…' headless: no uncaught JS exception. Ran: app.js, index.html.</code></li>
+    <li><code>[PAGE CHECK] not run — …</code> for a page that calls the network with no running service covering it. When the page fetches its OWN data file by a relative URL (<code>fetch('sales.json')</code>, <code>.json/.csv/.tsv/.txt/.md/.xml/.geojson</code>), a <code>[PAGE CHECK] note:</code> follows: opened by double-click (file://) the browser blocks that fetch and an http check does not test it — embed the data (inline JSON or a <code>&lt;script src="data.js"&gt;</code>) and check over file://, or say it needs a server (2026-11-18 live run: a "double-click" chart was tested only over http and errored from disk). <code>page_check.local_fetch_note</code>.</li>
+    <li><code>[PAGE CHECK] ✗ '…' FAILS on load (an uncaught exception, or its own files did not load) — … Ran: ….</code> followed by the exceptions, or the console lines of a LOCAL file that never loaded (<code>net::ERR_FILE_NOT_FOUND</code>, an ES module a <code>file://</code> page cannot load &mdash; with the classic-script hint). Network / CDN errors do not fail it (they depend on Tor);</li>
+    <li>for an HTML page the probe could not load: "not run — … load it yourself before you say it works"; nothing for a script with no page.</li>
+  </ul>
+  <p>The probe navigates with <code>SYSTEM_PROBE_NAV</code> set (<code>tools/browser_support.py</code>): its visits go to a throwaway <code>.last_url.sysprobe</code> sidecar, so the model's own url-less browser calls keep re-opening the page the model last visited. A later write in the batch takes the probe over only when it SUCCEEDED in writing a web file of the SAME page (a script in <code>js/ css/ scripts/ styles/ assets/ static/</code> belongs to the <code>index.html</code> one level up &mdash; the probe looks there too).</p>
+  <p>The write keeps its status (information, not a block). The <code>Ran:</code> list is the page plus its <code>&lt;script src&gt;</code> files that EXIST and their relative ES imports (four levels, from script files and inline module scripts; <code>data-src</code> is not a load); the claim arm reads the line back from the row (<code>page_check.checks_in</code>), so a clean load counts as a RUN of each file and a throw as a FAILED run &mdash; the same live and in the failure census. Only the FIRST whole line that starts with the marker counts (what follows a ✗ line is the page's own exception text). Switch: <code>GHOST_PAGE_CHECK=0</code>.</p>
+
+  <h2>2 &middot; The checklist (<code>tools/checklist.py</code>)</h2>
+  <p>A tool the model keeps its build plan in &mdash; one item per feature, each <code>{title, check}</code>. There is no "mark done": only <code>check</code> changes an item's state, by RUNNING the check.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Check</th><th>Passed when</th></tr></thead>
+    <tbody>
+      <tr><td>a shell command</td><td>it exits 0 through the sandbox <code>execute</code>. A command that runs nothing (a syntax check, <code>ls</code>, <code>cat</code>, <code>grep</code>, <code>test -f</code>, <code>echo</code>, <code>true</code>, <code>bash -c true</code>) is refused at <code>set</code>/<code>add</code> by the §4UU-3 rule. A request to a service running here counts when a bad answer fails it: <code>curl -f localhost:5000/api</code>, <code>curl -s 127.0.0.1:8080/ | grep ok</code>. A check whose failure is swallowed at the end (<code>|| true</code>, <code>; exit 0</code>, <code>|| echo no</code>, <code>set +e</code>) can never fail and is refused.</td></tr>
+      <tr><td><code>page:&lt;file.html&gt;</code></td><td>the page loads headless with no uncaught exception (the item-1 probe).</td></tr>
+      <tr><td><code>file:&lt;path&gt;</code></td><td>the file exists and is not empty (a folder: it holds something).</td></tr>
+    </tbody>
+  </table></div>
+  <p>A <code>drop</code> of ids the list does not hold is refused; a check call that runs out of its time budget says which items it did not run; a damaged list file loses only the damaged rows. Actions: <code>set</code> (replace the list; an item with the same title and check keeps its state), <code>add</code>, <code>check</code> (ids, or all), <code>drop</code>, <code>view</code>, <code>clear</code>; at most 20 items. The list lives in the HOST data dir, <code>$GHOST_HOME/system/checklists/&lt;scope&gt;.json</code> &mdash; never in the sandbox, so code running there cannot tick an item. Scope: the turn's project (kept until cleared), else the conversation (idles out after 24 h), else the request.</p>
+  <ul>
+    <li><strong>Stale passes.</strong> A <code>file_system</code> write, or an <code>execute</code> that writes code (a heredoc, a redirect, <code>filename=</code>, <code>sed -i</code> / <code>perl -pi</code>, <code>cp</code>/<code>mv</code> onto a code file, <code>git checkout</code>/<code>restore</code>, a formatter with its write flag, inline Python/Node <code>open(…,'w')</code> / <code>writeFileSync</code>) &mdash; whatever the call's status, unless it was refused &mdash; turns every ✓ item into ↻ "passed before the last code change — check again": which feature a file serves is unknown, so all are re-checked. Docs, tables and images (<code>.md .txt .csv .png</code> …) do not count. Exempt: the items a checklist call of the same batch RAN after that write &mdash; every checklist call for a <code>file_system</code> write (writes run in the batch's first phase), only LATER ones for an <code>execute</code> (they wait for it) &mdash; read from that call's own result rows.</li>
+    <li><strong>Honest rows.</strong> A check is one line that does not contain "— check:"; a title's "—" becomes "-", so a title can never plant a check the claim arm would read. A list of only <code>file:</code> checks, and weak checks (<code>exit 0</code>, <code>:</code>, <code>sleep</code>, <code>--version</code>), are refused.</li>
+    <li><strong>Order and limits.</strong> One checklist operation at a time; in a batch, a checklist call waits for the earlier <code>execute</code> / <code>lab</code> / <code>run</code> calls (and they for it). One <code>check</code> starts no new check after 600 s. A check that runs a privilege program the request already saw refused is not run (the §4UU-4 memo applies, and a check's own refusal is recorded).</li>
+    <li><strong>Status line.</strong> While items are open, the last tool result of a batch that writes / runs code or uses the checklist ends with <code>[CHECKLIST 2/5 passed · next: #3 rotate ✗; #4 score]</code>.</li>
+    <li><strong>Done claim.</strong> A reply that says the work is done / working / live while items the request worked on have not passed gets one repair round (the same re-entry as the code-claim arm, <code>checklist_directive</code>) &mdash; not when the reply itself says what is unfinished ("not yet", "except", "still fails", "remaining").</li>
+    <li><strong>Claim arm.</strong> A <code>checklist check</code> row counts as a run of the files its checks ran (by the execute rule; <code>page:</code> as a page load) &mdash; only items chosen by that call, never a <code>view</code>.</li>
+    <li>Turn-loop machinery treats it like <code>execute</code>: a failing check is the program's own failure (no strike); a check resets the edit-churn reminder (so does a write the page check loaded); a status-only question does not start checks; <code>operation=check</code> is a mutation like <code>action=check</code>; checks run through the egress-guarded <code>execute</code>. Members never see it; a contained / replay surface forbids it, and any surface that forbids <code>execute</code> or <code>browser</code> forbids it too.</li>
+  </ul>
+
+  <h2>3 &middot; A run is a run (<code>core/code_claims.py</code>)</h2>
+  <p>Each shell command is split into segments (per line, <code>&amp;&amp; || ; |</code>), and each segment is a <em>run</em>, a <em>check</em> (<code>node --check</code>, <code>python -m py_compile</code>, <code>bash -n</code>, <code>tsc --noEmit</code>, linters) or a <em>read</em> (<code>cat grep head ls curl wget test echo</code> …). Only run segments credit a written file (an interpreter's syntax flag counts only BEFORE the script: <code>node server.js -c conf</code> is a run; <code>cat app.py | python3</code> runs app.py; <code>git bisect run …</code> runs its command; <code>--version</code> / <code>-h</code> alone run nothing; every <code>$(…)</code>, <code>&lt;(…)</code> and backtick is a command of its own, quoted or not; heredoc bodies are read as commands (as before §4UU); a multi-line <code>python3 -c "…"</code> / <code>node -e '…'</code> is one command, and inline code runs what it imports or executes (<code>import x</code>, <code>exec(open(x))</code>, <code>require</code>, a subprocess interpreter) &mdash; not a file it only opens; <code>bash -c '…'</code> is classed by its own commands; a CLEAN browser load (or a Playwright <code>page.goto</code> in an execute) also runs the written scripts under the page's folder, or every written script for a page served from localhost; a deleted file (<code>file_system delete</code>, <code>rm</code>) is not "never run"; a formatter's check-only flags (<code>black --check</code>, <code>isort --check-only</code>, <code>prettier -c</code>) are no rewrite, and <code>mv</code> is a rename; a command string counts as run only when passed to a runner (<code>subprocess.run('python3 app.py')</code>, <code>execSync</code>), not when printed or logged; a page that threw or whose own script did not load credits nothing; a localhost page credits only scripts in a front-end folder (<code>js/ static/ public/ …</code>) or next to a written page; a <code>tests/check_page.py</code> run marks pages tested only when its exit code is the command's (last, or followed only by <code>&amp;&amp;</code>); shell keywords and grouping &mdash; <code>if then do ! { (</code> &mdash; lead into the real command, and <code>[[ ]]</code>, <code>read</code>, <code>fi done</code> run nothing); a check marks it "only syntax/lint-checked, never run". The note and the repair directive say so: "a syntax check or a read is not a run".</p>
+
+  <h2>4 &middot; Labs, the tailnet, privilege refusals</h2>
+  <ul>
+    <li><strong>Lab templates</strong> are an <code>enum</code> in the tool schema (<code>LAB_TEMPLATES</code>, pinned to <code>interface/ghost-labs/templates/*.yaml</code>).</li>
+    <li><strong>Lab member default</strong> for read actions (<code>http</code>, <code>screenshot</code>, <code>logs</code>) in an owner's call: the kept app's member when it exists, else the lab's only member; never a guess among several, never for exec/put/get. A note naming the member chosen is appended to the result.</li>
+    <li><strong>Tailnet URLs</strong> (<code>*.ts.net</code>, 100.64.0.0/10) are refused by the browser at once with the way that works: file:// / a sandbox service, or &mdash; when the model has the <code>lab</code> tool &mdash; <code>lab http</code> / <code>lab screenshot</code> (<code>tools/browser_tailnet.py</code>).</li>
+    <li><strong>Privilege refusals</strong> (<code>core/env_limits.py</code>): an <code>execute</code> that exits non-zero with "Operation not permitted" / "must be root" / "not in the sudoers"… records the privilege program the refusal NAMES (<code>su: Authentication failure</code>), or the command's only privilege program when it names none (<code>su sudo setpriv runuser chroot nsenter umount iptables …</code>; not <code>mount</code>, <code>sysctl</code>, <code>unshare</code>, which work unprivileged in some forms) for the request. Quoted text and heredoc bodies written to a file are data; a heredoc fed to a shell (<code>bash &lt;&lt;EOF</code>, <code>cat &lt;&lt;EOF | sh</code>) is commands; and <code>command -v sudo</code> / <code>which su</code> run nothing; a later command that runs one again is not run, and the model is told why and what works (current user, a purpose-built tool, a lab machine &mdash; labs give root). Plain programs are never recorded, and nothing is recorded when the refusal names another program of the command (<code>chown: … Operation not permitted</code>); <code>capsh --print</code> reads capabilities and is never blocked.</li>
+  </ul>
+
+  <h2>5 &middot; The web-app starter (<code>tools/scaffold.py</code>)</h2>
+  <p><code>file_system(operation='write', path='&lt;new folder&gt;', template='web-app')</code> writes <code>index.html</code>, <code>css/style.css</code>, <code>js/app.js</code> (the <code>App</code> namespace; one <code>js/&lt;feature&gt;.js</code> per feature), <code>js/main.js</code> (starts the app, sets <code>window.__appReady</code>) and <code>tests/check_page.py</code>: a Playwright check over file:// with the network blocked, which fails on any uncaught exception or console error and runs per-feature step lists (<code>click fill press wait visible hidden text count eval</code>); <code>python3 tests/check_page.py &lt;word …&gt;</code> runs only the checks whose name contains every word &mdash; what a checklist item runs. A check that freezes the page fails after 30 s (a watchdog) instead of hanging; a missing file is named; a malformed step says what it needs; <code>text</code> / <code>count</code> retry while content renders. A <code>path=</code> that names a file (<code>app/index.html</code>) is refused. Classic <code>&lt;script src&gt;</code>, not modules: Chromium blocks ES modules from file://. The folder may be relative, host-absolute or <code>/workspace/…</code>; the confirmation names it relative to the workspace, a <code>.git</code> folder is refused, and the files count as this request's own (a later whole rewrite needs no read first). A folder that already holds files is refused (nothing is ever overwritten); the confirmation is one <code>SUCCESS: Wrote …</code> line per file, so every write ledger, the project change log and the page check read it as ordinary writes.</p>
+
+  <h2>Residuals</h2>
+  <ul>
+    <li>A heredoc body written to a file is read as commands: <code>cat &gt; run.sh &lt;&lt;EOF … python3 app.py … EOF</code> credits <code>app.py</code> (pre-§4UU behaviour; a body-aware version was tried in review and dropped &mdash; it lost real runs such as <code>timeout 30 python3 - &lt;&lt;EOF</code>).</li>
+    <li>A literal in single quotes that looks like a substitution (<code>echo 'try `python3 app.py`'</code>) credits a run.</li>
+    <li>Stale marking and the claim arm see the write forms listed above; a generator script that writes code, or code changed by a long-running service, goes unseen.</li>
+    <li><code>os.setuid</code> from Python is not recorded by the privilege memo (only shell privilege programs are; fail-open: a retry, never a false block).</li>
+    <li>A bare MagicDNS name (<code>http://nova:8097</code>) is not refused by the browser: a single-label host is also how a sandbox service is named.</li>
+  </ul>
+  <p>Review: six rounds by fresh readers, then a second verification round (11-17: guard interplay, runtime of the checklist and the runner, a corpus replay of 1,017 real commands, the model-facing text, live functional probes) (r1 2&times;, then one reader per round on the previous round's fixes); MAJORs in r1&ndash;r5, mostly inside the shell-parsing fixes themselves. Pins: <code>tests/test_4uu_coding.py</code>. Battery: <code>scripts/mutate_4uu.py</code>. Journal: §4UU.</p>
+</main>
+</body>
+</html>

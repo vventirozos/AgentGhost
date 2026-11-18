@@ -145,6 +145,10 @@ _LAB_ID_RE = re.compile(r"^lab_[0-9a-f]{8}$")
 _MEMBER_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 #: actions that only READ (a status question while work is live may run them)
 READ_ACTIONS = frozenset({"templates", "list", "status", "logs", "http", "spec", "backups"})
+#: §4UU-4: the templates the labs host ships (interface/ghost-labs/templates/*.yaml — a test keeps the two equal).
+#: An enum in the tool schema: the model guessed `ubuntu` / `nginx` from the prose list.
+LAB_TEMPLATES = ("python-app", "node-app", "static-site", "pg-single", "python-pg", "web", "blank-dev",
+                 "mysql-single", "patroni-3")
 _MEMBER_ACTIONS = frozenset({"exec", "put", "get", "member", "logs", "http", "screenshot"})
 #: §4UD F9 — the ONE source of the batch-order classes (core/agent.py `_batch_call_depends` imports these; it had
 #: two hand lists, and `app` was in neither, `backup` in one):
@@ -829,12 +833,21 @@ async def tool_lab(context, action: str = "", lab_id: str = "", template: str = 
         return ToolOutcome(f"LAB ERROR (bad_request): {msg}", status=OutcomeStatus.REJECTED,
                            reason_code="lab_bad_request", world_changed=False)
     member = str(member or "").strip()
+    member_note = ""
     if action in _MEMBER_ACTIONS and not _MEMBER_RE.match(member):
         # req c9ea6238: name THIS lab's members (and the kept app's) instead of a generic `db`
         # only when member is MISSING: a malformed one never makes the agent call the host (r1 CRIT pin)
         det = await _lab_detail(context, origin, lab_id) if origin == "owner" and not member else None
         names = [str(m.get("name")) for m in (det or {}).get("members") or [] if isinstance(m, dict) and m.get("name")]
         app = (det or {}).get("app") if isinstance((det or {}).get("app"), dict) else {}
+        # §4UU-4: a READ that names no member goes to the one obvious member — the kept app's, or the lab's only
+        # one (`lab http` without member failed 6× in 5 owner turns on different days; the hint did not carry over)
+        _default = _default_read_member(action, names, app)
+        if _default and _MEMBER_RE.match(_default):
+            member = _default
+            member_note = (f"\n(member `{member}` was used — " + ("the kept app's member" if str(app.get("member") or "")
+                                                                == member else "this lab's only member") + ")")
+    if action in _MEMBER_ACTIONS and not _MEMBER_RE.match(member):
         hint = (f"{lab_id}'s members: {', '.join(names[:8])}" if names else "a member name like `db`")
         if app.get("member"):
             hint += f" (the kept app runs on `{app['member']}`)"
@@ -910,6 +923,10 @@ async def tool_lab(context, action: str = "", lab_id: str = "", template: str = 
                           reason_code="lab_no_time", world_changed=False)
     if origin == "autopilot":
         _note_lab_wait(out, action)
+    if member_note and isinstance(out, str) and not str(out).lstrip().startswith("LAB ERROR"):
+        # appended, never prepended: the head of a lab result is what the failure / no-answer readers match
+        from .outcome import with_text as _with_text
+        out = _with_text(out, str(out) + member_note)
     return out
 
 
@@ -1528,6 +1545,23 @@ def _app_status_line(a: Dict[str, Any]) -> str:
     if a.get("name"):
         bits.append(f"`run status name={a['name']}` shows the version that serves now")
     return "; ".join(bits)
+
+
+#: §4UU-4: member actions that only READ — a missing member may default to the obvious one
+_DEFAULTABLE_MEMBER_ACTIONS = frozenset({"http", "screenshot", "logs"})
+
+
+def _default_read_member(action: str, names: list, app: dict) -> str:
+    """The member a READ action without one goes to: the kept app's member when the lab has a kept app (and that
+    member exists), else the lab's ONLY member; "" otherwise — never a guess among several, never for an action
+    that changes anything (exec / put / get / member ops name their member)."""
+    if action not in _DEFAULTABLE_MEMBER_ACTIONS:
+        return ""
+    names = [str(n) for n in (names or []) if n]
+    app_member = str((app or {}).get("member") or "")
+    if app_member and app_member in names:
+        return app_member
+    return names[0] if len(names) == 1 else ""
 
 
 async def _lab_detail(context, origin: str, lab_id: str) -> Optional[Dict[str, Any]]:
@@ -3203,7 +3237,7 @@ LAB_TOOL_DEFINITION = {
             "workspace (`spec`, `get`). The workspace and the browser cannot reach a lab: use exec/http. `templates` "
             "→ `create`; each exec names lab_id + member (`cancel` stops one; `screenshot` → a "
             "workspace .png); `destroy` when done. Templates: python-app, node-app, static-site, pg-single, python-pg "
-            "(app + postgres, DATABASE_URL set), web, blank-dev, mysql-single, patroni-3. The OWNER may compose: "
+            "(+postgres), mysql-single, patroni-3, web, blank-dev. The OWNER may compose: "
             "params mem_mb / ports / cap_add / cpus / egress (a value, or {member: value}), or params.members "
             "[{name, image, mem_mb, ports}] with no template. A PROJECT's lab can be KEPT as production (owner origin "
             "only): `keep` (params.app {name, member, port, cmd, health {http: path|null, tcp}, workdir, build, "
@@ -3226,7 +3260,8 @@ LAB_TOOL_DEFINITION = {
             "properties": {
                 "action": {"type": "string", "enum": list(ACTIONS)},
                 "lab_id": {"type": "string", "description": "lab_xxxxxxxx (all actions but templates/create/list)"},
-                "template": {"type": "string", "description": "create: a template name from `templates`"},
+                "template": {"type": "string", "enum": list(LAB_TEMPLATES),
+                             "description": "create: the machine template"},
                 "params": {"type": "object", "description": "create: the template's params (`templates` lists "
                            "them) — the owner also mem_mb/ports/cap_add/cpus/egress/members; "
                            "keep/deploy/switch/rollback/restore: that action's inputs"},

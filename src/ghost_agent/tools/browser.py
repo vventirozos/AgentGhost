@@ -773,6 +773,9 @@ def webgl_denial_note(page_text: str) -> str:
     return WEBGL_CAPABILITY_NOTE if _WEBGL_DENIAL_RE.search(page_text or "") else ""
 
 
+from .browser_tailnet import tailnet_refusal  # noqa: E402  §4UU-4
+
+
 async def tool_browser(
     operation: str = None,
     url: Optional[str] = None,
@@ -922,6 +925,8 @@ async def tool_browser(
         _svc_ports = frozenset(int(p) for p in (allowed_local_ports or ()))
     except (TypeError, ValueError):
         _svc_ports = frozenset()
+    if tailnet_refusal(url, actions):                   # §4UU-4: never loads from here — say what reaches it
+        return _reject(tailnet_refusal(url, actions))
     _b = _browser_blocked_url(url, anonymous=_anon,
                               allowed_local_ports=_svc_ports)
     if _b:

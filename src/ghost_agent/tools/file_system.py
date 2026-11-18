@@ -8243,6 +8243,20 @@ def note_project_writes_hook(sandbox_dir, paths) -> str:
     return ""
 
 
+_TEMPLATE_WROTE_RE = re.compile(r"^SUCCESS: Wrote \d+ chars to '(.+?)'\.$")
+
+
+def _template_written_paths(message: str) -> list:
+    """§4UU-5: the paths a template confirmation lists (its leading write lines)."""
+    out = []
+    for line in str(message or "").splitlines():
+        m = _TEMPLATE_WROTE_RE.match(line.strip())
+        if not m:
+            break
+        out.append(m.group(1))
+    return out
+
+
 async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, read_budget: "ReadBudget | None" = None, **kwargs):
     _op0 = str(operation or "").strip().lower()
     if _op0 == "download":
@@ -8264,6 +8278,11 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
                 _dt = _download_target(path, kwargs)
                 _full = Path(_dt) if Path(_dt).is_absolute() else Path(sandbox_dir) / _dt
                 _note = note_project_write_hook(sandbox_dir, _dt) if _full.is_file() else ""
+                if _note:
+                    res = append_note(res, "\n" + _note)
+            elif _ok and _op == "write" and kwargs.get("template"):
+                # §4UU-5: a starter folder — every file it wrote, in one call
+                _note = note_project_writes_hook(sandbox_dir, _template_written_paths(str(res or "")))
                 if _note:
                     res = append_note(res, "\n" + _note)
             elif _ok:
@@ -8366,6 +8385,21 @@ async def _tool_file_system_impl(operation: str = None, sandbox_dir: Path = None
     if not target_path and url and operation != "download":
         target_path = url
         url = None
+
+    # §4UU-5: `write` with template= starts a project folder (every guard above already ran on the folder path)
+    if operation == "write" and kwargs.get("template"):
+        if final_content and str(final_content).strip():
+            return ToolOutcome.rejected(
+                "SYSTEM INSTRUCTION: template= starts a NEW folder from a starter project — give path= (the folder) "
+                "and no content. To write one file, drop template=.", reason_code="template_with_content")
+        from .scaffold import scaffold as _scaffold
+        _ok, _msg, _written = await asyncio.to_thread(
+            _scaffold, sandbox_dir, str(target_path or ""), str(kwargs.get("template")), _get_safe_path,
+            _mark_written)
+        if not _ok:
+            return ToolOutcome.rejected(_msg, reason_code="template_refused")
+        return "\n".join([f"SUCCESS: Wrote {_char_count} chars to '{_rel}'." for _rel, _char_count in _written]
+                         + ["", _msg])
 
     # §4HB: redeem a payload held by a rejected `replace` on this path.
     _held_redeemed = False

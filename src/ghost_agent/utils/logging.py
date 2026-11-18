@@ -1036,6 +1036,7 @@ class Icons:
     MIRROR       = "🎭"   # §4UG/§4UH: the character, its day records and the owner's `mirror` command
     DREAM        = "🌙"   # REM / dream consolidation cycle (NOT 💤 — that's SYSTEM_SHUT)
     SKIP         = "⏩"   # a step/cycle deliberately skipped
+    PROGRESS     = "👣"   # §4UT: a live step's sentence (was a stray narrow ℹ️ — shifted the columns)
     ACTIVITY     = "📡"   # autonomous-activity ledger / background digest surfaced
     NOTIFY_OUT   = "📣"   # outbound push notification to the operator
 
