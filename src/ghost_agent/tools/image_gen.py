@@ -569,6 +569,33 @@ def _resolve_reference(name, sandbox_dir) -> Path:
     raise ValueError(f"reference image {name!r} not found in the sandbox")
 
 
+def _ref_name(path, sandbox_dir) -> str:
+    """§4VD-A: the reference as the model can pass it back — relative to the
+    sandbox (or the root sandbox a project falls back to), else its name.
+    Review r1 MAJOR 5: `_plain` (no parentheses / brackets / newlines, so the
+    record parser and the `[no re-render:` mark stay safe) turned "photo (1).jpg"
+    into a file that does not exist; a name `_plain` would change is given
+    PERCENT-ENCODED instead, which `_resolve_reference` decodes."""
+    p = Path(path)
+    roots = []
+    try:
+        root = Path(sandbox_dir).resolve()
+        roots = [root] + ([root.parent.parent.resolve()] if root.parent.name == "projects" else [])
+    except Exception:  # noqa: BLE001
+        pass
+    rel = p.name
+    for r in roots:
+        try:
+            rel = str(p.resolve().relative_to(r))
+            break
+        except (ValueError, OSError):
+            continue
+    if _plain(rel) == rel:
+        return rel
+    import urllib.parse as _up
+    return _up.quote(rel, safe="/._-")
+
+
 def _join_label(path, i: int) -> str:
     """What the image model is told a joined file is."""
     return f"{'generated' if Path(path.name).name.startswith('gen_') else 'uploaded'} picture {i}"
@@ -1241,6 +1268,9 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                "; built from the subjects' photos" if subject_note and subj else
                "; built from the joined reference pictures" if subject_note else
                "; edited from the first picture, using the others joined beside it" if _crop_box else
+               (f"; edited from {_ref_name(ref_paths[0], sandbox_dir)} (a retry of this change edits "
+                f"{_ref_name(ref_paths[0], sandbox_dir)} again, never this result)")
+               if len(ref_b64) == 1 and len(ref_paths) == 1 else
                "; edited from the reference image" if len(ref_b64) == 1 else
                f"; edited from {len(ref_b64)} reference images" if ref_b64 else "")
             + ("; transparent background: the PNG has an alpha channel (the background is really transparent — it shows as a checkerboard or the page colour)"

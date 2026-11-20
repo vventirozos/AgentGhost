@@ -108,6 +108,14 @@
     <li><strong>Pins.</strong> <code>tests/test_4oz_subjects_collage.py</code> (§4PA section) + the rewritten §4MG pin: strip order for both cases, lead and record text, the limit counting the upload, two references refused, bad upload refused, collage check on subject+upload, upload-alone still an edit, schema text. Hand mutants: 5, all killed.</li>
   </ul>
 
+  <h2 id="4vd-drift">Edits of edits drift; a retry edits the source <span class="tag">2026-11-20 &sect;4VD</span></h2>
+  <p>An edit is a full 16-step generation from pure noise, conditioned on the reference's latents (no mask, no strength, no paste-back), so every pixel is redrawn. A live chain of six edits (a member's Slack thread) hardened the face and coarsened the texture on edits that never asked to touch it: edge energy 8.7 → 10.3 → 11.6 over two edits; geometry stayed (best-fit scale 1.00–1.01, shift ≤ 8 px), alpha flattening and letterboxing were measured and ruled out. The retry of a failed edit had edited the FAILED result, adding one more redraw.</p>
+  <ul>
+    <li>A plain single-reference edit's result says <code>edited from &lt;file&gt; (a retry of this change edits &lt;file&gt; again, never this result)</code>; <code>_ref_name</code> gives the sandbox-relative name (or the root sandbox's, for a picture a project falls back to), which <code>_resolve_reference</code> resolves. A name with parentheses, brackets or other characters <code>_plain</code> would rewrite ("photo (1).jpg") is given percent-encoded instead (review r1: plained, it named a file that does not exist).</li>
+    <li>The tool description says edits redraw the whole picture, to describe only the change, that a retry edits the source, and that a FURTHER change to an edit that worked edits that edit's result.</li>
+    <li><strong>Rejected: automatic paste-back</strong> of the pixels that barely changed. Prototyped on the same chain: on an aligned edit it restored the face, but on "remove 2 clouds" a white cloud on a white wall changed too little for the mask and came back as a ghost, and a render shifted by 4 px double-edged every outline. A rule that undoes the asked-for edit is worse than drift.</li>
+  </ul>
+
   <h2 id="join">Several pictures in one call <span class="tag">2026-11-07 &sect;4TO</span></h2>
   <p><strong>What went wrong.</strong> Asked to put a face from one upload on a game cover from another, the model had no route: the node takes one reference and only <code>subjects</code> could join pictures. It wrote its own PIL montage (4 of 5 scripts failed), sent it as a plain edit, so no panel check ran, and cropped the two-panel result by hand. The request took 758 s.</p>
   <ul>

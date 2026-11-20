@@ -834,19 +834,49 @@ def _in_dictionary(tok: str) -> bool:
     return False
 
 
+#: §4VD-D: a hyphenated compound of LETTERS ("write-ahead", "e-mail", "end-to-end"). Identifiers with digits
+#: ("Qwen3.5-9B-A3B", "COVID-19") are already distinctive by their digits and keep their parts.
+_COMPOUND_RE = re.compile(r"(?<![\w.-])[^\W\d_]+(?:-[^\W\d_]+)+(?![\w-])", re.UNICODE)
+
+
+def compound_hit(tok: str, flat: str, words) -> bool:
+    """§4VD-D r2: a hyphenated compound token is in a text when its joined form is in the
+    separator-free text ("write-ahead" in "Write-Ahead", "write ahead", "writeahead") OR every part
+    stands there as a word ("greece-turkey" in "Greece and Turkey border tensions") — never on one
+    part alone ("write" in "How to write a CV" was the §4UN defect)."""
+    parts = tok.split("-")
+    return tok.replace("-", "") in flat or all(p in words for p in parts)
+
+
+def _compound_forms(query: str) -> Dict[str, str]:
+    """{joined: hyphenated} for the query's hyphenated compounds, folded —
+    {"writeahead": "write-ahead"}."""
+    return {c.replace("-", ""): c for c in _COMPOUND_RE.findall(_rel_fold(query or ""))}
+
+
 def distinctive_tokens(query: str) -> List[str]:
     """The query's subject-bearing tokens (folded): the leading content word
     unless it is query framing, any token with a digit or underscore, and
-    any token the dictionary does not know. Years never count."""
+    any token the dictionary does not know. Years never count.
+    §4VD-D: a hyphenated compound is ONE token, joined ("write-ahead" →
+    "writeahead"): split, "write" alone was distinctive (the lead) and any
+    page saying "write" passed as on topic — yahoo's generic "write" results
+    won a deep_research wave. Joined, it matches "write-ahead", "write ahead"
+    and "writeahead" alike in `result_on_topic`'s separator-free haystack.
+    r2 (review): returned HYPHENATED ("write-ahead"), so a matcher knows its parts — joined-only,
+    "Greece-Turkey" missed every "Greece and Turkey" page (`compound_hit`)."""
     out: List[str] = []
     lead_pending = True                    # the first NON-year content word
-    for tok in _rel_tokens(query):
+    folded = _rel_fold(query or "")
+    forms = _compound_forms(folded)
+    joined = _COMPOUND_RE.sub(lambda m: m.group(0).replace("-", ""), folded)
+    for tok in _rel_tokens(joined):
         if _YEAR_RE.fullmatch(tok):
             continue
         is_lead, lead_pending = lead_pending, False
         if (is_lead and tok not in _WEAK_LEADING) or re.search(r"[\d_]", tok) \
                 or not _in_dictionary(tok):
-            out.append(tok)
+            out.append(forms.get(tok, tok))
     return out
 
 
@@ -860,13 +890,14 @@ def result_on_topic(result: Dict, dist: List[str]) -> bool:
     hay = _rel_fold(f"{result.get('title') or ''} {result.get('body') or ''} "
                     f"{result.get('href') or result.get('url') or ''}")
     flat = re.sub(r"\W+", "", hay, flags=re.UNICODE)
-    if any(tok in flat for tok in dist):
+    all_words = set(re.findall(r"\w+", hay, re.UNICODE))
+    if any((compound_hit(tok, flat, all_words) if "-" in tok else tok in flat) for tok in dist):
         return True
-    long_toks = [t for t in dist if len(t) >= _FUZZY_MIN_TOKEN]
+    long_toks = [t for t in dist if len(t) >= _FUZZY_MIN_TOKEN and "-" not in t]
     if not long_toks:
         return False
     import difflib
-    words = {w for w in re.findall(r"\w+", hay, re.UNICODE) if len(w) >= 5}
+    words = {w for w in all_words if len(w) >= 5}
     return any(difflib.SequenceMatcher(None, t, w).ratio() >= _FUZZY_RATIO
                for t in long_toks for w in words)
 
@@ -2271,6 +2302,8 @@ def _wiki_subject_tokens(query: str, original: Optional[str] = None) -> List[str
 
 
 def _wiki_token_found(tok: str, words: set, flat: str) -> bool:
+    if "-" in tok:                                         # §4VD-D: a hyphenated compound
+        return compound_hit(tok, flat, words)
     if tok in flat:
         return True
     if len(tok) >= 5 and _GREEK_RE.search(tok):          # a Greek case ending: match on the stem
@@ -4692,6 +4725,7 @@ _WINDOW_GAP = "\n[…]\n"
 def focus_terms(query: str, question: str = "") -> Tuple[List[str], List[str]]:
     """(distinctive tokens, other content words) of the search words and the question, folded."""
     both = f"{query or ''} {question or ''}"
+    # §4VD-D: a compound comes back hyphenated, the form page focus searches the page for as written
     dist = list(dict.fromkeys(distinctive_tokens(both)))
     rest = [t for t in dict.fromkeys(_rel_tokens(both)) if t not in dist and not _YEAR_RE.fullmatch(t)]
     return dist, rest

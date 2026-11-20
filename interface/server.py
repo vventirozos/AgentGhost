@@ -1576,6 +1576,35 @@ def _progress_header(value) -> dict:
     return {"X-Ghost-Progress": "steps" if str(value or "").strip().lower() == "off" else "1"}
 
 
+#: The probe headers the agent reads (`routes.py`, §4FB/§4MV/§4MW/§4UF). The
+#: web chat dropped them all, so a turn through this interface could not be
+#: marked as a probe — a test of web chat taught the agent and moved the
+#: owner's mood like a real message.
+_PROBE_FOLLOWERS = ("X-Ghost-Arm", "X-Ghost-Probe-Rule",
+                    "X-Ghost-Probe-Self-Image", "X-Ghost-Probe-Self-Image-Rule")
+
+
+def _probe_headers(headers) -> dict:
+    """The incoming probe mark for the upstream turn: `X-Ghost-Origin: probe`
+    plus the experiment headers that only mean something on a probe. {} for
+    every other request — an arm or rule header without the mark is not
+    forwarded (the agent would ignore it, and it is not this page's to send)."""
+    if str(headers.get("X-Ghost-Origin") or "").strip().lower() != "probe":
+        return {}
+    out = {"X-Ghost-Origin": "probe"}
+    for name in _PROBE_FOLLOWERS:
+        v = headers.get(name)
+        if v:
+            # review r1 m8: the bytes as they arrived — httpx encodes a str value as ASCII, so a Greek
+            # probe rule raised UnicodeEncodeError; starlette decoded latin-1, so this round-trips exactly
+            out[name] = str(v).encode("latin-1", "replace")
+    return out
+
+
+#: the agent's probe request-id prefix (`utils.logging.PROBE_REQUEST_PREFIX`; a test pins them equal)
+PROBE_REQUEST_PREFIX = "probe-"
+
+
 @app.post("/api/chat", dependencies=[Depends(verify_interface_key)])
 async def chat_proxy(request: Request):
     """Proxies chat requests to the Ghost Agent."""
@@ -1599,6 +1628,7 @@ async def chat_proxy(request: Request):
         # §4UY S10: the page's step mode rides the body too — "off" asks for the steps without their
         # sentences (no Nova call per step); the agent's chat schema has no such field
         _progress = _progress_header(body.pop("progress", None))
+        _probe = _probe_headers(request.headers)
 
         if is_streaming:
             task_id = str(uuid.uuid4())
@@ -1610,6 +1640,10 @@ async def chat_proxy(request: Request):
             # so /api/chat/cancel could not name the turn and the client
             # fell back to matching the prompt's first 40 characters.
             request_id = uuid.uuid4().hex[:8]
+            if _probe:
+                # review r1 m7: the agent renames a probe turn to `probe-<id>`; minted that way here, Stop
+                # (/api/turn/cancel) and the turn inbox name the turn the agent runs
+                request_id = PROBE_REQUEST_PREFIX + request_id
             stream_cap = _stream_cap_bytes()
             _enforce_active_task_cap()   # BEFORE inserting, not 60s later
             active_chat_tasks[task_id] = {
@@ -1647,7 +1681,8 @@ async def chat_proxy(request: Request):
                     _up_headers = {"X-Ghost-Key": GHOST_API_KEY,
                                    "X-Ghost-Client-Timeout": "inf",
                                    **_progress,                  # §4UT: the page shows the agent's steps
-                                   **_effort}
+                                   **_effort,
+                                   **_probe}
                     if t.get("request_id"):
                         _up_headers["X-Request-ID"] = t["request_id"]
                     async with client.stream("POST", "http://localhost:8000/api/chat", json=payload, headers=_up_headers, timeout=_chat_timeout()) as response:
@@ -1782,7 +1817,8 @@ async def chat_proxy(request: Request):
                 json=body,
                 headers={"X-Ghost-Key": GHOST_API_KEY,
                          "X-Ghost-Client-Timeout": str(int(CHAT_TIMEOUT_S)),   # §4JP
-                         **_effort},                                            # §4RB
+                         **_effort,                                             # §4RB
+                         **_probe},
                 timeout=_chat_timeout(),
             )
             # Propagate the upstream status — returning the body with an

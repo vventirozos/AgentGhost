@@ -96,6 +96,7 @@
     <li>Because subject names are sent out in a public search, your own address and private details are removed from them.</li>
     <li>vision_analysis reads only the first 10 pages of a PDF and refuses files over 50&nbsp;MB. For long documents use <a href="documents.html">Documents</a> instead.</li>
     <li>If the Jetson is off, image requests fail with a clear error; nothing else in the agent is affected.</li>
+    <li>Every edit redraws the whole picture from its reference, so a long chain of edits slowly drifts: faces harden and texture coarsens even where nothing was asked to change (measured on a live chain: edge energy 8.7 → 10.3 → 11.6 over two edits). The edit result names the file it was made from, and a retry edits that file again rather than the failed result. For many changes, ask for them together in one edit. An automatic "paste the unchanged parts back" step was tried and rejected: it put a removed cloud back into the picture as a ghost, and it double-edges any render that shifted by a few pixels.</li>
     <li>Switches: <code>--image-gen-nodes</code> points the agent at the image server; <code>GHOST_RENDER_LOOK</code> turns the look-at-every-render step on or off; <code>GHOST_VISION_TIMEOUT</code> bounds a vision call.</li>
   </ul>
   <p>Deep reference: <a href="../reference/pictures/image_gen.html">image_gen</a>, <a href="../reference/pictures/image_gen_server.html">image server</a>, <a href="../reference/pictures/vision.html">vision</a>.</p>

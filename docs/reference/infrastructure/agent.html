@@ -192,6 +192,15 @@
   <code>tests/test_governor_checkpoint_scrub.py</code>.</p>
 
   <h2>Multi-turn reply smoothing (2026-07-17)</h2>
+  <p><strong>§4VD (2026-11-20): pass 2 checks facts.</strong> An earlier summary group is superseded
+  only when the later one carries every figure, inline code span and URL it states (<code>_facts</code>,
+  case kept) — two parallel results ("accuracy 0.91 … batch 32" / "accuracy 0.84 … batch 64") shared
+  enough words to read as a restatement and the first was deleted. Cost, accepted: a stale count
+  ("7 passed" above "10 passed") now stays. <strong>Not changed, still open:</strong> the beat rule below
+  still drops a paragraph that only OPENS like a beat ("Great, your flight is confirmed for 09:40.").
+  A fix was built and withdrawn: three independent reviews each found new losses or leaks inside it
+  (shared work verbs leaking into the do-it-or-answer judges, beat runs eating findings, restored
+  working beats) — PROJECT_JOURNAL §4VD; the choice of approach is the operator's.</p>
   <p>The turn loop appends every iteration's visible text (<code>ui_content</code>) to
   <code>final_ai_content</code>, so a multi-tool fix used to arrive as stacked working
   narration ("Let me fix both:", "Now add the resize logic in openWindow:") with the

@@ -115,6 +115,21 @@ def _split_blocks(text: str) -> List[str]:
     return blocks
 
 
+#: §4VD-C: the facts a paragraph states — figures, inline code, URLs. A
+#: summary is superseded only when the later one carries every one of them:
+#: "The first run reached accuracy 0.91 …" next to "The second run reached
+#: accuracy 0.84 …" shared ≥ 0.55 of their words and the first was deleted —
+#: two results, not a restatement. Cost, accepted: a stale count ("7 passed")
+#: under a later one ("10 passed") now stays; it reads in order, a deleted
+#: result cannot be read at all.
+_FACT_RE = re.compile(r"https?://\S+|`[^`\n]+`|\d+(?:[.,:]\d+)*")
+
+
+def _facts(text: str) -> set:
+    # case kept: `Run.py` and `run.py` are two files — a fact that differs only in case is not restated
+    return {m.group(0).rstrip(".,;:)") for m in _FACT_RE.finditer(text or "")}
+
+
 def _has_fence(block: str) -> bool:
     return "```" in block
 
@@ -1108,9 +1123,8 @@ def smooth_reply(text: str) -> str:
     # comparable size supersedes the earlier statement (keep the last —
     # it is the one written after verification/restart, i.e. the truest).
     groups = _group_blocks(blocks)
-    group_words = [
-        _words("\n".join(blocks[k] for k in g)) for g in groups
-    ]
+    texts = ["\n".join(blocks[k] for k in g) for g in groups]
+    group_words = [_words(t) for t in texts]
     for a in range(len(groups)):
         if any(_has_fence(blocks[k]) for k in groups[a]):
             continue
@@ -1127,7 +1141,8 @@ def smooth_reply(text: str) -> str:
             if la and lb and la != lb:
                 continue
             union = len(wa | wb)
-            if union and len(wa & wb) / union >= _SUPERSEDE_JACCARD:
+            if union and len(wa & wb) / union >= _SUPERSEDE_JACCARD \
+                    and _facts(texts[a]) <= _facts(texts[b]):
                 for k in groups[a]:
                     drop[k] = True
                 break

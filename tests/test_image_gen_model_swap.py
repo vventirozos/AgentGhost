@@ -646,7 +646,8 @@ class TestToolEditing:
         assert cap["reference_images"] == [base64.b64encode(_PNG_1x1).decode()]
         assert "width" not in cap                         # size inherited from the reference
         assert "Rendered at 512x768" in out               # read back from the returned PNG
-        assert "edited from the reference image" in out
+        # §4VD-A: the result names the file the edit was made from, whatever spelling was passed
+        assert "edited from gen_ab12.png (a retry of this change edits gen_ab12.png again" in out
 
     def test_single_string_and_synonyms_are_healed(self, tmp_path):
         (tmp_path / "gen_ab12.png").write_bytes(_PNG_1x1)
@@ -1076,7 +1077,7 @@ class TestResultWording:
         assert "ASKED the model to change" in out
         assert "mood/style you aimed" not in out
         assert "reference image(s)" not in out          # no clumsy plural for the one-ref cap
-        assert "edited from the reference image" in out
+        assert "edited from a.png (a retry of this change edits a.png again, never this result)" in out
 
     def test_plain_generation_keeps_the_original_closing(self, tmp_path):
         out = self._run(tmp_path)
