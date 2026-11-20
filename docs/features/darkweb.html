@@ -74,7 +74,7 @@
   <h2 id="how">How it works</h2>
   <ol class="flow">
     <li><h4>Clean the query</h4><p>Google-style operators are removed, since the onion engines choke on them.</p></li>
-    <li><h4>Ask every engine</h4><p>The query goes to Ahmia (both its normal web address and its onion address), Torch and Torgle. Some engines need a hidden form token first, which Ghost fetches.</p></li>
+    <li><h4>Ask every engine</h4><p>The query goes to Ahmia (both its normal web address and its onion address), Torch and Torgle. Some engines need a hidden form token first, which Ghost fetches. In practice Ahmia answers most searches; Torch and Torgle answer only now and then, so agreement between indexes is rare. Once one engine has answered, the others get 12 more seconds, not the full wait.</p></li>
     <li><h4>Retry on a new route</h4><p>Whether an onion engine answers depends on which Tor exit you happen to use. Each retry forces Tor to build a fresh circuit instead of reusing the one that just failed.</p></li>
     <li><h4>Count independent sources</h4><p>Ahmia's two addresses are two doors to the same index, so a result found by both counts as one source, not two. Only different indexes count as corroboration.</p></li>
     <li><h4>Rank and report</h4><p>Results are merged, ranked, and returned with a clear “unverified” framing.</p></li>

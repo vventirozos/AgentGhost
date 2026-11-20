@@ -127,7 +127,6 @@ async def _run_search_with_waves(monkeypatch, waves):
         return list(res)
     monkeypatch.setattr(S, "_race_search_wave", _wave)
     monkeypatch.setattr(S, "_proxy_reachable", lambda *a, **k: True)
-    monkeypatch.setattr(S, "wiki_supplement_wanted", lambda q: False)
     S._SEARCH_CACHE.clear()
     return await S.tool_search_ddgs("postgresql 17 release", "socks5://127.0.0.1:9050")
 
@@ -153,31 +152,8 @@ async def test_a_cache_hit_says_so_and_a_low_batch_is_not_cached(monkeypatch):
     assert S.LOW_RELEVANCE_NOTE in out and not S._SEARCH_CACHE          # not cached
 
 
-def test_the_wiki_future_exception_is_retrieved(monkeypatch):
-    """A lookup that fails AFTER the search answered (past the 6 s wait) must
-    not leave an unretrieved exception on the loop — asyncio reports those
-    as an ERROR line when the future is collected."""
-    import gc, time as _t
-    unretrieved = []
-    def _lookup(query, proxy):
-        _t.sleep(0.2); raise RuntimeError("wiki down late")
-    monkeypatch.setattr(S, "_wiki_lookup", _lookup)
-    monkeypatch.setattr(S, "wiki_supplement_wanted", lambda q: True)
-    monkeypatch.setattr(S, "WIKI_SUPPLEMENT_WAIT_AFTER_WIN", 0.01)
-    async def _wave(query, proxy, wave, max_results=20, stats=None):
-        return [{"title": "Repeated query T", "body": "repeated query", "href": "https://ok.example/a"}]
-    monkeypatch.setattr(S, "_race_search_wave", _wave)
-    S._SEARCH_CACHE.clear()
-    async def _main():
-        loop = asyncio.get_running_loop()
-        loop.set_exception_handler(lambda l, ctx: unretrieved.append(ctx.get("message")))
-        out = await S.tool_search_ddgs("repeated query", "socks5://127.0.0.1:9050")
-        await asyncio.sleep(0.4)                                      # the thread fails after the search returned
-        gc.collect()
-        return out
-    out = asyncio.run(_main()); gc.collect()
-    assert "ok.example" in out
-    assert not [m for m in unretrieved if "never retrieved" in str(m)], unretrieved
+# (§4VA: the Wikipedia lookup moved into the wave; "a lookup that fails late leaves no unretrieved
+# exception" is pinned there — tests/test_4va_search_engines.py)
 
 
 # ── deep_research / fact_check ───────────────────────────────────────────────

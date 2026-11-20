@@ -9,6 +9,7 @@ import uuid
 import base64
 import datetime
 import ast
+import contextvars
 import hashlib
 import json
 import time
@@ -49,7 +50,9 @@ _SERVERISH_RE = re.compile(
     r"|\bphp\s+-S\b|--port[=\s]\d|\bhttpd\b|\bnginx\b",
     re.IGNORECASE)
 _SH_C_PAYLOAD_RE = re.compile(
-    r"\b(?:ba|z|da)?sh\s+(?:-\S+\s+)*-c\s+(?:'([^']*)'|\"([^\"]*)\")")
+    # review B2-M4: eval too; B3-M1: a quoted / escaped / pathed shell (`'bash'`, `\\bash`, `/bin/sh`) or a `$VAR` head
+    r"(?:(?:(?<![\w-])['\"\\]?(?:/[\w./-]*/)?(?:ba|z|da)?sh['\"]?|\$\{?[A-Za-z_]\w*\}?)\s+(?:-\S+\s+)*-[A-Za-z]*c|\beval)"   # B4-M1: `-lc`, `-ec`
+    r"\s+(?:'([^']*)'|\"([^\"]*)\")")
 _QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
 _DAEMON_BLOCK_MSG = (
     "SYSTEM BLOCK: this command backgrounds a long-lived server "
@@ -62,14 +65,308 @@ _DAEMON_BLOCK_MSG = (
     "command='<the same command without the & and without setsid/"
     "nohup>' — a free port is assigned automatically (exported as "
     "$PORT), logs are captured, and it keeps running across turns. "
-    "Foreground and short-lived commands are unaffected."
+    "A one-off smoke test that ends its own server in the same command passes: "
 )
 
 
 def _detached_server_signals(text: str) -> bool:
     return bool(_SERVERISH_RE.search(text)
                 and (_BG_AMP_RE.search(text)
-                     or re.search(r"\bsetsid\b", text)))
+                     or re.search(r"\bsetsid\b", text)
+                     or re.search(r"\bgunicorn\b[^;&|\n]*\s(?:--daemon|-D)(?=\s|$)", text)))   # §4UY C14
+
+
+#: §4UY C7: the smoke-test forms the server guards point to — a background start the SAME command ends AFTER it
+#: started it: `kill %N`, `kill $!`, `PID=$!; …; kill $PID` (any signal), `kill $(jobs -p)`, `pkill`/`killall`
+#: naming the started program, a `trap '… kill …' EXIT`, or a start bounded by its own `timeout N` (it dies on
+#: its own). Review r1: a kill BEFORE the start, a `kill 1234` naming nothing started, or a second server left
+#: running beside a killed first one is no smoke test — EVERY backgrounded start must be covered.
+_SMOKE_FORMS = ("`timeout 15 <server> & sleep 1; curl …`, `<server> & PID=$!; sleep 1; curl …; kill $PID`, "
+                "`<server> & sleep 1; curl …; kill %1` or a `trap 'kill $!' EXIT` — every `&` start needs its own")
+#: live probe 11-19: `cd d && server & P=$!; …; kill $P` backgrounds the whole LIST in a subshell — `$!` is that
+#: subshell, the kill leaves the server running. A job kill ends a server only when the job IS its process.
+_JOB_STEER = (" A `$!` / `%1` / `$(jobs -p)` kill is credited only for the forms proven to end the server: "
+              "a plain `server &` (env / nohup / nice prefixes and redirects are fine) — with `cd dir` first on its "
+              "own line (`cd dir; server & P=$!`) — or `(cd dir && exec server > log 2>&1) &`, or a pipeline with "
+              "`kill %1`. Anything else — `cd dir && server &` or `(cd dir && server) &` without exec (its kill can "
+              "leave the server running), `{ …; }`, `bash -c` / `eval`, a loop or function, `pkill -P` — is refused: "
+              "use one of those forms or end it by name (`pkill -f '<server>'`)")
+_DAEMON_BLOCK_MSG += _SMOKE_FORMS + "." + _JOB_STEER + "."
+
+_TIMEOUT_BOUNDED_RE = re.compile(
+    r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:\(\s*)?timeout\s+(?:-\S+\s+(?:\S+\s+)?)*[\d.]+[smhd]?\s")
+
+
+#: a kill whose signal ends nothing: `-0` (is it alive?), `-STOP`/`-TSTP`/`-CONT` (pause/resume), `-l`/`-L` (list)
+_NON_ENDING_SIGNAL_RE = re.compile(
+    r"^\s*(?:-(?:0|l|L|(?:SIG)?(?:STOP|TSTP|CONT|TTIN|TTOU|WINCH|CHLD|URG)|1[789]|2[0-3]|28)"
+    r"|-[sn]\s+(?:0|(?:SIG)?(?:STOP|TSTP|CONT|TTIN|TTOU|WINCH|CHLD|URG)))(?=\s|$)", re.I)
+
+
+def _background_starts(text: str) -> list:
+    """[(start, end, segment)] of every `… &` start, in job order (one split — §4UY C19: a re-split of the
+    prefix per `&` was quadratic)."""
+    parts = re.split(r"(\n|;|&&|\|\||(?<![&>|])&(?![&>]))", text)            # `|&` is a pipe
+    out, pos = [], 0
+    for i in range(0, len(parts), 2):
+        seg = parts[i]
+        sep = parts[i + 1] if i + 1 < len(parts) else ""
+        if sep == "&":
+            out.append((pos, pos + len(seg), seg))
+        pos += len(seg) + len(sep)
+    return out
+
+
+def _shape_view(text: str) -> str:
+    """`text` with the same length, for reading its SHAPE: quoted spans (`'…'`, `"…"`, `$'…'`) and comments
+    become `x`, a backslash-newline becomes two spaces (review C7: a quoted `;` / `|` / `(` / newline and a
+    continued line were read as structure)."""
+    out, i, n, q = list(text), 0, len(text), None
+    while i < n:
+        c = text[i]
+        if q:
+            if c == "\\" and q != "'" and i + 1 < n:
+                out[i] = out[i + 1] = "x"
+                i += 2
+                continue
+            if c == q:
+                q = None
+            else:
+                out[i] = "x"                            # a quoted newline is no structure either
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] == "\n":
+                out[i] = out[i + 1] = " "
+            i += 2
+            continue
+        if c in "'\"":
+            q = c
+        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;&|("):
+            while i < n and text[i] != "\n":
+                out[i] = "x"
+                i += 1
+            continue
+        i += 1
+    depth = 0                                         # a `)` closing nothing is a `case` pattern's end: a separator
+    for k, ch in enumerate(out):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                out[k] = ";"
+            else:
+                depth -= 1
+    return "".join(out)
+
+
+def _job_text(view: str, end: int) -> str:
+    """The whole job a `&` at `end` backgrounds, read on the shape view: back to the previous `;` / newline /
+    lone `&` outside parentheses and braces. An and-or list `a && b &` is ONE job, and a newline after `&&`,
+    `||` or `|` continues it."""
+    depth, i = 0, end - 1
+    while i >= 0:
+        c = view[i]
+        if c in ")}":
+            depth += 1
+        elif c in "({":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and c == "\n":
+            if not re.search(r"(?:&&|\|\||\|)\s*$", view[max(0, i - 80):i]):
+                break
+        elif depth == 0 and (c == ";" or (c == "&" and view[i - 1:i] != "&" and view[i + 1:i + 2] != "&"
+                                           and view[i - 1:i] not in (">", "<"))):
+            break
+        i -= 1
+    return view[i + 1:end]
+
+
+def _subshell_closes(view: str, ends) -> list:
+    """For each `&` at `ends[k]`: where the `( … )` subshell it runs inside closes (len(view) in the top shell).
+    `$!`, `%N`, `jobs` after that point belong to the outer shell, which never started it (`(srv &); kill $!`).
+    One pass with a bracket stack (linear: §4UY C19)."""
+    out, stack, k = [len(view)] * len(ends), [], 0
+    pending = {}                                      # open-paren index → starts waiting for its close
+    for i, c in enumerate(view):
+        while k < len(ends) and ends[k] <= i:
+            if stack and view[stack[-1]] == "(":
+                pending.setdefault(stack[-1], []).append(k)
+            k += 1
+        if c in "({":
+            stack.append(i)
+        elif c in ")}" and stack:
+            o = stack.pop()
+            for w in pending.pop(o, ()):
+                out[w] = i
+    return out
+
+
+#: a function the command defines: `name()` / `function name`
+_FN_DEF_RE = re.compile(r"(?:^|[\s;&|(])(?:function\s+([\w.:-]+)|([\w.:-]+)\s*\(\s*\))")
+#: heads whose job is NOT the program after them — or not proven to be in the sandbox: a nested shell / `eval`
+#: (judging its payload is not trivial), reserved words, `time`/`sudo`/`setsid`/`xargs`/`watch`. Refuse when unsure.
+_UNPROVEN_HEADS = frozenset("bash sh zsh dash ksh fish eval source . time sudo setsid xargs watch command builtin "
+                            "if then elif else fi while until for do done case esac select function ! [[ coproc".split())
+_SUBST_RE = re.compile(r"\$\(\([^()]*\)\)|\$\([^()]*\)|\$\{[^{}]*\}")       # `$((…))`, `$(…)`, `${…}`: words
+_REDIR_AMP_RE = re.compile(r"\d*>&\d*-?|&>>?|<&\d*")
+_GROUP_RE = re.compile(r"^([({])(.*)([)}])((?:\s*(?:\d*>>?|&>>?|\d*<)\s*&?\d*\s*[^\s()<>&|;]*)*)\s*$", re.S)
+
+
+def _defined_functions(view: str) -> set:
+    return {a or b for a, b in _FN_DEF_RE.findall(view)}
+
+
+def _plain(cmd: str) -> str:
+    """Redirect `&`s blanked and substitutions (`$(…)` nested, `` `…` ``, `${…}`) made one word `v`."""
+    prev = None
+    while prev != cmd:
+        prev, cmd = cmd, _SUBST_RE.sub("v", cmd)
+    return _REDIR_AMP_RE.sub(" ", re.sub(r"`[^`]*`", "v", cmd))
+
+
+def _resolve_head(words: list):
+    """THE head resolver (review B3-M1) — every head is judged here: the program a simple command runs, past
+    `VAR=` words, `exec` (and its flags), `env` (its flags and `VAR=` words), `nice` (its flags), `nohup`, `--`,
+    as a basename. None when unprovable: a quoted / escaped / substituted / `$VAR` head."""
+    w, i, n = words, 0, len(words)                    # an index walk: linear (review: pop(0) was quadratic)
+    while i < n:
+        h = w[i]
+        if re.match(r"^[A-Za-z_]\w*=", h) or h == "--":
+            i += 1
+            continue
+        base = h.rsplit("/", 1)[-1]
+        if base in ("exec", "env", "nice", "nohup"):
+            i += 1
+            while i < n and (w[i].startswith("-") and w[i] != "--"
+                             or base == "env" and re.match(r"^[A-Za-z_]\w*=", w[i])):
+                i += 1                                # a flag's argument then reads as the head: a program
+            continue
+        if re.search(r"[\\'\"$`]", h) or h == "v":
+            return None
+        return base
+    return None
+
+
+def _is_one_program(cmd: str, fns) -> bool:
+    """PROVEN form (1): ONE simple command — `VAR=x` prefixes, `nohup` / `env` / `nice` / `exec` wrappers,
+    redirects and substitutions in its ARGUMENTS allowed — whose resolved head is not a nested shell, a reserved
+    word, a function the command defined, or unprovable."""
+    c = _plain(cmd).strip()
+    if not c or re.search(r"[(){}|;&\n]", c):
+        return False
+    head = _resolve_head(c.split())                   # `$B …` / `` `x` `` / `$(x)` heads resolve to None
+    return bool(head) and head not in _UNPROVEN_HEADS and head not in fns
+
+
+def _job_kind(job: str, fns) -> str:
+    """What a job kill ends, for the job a `&` backgrounds (read on the shape view). REFUSE WHEN UNSURE (operator
+    11-19): only forms PROVEN in the sandbox's bash 5.2.15 are credited —
+    "own" (`$!`, `$VAR`, `%N`, `$(jobs -p)` end the server): (1) one simple command that is the server, bare or
+    alone in `( … )`; (2) a job of MORE than one command (`a && …`, `( … )`, `{ … }`, redirects anywhere) only when
+    its last command is `exec` server with no other server before it — holds in bash 3.2 and 5.2 alike;
+    "pipe" (only `%N` / `$(jobs -p)`, which signal every process of it): (3) a bare pipeline of simple commands;
+    "" for everything else: `a && srv`, `{ a; srv; }`, `||` lists, loops, functions, `bash -c` / `eval`.
+    Known limit — kill bookkeeping is not traced: `P=1; kill $P`, `echo kill $P` are read as kills."""
+    j = job.strip()
+    g = _GROUP_RE.match(j)
+    if g and (g.group(1), g.group(3)) in (("(", ")"), ("{", "}")):
+        inner = _plain(g.group(2))
+        if re.search(r"[(){}`]|(?<!&)&(?!&)", inner):
+            return ""                                 # nested groups (also `(a) && (b)`), a `&` inside: not proven
+        parts = [x.strip() for x in re.split(r"&&|;|\n", inner) if x.strip()]
+        if not parts or any(_SERVERISH_RE.search(x) or x.startswith("trap") for x in parts[:-1]):
+            return ""
+        last = parts[-1]
+        if g.group(1) == "(" and len(parts) == 1:    # `(srv …) &`: a single command, as bare
+            return "own" if _is_one_program(re.sub(r"^exec\s+", "", last), fns) else ""
+        # more than one command (or a `{ }` group): only an `exec`'d last command is the job's process — bash 5's
+        # own exec of a subshell's last command is silently lost to a redirect on it (measured 11-19)
+        return "own" if last.startswith("exec ") and _is_one_program(last[5:], fns) else ""
+    p = _plain(j)
+    if re.search(r"[(){}`]|\|\|", p):
+        return ""
+    if "&&" in p:
+        parts = [x.strip() for x in p.split("&&")]
+        if any(_SERVERISH_RE.search(x) for x in parts[:-1]):
+            return ""
+        return "own" if parts[-1].startswith("exec ") and _is_one_program(parts[-1][5:], fns) else ""
+    if "|" in p:
+        stages = [x for x in re.split(r"\|&?", j)]
+        if any(_SERVERISH_RE.search(x) for x in stages[1:]):
+            return ""                                 # review B3-M2: a job spec ends a pipeline only from its head
+        return "pipe" if all(_is_one_program(x, fns) for x in stages) else ""
+    return "own" if _is_one_program(j, fns) else ""
+
+
+_HEREDOC_ANY_RE = re.compile(r"(<<-?\s*(['\"]?)(\w+)\2[^\n]*)\n.*?\n[ \t]*\3[ \t]*(?=\n|$)", re.S)
+
+
+def _ends_its_background(cmd: str) -> bool:
+    """Does `cmd` end EVERY server it backgrounds, after starting it (see `_SMOKE_FORMS`)?"""
+    # review B2-M3: every heredoc body is data to this reading (an apostrophe in it would open a "quote")
+    text = _HEREDOC_ANY_RE.sub(lambda m: m.group(1), str(cmd or ""))
+    view = _shape_view(text)                          # quotes / comments / continuations read as shape only
+    starts = [(a, e, text[a:e]) for a, e, _seg in _background_starts(view)]
+    if not starts:
+        return False
+    covered = [bool(_TIMEOUT_BOUNDED_RE.match(seg)) for _s, _e, seg in starts]
+    # a job kill (`$!`, `$VAR`, `%N`, `$(jobs -p)`) ends a start only when its job IS the process (live 11-19)
+    jobs = [_job_text(view, e) for _s, e, _seg in starts]
+    fns = _defined_functions(view)
+    # review B4-M1, wrapper-proof: a job carrying a shell `-c` payload is never its server's process, whatever
+    # wraps it (`stdbuf -oL bash -c`, `caffeinate -i bash -c`, `busybox sh -c`)
+    kinds = ["" if _SH_C_PAYLOAD_RE.search(j) else _job_kind(j, fns) for j in jobs]
+    closes = _subshell_closes(view, [e for _s, e, _seg in starts])
+    own = [k == "own" for k in kinds]
+    # a job SPEC (`%N`, `$(jobs -p)`) also ends a bare pipeline: bash signals every process of it (verified);
+    # `$!` names only its last process
+    spec = [k in ("own", "pipe") for k in kinds]
+
+    import bisect as _bisect
+    ends = [e for _s, e, _t in starts]                # ascending: starts are in text order
+
+    def last_started(at: int) -> int:                 # index of the newest start before `at`, or -1
+        return _bisect.bisect_right(ends, at) - 1
+
+    pid_vars = {}                                     # VAR=$! → (the start it holds, where it was set)
+    for m in re.finditer(r"\b([A-Za-z_]\w*)=[\"']?\$(?:!|\{!\})", text):
+        pid_vars[m.group(1)] = (last_started(m.start()), m.start())
+    traps = [(m.start(), m.end()) for m in
+             re.finditer(r"\btrap\s+(['\"])(?:(?!\1).)*\1\s+(?:EXIT|INT|TERM|0)\b", text, re.S)]
+    for m in re.finditer(r"\b(kill|pkill|killall)\b([^;&|\n]{0,160})", text):
+        at = len(text) if any(a <= m.start() < b for a, b in traps) else m.start()   # a trap runs at the end
+        n = last_started(at)
+        if n < 0:
+            continue                                  # a kill before any start ends nothing it started
+        args = m.group(2)
+        if _NON_ENDING_SIGNAL_RE.match(args):
+            continue                                  # review r2 m3: `kill -0` probes, -STOP pauses, -l lists
+        if m.group(1) == "kill":
+            if m.start() > closes[n]:
+                continue                              # outside the subshell that started it: not its job
+            if re.search(r"\$\(\s*jobs\s+-p", args):
+                covered[:n + 1] = [c or (spec[k] and m.start() < closes[k]) for k, c in enumerate(covered[:n + 1])]
+            if re.search(r"\$!|\$\{!\}", args):
+                covered[n] = covered[n] or own[n]
+            for jm in re.finditer(r"%(\d+|[%+-]?)(?![\w])", args):
+                g = jm.group(1)
+                idx = int(g) - 1 if g.isdigit() else (n - 1 if g == "-" else n)
+                if 0 <= idx <= n and m.start() < closes[idx]:
+                    covered[idx] = covered[idx] or spec[idx]
+            for var in re.findall(r"\$\{?([A-Za-z_]\w*)", args):
+                held, set_at = pid_vars.get(var, (-1, len(text)))
+                if 0 <= held and set_at < at and m.start() < closes[held]:
+                    covered[held] = covered[held] or own[held]
+        else:
+            names = [w.strip("'\"") for w in args.split() if not w.startswith("-")]
+            for idx in range(n + 1):
+                if any(nm and nm in starts[idx][2] for nm in names):
+                    covered[idx] = True
+    # every server-shaped start must be covered (a `sleep 30 &` beside it is no server); with none, every start
+    need = [i for i, (_s, _e, seg) in enumerate(starts) if _SERVERISH_RE.search(seg)] or range(len(starts))
+    return all(covered[i] for i in need)
 
 
 # ⚠ THE INSTALL VERB IS REQUIRED, and `uninstall` is excluded — my first
@@ -95,11 +392,11 @@ def _daemonized_server_block(command: str):
         cmd = _strip_data_heredocs(cmd)
     except Exception:  # noqa: BLE001 — guard must not crash the tool
         pass
-    if re.search(r"\bkill\s+%", cmd):
+    if _ends_its_background(cmd):             # §4UY C7: the command ends what it started
         return None
     for m in _SH_C_PAYLOAD_RE.finditer(cmd):
         inner = m.group(1) or m.group(2) or ""
-        if inner and _detached_server_signals(inner):
+        if inner and _detached_server_signals(inner) and not _ends_its_background(inner):
             return _DAEMON_BLOCK_MSG
     if _detached_server_signals(_QUOTED_RE.sub(" ", cmd)):
         return _DAEMON_BLOCK_MSG
@@ -114,27 +411,33 @@ _END = r"(?=\s|$|[;&|)])"
 _FG_SERVER_RE = re.compile(
     r"^(?:sudo\s+(?:-[A-Za-z]\s+\S+\s+|-\S+\s+)*|env\s+(?:\S+=\S*\s+)*|nohup\s+|exec\s+|time\s+|nice\s+(?:-n\s*-?\d+\s+)?|[A-Za-z_]\w*=\S*\s+)*"
     r"(?:python[\d.]*\s+-m\s+(?:http\.server|SimpleHTTPServer|flask\s+run|uvicorn|gunicorn)" + _END +
-    r"|flask\s+run" + _END + r"|uvicorn\s+(?!--version)|gunicorn\s+(?!--check-config|--version)|hypercorn\s"
+    r"|python[\d.]*\s+-m\s+streamlit\s+run" + _END +
+    # §4UY C14: `flask --app x run`, `fastapi dev|run`, `nodemon`; `gunicorn --daemon` detaches (the §4G guard's)
+    r"|flask\s+(?:(?:--app|-A|--debug|--no-debug|-e|--env-file)(?:[\s=]\S+)?\s+)*run" + _END +
+    r"|fastapi\s+(?:dev|run)" + _END + r"|(?:npx\s+)?nodemon" + _END +
+    r"|uvicorn\s+(?!--version)|gunicorn\s+(?!--check-config|--version|(?:.*\s)?(?:--daemon|-D)(?:\s|$))|hypercorn\s"
     r"|(?:npm|pnpm|bun)\s+(?:(?:--prefix|-C)\s+\S+\s+)?(?:run(?:-script)?\s+)?(?:start|dev|serve|preview)" + _END +
     r"|pnpm\s+(?:start|dev|serve)" + _END + r"|yarn\s+(?:run\s+)?(?:start|dev|serve|preview)" + _END +
     r"|streamlit\s+run" + _END + r"|(?:python[\d.]*\s+)?manage\.py\s+runserver" + _END + r"|php\s+-S" + _END +
     r"|(?:npx\s+(?:-y\s+)?)?(?:serve|http-server|live-server)(?=\s|$)(?!\s+--?(?:h|help|v|version)\b)"
     r"|(?:npx\s+(?:-y\s+)?)?vite(?:\s+(?:dev|serve|preview))?" + _END + r"(?!\s*(?:build|optimize))"
-    r"|(?:npx\s+)?next\s+(?:dev|start)" + _END + r"|jupyter\s+(?:notebook|lab)" + _END +
+    r"|(?:npx\s+)?next\s+(?:dev|start)" + _END +
+    # §4UY C14: `jupyter notebook list|stop|password` and `--version` exit
+    r"|jupyter\s+(?:notebook|lab)" + _END + r"(?!\s+(?:list|stop|password|--version|--help|-h)\b)" +
     r"|hugo\s+server" + _END + r"|rails\s+s(?:erver)?" + _END + r")", re.I)
 _FG_SERVER_BLOCK_MSG = (
     "SYSTEM BLOCK: this command starts a server in the FOREGROUND — NOT executed. A server never exits on its own, so "
     "execute would wait its whole 600 s budget and then kill it. Start it with the `run` tool instead: "
     "run action='start' lifetime='server' where='workspace' name='<name>' command='<the same command>' (it gets a "
     "free port as $PORT and keeps running across turns), then request it with curl or the browser. For a one-off "
-    "smoke test bound it yourself: `timeout 15 <command>`."
+    "smoke test in ONE command, background it and end it yourself: " + _SMOKE_FORMS + "."
 )
 
 
 def _foreground_server_block(command: str):
     """Refusal message when a segment of the command runs a definite server in the foreground, else None."""
     cmd = str(command or "")
-    if not cmd or (re.search(r"\bkill\s+%", cmd) and re.search(r"[^&]&(?!&)", cmd)):
+    if not cmd or (_ends_its_background(cmd) and re.search(r"[^&]&(?!&)", cmd)):
         return None
     # final review: EVERY heredoc body is data to this guard (a python body's `serve = …` is not a shell line)
     cmd = re.sub(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n[ \t]*\2[ \t]*(?=\n|$)", "<<HEREDOC", cmd, flags=re.S)
@@ -145,6 +448,8 @@ def _foreground_server_block(command: str):
     cmd = _QUOTED_RE.sub("''", cmd)          # final review: quoted text (a commit message, a README) is data
     for seg in re.split(r"\n|;|&&|\|\|", cmd):
         seg = seg.strip().lstrip("( ").rstrip(") ").strip()
+        # §4UY C14: a server inside `if … then` / `for … do` / `{ …; }` / `! …` is still a foreground server
+        seg = re.sub(r"^(?:(?:then|do|else|elif|if|while|until|\{|!)\s+)+", "", seg).strip()
         if not seg or seg.endswith("&"):
             continue                          # backgrounded: the §4G guard owns it
         seg = seg.split("|", 1)[0].strip()    # `npm start | tee log` still never exits
@@ -197,6 +502,88 @@ def _youtube_download_block(command: str):
 from .shell_analysis import _shell_segments, _bulk_destructive, _released_written_ids  # noqa: E402
 
 
+def _keep_versions_before_run(command: str, sandbox_dir, container_workdir: str = "") -> int:
+    """§4UY C6/C21 — the shell side of `file_system.keep_before_replace`: before a command runs, the previous
+    version of every existing workspace file it would REMOVE (`rm`, `find -delete`, `mv` sources, `rsync
+    --delete`, …) or OVERWRITE (`>`, `sed -i`, `cp` onto it, `tee`, …) is kept in the version store. The
+    paths come from `shell_analysis` (quotes, comments and heredoc bodies set aside, nested shells read,
+    `cd` followed). A directory is kept only when it is REMOVED (a build tool writing into `.` is not a
+    removal). Returns how many files were kept; never raises, never blocks."""
+    try:
+        if not command or sandbox_dir is None:
+            return 0
+        from .file_versions import keep_previous
+        from .shell_analysis import _destructive_targets, _written_paths, _norm_shell_arg
+        sd = Path(sandbox_dir)
+        root = sd.parent.parent if (sd.parent.name == "projects" and re.fullmatch(r"[0-9a-f]{12}", sd.name)) else sd
+        cwd = str(container_workdir or "/workspace")
+        removed, written = [], []
+
+        def _host(p: str):
+            p = _norm_shell_arg(p)
+            if not p or "$" in p or "<unknown>" in p or p.startswith("~"):
+                return None
+            if not p.startswith("/") and not cwd:
+                return None                       # relative to a directory nobody knows
+            full = os.path.normpath(p if p.startswith("/") else cwd + "/" + p)
+            if not (full == "/workspace" or full.startswith("/workspace/")):
+                return None
+            hp = root / full[len("/workspace"):].lstrip("/")
+            return hp
+
+        _prev_find = None                         # §4UY r3: the find a following `| xargs rm` reads
+        for head, args, raw, via_xargs in _shell_segments(command):
+            if head in ("cd", "pushd"):
+                tgt = next((a for a in args if not a.startswith("-")), None)
+                if tgt is None or "$" in tgt or tgt.startswith("~"):
+                    cwd = ""
+                elif cwd or tgt.startswith("/"):
+                    cwd = os.path.normpath(tgt if tgt.startswith("/") else cwd + "/" + _norm_shell_arg(tgt))
+                continue
+            dt = _destructive_targets(head, args, via_xargs) or []
+            _fstarts = set()
+            _fargs, _frm = None, False
+            if head == "find" and not dt and not via_xargs:
+                _fargs = args             # §4UY r2 m4: a narrowed `find … -name '*.py' -delete`
+            elif via_xargs and head in ("rm", "unlink", "shred", "srm", "mv") and _prev_find is not None:
+                _fargs, _frm = _prev_find, True   # §4UY r3: `find … -print0 | xargs -0 rm` removes its matches
+            _prev_find = args if (head == "find" and not via_xargs) else None
+            if _fargs is not None:
+                # keep what the find's filter can match (a superset of what it selects)
+                from .shell_analysis import _find_kept_match
+                for _start, _match in (_find_kept_match(_fargs, removes=_frm) or []):
+                    _fstarts.add(_start)              # its start is filtered, not "written" whole below
+                    hp = _host(_start)
+                    if hp is not None and not any(c in str(hp) for c in "*?["):
+                        removed.append((hp, _match))
+            for t in dt:
+                import glob as _glob
+                hp = _host(t)
+                if hp is None:
+                    continue
+                if any(c in str(hp) for c in "*?["):
+                    removed += [Path(x) for x in _glob.glob(str(hp))[:500]]
+                else:
+                    removed.append(hp)
+            for t in _written_paths(head, args, raw):
+                if t in dt or t in _fstarts:
+                    continue
+                hp = _host(t)
+                if hp is not None and hp.is_file():
+                    written.append(hp)
+        if not removed and not written:
+            return 0
+        kept, skipped = keep_previous(removed + written, root)
+        if kept or skipped:
+            # §4UY r1: a spent budget says "kept N of M"; the store is outside the sandbox (file_versions)
+            pretty_log("File versions", f"{len(kept)} kept before the command ran"
+                       + (f"; not kept: {'; '.join(skipped[-2:])}" if skipped else ""), icon=Icons.TOOL_FILE_W)
+        return len(kept)
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("GhostAgent").debug("keep versions before run: %s", e)
+        return 0
+
+
 def _released_shell_block(project_store, command: str, workdir: str = ""):
     """Refusal message when a shell command would mutate a RELEASED
     project's workspace, else None. Heuristic by necessity (shell), so it
@@ -220,8 +607,10 @@ def _released_shell_block(project_store, command: str, workdir: str = ""):
             _held = (f" — and RELEASED (immutable) project(s) {', '.join(str(r) for r in _rel[:5])}" if _rel else "")
             return ToolOutcome.rejected(
                 f"SYSTEM BLOCK: this command removes or moves files in bulk (the projects folder, a wildcard at "
-                f"the workspace root, or the whole workspace), which holds every project's workspace{_held} — "
-                f"NOT executed. Name the files or folders to remove explicitly.",
+                f"the workspace root, the whole workspace, or everything in a project's own folder — "
+                f"`rm -rf *` / `find . -delete` at its top){_held} — NOT executed. Name the files or folders to "
+                f"remove explicitly (`rm -rf build dist`); a whole project is deleted with manage_projects "
+                f"action='delete'.",
                 reason_code="released_write_blocked")
         if project_store is None:
             return None
@@ -283,190 +672,321 @@ def _sandbox_mem_limit() -> str:
     return os.environ.get("GHOST_SANDBOX_MEM", "4g")
 
 
-#: §4HZ — the model's own status echo. `cmd; echo "exit=$?"` (and the
-#: `=== exit: $? ===` banner variant) makes the LAST command an `echo`, so
-#: bash reports 0 and the tool logged "execution ok" over a traceback, an
-#: OOM `Killed`, and a failed `pip install` (req d594668e: the strike
-#: counter fell from 4/6 to 1/6 on one such line, and System 3's chosen
-#: "capture the full output" recovery was booked as a success). The echo
-#: itself is the exact signal: the command text contains `$?` and the output
-#: contains the number it printed.
-_SELF_REPORTED_EXIT_RE = re.compile(
-    r"(?im)\bexit(?:\s*(?:code|status))?\s*[=:]\s*(\d{1,3})\b")
-#: bash's own job-status line for a SIGKILLed child (`bash: line 1:  807
-#: Killed  python3 x.py`). Printed by the shell, not by the program, so it
-#: is never data the command happened to echo.
-_BASH_KILLED_RE = re.compile(r"(?m)^bash: line \d+:\s+\d+ Killed\b")
+#: §4UY C9/C10 — ONE exit-status rule: the REAL exit codes. The shell reports the status of the LAST command
+#: of a list, so `python x.py; echo done`, `gcc …; ./a`, `pytest > out.log; tail -3 out.log` read as EXIT CODE 0
+#: over a failing program. The old cover was output signatures (a Python traceback, `N failed`, `npm ERR!`) and
+#: a printed `exit=N` — prose, wrong both ways. Now the shell itself records every top-level command that
+#: failed: an ERR trap (bash fires it exactly for an unhandled failure — never for the left side of `&&`/`||`,
+#: an `if`/`while` test or a `!`) appends `<code>:<stage codes>:<command>`, and an EXIT trap writes the list to
+#: a STATUS FILE (`/workspace/.ghost_status/<id>`, read back and removed by the host — review r1: a marker on
+#: stdout went into the user's own file under `exec > out.txt`). The run's status is then:
+#:   * the shell's status when it is non-zero (pipe / find forgiveness as before);
+#:   * else the LAST recorded failure of a program that RUNS CODE (`_RUNNER_HEAD_RE`: an interpreter, a test
+#:     runner, a compiler or build tool, `./x`) — review r1 inverted the rule: `rm` of an absent file, `lsof`,
+#:     `nc -z`, `cp 2>/dev/null`, `curl`, `pip` failing keep the shell's status, and so does a `timeout N`
+#:     run that the timeout ended (124/137/143: a bounded smoke run);
+#:   * the failing STAGE of a pipeline is named (from the stage codes), and a pipeline the reader closed early
+#:     (`… | head`) is forgiven by the same pipe rule as the last one.
+#: No trap is installed when the command reads statuses itself or brings its own handling (PIPESTATUS, its own
+#: `trap`, `set -e` / `-o pipefail` / `errexit`, `exec` redirection, a `source` / `.` of a file whose traps and
+#: PIPESTATUS reads would meet ours — not a virtualenv `bin/activate` or conda's `conda.sh`, which set no traps
+#: — `_reads_own_status`): it then behaves as plain bash. `$?` keeps the trap
+#: (bash restores `$?` after an ERR trap — pinned on the host's bash 3.2, the sandbox's 5.2 assumed the same);
+#: a runner failure whose status the NEXT list member reads (`…; echo "rc=$?"`) is the model's own probe.
+STATUS_DIRNAME = ".ghost_status"
+_CONTAINER_STATUS_DIR = "/workspace/" + STATUS_DIRNAME
+#: the legacy stdout marker (r0): stripped wherever a stored log still carries one, never read as a status
+_FAILED_MARK = "__GHOST_FAILED="
+_FAILED_LINE_RE = re.compile(r"\n?" + re.escape(_FAILED_MARK) + r"([^\n]*)(?:\n|\Z)")
+_STATUS_FILE_RE = re.compile(r"__g_sf=['\"]?(" + re.escape(_CONTAINER_STATUS_DIR) + r"/[0-9a-f]{32})\b")
+_STATUS_FILE_MAX = 64 * 1024
+
+_ERR_TRAP = ('__g_lp=("$?" "${PIPESTATUS[@]}"); printf -v __g_ps "%s," "${__g_lp[@]:1}"; '
+             '[ ${#__g_f[@]} -lt 32 ] && __g_f+=("${__g_lp[0]}:${__g_ps}:${BASH_COMMAND//[$\'\\t\\n\']/ }"); :')
+_EXIT_TRAP = ('[ ${#__g_f[@]} -gt 0 ] && { mkdir -p "${__g_sf%/*}" && (IFS=$\'\\t\'; '
+              'printf "%s\\n" "${__g_f[*]}") > "$__g_sf"; } 2>/dev/null')
+
+#: the command reads statuses itself — our trap would change what it sees (PIPESTATUS is reset by the trap's own
+#: commands) or fight its own handling: no trap, the shell's status stands
+_CMD_POS = r"(?:^|[;&|(){]|\b(?:then|do|else)\b)\s*"          # a word in command position
+#: an environment activator sets no traps and reads no statuses — sourcing one keeps the status rule
+#: (`. .venv/bin/activate`, `source venv/bin/activate.sh`, conda's `…/etc/profile.d/conda.sh`)
+_ACTIVATE_SCRIPT = (r"['\"]?(?:\S*/)?(?:bin/activate(?:\.sh|\.bash)?|etc/profile\.d/conda\.sh)['\"]?"
+                    r"(?=$|[\s;&|)])")
+_OWN_STATUS_RE = re.compile(
+    r"PIPESTATUS|" + _CMD_POS + r"trap\s|" + _CMD_POS + r"(?:source|\.)\s+(?!" + _ACTIVATE_SCRIPT + r")\S"
+    r"|" + _CMD_POS + r"set\s+(?:-[a-zA-Z]*e|[-+]o\s+(?:errexit|pipefail)|\+e)"
+    r"|" + _CMD_POS + r"exec\s+(?:\d*[<>]|&>)", re.M)
 
 
-def _status_echo_ends_the_run(command: str) -> bool:
-    """Is the last `$?` echo the run's summary — nothing after it but closers (`done`, `fi`) or more echoes?
-
-    ft live (req d6bff7a8): `… remove zebra 99; echo "exit=$?"; … remove zebra 2; … list; ls` tested the
-    error path ON PURPOSE and then went on; the mid-command `exit=1` was adopted as the whole run's status, the
-    run booked as a failure (effort raised, a failure banner the reply then had to explain away)."""
-    cmd = str(command or "")
-    i = max(cmd.rfind("$?"), cmd.rfind("${?}"))
-    if i < 0:
-        return False
-    q, k = None, 0
-    while k < i:                             # the quote state AT the `$?` (it usually sits inside "exit=$?")
-        c = cmd[k]
-        if c == "\\" and q != "'":
-            k += 2
-            continue
-        if q:
-            if c == q:
-                q = None
-        elif c in "'\"":
-            q = c
-        k += 1
-    j = i
-    while j < len(cmd):                      # the end of the segment holding the echo (quote-aware)
-        c = cmd[j]
-        if c == "\\" and q != "'":
-            j += 2
-            continue
-        if q:
-            if c == q:
-                q = None
-        elif c in "'\"":
-            q = c
-        elif c in ";\n" or cmd.startswith("&&", j) or cmd.startswith("||", j):
-            break
-        j += 1
-    closers = set(re.findall(r"<<-?\s*['\"]?(\w+)", cmd))           # heredoc delimiters
-    # final review: an allow-list of what may follow laundered real failures again (`; rm -f tmp`, `; deactivate`,
-    # `; cat out.log`). The live false alarm was a run that WENT ON RUNNING programs after the echo — so only a
-    # later member whose head is a runner (python, node, pytest, ./x, x.py, …) ends the echo's claim.
-    for member in re.split(r"&&|\|\||;|\n", cmd[j:]):
-        toks = member.strip().lstrip("({!").split()
-        while toks and (re.fullmatch(r"[A-Za-z_]\w*=.*", toks[0]) or toks[0] in _RUNNER_WRAPPERS
-                        or toks[0] in ("do", "then", "else")):
-            if toks[0] == "timeout":          # final review r2: `timeout -s KILL 5 python3 …` — skip its flags too
-                toks = toks[1:]
-                while toks and toks[0].startswith("-"):
-                    toks = toks[2:] if toks[0] in ("-s", "--signal", "-k", "--kill-after") else toks[1:]
-                toks = toks[1:]
-                continue
-            toks = toks[1:]
-        if not toks or toks[0].startswith("#") or (len(toks) == 1 and toks[0] in closers):
-            continue
-        head = toks[0] if toks[0].startswith("./") else toks[0].rsplit("/", 1)[-1]
-        if _RUNNER_HEAD_RE.match(head):
-            return False
-    return True
+def _reads_own_status(command: str) -> bool:
+    return bool(_OWN_STATUS_RE.search(str(command or "")))
 
 
-def _self_reported_exit(command: str, exit_code, output: str = "") -> int:
-    """Adopt the exit status the run REPORTED when the shell's is 0.
+def _status_traps(container_path: str) -> str:
+    # `set -E`: the ERR trap reaches inside shell functions (review r2 m5: `f(){ python3 x.py; echo t; }; f`
+    # recorded nothing) — a subshell's record stays in the subshell (its EXIT trap is not ours)
+    return (f"set -E; __g_f=(); __g_sf={shlex.quote(container_path)}; trap {shlex.quote(_ERR_TRAP)} ERR; "
+            f"trap {shlex.quote(_EXIT_TRAP)} EXIT; ")
 
-    Two shapes, both literal:
-      * the command contains ``$?`` and the output carries an
-        ``exit=N`` / ``exit code: N`` line with N != 0 — the program's own
-        status, echoed by the command that laundered it (the LAST such line
-        wins: a multi-probe script reports each probe, and the trailing
-        echo is the one summarising the run);
-      * bash's ``bash: line N: <pid> Killed`` job message — a SIGKILL the
-        shell itself reported (→ 137).
-    A command that never echoes ``$?`` is untouched: ``cat crash.log``
-    printing "exit=1" is data, not a status.
-    """
+
+def new_status_file(host_root):
+    """(container path, host path) of a fresh status file, or (None, None) without a host workspace."""
+    if not host_root:
+        return None, None
     try:
-        code = int(exit_code or 0)
-    except (TypeError, ValueError):
-        return exit_code
-    if code != 0:
-        return code
-    text = str(output or "")
-    if ("$?" in str(command or "") or "${?}" in str(command or "")) and _status_echo_ends_the_run(str(command or "")):
-        reported = [int(m.group(1)) for m in _SELF_REPORTED_EXIT_RE.finditer(text)]
-        if reported and reported[-1] != 0 and reported[-1] <= 255:
-            return reported[-1]
-    if _BASH_KILLED_RE.search(text):
-        return 137
-    return 0
+        import uuid as _uuid
+        name = _uuid.uuid4().hex
+        return f"{_CONTAINER_STATUS_DIR}/{name}", Path(str(host_root)) / STATUS_DIRNAME / name
+    except Exception:  # noqa: BLE001
+        return None, None
 
 
-def _normalise_exit(command: str, exit_code, output: str = "") -> int:
-    """THE exit-code normaliser for a sandbox run — pipe forgiveness first
-    (§4GE), then the self-reported status (§4HZ). Every adoption of a
-    sandbox result in the command path goes through here; the enumeration in
-    `tests/test_execute_self_reported_exit.py` fails when one does not."""
+def _parse_status(text: str) -> list:
+    out = []
+    for line in str(text or "").splitlines():
+        for item in line.split("\t"):
+            code, _, rest = item.partition(":")
+            stages, _, cmd = rest.partition(":")
+            try:
+                out.append((int(code), [int(c) for c in stages.split(",") if c.strip()], cmd.strip()))
+            except ValueError:
+                continue
+    return out
+
+
+def read_status_file(host_path, *, delete: bool = True) -> list:
+    """The failures a run's ERR trap recorded — [(code, [stage codes], command), …] — read from the host side
+    and removed. The directory lives in the bind mount, so the model can plant links there: the directory must
+    be a real directory directly under the workspace, the file a REGULAR file (review r2 M1: a FIFO planted at
+    the path blocked the open forever — on the event loop), opened O_NOFOLLOW|O_NONBLOCK and read up to 64 KB.
+    Blocking I/O: async callers run it in a thread."""
+    if not host_path:
+        return []
+    p = Path(str(host_path))
+    try:
+        import stat as _stat
+        if not _stat.S_ISDIR(os.lstat(p.parent).st_mode):
+            return []
+        if not _stat.S_ISREG(os.lstat(p).st_mode):
+            return []
+        fd = os.open(str(p), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return []
+    try:
+        import stat as _stat
+        from .file_system import _block_if_regular       # §4SD: a regular file reads BLOCKING (virtiofs EAGAIN)
+        if not _stat.S_ISREG(_block_if_regular(fd).st_mode):
+            return []
+        data = os.read(fd, _STATUS_FILE_MAX)
+    except OSError:
+        return []
+    finally:
+        os.close(fd)
+        if delete:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        _prune_status_dir(p.parent)
+    return _parse_status(data.decode("utf-8", "replace"))
+
+
+_STATUS_KEEP_S = 24 * 3600
+_STATUS_PRUNE_MAX = 2000          # entries looked at per read (the model can fill the directory)
+
+
+def _prune_status_dir(d) -> None:
+    """Status files a job wrote and nobody read (a timed-out run, a job collected twice) leave after a day."""
+    try:
+        cut = time.time() - _STATUS_KEEP_S
+        for n, e in enumerate(os.scandir(d)):
+            if n >= _STATUS_PRUNE_MAX:
+                break
+            if re.fullmatch(r"[0-9a-f]{32}", e.name) and e.is_file(follow_symlinks=False) \
+                    and e.stat(follow_symlinks=False).st_mtime < cut:
+                os.unlink(e.path)
+    except OSError:
+        pass
+
+
+def status_failures_of_job(command_text, host_root, *, delete: bool = False) -> list:
+    """A run's recorded failures: the status file its wrapped command names. A foreground run's file is
+    removed once read; a job's stays for its other readers (the wake, `run collect`) and ages out."""
+    m = _STATUS_FILE_RE.search(str(command_text or ""))
+    if not m or not host_root:
+        return []
+    return read_status_file(Path(str(host_root)) / STATUS_DIRNAME / m.group(1).rsplit("/", 1)[-1],
+                            delete=delete)
+
+
+_RUNNER_WRAPPERS = ("env", "nohup", "time", "sudo", "xvfb-run", "timeout", "nice", "stdbuf", "exec", "command")
+_SHELL_LEAD_WORDS = ("do", "then", "else", "elif", "!", "{", "(", "if", "while", "until")
+
+
+#: THE table of programs that RUN CODE — interpreters, test runners, compilers, build tools, `./x`, a script by
+#: its extension. A failure behind `;` counts only for these (§4UY r1); it is also the claims ledger's reading
+#: of "a runner".
+_RUNNER_HEAD_RE = re.compile(
+    r"^(?:python[\d.]*|py|node|nodejs|deno|bun|pytest|py\.test|npm|npx|yarn|pnpm|cargo|go|make|java|javac|ruby"
+    r"|php|perl|bash|sh|zsh|uv|poetry|pipenv|tox|nox|coverage|gunicorn|uvicorn|flask|django-admin|manage\.py"
+    r"|dotnet|mvn|gradle|swift|swiftc|rustc|gcc|g\+\+|cc|c\+\+|clang|clang\+\+|tsc|ts-node|tsx|jest|vitest|mocha"
+    r"|streamlit|lua|Rscript|julia|kotlinc|scala|ghc|elixir|mix|dart|cmake|ninja|bazel)$"
+    r"|^\./|\.(?:py|sh|js|mjs|cjs|ts|rb|pl)$")
+
+
+def _command_head(text: str) -> str:
+    """The program a simple command (or a pipeline stage) runs: env assignments, wrappers (`timeout -s KILL
+    5`, `nice -n 5`) and shell keywords that only lead into it skipped; a path's basename except `./x`."""
+    toks = str(text or "").strip().lstrip("({!").split()
+    while toks:
+        t = toks[0]
+        if re.fullmatch(r"[A-Za-z_]\w*=.*", t) or t in _SHELL_LEAD_WORDS:
+            toks = toks[1:]
+            continue
+        # a function definition leads into its body (§4UY r3): `name(){`, `name() {`, `function name {`
+        if t == "function" and len(toks) > 1:
+            toks = toks[2:]
+            continue
+        if re.fullmatch(r"[\w.:-]+\(\)\{?", t) or t == "()" or (t == "{" and len(toks) > 1):
+            toks = toks[1:]
+            continue
+        if t in _RUNNER_WRAPPERS:
+            toks = toks[1:]
+            while toks and toks[0].startswith("-"):
+                toks = toks[2:] if toks[0] in ("-s", "--signal", "-k", "--kill-after", "-n", "-u") else toks[1:]
+            if t == "timeout" and toks and re.fullmatch(r"[\d.]+[smhd]?", toks[0]):
+                toks = toks[1:]
+            continue
+        break
+    if not toks:
+        return ""
+    return toks[0] if toks[0].startswith("./") else toks[0].rsplit("/", 1)[-1]
+
+
+#: a runner's invocations that run no code of the project (review r2 m2): `python -m pip|venv|ensurepip|
+#: http.server|json.tool`, `make clean`, `npx kill-port` — read by the module / target / package
+_NOT_A_RUN_RE = re.compile(
+    r"^python[\d.]*\s+(?:-\S+\s+)*-m\s+(?:pip|venv|virtualenv|ensurepip|http\.server|json\.tool|site|pydoc)\b"
+    r"|^(?:make|gmake)\s+(?:-[Cf]\s+\S+\s+|-\S+\s+)*(?:clean|distclean|mostlyclean|maintainer-clean)\b"
+    r"|^(?:npx|pnpx)\s+(?:-\S+\s+)*(?:kill-port|fkill|rimraf)\b"
+    r"|^(?:pip[\d.]*|npm|yarn|pnpm)\s+(?:install|uninstall|i|add|remove|ci|cache)\b")
+
+
+def _runs_code(text: str) -> bool:
+    """Is this command a program that runs code (`_RUNNER_HEAD_RE`, minus `_NOT_A_RUN_RE`)?"""
+    head = _command_head(text)
+    if not head or not _RUNNER_HEAD_RE.match(head):
+        return False
+    toks = str(text or "").split()
+    i = next((k for k, w in enumerate(toks) if w.rsplit("/", 1)[-1] == head or w == head), None)
+    return not (i is not None and _NOT_A_RUN_RE.match(" ".join([head] + toks[i + 1:])))
+
+
+_TIMEOUT_LED_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:(?:sudo|nice|nohup|env)\s+(?:-\S+\s+)*)*timeout\b")
+
+
+def _take_status(output):
+    """(output without our marker lines, [pipeline stage statuses] or None, []) — the legacy stdout failure
+    marker is stripped wherever a stored log still has one, never read (failures come from the status file:
+    `read_status_file`)."""
+    text = output if isinstance(output, str) else str(output or "")
+    if _FAILED_MARK in text:
+        text = _FAILED_LINE_RE.sub("\n", text)
+    elif output is None or output == "":
+        text = output
+    clean, codes = _take_pipestatus_only(text)
+    return clean, codes, []
+
+
+def _list_members(command: str) -> list:
+    """The command's top-level list members (heredoc data bodies out), each as its pipeline stages."""
+    try:
+        text = _strip_data_heredocs(str(command or ""))
+    except Exception:  # noqa: BLE001
+        text = str(command or "")
+    out = []
+    for line in text.split("\n"):
+        out.extend(pl for pl in _shell_pipelines(line) if "".join(pl).strip())
+    return out
+
+
+def _failure_parts(item):
+    """(code, [stage codes], command) from a recorded failure (an old 2-tuple has no stage codes)."""
+    if len(item) == 3:
+        return int(item[0]), list(item[1] or []), str(item[2] or "")
+    return int(item[0]), [], str(item[1] or "")
+
+
+def _list_failure(command: str, failures, output: str = ""):
+    """(code, program) of the failure that is the run's status when the shell said 0 (see the rule above), or
+    (0, "")."""
+    if not failures:
+        return 0, ""
+    members = _list_members(command)
+    norm = [[" ".join(st.split()) for st in pl] for pl in members]
+    pos, found = 0, (0, "")
+    for item in failures:
+        try:
+            code, stage_codes, text = _failure_parts(item)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not code:
+            continue
+        t = " ".join(text.split())
+        idx = None
+        # review r4: an EXACT stage match first — `echo 'step: python3 t.py'` must not stand for `python3 t.py`
+        for exact, rng in ((True, range(pos, len(norm))), (True, range(0, len(norm))),
+                           (False, range(pos, len(norm))), (False, range(0, len(norm)))):
+            idx = next((i for i in rng if t and any(t == st if exact else t in st for st in norm[i])), None)
+            if idx is not None:
+                break
+        stages = members[idx] if idx is not None else [t]
+        if idx is not None:
+            pos = idx + 1
+            # §4UY r3: the model read THIS status itself in the very next member (`…; echo "rc=$?"`) — it
+            # asked for that code and sees it; a later program's failure still counts
+            nxt = members[idx + 1] if idx + 1 < len(members) else []
+            if any(re.search(r"\$\?|\$\{\?\}", st) for st in nxt):
+                continue
+        if len(stages) > 1 and _normalise_pipe_exit(" | ".join(stages), code, output) == 0:
+            continue                                 # an early-closed pipe (`… | head`), as for the last one
+        # the failing stage: the rightmost non-zero stage that runs code (review r1 (d): BASH_COMMAND names a
+        # pipeline's LAST stage, `tee log` for `python x.py | tee log`)
+        # one stage: the recorded simple command itself (inside a function body or a loop the list member is
+        # `f(){ …` / `do …`, the trap's BASH_COMMAND is the program that failed)
+        cands = ([(t, code)] if len(stages) == 1
+                 else [(stages[i], c) for i, c in enumerate(stage_codes) if c] if len(stage_codes) == len(stages)
+                 else [(stages[-1], code)])
+        cands = [(st, c) for st, c in cands if _runs_code(st)]
+        if not cands:
+            continue                                 # a reader / `rm` / `curl` / `pip` failing keeps the status
+        stage, scode = cands[-1]
+        if _TIMEOUT_LED_RE.match(stage) and scode in (124, 137, 143):
+            continue                                 # a bounded run its own `timeout` ended
+        found = (scode, " ".join(re.sub(r"^\s*(?:(?:do|then|else|elif|if|while|until|\{|\(|!)\s+)+", "", stage).split()))
+    return found
+
+
+def _list_failure_note(code: int, text: str) -> str:
+    return (f"\n[NOTE: the shell's own status was 0 (the LAST command of the list succeeded), but `{text[:120]}` "
+            f"earlier in it exited {code} — reported as EXIT CODE {code}: fix that program, do not re-run the "
+            f"same list.]")
+
+
+def _normalise_exit(command: str, exit_code, output: str = "", failures=None) -> int:
+    """THE exit-code normaliser for a sandbox run — pipe forgiveness (§4GE), a quiet find (§4IE), then the
+    list rule (§4UY C9/C10). Every adoption of a sandbox result in the command path goes through here; the
+    enumeration in `tests/test_execute_self_reported_exit.py` fails when one does not."""
     code = _normalise_find_exit(command,
                                 _normalise_pipe_exit(command, exit_code, output), output)
-    code = _normalise_list_exit(command, code, output)
-    reported = _self_reported_exit(command, code, output)
-    # The echoed `$?` is the PIPELINE's raw status under pipefail, so an
-    # early-closed `… | head -N; echo "exit=$?"` reports 141/120/1 for a
-    # producer that was merely SIGPIPE'd. The self-report gets the same
-    # forgiveness the shell's own code got, by the same rule — and so does
-    # the list rule's 1 (§4PH: a BrokenPipeError traceback under `| head -1;
-    # echo …` is the pipe's, not a laundered failure). Idempotent on a code
-    # the first pass already forgave.
-    return _normalise_pipe_exit(command, reported, output)
-
-
-#: §4PH (R2-1): `python -m pytest … || true`, `python x.py; ls`, a two-line
-#: command whose second line is `echo done` — the shell's status is the LAST
-#: list member's, and every reader (strike ledger, failure banner, world-
-#: changed credit, the futility counters) booked the failing program as a
-#: success. The `$?` echo shape was handled (§4HZ); the plain list was not.
-#: A program that printed its own death — a traceback, a pytest failure
-#: summary, npm's error block, a Rust/Go panic — under a laundered 0 is
-#: reported as the failure it was. `&&` is not a launderer (a failing left
-#: side IS the status) and is left alone.
-_LAUNDERED_FAILURE_RE = re.compile(
-    r"^Traceback \(most recent call last\):|^(?:=+ )?\d+ failed\b|^FAILED [\w/.\-:\[\]]+"
-    r"|^npm ERR!|^error\[E\d+\]|^panic: |^Exception in thread \"main\"", re.M)
-_LAUNDERED_NOTE = (
-    "\n[NOTE: the shell exited 0 because the LAST command of the list (after `;` / `||` / a "
-    "newline) succeeded — but the program before it printed a failure (a traceback / failed "
-    "tests). Reported as EXIT CODE 1: fix the program; do not re-run the same list.]")
-
-
-def _list_launder_possible(command: str) -> bool:
-    """Does `command` have a `;`, `||` or newline list separator outside
-    quotes — a later member whose 0 can replace an earlier failure?"""
-    s = str(command or "")
     try:
-        _w = shlex.split(s)
-    except ValueError:
-        _w = []
-    if len(_w) == 3 and Path(_w[0]).name in ("bash", "sh") and _w[1] == "-c":
-        return _list_launder_possible(_w[2])
-    q, i = None, 0
-    while i < len(s):
-        c = s[i]
-        if q:
-            if c == "\\" and q == '"' and i + 1 < len(s):
-                i += 2
-                continue
-            if c == q:
-                q = None
-            i += 1
-            continue
-        if c == "\\" and i + 1 < len(s):
-            i += 2
-            continue
-        if c in "'\"":
-            q = c
-        elif c == ";" or c == "\n" or s.startswith("||", i):
-            return True
-        i += 1
-    return False
-
-
-def _normalise_list_exit(command: str, exit_code, output: str = "") -> int:
-    try:
-        code = int(exit_code or 0)
+        if int(code or 0) == 0 and failures:
+            got, _t = _list_failure(command, failures, output)
+            if got:
+                return got
     except (TypeError, ValueError):
-        return exit_code
-    if code != 0 or not _list_launder_possible(command) or not _list_has_runner(command):
-        return code
-    if _LAUNDERED_FAILURE_RE.search(str(output or "")):
-        return 1        # `_normalise_exit` runs the pipe rule over this (a SIGPIPE'd
-                        # producer's BrokenPipeError traceback is forgiven there)
+        pass
     return code
 
 
@@ -482,6 +1002,35 @@ def _adopt_exit(exit_code, output):
     if exit_code is None:
         return 1, str(output or "") + _NO_STATUS_NOTE
     return exit_code, output
+
+
+async def _run_failures(wrapped: str, sandbox_manager) -> list:
+    """The failures the run of ``wrapped`` (a `_bash_c` string) recorded in its status file, or [] — read in a
+    thread (review r2 M1: file I/O on a path the model controls never runs on the event loop)."""
+    try:
+        return await asyncio.to_thread(status_failures_of_job, wrapped,
+                                       getattr(sandbox_manager, "host_workspace", None), delete=True)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _read_shell_run(command: str, exit_code, output, failures=None):
+    """(exit_code, output, stage statuses) — THE reading of one finished sandbox run of `command` (the
+    primary run and every heal retry): our marker lines out, a missing status made a failure, the exit
+    normalised (§4UY C9/C10: an earlier program's failure under a 0 — ``failures`` from its status file — is
+    named in a note)."""
+    output, codes, _legacy = _take_status(output)
+    exit_code, output = _adopt_exit(exit_code, output)
+    raw = exit_code
+    exit_code = _normalise_exit(command, exit_code, output, failures)
+    try:
+        if exit_code and int(raw or 0) == 0:
+            _c, _t = _list_failure(command, failures, output)
+            if _c == exit_code:
+                output = str(output or "") + _list_failure_note(_c, _t)
+    except (TypeError, ValueError):
+        pass
+    return exit_code, output, codes
 
 
 #: §4PH (R2-4): `nohup python3 app.py &` — a backgrounded process that is not
@@ -501,46 +1050,10 @@ def _bg_detached(command: str) -> bool:
         cmd = _strip_data_heredocs(cmd)
     except Exception:  # noqa: BLE001
         pass
-    cmd = _QUOTED_RE.sub(" ", cmd)
-    if re.search(r"\bkill\s+%", cmd):
+    if _ends_its_background(cmd):             # §4UY C7: one reading of "the command ends what it started"
         return False
+    cmd = _QUOTED_RE.sub(" ", cmd)
     return bool(_BG_AMP_RE.search(cmd)) and not _detached_server_signals(cmd)
-
-
-#: r3 (reader M6): a list launders a status only when an EARLIER member RAN
-#: a program — `cat app.log; echo ---` over a stored traceback and `git log
-#: -1; echo` are readers, and their output is data
-_RUNNER_HEAD_RE = re.compile(
-    r"^(?:python[\d.]*|py|node|deno|bun|pytest|py\.test|npm|npx|yarn|pnpm|cargo|go|make|java|ruby|php|perl"
-    r"|bash|sh|zsh|uv|poetry|pipenv|tox|coverage|gunicorn|uvicorn|flask|django-admin|manage\.py|dotnet|mvn"
-    r"|gradle|swift|rustc|gcc|g\+\+|clang|tsc|streamlit)$|^\./|\.(?:py|sh|js|mjs|ts)$", re.I)
-_RUNNER_WRAPPERS = ("env", "nohup", "time", "sudo", "xvfb-run", "timeout")
-
-
-def _list_has_runner(command: str) -> bool:
-    s = str(command or "")
-    try:
-        _w = shlex.split(s)
-    except ValueError:
-        _w = []
-    if len(_w) == 3 and Path(_w[0]).name in ("bash", "sh") and _w[1] == "-c":
-        return _list_has_runner(_w[2])
-    members = []
-    for line in s.split("\n"):
-        members.extend(pl for pl in _shell_pipelines(line) if "".join(pl).strip())
-    for pl in members[:-1]:
-        toks = pl[0].split()
-        while toks and (re.fullmatch(r"[A-Za-z_]\w*=.*", toks[0]) or toks[0] in _RUNNER_WRAPPERS):
-            if toks[0] == "timeout" and len(toks) > 1 and re.fullmatch(r"-?[\w.]+", toks[1]):
-                toks = toks[2:]
-                continue
-            toks = toks[1:]
-        if not toks:
-            continue
-        head = toks[0] if toks[0].startswith("./") else Path(toks[0]).name
-        if _RUNNER_HEAD_RE.match(head):
-            return True
-    return False
 
 
 #: §4IE: `find … 2>/dev/null` exits 1 whenever ANY directory under its root
@@ -664,7 +1177,7 @@ _BROKEN_PIPE_RE = re.compile(r"BrokenPipeError|Broken pipe|SIGPIPE",
                              re.IGNORECASE)
 
 
-def _bash_c(command: str) -> str:
+def _bash_c(command: str, status_path: str = None) -> str:
     """The sandbox shell invocation for a raw command — ONE home, because
     both call sites (the primary run and the project-path remap retry) must
     agree about pipefail or one of them keeps the old blindness.
@@ -676,7 +1189,11 @@ def _bash_c(command: str) -> str:
     moved off 1/6, the failure taught the model nothing, and it re-ran the
     same broken probe. A pipeline's failure is the pipeline's failure.
     """
-    cmd = "set -o pipefail; " + (command or "")
+    # §4UY C9/C10: the ERR/EXIT traps record every top-level failure in a status file the host reads back
+    # (`read_status_file`) — none when the command reads statuses itself (`_reads_own_status`)
+    traps = "" if _reads_own_status(command) else _status_traps(
+        status_path or f"{_CONTAINER_STATUS_DIR}/{uuid.uuid4().hex}")
+    cmd = "set -o pipefail; " + traps + (command or "")
     if _grep_tail_after_pipe(command):
         cmd += _PIPESTATUS_TRAILER
     return "bash -c " + shlex.quote(cmd)
@@ -688,7 +1205,12 @@ def _bash_c(command: str) -> str:
 #: that one shape the shell reports every stage's status on a marker line.
 _PIPESTATUS_MARK = "__GHOST_PIPESTATUS="
 _PIPESTATUS_TRAILER = (
-    '\n__g_ps=("${PIPESTATUS[@]}"); printf "\\n%s%s\\n" "' + _PIPESTATUS_MARK + '" "${__g_ps[*]}"; '
+    '\n__g_x=("$?" "${PIPESTATUS[@]}"); trap - ERR; __g_ps=("${__g_x[@]:1}"); '
+    # §4UY: an ERR trap that ran on the last pipeline reset PIPESTATUS to its own `:` — its saved copy is the
+    # pipeline's (a non-zero status with a lone 0 stage cannot be the pipeline's own)
+    'if [ "${__g_x[0]}" -ne 0 ] && [ "${#__g_x[@]}" -eq 2 ] && [ "${__g_x[1]}" -eq 0 ] && [ "${__g_lp[0]:-0}" = "${__g_x[0]}" ]; '
+    'then __g_ps=("${__g_lp[@]:1}"); fi; '
+    'printf "\\n%s%s\\n" "' + _PIPESTATUS_MARK + '" "${__g_ps[*]}"; '
     # §4PH (R2-8): the FIRST non-zero stage is the one that failed — the
     # producer's code, not the grep's 1 that followed it
     '__g_r=0; for __g_s in "${__g_ps[@]}"; do [ "$__g_s" -ne 0 ] && [ "$__g_r" -eq 0 ] && __g_r=$__g_s; done; exit $__g_r')
@@ -733,7 +1255,14 @@ def _stage_head(stage: str) -> str:
 
 
 def _take_pipestatus(output):
-    """(output without the marker line, [stage statuses] or None)."""
+    """(output without our marker lines, [stage statuses] or None) — the ERR-trap failure line is dropped too
+    (`_take_status` keeps it)."""
+    clean, codes, _failures = _take_status(output)
+    return clean, codes
+
+
+def _take_pipestatus_only(output):
+    """(output without the stage-status line, [stage statuses] or None)."""
     text = output or ""
     m = _PIPESTATUS_LINE_RE.search(text)
     if not m:
@@ -927,6 +1456,9 @@ def _record_promoted_command(workspace_model, command, duration_s, job):
     """Workspace ledger entry for a promoted run. Exit code 0 with an
     explicit note — recording it as a failure would put the same wrong label
     into the ledger that the strike accounting no longer takes."""
+    _run = _RUN_STATE.get()                    # §4UY N6 r3: both promotion sites pass here — the run's record
+    if _run is not None and isinstance(job, dict) and job.get("id"):
+        _run["job"] = str(job.get("id"))
     if workspace_model is None or not getattr(workspace_model, "enabled", False):
         return
     try:
@@ -1523,57 +2055,22 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     if command:
         if not sandbox_manager: return _format_error("Error: Sandbox manager not initialized.")
 
-        # `command` takes precedence and returns below; a filename/content
-        # supplied in the SAME call would be silently dropped (never written
-        # or run). Warn so the model doesn't assume its file was created.
-        if filename or content:
-            pretty_log(
-                "Execute Ambiguous Args",
-                f"Both `command` and file/content given; running `command` and "
-                f"IGNORING filename={filename!r}. Issue a separate call to write/run a file.",
-                level="WARNING", icon=Icons.WARN,
-            )
+        # §4UY C15: `command` AND `content` in one call — the file was silently dropped (only a log line said
+        # so) while the model believed it written; the run ledger even credited it as written and run. Nothing
+        # runs and nothing is written: the refusal says how to do both. A `filename` with no content beside a
+        # command loses nothing and is ignored.
+        if content:
+            pretty_log("Execute Ambiguous Args", f"`command` and `content` (filename={filename!r}) in one call — "
+                       f"refused, nothing written or run", level="WARNING", icon=Icons.WARN)
+            return ToolOutcome.rejected(_format_error(
+                "SYSTEM ERROR: execute got BOTH `command` and `content` — nothing was written and nothing ran. "
+                "Either run a script: execute(filename=\"x.py\", content=...) (written, then run), or write the "
+                "file with file_system(operation=\"write\") and then execute(command=...)."),
+                reason_code="execute_ambiguous_args")
 
-        # Auto-strip `cd /<nonexistent> && ` prefixes. Qwen 3.6 has a very
-        # strong prior for starting shell commands with `cd /sandbox`,
-        # `cd /home/user`, `cd /root`, etc. — none of those paths exist in
-        # our container (the shell starts in /workspace). Four rounds of
-        # prompt-side warnings (top-of-state `⚠️` banner, SPECIALIST rule,
-        # explicit ✗ negative examples) still produced occasional leaks.
-        # Cleaner to fix at the tool level: detect the pattern, strip it,
-        # log a warning so the operator sees it, and run the rest from the
-        # real CWD.
-        #
-        # ⚠ §4HZ: `/tmp` is NOT in this list any more — it EXISTS in the
-        # container (the same request wrote /tmp/mars.json and downloaded to
-        # /tmp/grig_test.grib through it), so `cd /tmp && python3 x.py` was
-        # a correct command silently rewritten to run from /workspace, and
-        # the model concluded "the cd didn't take effect in the sandbox
-        # shell" (req d594668e, 3 turns). The old comment's "this auto-fix
-        # can never be wrong" was wrong for exactly that entry. And the
-        # rewrite is now TOLD to the model in the result, not only to the
-        # operator's log: a silent rewrite reads as a broken shell.
-        _cd_strip_pattern = re.compile(
-            r'^\s*cd\s+/(?:sandbox|home(?:/\w+)?|root|app|usr/src|opt)'
-            r'(?:/[^\s&;]*)?\s*&&\s*',
-            re.IGNORECASE,
-        )
-        _cd_note = ""
-        _stripped = _cd_strip_pattern.sub('', command, count=1)
-        if _stripped != command:
-            _cd_dir = command[:len(command) - len(_stripped)].strip().rstrip("&").strip()
-            pretty_log(
-                "CWD Auto-fix",
-                f"Stripped invalid `cd` prefix; running from /workspace. "
-                f"Original: {command[:80]}",
-                level="INFO", icon=Icons.SHIELD,
-            )
-            command = _stripped
-            _cd_note = (
-                f"\n[SYSTEM NOTE: the leading `{_cd_dir} &&` was REMOVED before "
-                f"running — that directory does not exist in the sandbox — and "
-                f"the command ran from /workspace instead. Use paths relative "
-                f"to /workspace.]")
+        # §4UY C1: the leading-`cd` rewrite is gone. It stripped `cd /opt|/home|/root|/app|/sandbox|/usr/src… &&`
+        # and ran the rest in the project folder — `cd /opt/scratch && rm -rf *` became `rm -rf *` in the project,
+        # while the original is safe (a failed `cd` stops the `&&` chain). 0 firings in the live log since 11-12.
 
         # Inline `-c` handling. Inline `python -c "<body>"` / `bash -c
         # "<body>"` is a recurring failure source: bash quote-escaping mangles
@@ -1839,6 +2336,9 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     return ToolOutcome.rejected(
                         _format_error(_db),
                         reason_code="daemonized_server_blocked")
+                # §4UY C6/C21: nothing it removes or overwrites is lost (one rule with file_system)
+                await asyncio.to_thread(_keep_versions_before_run, command, sandbox_dir,
+                                        str(container_workdir or ""))
         except Exception as _vexc:
             logging.getLogger("GhostAgent").debug("shell validator crashed: %s", _vexc)
             _shell_ok, _shell_reason = True, ""
@@ -1884,14 +2384,12 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             label=command[:120],
             project_id=_project_id_from_workdir(container_workdir),
             spill_large_output=True, **_workdir_kw)
-        output, _pipe_codes = _take_pipestatus(output)
         if promoted_job is None:
-            exit_code, output = _adopt_exit(exit_code, output)          # §4PH (R2-3) — after the marker is read
-        _raw_exit = exit_code
-        exit_code = _normalise_exit(command, exit_code, output)
-        if (promoted_job is None and exit_code == 1 and int(_raw_exit or 0) == 0
-                and _normalise_list_exit(command, 0, output) == 1):
-            output = str(output or "") + _LAUNDERED_NOTE                 # §4PH (R2-1)
+            exit_code, output, _pipe_codes = _read_shell_run(                             # §4UY C9/C10
+                command, exit_code, output, await _run_failures(cmd_str, sandbox_manager))
+        else:
+            output, _pipe_codes = _take_pipestatus(output)
+            exit_code = _normalise_exit(command, exit_code, output)
         if promoted_job is None and _bg_detached(command):
             output = str(output or "") + _BG_NOTE                        # §4PH (R2-4)
         # Root fallback for project-scoped commands. When a project is active
@@ -1937,8 +2435,8 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 _fh_out, _fh_code = await asyncio.to_thread(
                     sandbox_manager.execute, cmd_str, timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True, workdir=_proj_wd)
-                _fh_code, _fh_out = _adopt_exit(_fh_code, _fh_out)
-                _fh_code = _normalise_exit(command, _fh_code, _fh_out)
+                _fh_code, _fh_out, _fh_pipe = _read_shell_run(command, _fh_code, _fh_out,
+                                                               await _run_failures(cmd_str, sandbox_manager))
                 if _fh_code == 0 or not _looks_like_file_not_found(_fh_out):
                     output, exit_code = _fh_out, _fh_code
                     output = (output or "") + (
@@ -1977,13 +2475,13 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 # spill_large_output on the retry too — dropping it meant a
                 # noisy retried command dumped its full output into context,
                 # the exact flood the primary call's spill mode prevents.
+                _re_cmd = _bash_c(_remapped)
                 _re_out, _re_code = await asyncio.to_thread(
                     sandbox_manager.execute,
-                    _bash_c(_remapped), timeout=_EXEC_TIMEOUT_S,
+                    _re_cmd, timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True, **_workdir_kw)
-                _re_out, _re_pipe = _take_pipestatus(_re_out)
-                _re_code, _re_out = _adopt_exit(_re_code, _re_out)
-                _re_code = _normalise_exit(_remapped, _re_code, _re_out)
+                _re_code, _re_out, _re_pipe = _read_shell_run(_remapped, _re_code, _re_out,
+                                                              await _run_failures(_re_cmd, sandbox_manager))
                 if _re_code == 0 or not _looks_like_file_not_found(_re_out):
                     output, exit_code, _pipe_codes = _re_out, _re_code, _re_pipe
                     # Teach on EVERY adopted remap, not just clean exits.
@@ -2006,8 +2504,8 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 _re_out, _re_code = await asyncio.to_thread(
                     sandbox_manager.execute, cmd_str, timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True)
-                _re_code, _re_out = _adopt_exit(_re_code, _re_out)
-                _re_code = _normalise_exit(command, _re_code, _re_out)
+                _re_code, _re_out, _re_pipe = _read_shell_run(command, _re_code, _re_out,
+                                                              await _run_failures(cmd_str, sandbox_manager))
                 # Same adoption guard as the two heals above: a scoped
                 # script that RAN and then died on a missing data file
                 # matches the file-not-found signature too, and adopting
@@ -2118,10 +2616,10 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 _format_error(
                     output or f"Process failed (Exit {exit_code}) with no output.",
                     exit_code=exit_code, elapsed_s=_dt,
-                ), _host_proc_note + _cd_note + _db_note)
+                ), _host_proc_note + _db_note)
 
         return (f"--- COMMAND RESULT ---\nEXIT CODE: {exit_code}\n"
-                f"STDOUT/STDERR:\n{output}{_host_proc_note}{_cd_note}{_db_note}")
+                f"STDOUT/STDERR:\n{output}{_host_proc_note}{_db_note}")
 
     is_ephemeral = False
     if content and not filename and not command:
@@ -2506,6 +3004,12 @@ if has_error:
         
     # Async Directory Creation
     if is_new_code:
+        if not is_ephemeral and isinstance(host_path, Path) and host_path.is_file():   # §4UY C6/C21
+            try:
+                from .file_system import keep_before_replace
+                await asyncio.to_thread(keep_before_replace, host_path, str(filename), sandbox_dir)
+            except Exception:  # noqa: BLE001
+                pass
         await asyncio.to_thread(host_path.parent.mkdir, parents=True, exist_ok=True)
         try: 
             await asyncio.to_thread(host_path.write_text, clean_content)
@@ -3054,10 +3558,119 @@ async def _note_job_log_printed(kwargs, result, finished_before=frozenset()) -> 
 _tool_execute_impl = tool_execute
 
 
+async def _net_snapshot(kwargs):
+    """§4UY N6: the sandbox's outbound-connection counters (`SandboxManager.net_connections`), or None."""
+    probe = getattr(kwargs.get("sandbox_manager"), "net_connections", None)
+    if not callable(probe):
+        return None
+    try:
+        snap = await asyncio.to_thread(probe)
+    except Exception:  # noqa: BLE001
+        return None
+    return snap if isinstance(snap, tuple) and len(snap) == 2 else None
+
+
+async def _note_network_use(kwargs, before, run=None) -> None:
+    """§4UY N6: did THIS run open a network connection? Measured: the counters moved between before and
+    after. r4: the run is marked by the old name rule OR the measured connection (`run_reached_out`), and
+    reads outside content when it names a ledgered file too (`execute_reads_outside`). A marked run's files —
+    those it created in its working directory and the write targets it names (`note_run_files`) — are
+    recorded, never when another sandbox call overlapped it (the counters are container-wide); a run
+    promoted to a detached job hands its record to the job (`note_job_started`, landed by
+    `delegate._land_sandbox_row`). Never raises."""
+    try:
+        run = run or {}
+        from ..utils import provenance as _prov
+        used = None
+        after = await _net_snapshot(kwargs) if before is not None else None
+        if after is not None and after[0] >= before[0]:   # read, and the rules were not reloaded mid-run
+            used = after[0] > before[0]
+        # r5: overlapped counters may be another call's — a "yes" marks THIS request only, and is never stored
+        # for the command text (a later run of the same command is not marked by it) nor handed to a job
+        _shared_yes = bool(used and run.get("overlap"))
+        if used is not None and not _shared_yes:
+            _prov.note_measured_run(kwargs, used=used, complete=bool(before[1] and after[1]))
+        if run.get("job"):
+            _prov.note_job_started(run["job"], kwargs, run.get("root"), run.get("before"),
+                                   None if _shared_yes else used, run.get("t0", 0.0), run.get("ws", ""))
+        # r5: a cp/mv/rsync of a ledgered file or folder keeps its rows — first (the source of a `mv` is gone
+        # afterwards), and whatever the counters say
+        await asyncio.to_thread(_prov.carry_run_moves, str(kwargs.get("command") or ""), run.get("root"),
+                                run.get("ws", ""))
+        # r7: extraction is a copy — a ledgered archive's unpacked files are its bytes (`unzip -q dl` names
+        # the archive only through the tool's own `.zip` default, so this is read before the naming verdict)
+        _ex = _prov.ledgered_extract(str(kwargs.get("command") or ""), run.get("root"), run.get("ws", ""))
+        if not (_ex or _prov.execute_reads_outside(kwargs)
+                or (_shared_yes and _prov.run_reached_out(kwargs, used))):
+            return
+        _prov.note_untrusted_content("execute (network)")
+        # §4UY N6 r7 (operator): only a run that itself reached out has its files recorded; one that only
+        # NAMES ledgered content marks the request (its copies/moves were carried above) — no spread
+        if not (_shared_yes or _prov.run_reached_out(kwargs, _prov.measured_run(kwargs))):
+            if _ex and not run.get("overlap"):
+                n = await asyncio.to_thread(_prov.note_run_files, run.get("root"), run.get("before"), kwargs,
+                                            run.get("t0", 0.0), run.get("ws", ""), _ex)
+                pretty_log("Outside Content", f"the run extracts a downloaded archive — {n} file(s) it created or "
+                           f"changed are outside content ({_ex})", icon=Icons.SHIELD, level="INFO")
+                return
+            pretty_log("Outside Content", "the run names outside content — its output is outside content; it did "
+                       "not reach out, so no file it wrote is recorded", icon=Icons.SHIELD, level="INFO")
+            return
+        if run.get("overlap"):
+            pretty_log("Outside Content", "the run reads outside content — another sandbox call overlapped "
+                       "it, so no file is recorded", icon=Icons.SHIELD, level="INFO")
+            return
+        n = await asyncio.to_thread(_prov.note_run_files, run.get("root"), run.get("before"), kwargs,
+                                    run.get("t0", 0.0), run.get("ws", ""), "execute run that read outside content")
+        pretty_log("Outside Content", f"the run reached out — its output and {n} file(s) it created "
+                   f"or wrote are outside content", icon=Icons.SHIELD, level="INFO")
+    except Exception:  # noqa: BLE001 — bookkeeping never breaks a run
+        logging.getLogger("GhostAgent").debug("network-use note skipped", exc_info=True)
+
+
+#: §4UY N6 r3: the run in progress — `_record_promoted_command` writes the job id here when it detaches
+_RUN_STATE: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar("ghost_execute_run", default=None)
+
+
+def _running_sandbox_jobs(sm) -> frozenset:
+    """§4UY N6 r3: ids of the sandbox's detached jobs marked running (their traffic shares the counters);
+    {"?"} when the registry cannot be read (treated as an overlap)."""
+    try:
+        if sm is None or not getattr(sm, "host_workspace", None):
+            return frozenset()
+        from ..sandbox.jobs import STATE_RUNNING, get_job_supervisor
+        sup = get_job_supervisor(sm)
+        if sup is None:
+            return frozenset()
+        return frozenset(str(e.get("id")) for e in sup.list_entries()
+                         if isinstance(e, dict) and e.get("state") == STATE_RUNNING)
+    except Exception:  # noqa: BLE001
+        return frozenset({"?"})
+
+
 async def _tool_execute_noting(*args, **kwargs):
     _prepare_execute_project_writes(kwargs)
     _done_before = await _finished_job_logs_named(kwargs)        # §4UO r3: BEFORE the command runs
-    res = await _tool_execute_impl(*args, **kwargs)
+    from ..utils import provenance as _prov_n6
+    _sm = kwargs.get("sandbox_manager")
+    _run = {"root": _prov_n6.run_root(kwargs.get("sandbox_dir"), kwargs.get("container_workdir")), "job": None,
+            "ws": _prov_n6.workspace_root(kwargs.get("sandbox_dir"))}
+    _tok = _prov_n6.sandbox_call_begin("execute")                 # §4UY N6 r3: overlap
+    try:
+        _jobs0 = await asyncio.to_thread(_running_sandbox_jobs, _sm)
+        _run["before"] = await asyncio.to_thread(_prov_n6.snapshot_names, _run["root"])
+        _net0 = await _net_snapshot(kwargs)                       # §4UY N6: every run is measured
+        _run["t0"] = time.time()
+        _cv = _RUN_STATE.set(_run)
+        try:
+            res = await _tool_execute_impl(*args, **kwargs)
+        finally:
+            _RUN_STATE.reset(_cv)
+    finally:
+        _overlap = _prov_n6.sandbox_call_end(_tok)
+    _jobs1 = await asyncio.to_thread(_running_sandbox_jobs, _sm)
+    _run["overlap"] = bool(_overlap or _jobs0 or (_jobs1 - {str(_run.get("job"))}))
+    await _note_network_use(kwargs, _net0, _run)
     await _note_job_log_printed(kwargs, res, _done_before)
     _note = _note_execute_project_writes(kwargs, res)
     if _note:

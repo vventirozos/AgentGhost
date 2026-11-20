@@ -319,6 +319,10 @@ async def test_the_distiller_keeps_time_after_a_slow_fetch(monkeypatch, fetch_s,
     monkeypatch.setattr(S, "_RESEARCH_PHASE_TIMEOUT_S", 11.0)   # just over the 10 s floor
     monkeypatch.setattr(S, "_QUEUE_ALLOWANCE_S", 2.0)
     monkeypatch.setattr(D, "_DISTILL_RESERVE_S", 4.0, raising=False)
+    # §4UZ: the distill is sized from what the PHASE has left less the report's reserve (no longer
+    # from the URL's own window less the queue allowance). Scaled so the late page (7.6 s of an
+    # 11 s phase) still leaves nothing: before, 7.6 + 2 + 2 > 11; now 7.6 + 4 > 11.
+    monkeypatch.setattr(S, "RESEARCH_ASSEMBLY_S", 4.0)
     client = _BudgetClient()
 
     async def _slow(url):

@@ -179,7 +179,8 @@ import pathlib
 
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
 _KNOWN_NONBLOCK_MODULES = ["tools/file_system.py", "api/routes.py", "core/project_research.py",
-                           "core/task_deliverable.py", "tools/labs.py"]
+                           "core/task_deliverable.py", "tools/labs.py",
+                           "tools/execute.py", "core/code_claims.py"]       # §4UY: the status file, a host page
 
 
 def _names_o_nonblock(path):

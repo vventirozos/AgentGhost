@@ -223,7 +223,7 @@
   <h2 id="4qx">The system shows what the picture shows <span class="tag">2026-10-23 &sect;4QX</span></h2>
   <ul>
     <li><strong>Why.</strong> With the look on, the tool told the model to describe the picture "taken ONLY from that line". Two blind readers went through all 131 replies that had a look (120 replay probes and the 11 member image turns since 10-22). Both flagged 61 of them for details the look never saw, and about 90 % of those details were copied from the request ("old fisherman", "Athens", the requested palette, "floating", real names). One member reply said "visible breasts and genitals, as you requested" over a look that said only "topless". Asking the model harder is the &sect;4NH/&sect;4NI null class, so the description is taken away from it.</li>
-    <li><strong>What changes.</strong> With <code>GHOST_LOOK_OWNED=1</code>, or the probe arm <code>look_owned</code>, the result still carries <code>WHAT THE PICTURE SHOWS …</code>. The line right after it changes to <code>LOOK_OWNED_NOTE</code> ("The SYSTEM shows the user that line itself, directly under the picture.") plus: do not describe the picture, and write at most one sentence, only for what is missing or different from the request. Both the switch and the arm imply the look. The agent then appends <code>What the picture shows: &lt;the look&gt;</code> to the delivered reply (<a href="../infrastructure/agent.html#4qx">agent &sect;4QX</a>). Both literals live in <code>core/receipt_marks.py</code>.</li>
+    <li><strong>What changes.</strong> With <code>GHOST_LOOK_OWNED=1</code>, or the probe arm <code>look_owned</code>, the result still carries <code>WHAT THE PICTURE SHOWS …</code>. The line right after it changes to <code>LOOK_OWNED_NOTE</code> ("The SYSTEM shows the user that line itself, directly under the picture.") plus: do not describe the picture, and write at most one sentence, only for what is missing or different from the request. Both the switch and the arm imply the look. The agent then shows <code>What the picture shows: &lt;the look&gt;</code> directly under the picture in the delivered reply, streamed or not (&sect;4UY image-1; <a href="../infrastructure/agent.html#4qx">agent &sect;4QX</a>). Both literals live in <code>core/receipt_marks.py</code>.</li>
     <li><strong>Measured</strong> (pre-registered; journal &sect;4QX). Paired replay, 12 prompts &times; 3 samples, interleaved, graded as delivered by two fresh blind readers who agreed on 70 of 72. Replies with unsupported claims went from 22/36 to 9/36, hidden mismatches from 4 to 3, WRONG stayed at 2, and the turn was 5 s shorter. The model wrote nothing after the picture in 25 of 36 turns. Most of the residue is the other 11, where it described anyway ("Here's your cozy reading nook").</li>
     <li>Pins <code>tests/test_4qx_look_owned.py</code>; battery <code>scripts/mutate_4qx.py</code> (22 mutants and a known-bad control, all killed; the no-op control survives).</li>
   </ul>
@@ -250,6 +250,15 @@
   second image in the same batch is always blocked. The block names the file and the ways out. With the vision caption fixed on the same day
   (<a href="vision.html">no-think for every action</a>), "inspect first" is once again a ~4&nbsp;s call rather than a
   44&nbsp;s empty one. Pins: <code>tests/test_blind_regeneration_guard.py</code>.</p>
+  <p><strong>§4UY image-4 (2026-11-18): results in call order, the right reason in the log.</strong> A call refused at dispatch
+  (this block, a member refusal, clarify-first, an unknown tool…) had its result appended at once, while the calls that ran
+  were appended after the gather — so for <code>[render A, render B]</code> B's "did NOT run" came before A's picture, and
+  with no call ids in the chat template the model read them by position (live 76e8b1d0: "the first call was blocked, the
+  second one succeeded" — the other way round). <code>agent.order_batch_tool_messages</code> now puts the batch's results in
+  call order once the results are in (a steer stays under the result it follows), for every early site at once; an AST pin
+  enumerates the dispatcher's message writes. The WARNING names the case that blocked: <code>a second image in the same
+  batch — one image per batch</code>, <code>… was never inspected or shown</code>, or the tool's own no-re-render hold.
+  Pins: <code>tests/test_4uy_image.py</code>.</p>
 
   <h2 id="4kd-seed">The seed line is information, not a next action <span class="tag">2026-09-24 &sect;4KD</span></h2>
   <p>The SUCCESS result used to end with <em>"Seed: N. Reuse seed=N with a tweaked prompt for ANOTHER TAKE …"</em>.

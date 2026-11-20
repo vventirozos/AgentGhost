@@ -542,7 +542,7 @@ def _storage(context, out: _Parts) -> None:
 _ENGINE_GROUPS = (("blocked", ("blocked",)), ("unreachable", ("conn-error", "timeout")),
                   ("error", ("error",)), ("empty", ("empty", "off-topic")),
                   ("low-relevance", ("low-relevance",)),
-                  ("outrun", ("unfinished",)), ("cut off", ("abandoned", "late")))
+                  ("outrun", ("unfinished",)), ("added rows", ("added",)))
 
 
 def _internet(context, out: _Parts, now: Optional[float] = None) -> None:
@@ -568,10 +568,13 @@ def _internet(context, out: _Parts, now: Optional[float] = None) -> None:
         head += f", {h['low_only']} only weak matches"
     out.parts.append(head)
     for name, per in sorted(h["engines"].items(), key=lambda kv: (-kv[1].get("win", 0), kv[0])):
-        label = f"{name[:-2]} (backup try)" if name.endswith("-h") else name
         rest = [f"{sum(per.get(o, 0) for o in outs)} {word}" for word, outs in _ENGINE_GROUPS
                 if sum(per.get(o, 0) for o in outs)]
-        out.parts.append(f"{label}: {per.get('win', 0)} won" + (", " + ", ".join(rest) if rest else ""))
+        if "added" in per or name == "wikipedia":
+            # §4VA: the supplement is never raced, so it never "wins": its rows join a batch or do not
+            out.parts.append(f"{name} (beside the race): " + (", ".join(rest) if rest else "nothing yet"))
+            continue
+        out.parts.append(f"{name}: {per.get('win', 0)} won" + (", " + ", ".join(rest) if rest else ""))
     if reads:
         out.parts.append(f"result pages read {reads.get('read', 0)} of {sum(reads.values())} tried")
     out.parts.append("(from my own recent searches; no live test was run)")

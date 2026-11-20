@@ -109,7 +109,6 @@ def _drive(monkeypatch, script, query="postgresql 17 release notes"):
         return list(script(q, wave, stats, kw) or [])
     monkeypatch.setattr(S, "_race_search_wave", _wave)
     monkeypatch.setattr(S, "_proxy_reachable", lambda *a, **k: True)
-    monkeypatch.setattr(S, "wiki_supplement_wanted", lambda q: False)
     monkeypatch.setattr(asyncio, "sleep", AsyncMock())
     S._SEARCH_CACHE.clear()
     out = asyncio.run(S.tool_search_ddgs(query, "socks5://127.0.0.1:9050"))
@@ -232,11 +231,13 @@ def test_a_low_relevance_batch_is_the_fallback_when_nothing_beats_it():
     assert "using duckduckgo's low-relevance batch" in lines[0]
 
 
-# ── 6. the hedge ─────────────────────────────────────────────────────────────
+# ── 6. the hedge — gone (§4VA) ───────────────────────────────────────────────
 
-def test_the_hedge_is_yandex_and_yahoo():
-    assert S._RACE_HEDGE_ENGINES == ("yandex", "yahoo")
-    assert set(S._RACE_HEDGE_ENGINES) <= set(S._RACE_ENGINES)
+def test_the_hedge_is_gone_and_yandex_races_three_circuits_from_the_start():
+    """The engine that works is asked on fresh circuits at once (the engine table), not again after 6 s."""
+    assert not hasattr(S, "_RACE_HEDGE_ENGINES") and not hasattr(S, "_race_hedge_at")
+    assert S.ENGINE_TABLE["yandex"].circuits == 3
+    assert all(s.circuits == 1 for n, s in S.ENGINE_TABLE.items() if n != "yandex")
 
 
 # ── 7. numbers rank ──────────────────────────────────────────────────────────
@@ -332,62 +333,16 @@ def test_the_engine_call_carries_the_time_limit():
     with patch.dict("sys.modules", {"ddgs": mod}):
         asyncio.run(S._race_search_wave("latest python release", None, 0, timelimit="y"))
         asyncio.run(S._race_search_wave("latest python release", None, 1))
-    assert seen[:len(S._RACE_ENGINES)] == ["y"] * len(S._RACE_ENGINES)
-    assert all(t is None for t in seen[len(S._RACE_ENGINES):])
+    _n = sum(S._engine_spec(e).circuits for e in S._RACE_ENGINES if S._engine_spec(e).kind == "ddgs")   # §4VA
+    assert seen[:_n] == ["y"] * _n and len(seen) == 2 * _n
+    assert all(t is None for t in seen[_n:])
 
 
 # ── 4. the Wikipedia lookup ─────────────────────────────────────────────────
-
-def _wiki_client(monkeypatch, status=200, pages=None):
-    calls = []
-    def get(url, params=None, **kw):
-        calls.append((url, params, kw))
-        return SimpleNamespace(status_code=status, json=lambda: {"query": {"pages": pages or {}}})
-    fake = SimpleNamespace(get=get)
-    monkeypatch.setitem(__import__("sys").modules, "curl_cffi.requests", fake)
-    monkeypatch.setitem(__import__("sys").modules, "curl_cffi", SimpleNamespace(requests=fake))
-    return calls
-
-
-def test_the_lookup_is_one_plain_client_call(monkeypatch):
-    pages = {"5": {"index": 1, "title": "Νίκος Καζαντζάκης", "extract": "Ο Νίκος Καζαντζάκης ήταν Έλληνας συγγραφέας."}}
-    calls = _wiki_client(monkeypatch, pages=pages)
-    out = S._wiki_lookup("πότε πέθανε ο καζαντζάκης", None, original="Πότε πέθανε ο Καζαντζάκης")
-    assert [a["title"] for a in out] == ["Νίκος Καζαντζάκης — Βικιπαίδεια"]
-    assert len(calls) == 1
-    _url, params, kw = calls[0]
-    assert params["generator"] == "search" and params["prop"] == "extracts"
-    assert kw["headers"]["User-Agent"].startswith("curl/") and "impersonate" not in kw
-
-
-def test_a_refused_lookup_is_one_info_line_and_nothing(monkeypatch):
-    _wiki_client(monkeypatch, status=429)
-    with patch.object(S, "pretty_log") as log:
-        assert S._wiki_lookup("Νίκος Καζαντζάκης", None) == []
-    assert any("HTTP 429" in str(c.args[1]) and c.kwargs.get("level") == "INFO" for c in log.call_args_list)
-
-
-def test_the_greek_subject_comes_from_the_query_as_typed():
-    art = {"title": "Νίκος Καζαντζάκης", "body": "Ο Νίκος Καζαντζάκης πέθανε το 1957."}
-    assert S.wiki_article_on_topic("πότε πέθανε ο καζαντζάκης", art, "Πότε πέθανε ο Καζαντζάκης") is True
-    # an article that has the verb but not the name: lower-cased, the first
-    # distinctive word (the verb) was the "subject"; as typed, the name is
-    other = {"title": "Ο Σεφέρης πέθανε", "body": "Ο Γιώργος Σεφέρης πέθανε το 1971."}
-    assert S.wiki_article_on_topic("πότε πέθανε ο καζαντζάκης", other) is True
-    assert S.wiki_article_on_topic("πότε πέθανε ο καζαντζάκης", other, "Πότε πέθανε ο Καζαντζάκης") is False
-
-
-def test_tool_search_hands_the_typed_text_past_the_scrub(monkeypatch):
-    seen = {}
-    async def _ddgs(query, proxy):
-        seen["original"] = S._typed_original(query)
-        seen["sent"] = query
-        return "### 1. x\nb\n[Source: https://x.example]"
-    monkeypatch.setattr(S, "tool_search_ddgs", _ddgs)
-    monkeypatch.setattr("ghost_agent.utils.stylometry.scrub_query", lambda q: q.lower())
-    asyncio.run(S.tool_search("Πότε πέθανε ο Καζαντζάκης", anonymous=True, tor_proxy=None))
-    assert seen == {"original": "Πότε πέθανε ο Καζαντζάκης", "sent": "πότε πέθανε ο καζαντζάκης"}
-    assert S._QUERY_AS_TYPED.get() is None                              # reset after the call
+# §4VA: the Greek-only article lookup (§4JO: one generator=search call, a subject rule read from the
+# query's capitals, the as-typed query handed past the scrub for it) is replaced by the Wikipedia
+# supplement of every wave, judged by the relevance rule every row passes. Its pins — the plain client,
+# a refused lookup being silent, relevance — are in tests/test_4va_search_engines.py.
 
 
 # ── 3. the fetch memo allows the one retry ──────────────────────────────────
@@ -570,7 +525,6 @@ def test_r1_freshness_still_fires(query, limit):
 
 def test_r1_a_low_batch_waits_only_a_short_grace_and_no_hedge(monkeypatch):
     """MINOR 5: a low-relevance query went ~2 s → ~30 s (wave deadline + hedge + a second wave)."""
-    monkeypatch.setattr(S, "_race_hedge_at", lambda: 0.6)
     monkeypatch.setattr(S, "LOW_RELEVANCE_GRACE_S", 0.4)
     launched = []
     def by_engine(q, **kw):
@@ -585,39 +539,35 @@ def test_r1_a_low_batch_waits_only_a_short_grace_and_no_hedge(monkeypatch):
         rows = asyncio.run(S._race_search_wave("kubernetes ingress nginx timeout", None, 0, soft_low=True))
     assert rows and rows[0]["href"] == "https://k.example/a"
     assert time.monotonic() - t0 < 1.5
-    assert len(launched) == len(S._RACE_ENGINES)                    # no hedge for a low batch
+    # nothing is launched after the start (§4VA: one call per circuit of every ddgs engine, at once)
+    assert len(launched) == sum(S._engine_spec(e).circuits for e in S._RACE_ENGINES
+                                if S._engine_spec(e).kind == "ddgs")
 
 
-def test_r1_without_soft_low_a_low_batch_wins_as_before():
-    """MINOR 5: deep_research and the counter-search keep the pre-§4UN-web race."""
+def test_r1_every_race_treats_a_low_batch_as_a_soft_loss():
+    """§4UY N2 (was: deep_research and the counter-search keep the pre-§4UN-web race — that race let
+    deep_research read eight pages about the query's first word): with no `soft_low` argument the
+    on-topic engine that answers within the grace wins over the fast low batch."""
     def by_engine(q, **kw):
         if kw["backend"] == "duckduckgo":
             return [{"title": "Kubernetes pricing", "body": "cloud", "href": "https://k.example/a"}]
-        time.sleep(1.5)
+        time.sleep(1.0)
         return [{"title": "Kubernetes ingress nginx timeout", "body": "ingress nginx timeout", "href": "https://d.example"}]
     mod, _ = _ddgs_module(by_engine)
-    t0 = time.monotonic()
     with patch.dict("sys.modules", {"ddgs": mod}):
         rows = asyncio.run(S._race_search_wave("kubernetes ingress nginx timeout", None, 0))
-    assert rows[0]["href"] == "https://k.example/a" and time.monotonic() - t0 < 1.2
+    assert rows[0]["href"] == "https://d.example"
 
 
 def test_r1_a_low_first_wave_is_the_answer_no_second_wave(monkeypatch):
+    """…when another engine ANSWERED in that wave (§4UY N3: a low batch whose rivals were all refused
+    gets one wave on fresh circuits — `test_4uy_internet`)."""
     low = [{"title": "Kubernetes pricing", "body": "cloud", "href": "https://k.example/a"}]
-    soft = []
     def script(q, w, st, kw):
-        soft.append(S._SOFT_LOW_RACE.get())
+        st["low_unheard"] = False
         return low
     out, calls = _drive(monkeypatch, script, "kubernetes ingress nginx timeout")
-    assert len(calls) == 1 and soft == [True] and S.LOW_RELEVANCE_NOTE in out
-    assert S._SOFT_LOW_RACE.get() is False
-
-
-def test_r1_the_wiki_subject_is_the_name_not_a_generic_word():
-    """MINOR 6: "Νίκος Καζαντζάκης Βιογραφία" required "βιογραφια"."""
-    art = {"title": "Νίκος Καζαντζάκης", "body": "Ο Νίκος Καζαντζάκης ήταν Έλληνας συγγραφέας."}
-    assert S.wiki_article_on_topic("νίκος καζαντζάκης βιογραφία", art, "Νίκος Καζαντζάκης Βιογραφία") is True
-    assert S.wiki_article_on_topic("Νίκος Καζαντζάκης Βιογραφία", art) is True
+    assert len(calls) == 1 and S.LOW_RELEVANCE_NOTE in out
 
 
 def test_r1_site_wildcards_and_the_cache_key(monkeypatch):

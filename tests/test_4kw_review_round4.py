@@ -341,7 +341,8 @@ def test_rerun_safety_second_review(cmd, unsafe):
 @pytest.mark.parametrize("cmd,wd,blocked", [
     ("mv *.png images/", "/workspace", False), ("mv report.md ./", "/workspace", False),
     ("git rm -r --cached .", "/workspace", False), ("find . -name '*.pyc' -delete", "/workspace", False),
-    ("rm -rf -- *", "/workspace/projects/bbbbbbbbbbbb", False),          # inside its own project
+    ("rm -rf -- *", "/workspace/projects/bbbbbbbbbbbb", True),           # §4UY C6: its own project's top
+    ("cd src && rm -rf -- *", "/workspace/projects/bbbbbbbbbbbb", False),    # one level down: ordinary cleanup
     ("rm -rf -- *", "/workspace", True), ("rm -rf ..", "/workspace/projects/bbbbbbbbbbbb", True),
     ("rm -rf ../aaaaaaaaaaaa", "/workspace/projects/bbbbbbbbbbbb", True),
     ("rm -r /workspace/projects", "/workspace/projects/bbbbbbbbbbbb", True),

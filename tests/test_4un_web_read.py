@@ -144,7 +144,8 @@ def test_pages_are_read_in_parallel_and_a_slow_one_is_left_out(monkeypatch):
     assert took < 2.0
     assert out.startswith(S.WEB_READ_HEAD)
     assert '[PAGE] Date: published 2025-10-07 | Title: "Python Release Python 3.14.0"' in out
-    assert f"URL: {fast}" in out and "slow.example" not in out
+    assert f"URL: {fast}" in out and S.web_read_urls(out) == [fast]
+    assert "https://slow.example/py314 — not loaded within" in out          # §4UY N11: told, not read
     assert "released on 7 October 2025" in out
     # each read rides its own circuit, never renews Tor's identity, and asks for the page's meta
     assert {c["url"] for c in calls} == {fast, slow}
@@ -159,10 +160,10 @@ def test_failed_thin_and_bot_check_pages_are_dropped_and_nothing_is_said(monkeyp
     a, b = "https://a.example/py", "https://b.example/py"
     monkeypatch.setattr(S, "helper_fetch_url_content",
                         _fake_fetch({a: FetchError("Error: HTTP 403 Forbidden"), b: _page("Just a moment...")}))
-    assert asyncio.run(S.read_top_pages("python 3.14 release date", [_row(a), _row(b)], None)) == ""
+    assert S.web_read_urls(asyncio.run(S.read_top_pages("python 3.14 release date", [_row(a), _row(b)], None))) == []  # §4UY N11: told, not read
     monkeypatch.setattr(S, "helper_fetch_url_content",
                         _fake_fetch({a: RuntimeError("boom"), b: _page("tiny")}))
-    assert asyncio.run(S.read_top_pages("python 3.14 release date", [_row(a), _row(b)], None)) == ""
+    assert S.web_read_urls(asyncio.run(S.read_top_pages("python 3.14 release date", [_row(a), _row(b)], None))) == []  # §4UY N11: told, not read
     c = S.page_read_counts()
     assert c.get("failed") == 2 and c.get("thin") == 2
 
@@ -171,7 +172,7 @@ def test_a_page_that_never_mentions_the_query_is_not_shown(monkeypatch):
     a = "https://a.example/py"
     monkeypatch.setattr(S, "helper_fetch_url_content",
                         _fake_fetch({a: _page("Cookie settings and newsletter signup. " * 20)}))
-    assert asyncio.run(S.read_top_pages("python 3.14 release date", [_row(a)], None)) == ""
+    assert S.web_read_urls(asyncio.run(S.read_top_pages("python 3.14 release date", [_row(a)], None))) == []  # §4UY N11: told, not read
     assert S.page_read_counts().get("off-topic") == 1
 
 
@@ -216,7 +217,6 @@ def _search(monkeypatch, query, rows=_ROWS, fetch=None):
         return [dict(r) for r in rows]
     monkeypatch.setattr(S, "_race_search_wave", _wave)
     monkeypatch.setattr(S, "_proxy_reachable", lambda *a, **k: True)
-    monkeypatch.setattr(S, "wiki_supplement_wanted", lambda q: False)
     if fetch is not None:
         monkeypatch.setattr(S, "helper_fetch_url_content", fetch)
     S._SEARCH_CACHE.clear()
@@ -241,7 +241,10 @@ def test_switch_off_broad_query_and_total_failure_leave_the_result_as_before(mon
     assert S.WEB_READ_HEAD not in before and calls == []
     monkeypatch.setenv("GHOST_SEARCH_READ_PAGES", "1")
     failing = {r["href"]: RuntimeError("tor down") for r in _ROWS}
-    assert _search(monkeypatch, "python 3.14 release date", fetch=_fake_fetch(failing)) == before
+    # §4UY N11: a total failure adds only the line that says which pages could not be read
+    _after = _search(monkeypatch, "python 3.14 release date", fetch=_fake_fetch(failing))
+    assert _after.startswith(before) and S.web_read_urls(_after) == []
+    assert S.PAGE_READS_NOT_READ_HEAD in _after[len(before):]
     # a broad question never fetches
     _search(monkeypatch, "python 3.14 tutorial", fetch=_fake_fetch(pages, calls=calls))
     assert calls == []
@@ -364,28 +367,27 @@ def test_r1_only_numbers_or_short_words_in_common_is_off_topic(monkeypatch):
     a = "https://a.example/x"
     page = "Our shop opens at 9 and closes at 17. Pi is 3.14. Call us on 2025 for an offer. " * 10
     monkeypatch.setattr(S, "helper_fetch_url_content", _fake_fetch({a: _page(page)}))
-    assert asyncio.run(S.read_top_pages("python 3.14 release date 2025", [_row(a)], None)) == ""
+    assert S.web_read_urls(asyncio.run(S.read_top_pages("python 3.14 release date 2025", [_row(a)], None))) == []  # §4UY N11: told, not read
 
 
-def test_r1_the_encyclopedia_row_is_never_read(monkeypatch):
+def test_r1_the_encyclopedia_row_is_listed_last_and_read_after_the_web_rows(monkeypatch):
+    """§4VA: the Wikipedia rows of a wave come AFTER the winner's rows (they were placed first, and never
+    read, when the lookup returned the article's intro) — so the pages read are the web rows first."""
     calls = []
-    wiki = {"title": "Python — Βικιπαίδεια", "href": "https://el.wikipedia.org/wiki/Python",
-            "body": "Η Python είναι γλώσσα προγραμματισμού, έκδοση 3.14 κυκλοφόρησε το 2025."}
+    wiki = {"title": "Python 3.14 release", "href": "https://en.wikipedia.org/wiki/History_of_Python",
+            "body": "Python 3.14 release date: the release was published in 2025.", "engine": "wikipedia"}
     pages = {r["href"]: _page(_ARTICLE) for r in _ROWS}
     pages[wiki["href"]] = _page(_ARTICLE)
 
     async def _wave(q, proxy, wave, max_results=20, stats=None, **kw):
-        return [dict(r) for r in _ROWS]
-
-    async def _wiki_sup(task, budget):
-        return [dict(wiki)]
+        return S.WaveBatch([dict(r) for r in _ROWS] + [dict(wiki)], [dict(wiki)])
     monkeypatch.setattr(S, "_race_search_wave", _wave)
     monkeypatch.setattr(S, "_proxy_reachable", lambda *a, **k: True)
-    monkeypatch.setattr(S, "_wiki_supplement", _wiki_sup)
     monkeypatch.setattr(S, "helper_fetch_url_content", _fake_fetch(pages, calls=calls))
     S._SEARCH_CACHE.clear()
     out = asyncio.run(S.tool_search_ddgs("python 3.14 release date", "socks5://127.0.0.1:9050"))
-    assert wiki["href"] in out                                      # still listed first
+    assert out.count(wiki["href"]) >= 1 and f"{wiki['href']} — {S.WIKIPEDIA_TAG}]" in out
+    assert all(out.index(r["href"]) < out.index(wiki["href"]) for r in _ROWS)   # after every web row
     assert wiki["href"] not in [c["url"] for c in calls]
     assert S.web_read_urls(out) == [_ROWS[0]["href"], _ROWS[1]["href"]]
 
@@ -439,7 +441,7 @@ def test_r1_an_unexpected_failure_is_a_warning(monkeypatch, caplog):
     import logging
     monkeypatch.setattr(S, "page_read_candidates", lambda rows: (_ for _ in ()).throw(RuntimeError("bug")))
     with caplog.at_level(logging.WARNING):
-        assert asyncio.run(S.read_top_pages("python 3.14 release date", [_row("https://a.example/")], None)) == ""
+        assert S.web_read_urls(asyncio.run(S.read_top_pages("python 3.14 release date", [_row("https://a.example/")], None))) == []  # §4UY N11: told, not read
     assert any("page read" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
 
 
@@ -455,7 +457,7 @@ def test_r2_on_topic_needs_whole_words(monkeypatch):
     a = "https://a.example/x"
     page = "Actually, this page is about gardening and actors and their dates. " * 10
     monkeypatch.setattr(S, "helper_fetch_url_content", _fake_fetch({a: _page(page)}))
-    assert asyncio.run(S.read_top_pages("act 2025 deadline", [_row(a)], None)) == ""
+    assert S.web_read_urls(asyncio.run(S.read_top_pages("act 2025 deadline", [_row(a)], None))) == []  # §4UY N11: told, not read
     # an inflection still counts ("released" for "release"), and C++ is matched as C++
     page2 = "C++23 was released by ISO in 2024 with many new library features. " * 10
     monkeypatch.setattr(S, "helper_fetch_url_content", _fake_fetch({a: _page(page2)}))
@@ -574,7 +576,7 @@ def test_l_greek_prices_of_power_stay_on_topic_and_unrelated_greek_does_not(monk
     assert S.web_read_urls(asyncio.run(S.read_top_pages("τιμές ρεύματος", [_row(a)], None))) == [a]
     other = "Νομίζω ότι ο πόλεμος ήταν πολύ μεγάλη τιμωρία για όλους τους ανθρώπους εκεί. " * 10
     monkeypatch.setattr(S, "helper_fetch_url_content", _fake_fetch({a: _page(other)}))
-    assert asyncio.run(S.read_top_pages("πόλεις νόμος τιμές", [_row(a)], None)) == ""
+    assert S.web_read_urls(asyncio.run(S.read_top_pages("πόλεις νόμος τιμές", [_row(a)], None))) == []  # §4UY N11: told, not read
 
 
 @pytest.mark.parametrize("q", [

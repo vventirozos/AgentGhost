@@ -26,8 +26,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 logger = logging.getLogger("GhostAgent")
 
@@ -207,6 +209,132 @@ def deliverable_problem(ws, description) -> Optional[str]:
                     f"(file_system operation=move) or write {rel}")
         return f"the declared deliverable {rel} does not exist — write it first"
     return hollow_document_reason(text, rel)
+
+
+#: §4UY P7: a file's content time within this much before the task's creation is still the task's (clock skew,
+#: the plan call and its first write in one batch)
+DELIVERABLE_SINCE_SLACK_S = 5.0
+
+
+#: §4UY P7 (review): the files each request's own successful tool calls wrote, read or ran ({request id: set of
+#: resolved paths}) — the evidence a task that declares an ALREADY EXISTING file must have (14 of 16 live DONE
+#: results named their file: result prose is no evidence). Bounded (newest requests kept).
+_TOUCHED: Dict[str, set] = {}
+TOUCHED_MAX = 256
+_TOUCHED_LOCK = threading.Lock()
+_WORD_RE = re.compile(r"[\w.~/*-]+")
+
+
+def note_touched(request_id: str, paths) -> None:
+    rid = str(request_id or "")
+    if not rid:
+        return
+    with _TOUCHED_LOCK:
+        bucket = _TOUCHED.setdefault(rid, set())
+        for p in paths or ():
+            try:
+                bucket.add(str(Path(p).resolve()))
+            except (OSError, ValueError):
+                continue
+        while len(_TOUCHED) > TOUCHED_MAX:
+            _TOUCHED.pop(next(iter(_TOUCHED)))
+
+
+def touched_in(request_id: str) -> set:
+    with _TOUCHED_LOCK:
+        return set(_TOUCHED.get(str(request_id or ""), ()))
+
+
+_CONTENTS_HDR_RE = re.compile(r"^--- .+ CONTENTS ---$", re.M)
+
+
+def _call_succeeded(name: str, res) -> bool:
+    """§4UY P7 review 2: did the call succeed — judged by its OUTCOME or its header, never by a file's content
+    (a read of a file that starts "Error:" or holds "EXIT CODE: 1" succeeded). `execute`: its exit banner."""
+    st = getattr(getattr(res, "status", None), "value", None)
+    if st is not None:
+        return st == "ok"
+    text = str(res or "")
+    if name == "execute":
+        from .project_turns import _succeeded
+        return _succeeded(text)
+    m = _CONTENTS_HDR_RE.search(text)
+    head = text[:m.start()] if m else text.split("\n", 1)[0]
+    if m and not head.strip():
+        return True                                  # a read: the header, then the file's own text
+    from ..tools.tool_failure import result_is_failure
+    return not result_is_failure(head.split("\n", 1)[0] if not m else head)
+
+
+def note_tool_evidence(request_id: str, name: str, kwargs: dict, res, folder) -> None:
+    """§4UY P7 (review): after a tool call — the files of ``folder`` (the project's working folder) a SUCCESSFUL
+    `file_system` call named (any operation: a read is evidence it was looked at) or a successful `execute` named
+    (its file, or a word of its command that is a file there) are this request's own evidence. Review 2: the
+    words go through the one normalisation (`project_turns.project_rel`: `/workspace/…`, `./…`,
+    `projects/<id>/…`), a command's words are read in the folder its leading `cd` moved to, each word is tried on
+    its own (an over-long word is skipped, not the call), success is the outcome / header, never the file's
+    content. Never raises."""
+    try:
+        if not folder or name not in ("file_system", "execute"):
+            return
+        if not _call_succeeded(name, res):
+            return
+        from .project_turns import leading_cd, project_rel
+        root = Path(str(folder))
+        base = root
+        words: list = []
+        if name == "file_system":
+            words = [kwargs.get(k) for k in ("path", "filename", "file", "destination", "source")]
+        else:
+            cmd = str(kwargs.get("command") or kwargs.get("cmd") or "")
+            words = [kwargs.get("filename"), kwargs.get("file"), kwargs.get("script")]
+            words += _WORD_RE.findall(cmd)
+            if cmd:
+                base = leading_cd(cmd, root)
+        hits = []
+        rroot = root.resolve()
+        for w in [str(w) for w in words if w]:
+            try:
+                rel = project_rel(w, root)
+                if not rel:
+                    continue
+                for d in ((base, root) if base != root else (root,)):
+                    f = d / rel
+                    if f.is_file() and rroot in f.resolve().parents:
+                        hits.append(f)
+                        break
+            except (OSError, ValueError):
+                continue                             # ENAMETOOLONG and the like: this word only
+        if hits:
+            note_touched(request_id, hits)
+    except Exception:  # noqa: BLE001
+        logger.debug("task evidence not noted", exc_info=True)
+
+
+def stale_deliverable_problem(ws, description, *, since: Optional[float], touched=()) -> Optional[str]:
+    """§4UY P7: why the declared file (it exists, with content) is not this task's work — None when it was written
+    after the task was created (``since``), when this request's own successful tool calls wrote, read or ran it
+    (``touched``: resolved paths, `touched_in`), or when nothing is known. Review: the close's `result` prose is
+    not evidence (live, 14 of 16 DONE results named their file)."""
+    rel = declared_deliverable(description)
+    if not rel or ws is None or not since:
+        return None
+    target = Path(ws) / rel
+    try:
+        mt = os.stat(target).st_mtime
+    except OSError:
+        return None
+    if mt >= float(since) - DELIVERABLE_SINCE_SLACK_S:
+        return None
+    try:
+        if str(target.resolve()) in set(touched or ()):
+            return None
+    except (OSError, ValueError):
+        pass
+    return (f"the declared deliverable {rel} already existed before this task (last written "
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(mt))}) and nothing in this task wrote, read or ran "
+            f"it — write what the task asks into it, or, if it already does that, open or run {rel} to check it "
+            f"and close again")
 
 
 #: the owner's ledger line — fixed text, no transcript words (r32: the ledger

@@ -1,6 +1,7 @@
 """§4UL (decision 1A) — autopilot and owner-requested batches run each project
-task as ONE full main-loop agent turn (`core/project_turns.py`); the build
-executor stays only as the fallback. Plus (1d): a `lab exec` / `run collect`
+task as ONE full main-loop agent turn (`core/project_turns.py`); since §4UY
+C18 there is no fallback builder (a task whose turn cannot run is reopened).
+Plus (1d): a `lab exec` / `run collect`
 program failure is a fix-and-retry step like `execute`'s, and the fork-P
 hooks (project writes noted, DONE sweeps flushed at the request's end)."""
 from __future__ import annotations
@@ -294,13 +295,15 @@ async def test_a_kept_lab_refusal_holds_the_task_for_the_owners_run(turns_on, mo
     assert res2.task_id == tid and seen[0]["origin"] == "owner" and store.get_task(tid)["status"] == "DONE"
 
 
-async def test_a_turn_that_never_closes_its_task_fails_it_with_the_reply(turns_on, monkeypatch, store):
+async def test_a_turn_that_never_closes_its_task_reopens_it_with_the_reply(turns_on, monkeypatch, store):
+    # §4UY P15 (was ..._fails_it_with_the_reply): an OWNER-run turn that ends unclosed puts the task back (never
+    # FAILED, which rolled the whole project up FAILED); the batch stops with the turn's reply
     pid, tid = _project(store)
     _fake_turn(monkeypatch, lambda a, kw: "I looked at the files.", [])
     res = await _advance(_ctx(store), pid, owner=True)
     row = store.get_task(tid)
-    assert row["status"] == "FAILED" and "without closing it" in (row.get("failure_reason") or "")
-    assert "I looked at the files." in res.summary
+    assert row["status"] not in ("FAILED", "IN_PROGRESS") and store.get_project(pid)["status"] != "FAILED"
+    assert res.summary.startswith(PT.TASK_TURN_UNCLOSED_PREFIX)
 
 
 async def test_a_turn_that_splits_its_task_leaves_the_subtasks(turns_on, monkeypatch, store):
@@ -365,20 +368,27 @@ async def test_too_little_time_left_starts_no_turn(turns_on, monkeypatch, store)
     assert store.get_task(tid)["status"] == "PENDING"
 
 
-async def test_switched_off_or_unbuildable_the_executor_runs_it(monkeypatch, store):
+async def test_switched_off_or_unbuildable_nothing_builds_and_the_task_is_reopened(monkeypatch, store):
+    # §4UY C18: the production executor is a marker — with the turn switched
+    # off or unbuildable, NO builder runs (the spec executor was removed) and
+    # the claimed task goes back to the queue, never FAILED or DONE
+    from ghost_agent.core.project_advancer import TASK_TURN_UNAVAILABLE_PREFIX
     pid, tid = _project(store)
     seen, built = [], []
     _fake_turn(monkeypatch, _close(store, tid), seen)
-    await _advance(_ctx(store), pid, owner=True, executor=_executor(calls=built))
-    assert seen == [] and len(built) == 1            # GHOST_PROJECT_TASK_TURNS=0 (suite default)
+    res = await _advance(_ctx(store), pid, owner=True, executor=_executor(calls=built))
+    assert seen == [] and built == []                # GHOST_PROJECT_TASK_TURNS=0 (suite default)
+    assert res.summary.startswith(TASK_TURN_UNAVAILABLE_PREFIX) and res.worked is False
+    assert store.get_task(tid)["status"] == "PENDING"
     monkeypatch.setenv("GHOST_PROJECT_TASK_TURNS", "1")
-    store.update_task(tid, status="PENDING")
 
     def bad(*a, **k):
         raise ValueError("no prompt")
     monkeypatch.setattr(PT, "task_turn_prompt", bad)
-    await _advance(_ctx(store), pid, owner=True, executor=_executor(calls=built))
-    assert seen == [] and len(built) == 2            # the fallback, logged
+    res = await _advance(_ctx(store), pid, owner=True, executor=_executor(calls=built))
+    assert seen == [] and built == []                # no fallback builder
+    assert res.summary.startswith(TASK_TURN_UNAVAILABLE_PREFIX)
+    assert store.get_task(tid)["status"] == "PENDING"
 
 
 async def test_a_research_task_is_a_turn_too(turns_on, monkeypatch, store):

@@ -16,8 +16,8 @@ IMAGE_SUCCESS_HEAD = "SUCCESS: Image generated"
 #: render look, §4QP) — the blind second-render guard counts it as inspected
 IMAGE_SEEN_HEAD = "WHAT THE PICTURE SHOWS (the vision model looked at it): "
 #: §4QX: image_generation: the SYSTEM shows the look line in the delivered reply — the
-#: sentence the tool writes right after that line (own paragraph); `agent._owned_look_note`
-#: appends the line only when it finds this right after it
+#: sentence the tool writes right after that line (own paragraph); `agent._owned_look_rows`
+#: owns the line only when it finds this right after it (placed by `agent.owned_look_insertions`)
 LOOK_OWNED_NOTE = "The SYSTEM shows the user that line itself, directly under the picture."
 #: §4QX: the label the system writes before the look line in the delivered reply
 LOOK_OWNED_LABEL = "What the picture shows: "

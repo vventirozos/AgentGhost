@@ -200,12 +200,26 @@ def rebuttal_clause(current_user_text, prev_assistant_response) -> Optional[str]
     return None
 
 
-def is_correction_candidate(current_user_text, prev_assistant_response) -> bool:
+def is_correction_candidate(current_user_text, prev_assistant_response, *, displeased: bool = False) -> bool:
     """THE cheap gate in front of the judge: an anchored correction phrase
     (Signal A) OR a rebuttal clause against the reply (Signal C). One
-    authority — the caller must not keep a private copy of either test."""
+    authority — the caller must not keep a private copy of either test.
+
+    §4UW (review 11-18: the phrase is anchored to the START of the message —
+    "the dashboard is still empty", "fix index.html, it doesn't work" never
+    reached the judge; on the owner's 93 messages with an emotion reading the
+    one that read displeased was the one real correction among them):
+    ``displeased`` — the emotion model read annoyance or disapproval in the
+    message (``selfhood.mood.sounds_displeased``) — also lets it in front of
+    the judge. JUDGE-ONLY, and for the MOOD only: ``classify_user_correction``
+    still promotes the prior turn on a phrase or a rebuttal clause alone, so a
+    message let in this way can make the agent feel corrected and can never
+    relabel a turn."""
+    if not (isinstance(current_user_text, str) and current_user_text.strip()):
+        return False
     return (has_correction_phrase(current_user_text)
-            or rebuttal_clause(current_user_text, prev_assistant_response) is not None)
+            or rebuttal_clause(current_user_text, prev_assistant_response) is not None
+            or bool(displeased))
 
 
 def has_correction_phrase(text) -> bool:

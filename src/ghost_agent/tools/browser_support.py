@@ -595,6 +595,43 @@ def _new_nonce() -> str:
     return _secrets.token_hex(12)
 
 
+#: §4UY N19: the browser result's own grammar — a line that starts with `---` (its section rules), an
+#: upper-case label and a colon (`STATUS:`, `URL:`, `TITLE:`, `LINKS ON THIS PAGE (…):`), a `⚠` banner or a
+#: `[n]` per-action row. A PAGE's text, title or console line that starts like one is quoted ("> "), so a page
+#: cannot print `STATUS: OK` or `--- BROWSER RESULT ---` into the result the model reads. By shape, not a list.
+_PAGE_GRAMMAR_BODY = (r"(?:-{3}|[A-Z][A-Z0-9_]*(?:[ _/-][A-Z0-9_]+)*[^\S\n]*(?:\([^\n)]*\))?[^\S\n]*:|"
+                      r"\u26a0|\[-?\d+\])")
+#: runner fields that are the HOST's own values, not page text (a URL or path is never quoted)
+_NOT_PAGE_FIELDS = frozenset({"url", "final_url", "path", "profile_dir", "selector", "action", "abort_reason",
+                              "nonce", "wait_until"})
+_PAGE_GRAMMAR_RE: list = []
+
+
+def quote_page_text(text: str) -> str:
+    """Page-supplied text with every line that starts like the browser result's grammar quoted ("> ")."""
+    t = str(text or "")
+    if not t:
+        return t
+    if not _PAGE_GRAMMAR_RE:
+        from .search import _GRAMMAR_LEAD
+        _PAGE_GRAMMAR_RE.append(re.compile(r"(?m)^(?=" + _GRAMMAR_LEAD + _PAGE_GRAMMAR_BODY + ")"))
+    from .search import unify_line_breaks
+    return _PAGE_GRAMMAR_RE[0].sub("> ", unify_line_breaks(t))
+
+
+def quote_page_fields(value, key: str = ""):
+    """§4UY N19: THE sink — every string the runner shipped (titles, page text, console lines, evaluate
+    values, link texts, error messages), at any depth, quoted by `quote_page_text`; the host's own fields
+    (`_NOT_PAGE_FIELDS`) and every non-string pass unchanged."""
+    if isinstance(value, dict):
+        return {k: (v if k in _NOT_PAGE_FIELDS else quote_page_fields(v, k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [quote_page_fields(v, key) for v in value]
+    if isinstance(value, str):
+        return quote_page_text(value)
+    return value
+
+
 def _parse_runner_output(stdout: str, nonce: str = "") -> tuple[bool, object]:
     """Pick the [BROWSER_OK]/[BROWSER_ERR] sentinel line out of stdout.
 
@@ -621,7 +658,7 @@ def _parse_runner_output(stdout: str, nonce: str = "") -> tuple[bool, object]:
             err_line = line[len(err_tag):]
     if ok_line is not None:
         try:
-            return True, json.loads(ok_line)
+            return True, quote_page_fields(json.loads(ok_line))
         except Exception as e:
             return False, f"malformed OK payload from runner: {e}: {ok_line[:200]}"
     if err_line is not None:
@@ -645,3 +682,24 @@ def text_block(p: dict) -> str:
     return (f"\nLENGTH: {p.get('length')}{trunc}"
             f"\n--- PAGE TEXT (capped preview) ---\n{text}"
             f"{webgl_denial_note(str(text))}")
+
+
+def goto_page_view(actions, goto) -> dict:
+    """§4UY N5: what an interact knows of the page a goto landed on — its status, title and url, and the
+    text of the first extract_text that read it (before the next goto), so THE page classifier sees the
+    page's words too (a goto alone carries no text, and the size stays unknown)."""
+    view = {"status": goto.get("status"), "title": goto.get("title"), "url": goto.get("url")}
+    seen = not any(r is goto for r in actions or [])      # the implicit first navigation: read from the start
+    for r in actions or []:
+        if r is goto:
+            seen = True
+            continue
+        if not seen or not isinstance(r, dict):
+            continue
+        if r.get("action") == "goto":
+            break
+        if r.get("action") == "extract_text" and r.get("ok") and isinstance(r.get("text"), str):
+            view["text"] = r["text"]
+            view["length"] = r.get("length") if r.get("length") is not None else len(r["text"])
+            break
+    return view

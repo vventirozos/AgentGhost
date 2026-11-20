@@ -77,12 +77,18 @@ Log notice file {TOR_LOG}
 """
 
 #: Idempotent: (re)creates the three chains, hooks them into OUTPUT once.
+#: §4UY N6: the SOCKS-port rule decides nothing (the next rule RETURNs all
+#: loopback anyway) — it COUNTS the connections sandbox code opens to Tor's
+#: SocksPort, the one way out the redirect rules below never see. Together
+#: with the REDIRECT counters it is how `net_connections` knows whether a
+#: run reached the network (`counters_cmd`, `parse_net_counters`).
 #: Order inside the nat chain is the contract — Tor's own traffic and
 #: loopback must be exempted BEFORE the redirects, or Tor would be sent to
 #: itself.
 RULES_SCRIPT = f"""set -e
 iptables -t nat -N {NAT_CHAIN} 2>/dev/null || iptables -t nat -F {NAT_CHAIN}
 iptables -t nat -A {NAT_CHAIN} -m owner --uid-owner {TOR_USER} -j RETURN
+iptables -t nat -A {NAT_CHAIN} -o lo -p tcp --dport {SOCKS_PORT} -j RETURN
 iptables -t nat -A {NAT_CHAIN} -o lo -j RETURN
 iptables -t nat -A {NAT_CHAIN} -d 127.0.0.0/8 -j RETURN
 iptables -t nat -A {NAT_CHAIN} -p udp --dport 53 -j REDIRECT --to-ports {DNS_PORT}
@@ -213,3 +219,37 @@ def parse_tor_check(output: str) -> Tuple[Optional[bool], str]:
     if not isinstance(_is_tor, bool):
         return None, str(data.get("IP") or "")
     return _is_tor, str(data.get("IP") or "")
+
+
+def counters_cmd() -> str:
+    """§4UY N6: the nat chain's rules with their exact packet counters. Run it
+    ``privileged=True`` (reading counters needs NET_ADMIN, which the container
+    lacks)."""
+    return f"iptables -t nat -L {NAT_CHAIN} -v -x -n"
+
+
+def parse_net_counters(output) -> Optional[Tuple[int, bool]]:
+    """``(connections, socks_counted)`` from `counters_cmd`'s output: the NEW
+    connections the sandbox sent out — every REDIRECT (TCP to the TransPort,
+    DNS to the DNSPort) plus the SOCKS-port counting rule. The nat table sees
+    the first packet of a connection only, so the packet count IS the
+    connection count. ``socks_counted`` is False on a chain loaded before the
+    counting rule existed (that sandbox cannot see SOCKS use). None when the
+    output is not this chain's listing."""
+    if isinstance(output, (bytes, bytearray)):
+        output = output.decode("utf-8", "replace")
+    text = str(output or "")
+    if f"Chain {NAT_CHAIN}" not in text:
+        return None
+    total, socks = 0, False
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        target = parts[2]
+        if target == "REDIRECT":
+            total += int(parts[0])
+        elif target == "RETURN" and f"dpt:{SOCKS_PORT}" in line:
+            total += int(parts[0])
+            socks = True
+    return total, socks

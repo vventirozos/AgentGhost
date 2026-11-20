@@ -31,6 +31,8 @@ import inspect
 
 import pytest
 
+import ghost_agent.core.agent as agent_mod
+
 from ghost_agent.core.agent import GhostAgent
 
 
@@ -253,52 +255,26 @@ def test_the_two_sandbox_op_lists_stay_identical(block):
     `cached_sandbox_state` stayed valid and every later turn in the request
     listed a workspace without it. Pinned as an identity rather than as two
     lists to read."""
-    ops = {}
-    for node in ast.walk(block):
-        if not (isinstance(node, ast.Compare)
-                and isinstance(node.ops[0], ast.In)
-                and isinstance(node.comparators[0], ast.List)):
-            continue
-        values = {e.value for e in node.comparators[0].elts
-                  if isinstance(e, ast.Constant) and isinstance(e.value, str)}
-        if "write" in values and "replace" in values:
-            ops.setdefault("seen", []).append(values)
-    # ...and each list must actually be guarded by a `file_system` test.
-    # Comparing the two SETS to each other and to `expected` still passed
-    # when one list was re-keyed onto `_cname == "execute"`, which would mean
-    # no file_system write ever invalidates the sandbox cache.
+    # §4UY r2 m1: both read ONE set (`tools/fs_ops.FS_MUTATING_OPS`, also read by the outcome heuristics) —
+    # identity by construction; what stays pinned is that BOTH sites test it under a `file_system` guard
+    # (re-keying one onto another tool would leave every write un-invalidated) and the set's content.
+    from ghost_agent.tools.fs_ops import FS_MUTATING_OPS
     fs_guarded = 0
     for node in ast.walk(block):
         if not isinstance(node, ast.BoolOp):
             continue
         src = ast.unparse(node)
-        if "'file_system'" in src and "'write'" in src and "'replace'" in src:
+        if "'file_system'" in src and "in _FS_MUTATING_OPS" in src:
             fs_guarded += 1
     assert fs_guarded >= 2, (
-        f"only {fs_guarded} of the two mutating-op lists is guarded by a "
-        f"file_system test; the other decides on some different tool"
+        f"only {fs_guarded} of the two mutating-op tests reads the shared list under a file_system guard; "
+        f"the other decides on some different tool or keeps a private copy"
     )
-    seen = ops.get("seen") or []
-    assert len(seen) >= 2, (
-        f"expected the file_system op list in both is_mutating and "
-        f"is_sandbox_mutation; found {len(seen)}"
-    )
-    assert all(v == seen[0] for v in seen), (
-        f"the file_system operation lists have drifted: "
-        f"{[sorted(v ^ seen[0]) for v in seen if v != seen[0]]}. A workspace "
-        f"mutation classified by one and not the other leaves the sandbox "
-        f"cache stale."
-    )
-    # CONTENT, not just equality — dropping an op from BOTH lists kept them
-    # equal and left `delete` no longer invalidating the sandbox cache.
+    assert agent_mod._FS_MUTATING_OPS is FS_MUTATING_OPS
+    # CONTENT — dropping an op left the sandbox cache valid after a real change
     expected = {"write", "edit", "replace", "download", "delete", "move", "rename",
-                "unzip", "git_clone", "copy"}
-    assert seen[0] == expected, (
-        f"the file_system mutating-op set changed: "
-        f"{sorted(seen[0] ^ expected)}. Every one of these writes to the "
-        f"workspace; an op missing here leaves the sandbox cache valid "
-        f"after a real change and makes the call dedup-collapse eligible."
-    )
+                "unzip", "git_clone", "copy", "restore"}
+    assert expected <= FS_MUTATING_OPS, sorted(expected - FS_MUTATING_OPS)
 
 
 def test_a_real_tool_name_outranks_an_alias():

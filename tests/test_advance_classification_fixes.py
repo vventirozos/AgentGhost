@@ -24,7 +24,7 @@ from ghost_agent.core import project_advancer as PA
 from ghost_agent.core.project_advancer import (
     advance_once, _gather_project_files,
 )
-from ghost_agent.core.coding_executor import CodingResult, _generate_build_spec
+from ghost_agent.core.coding_executor import CodingResult
 from ghost_agent.core.planning import ProjectPlan
 from ghost_agent.memory.projects import ProjectStore
 from ghost_agent.tools.projects import _infer_kind, MANAGE_PROJECTS_TOOL_DEF
@@ -207,22 +207,6 @@ def test_gather_binary_files_do_not_consume_the_cap(store):
     assert files == {"z_app.js": "console.log('app')"}
 
 
-@pytest.mark.asyncio
-async def test_build_spec_prompt_instructs_extend_when_files_exist():
-    captured = {}
-
-    class LLM:
-        async def chat_completion(self, payload, is_background=False, **_kw):
-            captured["user"] = payload["messages"][-1]["content"]
-            return {"choices": [{"message": {"content": "{}"}}]}
-
-    await _generate_build_spec(LLM(), "m", "add the editor app", "",
-                               existing_files={"index.html": "<html>shell</html>"})
-    u = captured["user"]
-    assert "EXISTING PROJECT FILES" in u
-    assert "index.html" in u and "<html>shell</html>" in u
-    # steers toward the incremental primitives instead of re-emitting the file
-    assert "append" in u and "ADDS to these" in u
 
 
 # ---------------------------------------------------------------- 4 large-file guidance

@@ -27,6 +27,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import math
 import re
 import threading
 from pathlib import Path
@@ -212,6 +213,14 @@ def build_day(home, day: datetime.date, *, tz=None, now: Optional[datetime.datet
         except (TypeError, ValueError):
             dp = de = 0.0
         cause = str(ev.get("cause") or "")
+        # §4UW: ``dp``/``de`` are the event's SIZE; ``moved`` (when the row has it) is what the pair moved by —
+        # a tone fitted to its cap, the ±1 limit, a reaction that replaced another. The day's sums and its biggest events are about what
+        # moved; what the event says about the day (``_count_evidence``) reads its size
+        mp, me = dp, de
+        mv = ev.get("moved")
+        if (isinstance(mv, (list, tuple)) and len(mv) == 2
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in mv)):
+            mp, me = float(mv[0]), float(mv[1])
         if held:
             rec["held"] = int(rec["held"]) + 1          # it happened, it did not move the mood
             # §4UH-e2e review (MAJOR): a day the owner set the mood held every event until 04:00, and the
@@ -226,12 +235,12 @@ def build_day(home, day: datetime.date, *, tz=None, now: Optional[datetime.datet
         rec["events"] = int(rec["events"]) + 1
         slot = by_kind.setdefault(kind, {"n": 0, "dp": 0.0, "de": 0.0})
         slot["n"] += 1
-        slot["dp"] = round(slot["dp"] + dp, 4)
-        slot["de"] = round(slot["de"] + de, 4)
+        slot["dp"] = round(slot["dp"] + mp, 4)
+        slot["de"] = round(slot["de"] + me, 4)
         _count_evidence(rec, kind, cause, dp, ev)
         if kind not in (M.KIND_OWNER, M.KIND_MANNER):
-            candidates.append((abs(dp) + abs(de), {"at": str(ev.get("at") or ""), "kind": kind,
-                                                   "dp": round(dp, 4), "de": round(de, 4), "cause": cause[:160]}))
+            candidates.append((abs(mp) + abs(me), {"at": str(ev.get("at") or ""), "kind": kind,
+                                                   "dp": round(mp, 4), "de": round(me, 4), "cause": cause[:160]}))
     rec["by_kind"] = by_kind
     rec["thumbs_up"], rec["thumbs_down"] = owner_thumbs(home, day, tz=tz)
     rec["msgs_rated"], rec["msgs_warm"], rec["msgs_cold"], rec["msgs_thanks"] = owner_tones(home, day, tz=tz)

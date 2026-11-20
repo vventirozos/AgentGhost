@@ -222,11 +222,12 @@ class TestAdaptiveSampling:
 # ============================================================
 
 class TestFallbackChains:
-    def test_get_fallback_for_deep_research(self):
+    def test_no_chain_for_the_internet_tools(self):
+        """§4UY N1 (was: deep_research → "try web_search", the same engines; web_search → "try
+        deep_research"): an internet tool's failure names its own next step."""
         from ghost_agent.tools.fallback_chains import get_fallback_chain_hint as get_fallback_hint
-        hint = get_fallback_hint("deep_research")
-        assert hint is not None
-        assert "web_search" in hint.lower()
+        assert get_fallback_hint("deep_research") is None
+        assert get_fallback_hint("web_search", "ERROR: web search failed on TRANSPORT") is None
 
     def test_get_fallback_for_execute(self):
         from ghost_agent.tools.fallback_chains import get_fallback_chain_hint as get_fallback_hint
@@ -237,14 +238,6 @@ class TestFallbackChains:
     def test_no_fallback_for_unknown_tool(self):
         from ghost_agent.tools.fallback_chains import get_fallback_chain_hint as get_fallback_hint
         assert get_fallback_hint("unknown_tool") is None
-
-    def test_skips_web_search_on_captcha(self):
-        from ghost_agent.tools.fallback_chains import get_fallback_chain_hint as get_fallback_hint
-        hint = get_fallback_hint("deep_research", "CAPTCHA detected, search blocked")
-        # Should skip web_search and suggest recall instead
-        assert hint is not None
-        assert "recall" in hint.lower() or "memory" in hint.lower()
-
 
 # ============================================================
 # #8: Checkpoint & Resume

@@ -26,8 +26,9 @@ did it better. So a batch now runs each task as ONE fresh agent request:
 
 The turn closes its task with ``manage_projects task_update`` (DONE with its
 deliverables, FAILED with a reason). The advancer reads the task's status
-afterwards. The old executor path stays as the fallback, used only when this
-one cannot be built (logged).
+afterwards. §4UY C18: there is no fallback any more — the spec executor and
+the agentic leaf were removed; a task whose turn cannot be built or run goes
+back to the queue (`project_advancer`, `TASK_TURN_UNAVAILABLE_PREFIX`).
 """
 from __future__ import annotations
 
@@ -38,6 +39,7 @@ import re
 import shlex
 import time
 from typing import Any, Dict, Optional
+from pathlib import Path
 
 from ..utils.helpers import env_positive
 from ..utils.logging import Icons, pretty_log
@@ -45,6 +47,8 @@ from ..utils.logging import Icons, pretty_log
 logger = logging.getLogger("GhostAgent")
 
 TASK_TURN_RID_PREFIX = "sub-ptask-"
+#: §4UY P15: an owner-run task turn ended with its task still open — reopened, and the batch stops on it
+TASK_TURN_UNCLOSED_PREFIX = "task turn ended unclosed"
 TASK_TURN_LABEL = "ptask"
 #: a task turn's own cap; the unattended step's cap and the owner request's time left bound it further
 TASK_TURN_TIMEOUT_S = env_positive("GHOST_TASK_TURN_TIMEOUT_S", 1800.0)
@@ -90,7 +94,9 @@ def _norm_status(value) -> str:
 
 def enabled() -> bool:
     """GHOST_PROJECT_TASK_TURNS (default ON); the test suite pins it OFF so
-    the executor tests keep the path they were written for."""
+    the advancer tests with a stub executor keep the path they were written
+    for. OFF with the production executor wired, a task does not run at all
+    (§4UY C18: no fallback builder)."""
     return str(os.environ.get("GHOST_PROJECT_TASK_TURNS", "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
@@ -143,24 +149,31 @@ _PY_RE = re.compile(r"(?:python|pypy)[0-9.]*")
 _INTERPRETERS = frozenset({"node", "nodejs", "deno", "ruby", "php", "perl", "lua", "julia", "Rscript", "tsx",
                            "ts-node", "java", "elixir", "swift", "kotlin", "groovy", "scala", "dotnet-script"})
 _SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
-#: test runners, build tools, compilers, database clients, linters and type checkers: any run
+#: test runners, task runners and database clients: a RUN (§4UY P6: the project's own code runs)
 _RUNNERS = frozenset({"pytest", "py.test", "tox", "nox", "make", "gmake", "ninja", "just", "jest", "vitest",
-                      "mocha", "phpunit", "rspec", "gradle", "gradlew", "mvn", "javac", "tsc", "gcc", "g++",
-                      "cc", "c++", "clang", "clang++", "rustc", "kotlinc", "ctest", "psql", "sqlite3", "mysql",
-                      "mariadb", "mongosh", "redis-cli",
-                      "mypy", "ruff", "flake8", "pylint", "pyflakes", "pycodestyle", "pyright", "bandit",
-                      "eslint", "stylelint", "htmlhint", "shellcheck", "hadolint", "yamllint", "jsonlint",
-                      "xmllint", "markdownlint", "golangci-lint", "staticcheck"})
-#: `<tool> <sub>`: the subcommands that run, build or check (`npm test`, `go test`, `cargo run`, `dotnet test`)
+                      "mocha", "phpunit", "rspec", "gradle", "gradlew", "mvn", "ctest", "psql", "sqlite3", "mysql",
+                      "mariadb", "mongosh", "redis-cli"})
+#: §4UY P6: linters, type checkers and compilers read or translate the code — they never RUN it (`node --check`,
+#: `tsc --noEmit`, `ruff check` passed the unattended DONE gate). Not a check; with --fix / --write a WRITE
+_STATIC_CHECKERS = frozenset({"mypy", "ruff", "flake8", "pylint", "pyflakes", "pycodestyle", "pyright", "bandit",
+                              "eslint", "stylelint", "htmlhint", "shellcheck", "hadolint", "yamllint", "jsonlint",
+                              "xmllint", "markdownlint", "golangci-lint", "staticcheck", "javac", "tsc", "gcc",
+                              "g++", "cc", "c++", "clang", "clang++", "rustc", "kotlinc", "py_compile",
+                              "compileall"})
+#: §4UY P6: an interpreter's syntax-only flags (`node --check`, `php -l`, `ruby -c`, `perl -c`, `bash -n`)
+_SYNTAX_ONLY_FLAGS = {"node": {"--check", "-c"}, "nodejs": {"--check", "-c"}, "php": {"-l", "--syntax-check"},
+                      "ruby": {"-c"}, "perl": {"-c"}, "bash": {"-n"}, "sh": {"-n"}, "zsh": {"-n"}, "dash": {"-n"},
+                      "ksh": {"-n"}}
+#: `<tool> <sub>`: the subcommands that RUN the project (`npm test`, `go test`, `cargo run`, `dotnet test`) — a
+#: build / vet / check / lint compiles or reads it (§4UY P6: not a run)
 _SUBCOMMAND_RUNS = {
     "npm": {"test", "t", "tst", "run", "run-script", "rum", "urn", "start", "restart"},
-    "go": {"test", "run", "build", "vet"},
-    "cargo": {"test", "run", "build", "check", "bench", "clippy"},
-    "dotnet": {"test", "run", "build"},
-    "deno": {"test", "run", "task", "eval", "check", "lint"},
+    "go": {"test", "run"},
+    "cargo": {"test", "run", "bench"},
+    "dotnet": {"test", "run"},
+    "deno": {"test", "run", "task", "eval"},
     "bun": {"test", "run"},
-    "cmake": {"--build"},
-    "swift": {"test", "run", "build"},
+    "swift": {"test", "run"},
     "playwright": {"test"},
 }
 #: `yarn` / `pnpm`: everything but these runs a script (`yarn test`, `pnpm build`)
@@ -297,11 +310,13 @@ def _runs_program(words: list, command: str, depth: int) -> list:
                 if mod in _PY_NOT_CHECK_MODULES:
                     return []
                 return _runs_program([mod] + args[j + 2 if a == "-m" else j + 1:], command, depth) \
-                    if mod in _FORMATTERS or mod == "ruff" else ["c"]
+                    if mod in _FORMATTERS or mod in _STATIC_CHECKERS else ["c"]
             if not a.startswith("-"):
                 break
         code = _inline_code(head, args, command)
         return ["w"] if code is not None and code_writes_files(code) else ["c"]
+    if head in _SYNTAX_ONLY_FLAGS and any(a in _SYNTAX_ONLY_FLAGS[head] for a in _leading_flags(args)):
+        return []                                        # §4UY P6: a syntax check reads the code, never runs it
     if head in _SHELLS:
         for j, a in enumerate(args):
             if a == "-c" or (a.startswith("-") and not a.startswith("--") and a.endswith("c")):
@@ -320,19 +335,22 @@ def _runs_program(words: list, command: str, depth: int) -> list:
     if head in _FORMATTERS or (head == "ruff" and args[:1] == ["format"]) \
             or (head in ("cargo", "go", "dotnet") and args[:1] in (["fmt"], ["format"])):
         if any(a in _FORMAT_CHECK_FLAGS for a in args):
-            return ["c"]                                 # `black --check`, `ruff format --check`
+            return []                                    # `black --check`: reads the code (§4UY P6: not a run)
         if head in ("prettier", "gofmt") and not any(a in ("--write", "-w") for a in args):
-            return ["c"]                                 # prints the formatted text, writes nothing
+            return []                                    # prints the formatted text, writes nothing
         return ["w"]
+    if head in _STATIC_CHECKERS:
+        return ["w"] if any(a in ("--fix", "--write") or a.startswith("--fix=") for a in args) else []
     if head in _RUNNERS:
-        return ["c", "w"] if any(a in ("--fix", "--write") or a.startswith("--fix=") for a in args) else ["c"]
+        return ["c"]
     if head in _RUN_WRAPPERS:
         return _simple_events(args[1:], command, depth + 1) if args[:1] == ["run"] else []
     if head in _NPX or (head == "npm" and args[:1] in (["exec"], ["x"])) \
             or (head in ("yarn", "pnpm") and args[:1] in (["dlx"], ["exec"])):
         rest = [a for a in (args if head in _NPX else args[1:]) if a not in ("-y", "--yes", "--")]
         evs = _simple_events(rest, command, depth + 1)
-        if evs or not rest or "install" in rest or os.path.basename(rest[0]).startswith("create-"):
+        if evs or not rest or "install" in rest or os.path.basename(rest[0]).startswith("create-") \
+                or os.path.basename(rest[0]) in _STATIC_CHECKERS or os.path.basename(rest[0]) in _FORMATTERS:
             return evs
         return ["c"]                                     # another program it fetched and ran
     if head in ("yarn", "pnpm"):
@@ -451,6 +469,230 @@ def shell_check_events(command: str) -> list:
         return []
 
 
+#: §4UY P6: the program heads that run the project as configured in its folder (its tests, its scripts) — a run
+#: of one in the project's folder is a run of its code with no file named
+_PROJECT_RUN_HEADS = frozenset(_RUNNERS - {"psql", "sqlite3", "mysql", "mariadb", "mongosh", "redis-cli"}) | \
+    frozenset(_SUBCOMMAND_RUNS) | {"yarn", "pnpm", "npx", "pnpx", "bunx", "docker", "podman", "unittest",
+                                    "doctest"}
+_IMPORT_RE = re.compile(r"(?:^|[\s;'\"(])(?:import|from)\s+([A-Za-z_][\w.]*)|require\(\s*['\"]\.?/?([\w./-]+)['\"]")
+_PATHLIKE_RE = re.compile(r"[\w.~/*-]+")
+#: §4UY P6 review 3: a path only inside `open(…)` of inline code is READ by it, not run
+#: (`python3 -c 'import ast; ast.parse(open("app.py").read())'` is a syntax check)
+_OPEN_ARG_RE = re.compile(r"\bopen\(\s*(['\"])[^'\"]*\1")
+#: review 4: code that exec()s / compile()s what it opened RUNS that file (`exec(open("app.py").read())`,
+#: `with open(X) as f: exec(f.read())`) — its open() paths are kept
+_EXEC_RE = re.compile(r"\b(?:exec|compile)\s*\(")
+
+
+def _strip_open_reads(text: str) -> str:
+    """Inline code with the paths it only opens (reads) taken out — unless it exec()s / compile()s code."""
+    return text if _EXEC_RE.search(text) else _OPEN_ARG_RE.sub("open(", text)
+
+
+def _names_project_file(text: str, root: Optional[Path], known=()) -> bool:
+    """Some word of ``text`` names a file or folder of the project — on disk, or one this turn wrote (``known``,
+    project-relative) — a path, a glob, an imported module that is a file of it."""
+    if root is None or not str(text or "").strip():
+        return False
+    known = {str(k) for k in known or ()}
+    _kmods = {Path(k).stem for k in known} | {k.split("/")[0] for k in known}
+    try:
+        rroot = root.resolve()
+    except OSError:
+        return False
+    for m in _IMPORT_RE.finditer(text):
+        mod = (m.group(1) or m.group(2) or "").split(".")[0] if m.group(1) else (m.group(2) or "")
+        mod = mod.strip("./")
+        if mod and (mod in _kmods or any((root / f"{mod}{ext}").exists() for ext in ("", ".py", ".js", ".mjs",
+                                                                                      ".ts"))):
+            return True
+    for w in set(_PATHLIKE_RE.findall(text)):
+        w = w.strip()
+        if not w or w in (".", "..", "/", "~") or len(w) < 2:
+            continue
+        rel = project_rel(w, root)
+        if not rel:
+            continue
+        if rel.rstrip("/") in known or any(k.startswith(rel.rstrip("/") + "/") for k in known):
+            return True
+        try:
+            if any(ch in rel for ch in "*?["):
+                if any(rroot in p.resolve().parents for p in root.glob(rel)):
+                    return True
+            elif (root / rel).exists() and rroot in (root / rel).resolve().parents:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def project_rel(word: str, root: Path) -> Optional[str]:
+    """§4UY: a word of a command or a path argument as a path relative to the project folder ``root`` — the one
+    normalisation (`/workspace/…`, `./…`, `projects/<id>/…`); "" for the folder itself, None for a path outside
+    (absolute elsewhere, `..`)."""
+    rel = str(word or "").strip()
+    for pre in ("/workspace/", "./"):
+        if rel.startswith(pre):
+            rel = rel[len(pre):]
+    if root.name and (rel == f"projects/{root.name}" or rel.startswith(f"projects/{root.name}/")):
+        rel = rel[len(f"projects/{root.name}"):].lstrip("/")
+    if rel.startswith("/") or ".." in rel.split("/"):
+        return None
+    return rel
+
+
+def leading_cd(command: str, root: Path) -> Path:
+    """§4UY: the folder a command runs its words in — ``root``, or the project subfolder a leading
+    `cd <dir> &&` / `cd <dir>;` moves to (review 2: `cd src && python main.py`). Outside the project → ``root``."""
+    try:
+        from ..tools.execute import _shell_tokens
+        toks = _shell_tokens(command) or []
+    except Exception:  # noqa: BLE001
+        return root
+    if len(toks) >= 3 and toks[0] == "cd" and toks[2] in ("&&", ";"):
+        rel = project_rel(toks[1], root)
+        if rel is not None:
+            try:
+                d = (root / rel) if rel else root
+                if d.is_dir() and (d.resolve() == root.resolve() or root.resolve() in d.resolve().parents):
+                    return d
+            except (OSError, ValueError):
+                pass
+    return root
+
+
+def _py_modules(command: str) -> list:
+    """The modules a `python -m <mod>` of the command runs (full dotted names)."""
+    from ..tools.execute import _shell_tokens, _SEPARATORS, strip_command_prefixes
+    out, seg = [], []
+    for t in (_shell_tokens(command) or []) + [";"]:
+        if t not in _SEPARATORS:
+            seg.append(t)
+            continue
+        w = _strip_keywords(strip_command_prefixes(_strip_keywords(seg)))
+        seg = []
+        if not w or not _PY_RE.fullmatch(os.path.basename(w[0])):
+            continue
+        for j, a in enumerate(w[1:]):
+            if a == "-m" and j + 2 < len(w):
+                out.append(w[j + 2])
+                break
+            if a.startswith("-m") and len(a) > 2:
+                out.append(a[2:])
+                break
+            if not a.startswith("-"):
+                break
+    return out
+
+
+def _runs_project_module(command: str, root: Path, known=()) -> bool:
+    """§4UY P6 review 2: `python -m mod.sub` runs the project's code when ``mod/sub.py``, the package
+    ``mod/sub/`` or ``mod.py`` is a file of the project — on disk or written this turn (``known``). (A leading
+    `cd <project folder>` already names a file of the project: `_names_project_file`.)"""
+    known = {str(k).strip("/") for k in known or ()}
+    for mod in _py_modules(command):
+        parts = [p for p in mod.split(".") if p]
+        if not parts or not all(re.fullmatch(r"[A-Za-z_]\w*", p) for p in parts):
+            continue
+        cands = ["/".join(parts) + ".py", "/".join(parts), parts[0] + ".py"]
+        for c in cands:
+            if c in known or any(k.startswith(c + "/") for k in known):
+                return True
+            try:
+                f = root / c
+                if (f.is_file() or (f.is_dir() and c == "/".join(parts))) and \
+                        root.resolve() in f.resolve().parents:
+                    return True
+            except (OSError, ValueError):
+                continue
+    return False
+
+
+def _leading_flags(args: list) -> list:
+    """The interpreter's own flags — the ones before the script name (`bash run.sh -n 5`: `-n` is the script's)."""
+    out = []
+    for a in args:
+        if not a.startswith("-"):
+            break
+        out.append(a)
+    return out
+
+
+def _cmd_heads(command: str) -> set:
+    from ..tools.execute import _shell_tokens, _SEPARATORS, strip_command_prefixes
+    toks = _shell_tokens(command) or []
+    heads, seg = set(), []
+    for t in toks + [";"]:
+        if t in _SEPARATORS:
+            w = _strip_keywords(strip_command_prefixes(_strip_keywords(seg)))
+            if w:
+                heads.add(os.path.basename(w[0]))
+                if _PY_RE.fullmatch(os.path.basename(w[0])):     # review: `python3 -m pytest` runs pytest
+                    for j, a in enumerate(w[1:]):
+                        if a == "-m" and j + 2 < len(w):
+                            heads.add(w[j + 2].split(".")[0])
+                            break
+                        if a.startswith("-m") and len(a) > 2:
+                            heads.add(a[2:].split(".")[0])
+                            break
+                        if not a.startswith("-"):
+                            break
+            seg = []
+        else:
+            seg.append(t)
+    return heads
+
+
+def run_touches_project(name: str, kwargs: Dict[str, Any], op: str, root: Optional[Path],
+                        project_id: str = "", known=()) -> bool:
+    """§4UY P6: does this check run (or look at) the project's OWN code? An `execute` that names a file of the
+    project (a script, a module its inline code imports, a test folder), runs the project as configured (a test or
+    task runner in its folder), or asks a server on this machine (the project's server); a `lab` exec / http /
+    screenshot (labs are the project's); `run collect` / `logs`; a browser call on a page of this machine or a file
+    of the project. Not: inline code that names nothing of the project, a page on the internet."""
+    if name in ("lab", "run") or root is None:
+        return True                                      # (no folder known: a watch built with no project)
+    if name == "browser":
+        tgt = str(kwargs.get("url") or kwargs.get("path") or kwargs.get("file") or "")
+        if not tgt:
+            return True                                  # the page already open (opened by a counted call)
+        if tgt.startswith("file:"):
+            tgt = tgt[5:].lstrip("/")
+            tgt = tgt if not tgt.startswith("workspace/") else tgt[len("workspace/"):]
+        return _local_url(tgt) or _names_project_file(tgt, root, known)
+    if name != "execute":
+        return False
+    cmd = str(kwargs.get("command") or kwargs.get("cmd") or "")
+    if cmd:
+        if _cmd_heads(cmd) & _PROJECT_RUN_HEADS or any(_local_url(a) for a in re.split(r"\s+", cmd)):
+            return True
+        if _runs_project_module(cmd, root, known):
+            return True
+        return _names_project_file(_strip_open_reads(cmd + "\n" + "\n".join(_heredoc_bodies(cmd))),
+                                   root, known)
+    fname = kwargs.get("filename") or kwargs.get("file") or kwargs.get("script") or kwargs.get("name")
+    code = kwargs.get("content") or kwargs.get("code") or kwargs.get("script_content") or kwargs.get("text")
+    if fname and (code or _names_project_file(str(fname), root, known)):
+        return True                                      # the project's file (saved by this very call)
+    return _names_project_file(_strip_open_reads(str(code or "")), root, known)
+
+
+def _succeeded(res) -> bool:
+    """§4UY P6: the run SUCCEEDED — its exit status 0 (the execute banner), else the call's own outcome is ok /
+    the text is not a failure. A run that exited 1 is the turn's evidence of a bug, not of a working build."""
+    try:
+        from ..tools.tool_failure import exec_exit_code, result_is_failure
+        code = exec_exit_code(str(res or ""))
+        if code is not None:
+            return int(code) == 0
+        st = getattr(getattr(res, "status", None), "value", None)
+        if st is not None:
+            return st == "ok"
+        return not result_is_failure(str(res or ""))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _ran(res) -> bool:
     """The call RAN (its program started, the page answered): not refused before it ran. A failing exit status
     still ran — an honest model reads the failure; the gate only asks that something ran."""
@@ -566,7 +808,7 @@ class _TurnWatch:
     project and task, and whether it runs unattended (then a DONE waits for a check run after the last write)."""
 
     def __init__(self, project_id: str = "", task_id: str = "", *, unattended: bool = False,
-                 classification: str = "", description: str = "", store=None, kind: str = ""):
+                 classification: str = "", description: str = "", store=None, kind: str = "", root=None):
         self.kept_refused = ""
         self.last_write = -1.0
         self.last_check = -1.0
@@ -588,6 +830,8 @@ class _TurnWatch:
         self.turn_set: Dict[str, str] = {}
         #: files the turn wrote (project-relative), kept with a hold so the owner's run re-checks, not rebuilds
         self.files: Dict[str, None] = {}
+        #: §4UY P6: the project's folder (a check must name something in it), read from the store when unset
+        self.root: Optional[Path] = Path(root) if root else None
 
     def note(self, name: str, kwargs: Dict[str, Any], res) -> None:
         """Book one call (§4UL round 3). A CHECK is any allow-listed program that RAN (`shell_check_events`; its
@@ -646,7 +890,9 @@ class _TurnWatch:
         elif name == "browser" and op != "close":
             evs = ["c"]
         landed = _write_landed(res) if (wrote or "w" in evs) else False
-        ran = _ran(res) if "c" in evs else False
+        # §4UY P6: a CHECK is a run of THIS project's code that succeeded — not any program that ran: an unrelated
+        # page, `python3 -c 'print(1)'`, a run that exited 1 passed the unattended DONE gate
+        ran = (_ran(res) and _succeeded(res) and self._touches_project(name, kwargs, op)) if "c" in evs else False
         for k, e in enumerate(evs):
             pos = self.n + (k + 1) / 1000.0
             if e == "w" and landed:
@@ -659,9 +905,23 @@ class _TurnWatch:
                 if rel:
                     self.files[rel] = None
 
+    def _root(self) -> Optional[Path]:
+        """The project's folder (where the turn's relative paths resolve), None when unknown."""
+        if self.root is None and self.store is not None and self.project_id:
+            try:
+                ws = self.store._default_workspace(self.project_id)
+                self.root = Path(ws) if ws else None
+            except Exception:  # noqa: BLE001
+                self.root = None
+        return self.root
+
+    def _touches_project(self, name: str, kwargs: Dict[str, Any], op: str) -> bool:
+        """§4UY P6: the call runs (or looks at) this project's own code — `run_touches_project`."""
+        return run_touches_project(name, kwargs, op, self._root(), self.project_id, known=self.files)
+
     @property
     def verified(self) -> bool:
-        """A program ran after the last write."""
+        """A run of the project's code that succeeded, after the last write."""
         return self.last_check > self.last_write
 
     def _own(self, tid: str) -> bool:
@@ -902,7 +1162,7 @@ async def run_task_turn_for_advance(context, store, project_id: str, nxt, classi
                                     started_at: Optional[float] = None):
     """Run task ``nxt`` (claimed IN_PROGRESS by the advancer) as one agent
     turn. Returns an `AdvanceResult`, or None when the turn could not be
-    built at all (the caller falls back to the old executor and logs it)."""
+    built at all (§4UY C18: the caller gives the task back to the queue)."""
     from .coding_loop import run_leaf_turn
     from .planning import ProjectPlan, TaskStatus
     from .project_advancer import (AdvanceResult, MODEL_SERVER_FAILED_PREFIX, OUT_OF_TIME_PREFIX, _HELD_MARK,
@@ -946,8 +1206,11 @@ async def run_task_turn_for_advance(context, store, project_id: str, nxt, classi
         if outer:
             from ..memory.projects import set_request_parent
             set_request_parent(rid, outer)
-    except Exception as e:  # noqa: BLE001 — nothing ran: the old path takes the task
-        logger.warning("task turn not built for %s (%s: %s) — the build executor runs it", tid,
+            # §4UY P3: the turn's coding progress is the batch request's progress too (its deadline extends)
+            from ..utils.logging import set_progress_parent
+            set_progress_parent(rid, outer)
+    except Exception as e:  # noqa: BLE001 — nothing ran: the caller reopens the task
+        logger.warning("task turn not built for %s (%s: %s) — the task goes back to the queue", tid,
                        type(e).__name__, e)
         return None
     pretty_log("Task Turn", f"{origin} · {str(tid)[:8]} · {classification} · "
@@ -1170,6 +1433,16 @@ async def run_task_turn_for_advance(context, store, project_id: str, nxt, classi
             _work_log_step(store, project_id, nxt, outcome="held", note="ran as an agent turn; " + _why)
             _event("held", {"hold": "kept_lab"})
             return AdvanceResult(True, tid, "needs_user", _why)
+        if status == "IN_PROGRESS" and not unattended:
+            # §4UY P15: the OWNER's run that ends with its task open has not failed it — FAILED rolled the whole
+            # project up FAILED over a turn that simply stopped. The task goes back (PENDING, or the hold it was
+            # claimed from) with what the turn said; the batch stops on it (`TASK_TURN_UNCLOSED_PREFIX`)
+            _why = f"the task's turn ended without closing it: {head or '(no reply)'}"
+            _back = _release(_why[:500]) or "PENDING"
+            _work_log_step(store, project_id, nxt, outcome="reopened", note=_why[:300])
+            _event("unclosed", {"reopened": _back})
+            return AdvanceResult(True, tid, "blocked", f"{TASK_TURN_UNCLOSED_PREFIX} on '{tid}' — task back to "
+                                                       f"{_back}: {head[:200] or '(no reply)'}")
         if status == "IN_PROGRESS":
             _why = f"the task's turn ended without closing it: {head or '(no reply)'}"
             plan.update_status(tid, TaskStatus.FAILED, failure_reason=_why[:500])

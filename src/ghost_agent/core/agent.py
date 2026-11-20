@@ -53,6 +53,7 @@ from ..utils import logging as _glog
 from ..utils.tool_stop import uncut_note as _uncut_note  # §4RZ step 5 (s5-r12)
 from ..utils.tool_stop import is_user_interrupted as _s5_is_intr  # §4RZ step 5
 from ..tools.outcome import with_text as _s5_with_text  # §4RZ step 5 (s5-r13)
+from ..tools.fs_ops import FS_MUTATING_OPS as _FS_MUTATING_OPS  # §4UY r2 m1: the ONE mutating-op list
 from . import effort as _effort
 from . import head_saves as _head_saves
 from .isolation import is_simulated_context   # §4TD: THE marker of a simulated context (was skill_memory.is_read_only)
@@ -1801,7 +1802,39 @@ def _latch_forces_final(task_closed_this_req: bool,
 _SELF_REPORT_TOOLS = frozenset({"introspect"})   # §4TB: `self_state` removed; §4TD: `list_lessons` removed
 
 
-def _should_await_repair_verdict(budget: float, lt, unverified: bool) -> bool:
+#: §4UY image-2 (review r2 #2): every override arm of `_compute_verifier_verdict`,
+#: classified for the loop-exit wait gate. The arms whose refute is repaired
+#: inside the turn and that are cheap and pure run AT the gate on an image-only
+#: turn (`GhostAgent._repairable_refutes`, keyed by these names); the others say
+#: why they are not asked there. A new arm must be added to one of the two
+#: (tests/test_4uy_image.py walks the verdict's arms).
+IN_TURN_REPAIRABLE_ARMS = ("reply-shape", "turn-state", "file-artifact")
+NOT_ASKED_AT_THE_IMAGE_GATE = {
+    "visual": "the pixel check: its refute is repaired after the reply (§4OX r1)",
+    "image-unseen": "the pixel check's no-look form: after the reply, as above",
+    "memory-claim": "tool-free turns only — an image turn has a tool",
+    "web-exec": "needs web artifacts written this turn — an image-only turn writes none",
+}
+
+
+def _only_unrepairable_checks_armed(tools_run, pure_refutes=()) -> bool:
+    """§4UY image-2: True when the in-turn verdict can repair nothing — the LLM
+    judge is off, every real call of the turn rendered an image (so the only
+    EVIDENCE arm is the pixel check, whose refute is never repaired inside the
+    turn: §4OX r1, a re-render is minutes) AND the in-turn-repairable arms the
+    gate already ran (`pure_refutes`: `IN_TURN_REPAIRABLE_ARMS` — "draw a cat …
+    describe it in one sentence", a claimed file left empty) found nothing. Live 76e8b1d0
+    waited for the pixel check before the reply all the same."""
+    if verifier_judge_enabled():
+        return False
+    if any(r is not None for r in (pure_refutes or ())):
+        return False
+    real = [t for t in (tools_run or []) if isinstance(t, dict) and not t.get("_synthetic")]
+    return bool(real) and all(str(t.get("name") or "").strip() == "image_generation" for t in real)
+
+
+def _should_await_repair_verdict(budget: float, lt, unverified: bool, *, tools_run=None,
+                                 pure_refutes=()) -> bool:
     """Loop-exit gate: is the bounded in-loop verdict await worth blocking
     the reply for? Extracted pure so the §4BC exclusion is unit-testable.
 
@@ -1823,6 +1856,8 @@ def _should_await_repair_verdict(budget: float, lt, unverified: bool) -> bool:
     unchanged."""
     if not (budget > 0 and lt is not None and not unverified):
         return False
+    if tools_run is not None and _only_unrepairable_checks_armed(tools_run, pure_refutes):
+        return False                                   # §4UY image-2
     # §4LE: a SELF-REPORT (the agent describing its own state) has no outside
     # evidence to repair it from — "good morning ghost" waited 35 s of 60 on
     # this verdict; it still lands through the deferred/late path
@@ -4516,6 +4551,8 @@ _FS_WROTE_PAIR_RE = re.compile(
     r"Script-side path \(from sandbox cwd\): '(.+?)'\.")
 _FS_PRODUCE_RES = (
     re.compile(r"^SUCCESS: (?:Wrote|Appended) \d+ chars to '(.+?)'\."),
+    # §4UY C21: `restore` puts a kept version back — a whole-file write of that path
+    re.compile(r"^SUCCESS: Restored '(.+?)' — "),
     # §4SH: an empty last part finishing a file written in parts
     re.compile(r"^SUCCESS: Finished '(.+?)' — written in parts, nothing added now;"),
     # §4KC operation='edit' — path LAST and end-anchored, so a filename
@@ -6836,8 +6873,6 @@ def failure_preview(body: str, limit: int = 200) -> str:
 #: what fails, and what would unblock it. A blocker report is a
 #: deliverable; narration is not.
 EDIT_CHURN_REPORT_AFTER_STEERS = _EDIT_CHURN_MAX_STEERS if "_EDIT_CHURN_MAX_STEERS" in globals() else 2
-FUTILITY_REPORT_WRITES = 6
-FUTILITY_REPORT_RUNS = 4
 #: The last turn of the budget is reserved for the report from this many
 #: turns in (a two-turn request should not lose half its budget to it).
 REPORT_TURN_MIN_TURN = 3
@@ -7353,9 +7388,11 @@ _FUTILITY_NAME_RE = re.compile(r"[\w.\-]+\.(?:py|sh|js|mjs|ts)\b", re.I)
 
 
 def futility_key(name) -> str:
-    """The key one code file is counted under by the futility breaker: its
-    basename, lower-cased, with a trailing run of digits/underscores/dashes
-    stripped from the stem. §4IG: probe6.py … probe19.py (14 files, one
+    """The key one code file is counted under in the per-request write/run
+    counters (`_script_iter` — read by the §4RA progress earn and the §4RB
+    stuck reading; §4UY C5: the futility breaker that once read them is
+    gone): its basename, lower-cased, with a trailing run of
+    digits/underscores/dashes stripped from the stem. §4IG: probe6.py … probe19.py (14 files, one
     dead end) and oxford_grid2.py are the same script being rewritten under
     a new name; keyed literally they never reached the 3-write floor."""
     bn = str(name or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
@@ -7428,7 +7465,7 @@ _RUN_TIMING_RE = re.compile(r"\bin \d+(?:\.\d+)?s\b|\b\d+(?:\.\d+)?\s*(?:ms|s|se
 
 
 def note_run_outcome(rec: dict, *, ok: bool, output: str = "") -> None:
-    """§4OE-2: the futility counters learn whether the run made PROGRESS —
+    """§4OE-2: the per-file counters (`_script_iter`) learn whether the run made PROGRESS —
     the breaker measured churn only (6 edits + 4 runs → forced report even
     when every run passed more tests, §4OD). With test counts in the output
     (review 4): progress = the failing count fell or the passing count rose
@@ -7485,21 +7522,6 @@ def note_run_outcome(rec: dict, *, ok: bool, output: str = "") -> None:
         rec["fails"] = fails
     if passed is not None:
         rec["passed"] = passed
-
-
-def futility_tier(script_iter: dict, steer_done: bool, report_done: bool):
-    """Which futility tier fires for the rewrite/rerun counters, if any:
-    ("steer", name, rec) on the 3rd rewrite + 2nd rerun of one code file
-    (once), else ("", None, None). §4UI removed the forced "report" tier.
-    Pure."""
-    items = list((script_iter or {}).items())
-    # (§4UI: no "report" tier — the steer is advice once; the model decides
-    # when to stop. `report_done` is accepted and ignored.)
-    if not steer_done:
-        for bn, rec in items:
-            if rec.get("writes", 0) >= 3 and rec.get("runs", 0) >= 2 and not rec.get("progress"):
-                return ("steer", bn, rec)          # §4OG-1 (a): a converging loop is not steered (reader M3)
-    return ("", None, None)
 
 
 def thinking_disabled(payload: Any) -> bool:
@@ -8361,6 +8383,22 @@ def _find_unquoted(text: str, marker: str) -> int:
     return i
 
 
+def _scrub_turn_reply(ui_content: str) -> str:
+    """The per-generation cleanup of the text a turn shows (`_run_internal_turn`).
+
+    1. prompt bleed — the shared strong/weak helper (§ R1 A-F3), same rules as the finalize twin;
+    2. tool-response and execution-result artifacts;
+    3. leaked prompt labels (FOCUS TASK:, PLAN:, THOUGHT:) — the label only, never the line.
+    §4VC: NO task-tree scrub. This is where the live 11-20 loss happened: the owner asked for
+    `manage_projects get`'s task tree, the status-run scrub here deleted all three task lines and the owner
+    got an empty code fence. The internal plan those scrubs guarded against is in no prompt any more."""
+    ui_content = _truncate_prompt_bleed(ui_content)
+    ui_content = re.sub(r'<tool_response>.*?(?:</tool_response>|$)', '', ui_content, flags=re.DOTALL | re.IGNORECASE)
+    ui_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', ui_content, flags=re.DOTALL)
+    ui_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', ui_content)
+    return ui_content.strip()
+
+
 def _truncate_prompt_bleed(text: str) -> str:
     if not text:
         return text
@@ -8380,56 +8418,11 @@ def _truncate_prompt_bleed(text: str) -> str:
     return text
 
 
-# A line ending in a task-status suffix. Stripped only in RUNS of >=3
-# consecutive matching lines — that shape is a regurgitated task TREE, while
-# one or two isolated lines ("- Ship the report (PENDING)") are legitimate
-# content in a task-status answer, the exact format the agent's own task
-# tooling teaches (§ finalize/stream R1 A-F3: the old unconditional line
-# scrub deleted them, unlogged, on every non-streamed turn).
-_TASK_STATUS_LINE_RE = re.compile(
-    r'^.*?\((?:IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\)\s*$')
-
-
 # § R3 B-D3: fence markers, BOTH dialects (``` and ~~~), line-anchored — the
 # R2 fence walk counted bare "```" substrings, so tilde fences were invisible
 # (a correction landed inside a ~~~markdown block) and inline ``` mentions
 # miscounted.
 _FENCE_MARK_RE = re.compile(r'(?m)^\s*(?:`{3,}|~{3,})')
-
-
-# § R3 B-D2: the bracket arm requires task-ish interiors — a bare `^\s*\[`
-# counted a markdown-link lead ("[README](docs/…) refreshed (DONE)") as
-# task-shaped.
-_TASK_SHAPE_RE = re.compile(
-    r'task_\d+|^\s*(?:🔄|🟢|⏳|✅|❌|🛑|➖)'
-    r'|^\s*\[(?:task_\d+|IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\b')
-
-
-def _scrub_task_status_runs(text: str) -> str:
-    if not text or "(" not in text:
-        return text
-    lines = text.split("\n")
-    flags = [bool(_TASK_STATUS_LINE_RE.match(l)) for l in lines]
-    out: list = []
-    i, n = 0, len(lines)
-    while i < n:
-        if flags[i]:
-            j = i
-            while j < n and flags[j]:
-                j += 1
-            # § R2 M-4 + R3 B-D2: a run is stripped only when it is long
-            # (>=3) AND MAJORITY task-shaped. `any()` let one task_NN id
-            # mentioned in PROSE ("Fix the task_7 regression") poison a
-            # legitimate workstream answer wholesale; a real regurgitated
-            # tree carries its markers on (essentially) every line.
-            _shaped = sum(1 for l in lines[i:j] if _TASK_SHAPE_RE.search(l))
-            if j - i < 3 or _shaped * 2 < (j - i):
-                out.extend(lines[i:j])
-            i = j
-        else:
-            out.append(lines[i])
-            i += 1
-    return "\n".join(out)
 
 
 # Streaming sanity guards live in core/stream_guards.py (the guard-module seam,
@@ -11416,7 +11409,7 @@ def _owned_look_rows(tools_run_this_turn) -> List[tuple]:
 def _owned_line_re(line: str):
     """The system's line as a line of its own (r1 M2: a model sentence that
     merely STARTS with the label and the look is the model's)."""
-    return re.compile(r"(?:^|\n)" + re.escape(line) + r"[ \t]*(?=\n|$)")
+    return re.compile(r"(?:^|\n)" + re.escape(line) + r"[ \t\r]*(?=\n|$)")    # \r: a CRLF reply (review r3 #2)
 
 
 def _without_owned_look_lines(text, tools_run_this_turn):
@@ -11440,28 +11433,247 @@ def _without_owned_look_lines(text, tools_run_this_turn):
         return text
 
 
-def _owned_look_note(text, tools_run_this_turn) -> str:
-    """§4QX: the look line the SYSTEM shows under a picture — for each image
-    this request generated whose tool result told the model "the SYSTEM shows
-    the user that line itself" (`LOOK_OWNED_NOTE`, directly after the look
-    line), whose picture the reply SHOWS, and whose line the reply does not
-    already carry: "\n\nWhat the picture shows: <the look>". Else "".
-    The model was told not to describe the picture (61 of 131 replies that
-    had the look copied the request into it); the line is the vision model's
-    own sentence, one line (scene_look collapses whitespace), so nothing
-    after it in the tool result can be spelt by the picture. Never raises."""
+#: §4UY image-1 (review M2): a picture in markdown — the look line goes under
+#: THIS, never under a plain link or a bare path to the same file
+_IMAGE_MD_LINK_RE = re.compile(r"!\[[^\]\n]*\]\(\s*/api/download/([^)\s\"'>]+)\s*\)")
+#: a blank line
+_BLANK_LINE_RE = re.compile(r"\r?\n[ \t\r]*\n")
+#: what ends a markdown block (review r2 #3): a blank line, or the newline before
+#: a line that opens a fence, a heading or a list item — each decided by the
+#: line's first few characters, so a streamed prefix decides it as the whole
+#: reply does (`LookPlacer.hold` keeps back a last line that may still become one)
+_BLOCK_END_RE = re.compile(
+    r"\r?\n(?:[ \t\r]*\n|(?=[ \t]{0,3}(?:#{1,6}[ \t]|```|~~~)|[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]))")
+#: a last line that may still become a block opener once more of it arrives
+_MAYBE_OPENER_RE = re.compile(r"[ \t\r]*(?:#{0,6}|[-*+]|\d{1,9}[.)]?|`{1,2}|~{1,2})")
+_FENCE_LINE_RE = re.compile(r"^[ \t]{0,3}(?:```|~~~)", re.M)
+_TABLE_RULE_RE = re.compile(r"^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)+\|?[ \t]*$", re.M)
+
+
+def _in_markdown_structure(body: str, start: int) -> bool:
+    """Whether the link at ``start`` sits inside a code fence, a table or a
+    blockquote — a line inserted after its block would break that structure.
+    Read from the text before the link and the link's own line."""
+    ls = body.rfind("\n", 0, start) + 1
+    le = body.find("\n", start)
+    own = body[ls:(le if le >= 0 else len(body))]
+    head = own.lstrip()
+    if head.startswith(">"):
+        return True
+    if len(_FENCE_LINE_RE.findall(body, 0, ls)) % 2:
+        return True
+    if "|" in own:
+        # a pipe-less table: its rule line is in the block above, or right under a header row
+        blk = _BLANK_LINE_RE.split(body[:ls])[-1]
+        nxt = body[le + 1:].split("\n", 1)[0] if le >= 0 else ""
+        if _TABLE_RULE_RE.search(blk) or _TABLE_RULE_RE.search(nxt):
+            return True
+    return False
+
+
+def _call_spans(body: str) -> List[tuple]:
+    """(start, end) of every tool-call / tool-response region of ``body``
+    (`_MODULE_SCRUB_RE`; an unclosed one runs to the end). A look line is never
+    placed inside one, nor across one (review r2 #1: a line inside a write
+    call's content was written to the file)."""
+    try:
+        # an unclosed region holds the end of the text too
+        return [(m.start(), m.end() + (1 if m.group("eof") is not None else 0))
+                for m in _MODULE_SCRUB_RE.finditer(body)]
+    except Exception:  # noqa: BLE001
+        return [(0, len(body))]
+
+
+def _look_anchors(body: str, rows):
+    """{line: ("block", match) | ("end", None)} — where each owned look line of
+    a picture ``body`` shows belongs: under the FIRST markdown picture of it
+    that is not inside a fence, table or blockquote; at the reply's end when
+    every picture of it is inside one, or the reply only links/names the file."""
+    pics: dict = {}
+    for m in _IMAGE_MD_LINK_RE.finditer(body):
+        pics.setdefault(os.path.basename(m.group(1).split("?", 1)[0]), []).append(m)
+    linked = {os.path.basename(m.group(2).split("?", 1)[0]) for m in _DOWNLOAD_LINK_RE.finditer(body)}
+    out: dict = {}
+    calls = _call_spans(body)
+
+    def _ok(m) -> bool:
+        le = body.find("\n", m.end())
+        rest = body[m.end():(le if le >= 0 else len(body))]
+        return (not _in_markdown_structure(body, m.start())
+                and "```" not in rest and "~~~" not in rest          # the picture's line opens a fence
+                and not any(a <= m.start() < b for a, b in calls))
+    for names, line in (rows or []):
+        if line in out or not any(n in linked for n in names):
+            continue
+        clean = sorted((m for n in names for m in pics.get(n, []) if _ok(m)), key=lambda m: m.start())
+        out[line] = ("block", clean[0]) if clean else ("end", None)
+    return out
+
+
+def owned_look_insertions(text, rows, *, final: bool = True) -> List[tuple]:
+    """§4QX / §4UY image-1: THE placement rule of the look line the SYSTEM shows
+    under a picture — (position, inserted text, line) for each owned row
+    (`_owned_look_rows`) whose picture ``text`` shows and whose line ``text``
+    does not already carry, sorted by position (row order on a tie).
+
+    The line goes under the picture: at the END of the markdown block holding
+    the picture's first markdown image (`![…](…)`, before any plain link or
+    path to the file) — just before the blank line that ends that block, as
+    "\\n\\n<line>", so the blank line follows it: "<pic>\\n<caption>\\n\\n<rest>"
+    reads "<pic>\\n<caption>\\n\\n<line>\\n\\n<rest>". A block the reply ends on,
+    a picture inside a code fence, a table or a blockquote (a line there would
+    break it, review M2), or a file only linked or named, puts the line at the
+    reply's end — only when ``final`` (the whole reply). A streamed prefix
+    (``final=False``) places a line only once its block's blank line has
+    arrived, so the insertions of a prefix are insertions of the whole reply at
+    the same places: what a stream sent is what the finalized reply carries
+    (the tool tells the model "The SYSTEM shows the user that line itself,
+    directly under the picture"; live 76e8b1d0 it arrived 54 s later at the
+    reply's end). The line is the vision model's own sentence, one line
+    (scene_look collapses whitespace). Never raises."""
     try:
         body = str(text or "")
-        shown = {os.path.basename(m.group(2).split("?", 1)[0]) for m in _DOWNLOAD_LINK_RE.finditer(body)}
-        out: List[str] = []
-        for names, line in _owned_look_rows(tools_run_this_turn):
-            if not any(n in shown for n in names):
-                continue
+        out: List[tuple] = []
+        tail = len(body.rstrip(" \t\r\n"))
+        calls = _call_spans(body)
+
+        def _crosses(a: int, b: int) -> bool:          # a call region meets [a, b] (a point when a == b)
+            return any(s < b and a < e for s, e in calls) or any(s <= b < e for s, e in calls)
+        for line, (kind, m) in _look_anchors(body, rows).items():
             # already carried = the exact line as a line of its own (a retry, the census re-read)
-            if line in out or _owned_line_re(line).search(body):
+            if _owned_line_re(line).search(body):
                 continue
-            out.append(line)
-        return "".join("\n\n" + ln for ln in out)
+            be = _BLOCK_END_RE.search(body, m.end()) if kind == "block" else None
+            # tie rank (review r3 #4): on one position the lines under a picture come
+            # first, by the picture's position — a stream sends those as their blocks
+            # end, before the reply's end where the file-only lines go
+            rank = (0, m.start()) if kind == "block" else (1, 0)
+            if be is not None and not _crosses(m.end(), be.start()):
+                # a blank line follows the line: the one that ended the block, or one added before an opener
+                out.append((be.start(), rank, "\n\n" + line + ("" if be.group().count("\n") > 1 else "\n"), line))
+            elif final and not _crosses(tail, tail):
+                out.append((tail, rank, "\n\n" + line, line))
+        # a block line placed inside the trailing whitespace ("pic \n\n": after the
+        # space) — the reply-end lines go there too, after it, never before it
+        late = max([p for p, rk, _i, _l in out if rk[0] == 0 and p > tail], default=tail)
+        out = [((late if (rk[0] == 1 and p == tail) else p), rk, i, l) for p, rk, i, l in out]
+        out.sort(key=lambda r: (r[0], r[1]))   # stable: row order among equals
+        return [(pos, ins, line) for pos, _rank, ins, line in out]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def place_owned_looks(text, rows, *, final: bool = True) -> str:
+    """``text`` with every owned look line placed by `owned_look_insertions`
+    (the finalized reply, the census's delivered reply; ``final=False``: a
+    prefix, as a stream sends it). Never raises."""
+    try:
+        body = str(text or "")
+        ins = owned_look_insertions(body, rows, final=final)
+        if not ins:
+            return text if isinstance(text, str) else body
+        parts, at = [], 0
+        for pos, piece, _line in ins:
+            parts.append(body[at:pos])
+            parts.append(piece)
+            at = pos
+        parts.append(body[at:])
+        return "".join(parts)
+    except Exception:  # noqa: BLE001
+        return text if isinstance(text, str) else str(text or "")
+
+
+#: the notes the forced-final stream appends AFTER its view, in their order —
+#: the client got the view (look lines placed) and THEN these
+STREAM_POST_VIEW_NOTES = ("_miss_note", "_up_note", "_cite_note", "_src_note", "_fi_note",
+                          "_img_note_s", "_ol_note_s", "_tp_note_s", "_um_note_s")
+
+
+def place_owned_looks_before_notes(text, rows, notes) -> str:
+    """``text`` (a view the stream's post-view ``notes`` were appended to, in
+    their order) as the client got it: the look lines placed on the view, the
+    notes after them (seam review: a reply-end line placed on text with the
+    Sources list went AFTER it; the client got it before). Notes are peeled off
+    the end last-first; one that is not a suffix was not appended. Never raises."""
+    try:
+        body, tail = str(text or ""), ""
+        for note in reversed([n for n in (notes or ()) if isinstance(n, str) and n]):
+            if body.endswith(note):
+                body, tail = body[:-len(note)], note + tail
+        return place_owned_looks(body, rows) + tail
+    except Exception:  # noqa: BLE001
+        return place_owned_looks(text, rows)
+
+
+def _place_owned_look_lines(text, tools_run_this_turn) -> str:
+    """`place_owned_looks` over the rows of ``tools_run_this_turn``."""
+    return place_owned_looks(text, _owned_look_rows(tools_run_this_turn))
+
+
+class LookPlacer:
+    """§4UY image-1: a stream's side of the placement rule. ``take(text, start,
+    end)`` returns ``text[start:end]`` with the look lines whose place (an
+    ended picture block, `owned_look_insertions(final=False)`) falls inside it,
+    each once; the stream sends that, so its prefix equals the finalized
+    reply's. ``placed`` holds the lines already sent. ``text`` is the
+    generation's own text (no lines inserted). Never raises."""
+
+    def __init__(self, rows):
+        self.rows = list(rows or [])
+        self.placed: List[str] = []
+
+    def hold(self, text, start: int, end: int) -> int:
+        """How far the stream may send now (``end`` or less, never below
+        ``start``): while a picture's block has not ended, the whitespace
+        after its text is held — the line goes just before the blank line,
+        and a blank line is known only once the text after it arrives — and
+        so is a last line that may still open a fence, a heading or a list
+        item (with the newline before it: the line goes there)."""
+        if not self.rows:
+            return end
+        try:
+            body = str(text or "")[:end]
+            for line, (kind, m) in _look_anchors(body, self.rows).items():
+                if (kind == "block" and line not in self.placed
+                        and not _owned_line_re(line).search(body)
+                        and _BLOCK_END_RE.search(body, m.end()) is None):
+                    cut = len(body.rstrip(" \t\r\n"))
+                    nl = body.rfind("\n", m.end())
+                    if nl >= 0 and _MAYBE_OPENER_RE.fullmatch(body, nl + 1):
+                        cut = min(cut, nl - (1 if nl > 0 and body[nl - 1] == "\r" else 0))
+                    return max(start, min(end, cut))
+            return end
+        except Exception:  # noqa: BLE001
+            return end
+
+    def take(self, text, start: int, end: int, *, final: bool = False) -> str:
+        body = str(text or "")
+        piece = body[start:end]
+        if not self.rows:
+            return piece
+        try:
+            parts, at = [], start
+            for pos, ins, line in owned_look_insertions(body[:end], self.rows, final=final):
+                if line in self.placed or pos < start or pos > end:
+                    continue
+                parts.append(body[at:pos])
+                parts.append(ins)
+                at = pos
+                self.placed.append(line)
+            parts.append(body[at:end])
+            return "".join(parts)
+        except Exception:  # noqa: BLE001
+            return piece
+
+
+def _owned_look_note(text, tools_run_this_turn) -> str:
+    """§4QX: the FALLBACK for text already shown: the owned look lines
+    ``text`` does not carry yet (its picture's link sits in text that went out
+    before the line could), each as "\\n\\n<line>" for the END of the reply.
+    Text not yet shown takes `place_owned_looks` instead. Else "". Never raises."""
+    try:
+        return "".join("\n\n" + line for _pos, _ins, line
+                       in owned_look_insertions(text, _owned_look_rows(tools_run_this_turn)))
     except Exception:  # noqa: BLE001
         return ""
 
@@ -11716,6 +11928,62 @@ _BLIND_REGEN_NOT_RUN = ("SYSTEM BLOCK — BLOCKED: this image_generation call di
                         "nothing new was generated. ")
 
 
+class _BlockText(str):
+    """§4UY image-4: a block message that also says, for the log, WHY it
+    blocked (``why``) — live 76e8b1d0 a second image in the same batch was
+    logged "a generated image from this request was never inspected or shown"."""
+    why: str = ""
+
+    def __new__(cls, text: str, *, why: str = ""):
+        obj = super().__new__(cls, text)
+        obj.why = str(why or "")
+        return obj
+
+
+def order_batch_tool_messages(messages, start: int, tool_calls) -> bool:
+    """§4UY image-4: the tool results of ONE batch enter the conversation in
+    the order of the calls. A call refused at dispatch (a block, a refusal, an
+    unknown tool, a duplicate) had its result appended at once; the calls that
+    ran were appended after the gather — so call B's refusal came BEFORE call
+    A's result, and with no call ids in the chat template the model read them
+    by position (live 76e8b1d0: "the first call was blocked, the second one
+    succeeded" — it was the other way round). ``messages[start:]`` is the
+    batch. Each tool message opens a group that keeps the non-tool messages
+    after it (a steer about that result stays under it); the groups are put
+    in call order (the k-th message with a call id answers the k-th call with
+    that id; an unknown id sorts after the known ones). Messages
+    before the first tool message stay first. Already in order = untouched.
+    Returns whether anything moved. Never raises."""
+    try:
+        tail = list(messages[start:])
+        if not tail:
+            return False
+        slots: dict = {}
+        for i, tc in enumerate(tool_calls or []):
+            slots.setdefault(str((tc or {}).get("id") or ""), []).append(i)
+        used: dict = {}
+        lead: list = []
+        groups: list = []                  # [call index, arrival, [messages]]
+        for m in tail:
+            if isinstance(m, dict) and m.get("role") == "tool":
+                cid = str(m.get("tool_call_id") or "")
+                k = used.get(cid, 0)
+                idx = slots.get(cid, [])
+                used[cid] = k + 1
+                groups.append([idx[k] if k < len(idx) else len(tool_calls or []), len(groups), [m]])
+            elif groups:
+                groups[-1][2].append(m)
+            else:
+                lead.append(m)
+        ordered = sorted(groups, key=lambda g: (g[0], g[1]))
+        if [g[1] for g in ordered] == list(range(len(groups))):
+            return False
+        messages[start:] = lead + [m for g in ordered for m in g[2]]
+        return True
+    except Exception:  # noqa: BLE001 — the order is a courtesy, never the turn
+        return False
+
+
 def _blind_regeneration_block(fname, tools_run_this_turn, messages, user_text,
                               *, repair_active: bool = False, batch_images: int = 0) -> Optional[str]:
     """The SYSTEM BLOCK for a second `image_generation` this request whose
@@ -11731,9 +11999,10 @@ def _blind_regeneration_block(fname, tools_run_this_turn, messages, user_text,
     prior = _turn_generated_images(tools_run_this_turn)
     if batch_images > 0:
         # a second image in the SAME batch is blind, repair or not (R6)
-        return (_BLIND_REGEN_NOT_RUN
-                + "One image per batch: present or inspect the first one before generating "
-                "another; each generation occupies the image node for minutes.")
+        return _BlockText(_BLIND_REGEN_NOT_RUN
+                          + "One image per batch: present or inspect the first one before generating "
+                          "another; each generation occupies the image node for minutes.",
+                          why="a second image in the same batch — one image per batch")
     # §4QP r2 M2 / r3 M1+m3: the tool's own hold ("Do NOT render again" — the
     # collage ladder spent its attempts, had no time for another, or could not
     # render one) is the USER's call: neither a looked-at result nor a verifier
@@ -11752,11 +12021,13 @@ def _blind_regeneration_block(fname, tools_run_this_turn, messages, user_text,
         _hm = re.search(r"^" + re.escape(NO_RERENDER_MARK) + r" ([^\]\n]{1,80})\]$", head_part, re.M)
         if _hm:
             names = [os.path.basename(m.group(1).strip()) for m in _GENERATED_IMAGE_LINE_RE.finditer(body)]
-            return (_BLIND_REGEN_NOT_RUN
-                    + "The earlier call's result says not to render again on your own"
-                    + (f" ({names[-1]} is a two-panel picture: {_hm.group(1)})" if names else f" ({_hm.group(1)})")
-                    + ": present that picture with its markdown line, say plainly it is a two-panel picture, "
-                    "and ask the user whether they want another attempt. Each generation occupies the image node for minutes.")
+            return _BlockText(
+                _BLIND_REGEN_NOT_RUN
+                + "The earlier call's result says not to render again on your own"
+                + (f" ({names[-1]} is a two-panel picture: {_hm.group(1)})" if names else f" ({_hm.group(1)})")
+                + ": present that picture with its markdown line, say plainly it is a two-panel picture, "
+                "and ask the user whether they want another attempt. Each generation occupies the image node for minutes.",
+                why="the earlier render's result says not to render again — the user's call")
         break                                            # only the NEWEST render's note counts
     if repair_active:
         return None
@@ -11770,7 +12041,7 @@ def _blind_regeneration_block(fname, tools_run_this_turn, messages, user_text,
     if newest in inspected:
         return None
     first = newest
-    return (
+    return _BlockText(
         _BLIND_REGEN_NOT_RUN
         + f"The newest image of this request is {first}, from an EARLIER call; this call "
         "made no file — do not look for one. You have not looked at it. Either present it NOW "
@@ -11779,7 +12050,8 @@ def _blind_regeneration_block(fname, tools_run_this_turn, messages, user_text,
         "it shows — you have not seen it), or inspect it first "
         f"— vision_analysis(action='describe_picture', "
         f"target='{first}') — and only then decide whether a second take is needed. "
-        "Each generation occupies the image node for minutes."
+        "Each generation occupies the image node for minutes.",
+        why=f"{first}, generated earlier in this request, was never inspected or shown"
     )
 
 
@@ -12900,7 +13172,7 @@ def _mood_blind_row(m) -> bool:
     return str(getattr(m.get("content"), "reason_code", "") or "") in MOOD_BLIND_REASONS
 
 
-def mood_excuses_failure(text) -> bool:
+def mood_excuses_failure(text, reason_code=None) -> bool:
     """§4TX (review 11-09): a failed call the mood does not count against
     itself — the tool worked and the world said no, or it will say yes on
     the next try: a transient failure (Tor, a timeout, the sandbox briefly
@@ -12922,30 +13194,127 @@ def mood_excuses_failure(text) -> bool:
         if is_program_output(t) and _TEST_RUNNER_RE.search(t):
             # review r2: a test RUN's output (the runner's own summary), not any text saying "2 failed"
             return True
-        return classify_tool_failure(t)[0] == FailureClass.RETRYABLE
+        # §4UY N18: the declared reason first (the call's ToolOutcome, or the reason passed by the caller)
+        _rc = reason_code or getattr(text, "reason_code", None)
+        return classify_tool_failure(t, reason_code=_rc)[0] == FailureClass.RETRYABLE
     except Exception:  # noqa: BLE001 — a mood reading never breaks a turn
         return False
 
 
-def mood_tasks_done(call) -> int:
-    """§4TX: how many project tasks one ``manage_projects`` call closed DONE
-    — its ``closed`` list (a refused close and a re-close of a task already
-    DONE are not in it). Read from the call's FULL result when there is one
-    (review r2: the row's result is cut at 4,000 characters, and a cut JSON
-    counted no task)."""
-    if getattr(call, "name", "") != "manage_projects" or getattr(call, "error", None):
-        return 0
-    args = getattr(call, "arguments", None) or {}
-    if not isinstance(args, dict) or str(args.get("action") or "").strip().lower() != "task_update":
-        return 0
-    try:
-        payload = json.loads(str(getattr(call, "full_result", "") or getattr(call, "result", "") or ""))
-    except (TypeError, ValueError):
-        return 0
+def mood_payload_tasks(payload, action: str = "") -> Tuple[int, int]:
+    """§4UW: ``(tasks closed DONE, tasks left FAILED)`` that one ``manage_projects`` result reports — from the
+    tool's own JSON, never from prose. ``task_update``: its ``closed`` list (a refused close and a re-close of
+    a task already DONE are not in it; it leaves no task FAILED that the mood counts). ``autoadvance``: the
+    batch's ``advanced`` entries by the status the STORE holds for each task after the batch (review 11-18:
+    req a211f0db's task turn built and closed a task in 27 minutes and the mood booked "a turn of 1 tool call
+    went through") — one task counts once, by its last entry. ``action`` "" = tell the two apart by shape
+    (the mid-turn reader has the result only). Anything else: (0, 0). Pure."""
     if not isinstance(payload, dict):
-        return 0
+        return 0, 0
+    act = str(action or "").strip().lower()
+    if act not in ("", "task_update", "autoadvance"):
+        return 0, 0
+    advanced = payload.get("advanced")
+    if act == "autoadvance" or (not act and isinstance(advanced, list) and "stop_reason" in payload):
+        last: Dict[str, str] = {}
+        for i, a in enumerate(advanced if isinstance(advanced, list) else []):
+            if isinstance(a, dict):
+                last[str(a.get("task_id") or f"#{i}")] = str(a.get("status") or "").strip().upper()
+        return (sum(1 for v in last.values() if v == "DONE"), sum(1 for v in last.values() if v == "FAILED"))
     closed = payload.get("closed") or []
-    return len({str(t) for t in closed}) if isinstance(closed, list) else 0
+    return (len({str(t) for t in closed}) if isinstance(closed, list) else 0), 0
+
+
+def _mood_tool_json(text):
+    """§4UW: the JSON object that LEADS a tool row, or None. The loop may append a note after the tool's own
+    result (the open checklist line, a hint) — it is not part of it, and both readers of a task result (the
+    mid-turn marker and the end-of-turn count) must read the same thing (review r1: one took the note for
+    broken JSON, so the reply heard the pride of a task the mood then never booked)."""
+    try:
+        return json.JSONDecoder().raw_decode(str(text or "").lstrip())[0]
+    except (TypeError, ValueError):
+        return None
+
+
+def _mood_call_tasks(call) -> Tuple[int, int]:
+    """``mood_payload_tasks`` for one reconstructed tool call. Read from the call's FULL result when there is
+    one (§4TX review r2: the row's result is cut at 4,000 characters, and a cut JSON counted no task). A
+    ``task_update`` that failed closed nothing; an ``autoadvance`` that stopped on a failure is PARTIAL — its
+    row carries an error AND the tasks it did close."""
+    if getattr(call, "name", "") != "manage_projects":
+        return 0, 0
+    args = getattr(call, "arguments", None) or {}
+    act = str(args.get("action") or "").strip().lower() if isinstance(args, dict) else ""
+    if act not in ("task_update", "autoadvance") or (act == "task_update" and getattr(call, "error", None)):
+        return 0, 0
+    return mood_payload_tasks(
+        _mood_tool_json(getattr(call, "full_result", "") or getattr(call, "result", "") or ""), act)
+
+
+def mood_tasks_done(call) -> int:
+    """§4TX: how many project tasks one ``manage_projects`` call closed DONE (``mood_payload_tasks``)."""
+    return _mood_call_tasks(call)[0]
+
+
+def mood_tasks_failed(call) -> int:
+    """§4UW: how many project tasks one ``autoadvance`` batch left FAILED (``mood_payload_tasks``)."""
+    return _mood_call_tasks(call)[1]
+
+
+#: §4UW (review r1): the requests whose FINISHED turn the mood has read, and when — a turn recorded as finished
+#: and then cut while its bookkeeping ran (a disconnect after the reply was built) is recorded a second time
+#: as aborted; the mood reads it once. Bounded; in memory.
+_MOOD_TURN_READ: "collections.OrderedDict[str, float]" = collections.OrderedDict()
+
+
+def _mood_turn_already_read(req_id: str, aborted: bool) -> bool:
+    """Is this record a second one of a turn the mood has read? Only an ABORTED record can be (a finished
+    turn is always read: a client may send the same request id again). Notes a finished one."""
+    rid = str(req_id or "")
+    if not rid:
+        return False
+    with _MOOD_MEMO_LOCK:
+        if aborted:
+            return rid in _MOOD_TURN_READ        # (a new request under the same id forgets it on arrival)
+        _MOOD_TURN_READ[rid] = time.monotonic()
+        _MOOD_TURN_READ.move_to_end(rid)
+        while len(_MOOD_TURN_READ) > _MOOD_MEMO_MAX:
+            _MOOD_TURN_READ.popitem(last=False)
+    return False
+
+
+#: §4UW: the requests in which a project task has been closed DONE so far (the tool's own result said so) — the
+#: reply that reports the finished work hears the pride of it (``_mood_shade_block``). Bounded; in memory.
+_MOOD_TASK_DONE_REQ: "collections.OrderedDict[str, int]" = collections.OrderedDict()
+
+
+def mood_note_task_result(req_id: str, tool_name: str, result_text) -> int:
+    """§4UW: note what one tool result of request ``req_id`` says about finished project tasks. Returns how
+    many it closed DONE (0 for any other tool, a result that is not the tool's JSON, or no request).
+    Never raises."""
+    try:
+        rid = str(req_id or "")
+        if not rid or str(tool_name or "").strip() != "manage_projects":
+            return 0
+        text = str(result_text or "")
+        if '"closed"' not in text and '"advanced"' not in text:
+            return 0
+        done = mood_payload_tasks(_mood_tool_json(text))[0]
+        if done > 0:
+            with _MOOD_MEMO_LOCK:
+                _MOOD_TASK_DONE_REQ[rid] = int(_MOOD_TASK_DONE_REQ.get(rid, 0)) + done
+                _MOOD_TASK_DONE_REQ.move_to_end(rid)
+                while len(_MOOD_TASK_DONE_REQ) > _MOOD_MEMO_MAX:
+                    _MOOD_TASK_DONE_REQ.popitem(last=False)
+        return done
+    except Exception:  # noqa: BLE001 — a mood reading never breaks a turn
+        return 0
+
+
+def mood_tasks_done_so_far(req_id: str) -> int:
+    """§4UW: project tasks request ``req_id`` has closed DONE so far (0 = none, or unknown)."""
+    with _MOOD_MEMO_LOCK:
+        return int(_MOOD_TASK_DONE_REQ.get(str(req_id or ""), 0))
 
 
 #: §4TX: per conversation, the mood last heard in it and the request that first heard it — a remark about the
@@ -13169,7 +13538,7 @@ def _self_image_block(context) -> str:
         return ""
 
 
-#: §4UG: per request, the shade line its first step heard (frozen: the same bytes on every step)
+#: §4UG: per request, the shade line it heard (§4UW: once it has heard one, the same bytes on every step)
 _MOOD_SHADE_BY_REQ: "collections.OrderedDict[str, Tuple[str, str, float]]" = collections.OrderedDict()
 
 
@@ -13184,7 +13553,8 @@ def _mood_shade_block(context) -> str:
     """§4UG: the mood's shade (relieved / chastened / proud) as ONE line of the per-turn state block —
     heard by the first reply to the OWNER on a private surface after the shade was set, and by no reply
     after it (``ShadeStore.take``). Not a probe (it would use the moment up), a member, a public channel,
-    a scheduled run, a job or a contained copy. "" otherwise. The same bytes on every step of the request."""
+    a scheduled run, a job or a contained copy. "" otherwise. §4UW: a request that has heard none asks again
+    at every step; once it has heard one, the same bytes to its end."""
     try:
         req_id = str(request_id_context.get() or "")
         if not req_id:
@@ -13202,7 +13572,13 @@ def _mood_shade_block(context) -> str:
                 # AND for the age limit (r2: the stamp stayed at step 1, so the line left a 4-hour request)
                 _MOOD_SHADE_BY_REQ[req_id] = (got[0], got[1], time.monotonic())
                 _MOOD_SHADE_BY_REQ.move_to_end(req_id)
-                return got[0]
+                if got[0]:
+                    return got[0]            # a line once heard is this request's, the same bytes to its end
+        # §4UW (review 11-18: a shade was set at the END of a turn, so the reply that reported the finished
+        # task could not carry it and the next, unrelated one did; and a correction judged while its reply
+        # was being written was heard one reply late): while this request has heard none, every step asks
+        # again — a shade set since the last step (the judge's "chastened"), or the pride of a project
+        # task THIS request has closed (the tool's own result said so, `mood_note_task_result`)
         text = name = ""
         sm = _mood_model(context)
         store = getattr(sm, "shade", None) if sm is not None else None
@@ -13210,6 +13586,9 @@ def _mood_shade_block(context) -> str:
             from ..selfhood import shade as _shade
             name = store.take()
             text = _shade.line(name)
+            if not text and mood_tasks_done_so_far(req_id) > 0 and sm.may_shade_now():
+                name = _shade.PROUD
+                text = _shade.line(name)
             if not text:
                 name = ""
         with _MOOD_MEMO_LOCK:
@@ -15166,9 +15545,8 @@ class GhostAgent:
                         from .coding_executor import build_coding_task as _bct
 
                         async def _aa_build(*a, **kw):
-                            # IDLE build — defer its spec-generation LLM call to
-                            # the background lane so a user who starts typing
-                            # mid-build isn't stuck behind a 8K-token spec call.
+                            # §4UY C18: a marker only — the advancer runs the
+                            # idle task as a background agent turn, never this
                             kw.setdefault("is_background", True)
                             return await _bct(*a, **kw)
 
@@ -19438,22 +19816,16 @@ class GhostAgent:
         # with its additions: raw output asked for excuses a dump; a figure
         # the user wrote is masked in narration (§4JI echo rule), so a reply
         # that only repeats it reads as narration — as for the bare request.
-        _qd = _queued_delivered_any()
         if (verifier is not None
                 and getattr(verifier, "llm_client", None) is not None
                 and final_ai_content
                 and not self._is_strict_trivial_chat(lc)):
-            _ask = (_queued_current_ask(last_user_content or "", added_max=2000)
-                    if _qd else last_user_content)
-            _shape = self._reply_shape_refutation(final_ai_content, _ask,
-                                                  tools_run_this_turn,
-                                                  request_rules=not _qd)
             # §4FY: the turn's own STATE — the current request's mechanical
             # constraints and its retrieval record — under the same guard,
-            # applied the same two ways as the shape check below.
-            _state = self._turn_state_refutation(
-                final_ai_content, _ask, tools_run_this_turn,
-                request_rules=not _qd)
+            # applied the same two ways as the shape check below. §4UY image-2:
+            # one helper, which the loop-exit wait gate also asks.
+            _shape, _state = self._pure_mechanical_refutes(
+                final_ai_content, last_user_content, tools_run_this_turn)
         # Flat early-return (not an `if (verifier is not None and ...)`
         # block) so the post-loop gate stays the single match for the
         # gate-strictness source check — and so a missing verifier /
@@ -20000,90 +20372,11 @@ class GhostAgent:
             # never for a member (§4LH final review, CRIT): a file name in the
             # member's reply was looked up in the OWNER's sandbox, and "claimed
             # but empty" told the member that the owner's file exists
-            if requester_is_member():
-                _claimed, (_mutated, _retired) = [], ([], [])
-            else:
-                _claimed = _claimed_deliverable_files(_claim_src)
-                _mutated, _retired = _fs_path_ledger(tools_run_this_turn)
-            # ⚠ THE LEDGER IS THE ONLY ABSENCE-GRADE EVIDENCE. The hard,
-            # missing-refuting list is built from tool confirmations alone;
-            # prose claims ride the `soft` (emptiness-only) arm alongside the
-            # retired paths. Every attested false FILE-ARTIFACT refute came
-            # from a prose capture on a turn that ran no file tool, while
-            # prose contributed a file the ledger lacked on 7 of 1,855
-            # recorded turns — a trade that buys the whole false-refute class
-            # for almost nothing. Prose keeps its teeth for emptiness: a
-            # claimed file that exists at 0 bytes still refutes. (This also
-            # retires the claim/mutated interleave — with one source for the
-            # hard list there is nothing to interleave.)
-            _seen_keys, _to_check = set(), []
-            for _cand in _mutated:
-                _k = _fs_norm(_cand)
-                if _k not in _seen_keys:
-                    _seen_keys.add(_k)
-                    _to_check.append(_cand)
-            # ⚠ ONE EXCEPTION TO "THE LEDGER IS THE ONLY ABSENCE-GRADE
-            # EVIDENCE" (§4GN, 2026-09-14). The false-refute class above
-            # comes from turns that ran NO file tool — a reply may mention a
-            # file that predates it. A turn whose own note says its
-            # `file_system` call was DROPPED at the finish line is not that
-            # turn: it attempted the write, the write did not run, and a
-            # claim that the file exists is knowably false. Measured on
-            # req da4c17ba: a 24-minute investigation ended "The report is
-            # saved to /workspace/…md", the log said `Dropping 1 tool_call(s)
-            # — final-generation turn (names=['file_system'])`, the sandbox
-            # had no such file, and FILE-ARTIFACT reported "clean … checked
-            # for emptiness only — no files written this turn". Arming the
-            # absence leg here refutes it and hands the repair loop the one
-            # thing the user actually wanted: the file.
-            if _dropped_write_admitted(_claim_src):
-                for _cand in _claimed:
-                    _k = _fs_norm(_cand)
-                    if _k not in _seen_keys:
-                        _seen_keys.add(_k)
-                        _to_check.append(_cand)
-            _to_check = _to_check[:8]
-            # Soft = written-then-removed paths (absence is what "removed"
-            # means, but a re-created-EMPTY one is a real defect) + the
-            # prose claims not already covered by the ledger. Retired first:
-            # they are ledger-grounded and rarer.
-            _soft, _soft_keys = [], set()
-            for _cand in list(_retired) + [c for c in _claimed]:
-                _k = _fs_norm(_cand)
-                if _k in _seen_keys or _k in _soft_keys:
-                    continue
-                _soft_keys.add(_k)
-                _soft.append(_cand)
-            _soft = _soft[:8]
-            if _to_check or _soft:
-                # ⚠ RACE-FREE SCOPING — see _scoped_sandbox_for. All three
-                # ground-truth arms scope through the one spawn-captured id.
-                _host_dir = self._scoped_sandbox_for(project_id)
-                # ⚠ Its SIBLING already un-scopes: `_execute_web_artifact`
-                # uses `sbx.parent.parent if sbx.parent.name == "projects"`
-                # because a turn's writes can land at the sandbox ROOT while
-                # the binding still reads as scoped. Passing it as a FALLBACK
-                # root keeps one verdict, and `_verify_file_artifacts`
-                # refuses a hit under another project so the wider search
-                # cannot certify a namesake.
-                _sbx = Path(str(_host_dir))
-                _extra = ([str(_sbx.parent.parent)]
-                          if _sbx.parent.name == "projects" else [])
-                _rep = {}
-                # removals of the SCOPE project's files within the last 15
-                # minutes (matching _locate_entry_page's recency-gate
-                # precedent) explain a missing written file without implying
-                # failure. Per-project dict, carrying the deleted list —
-                # see workspace_cleanup._mark_removal for the four ways the
-                # single-tuple version failed.
-                _swept = _fresh_removal_marks(self.context)
-                _fa = self._verify_file_artifacts(
-                    _to_check, _host_dir, soft=_soft, extra_roots=_extra,
-                    file_claims=set(_claimed), report=_rep,
-                    alt_spellings=_fs_wrote_pair_alts(tools_run_this_turn),
-                    removable_keys=_keys_removable_after_write(
-                        tools_run_this_turn),
-                    swept_removals=_swept)
+            # §4UY image-2 (review r2 #2): the inputs and the check are ONE
+            # method, which the loop-exit wait gate also runs
+            _ran, _fa, _rep, _to_check, _soft = self._file_artifact_check(
+                _claim_src, tools_run_this_turn, project_id)
+            if _ran:
                 if _rep.get("skipped_removable"):
                     # ⚠ durable, not just a log line: the downgrade decides
                     # verdicts, and a mechanism whose firings live only in a
@@ -24228,6 +24521,7 @@ class GhostAgent:
                     opaque=lambda _n: getattr((self.available_tools or {}).get(_n), "_ghost_opaque", False) is True)
             except Exception:  # noqa: BLE001
                 _batch_writes_ws = True
+            _batch_msg_start = len(messages)    # §4UY image-4: the batch's results go in call order
             for _tc_idx, tool in enumerate(tool_calls):
                 # Strike cap inside the per-tool loop. The outer cap
                 # at the top of the turn loop only runs at turn
@@ -24414,8 +24708,9 @@ class GhostAgent:
                     batch_images=_batch_image_calls)
                 if _br_block:
                     pretty_log("Blind Regeneration",
-                               f"{_cname} blocked — a generated image from this request "
-                               "was never inspected or shown",
+                               f"{_cname} blocked — "
+                               + (getattr(_br_block, "why", "") or "a generated image from this request "
+                                  "was never inspected or shown"),           # §4UY image-4: the actual reason
                                icon=Icons.STOP, level="WARNING")
                     err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname,
                                "content": _TO.rejected(_br_block, reason_code="blind_regeneration")}
@@ -24575,7 +24870,7 @@ class GhostAgent:
                     # test asserts it.
                     is_sandbox_mutation = _cname in ["execute", "image_generation"] or \
                                           (_cname == "lab" and str(t_args.get("action") or "").strip().lower() in _LAB_WS_WRITERS) or \
-                                          (_cname == "file_system" and t_args.get("operation") in ["write", "edit", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"])
+                                          (_cname == "file_system" and str(t_args.get("operation") or "").strip().lower() in _FS_MUTATING_OPS)   # §4UY r2 m1: the one list
 
                     if is_sandbox_mutation:
                         # Invalidate both the legacy global and the
@@ -24652,7 +24947,7 @@ class GhostAgent:
                               (_cname == "lab" and not _lab_is_read_call(t_args)) or \
                               (_cname == "run" and not _run_is_read_call(t_args)) or \
                               (_cname == "introspect" and _introspect_is_write_call(t_args)) or \
-                              (_cname == "file_system" and t_args.get("operation") in ["write", "edit", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"]) or \
+                              (_cname == "file_system" and str(t_args.get("operation") or "").strip().lower() in _FS_MUTATING_OPS) or \
                               (_cname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"]) or \
                               (_cname == "checklist" and str(t_args.get("action") or t_args.get("operation") or "view").strip().lower() != "view")
 
@@ -25389,6 +25684,7 @@ class GhostAgent:
 
                 turn_has_failure = False
                 last_error_res = ""
+                last_error_reason = ""        # §4UY N18: the failing call's declared reason_code
                 last_error_preview = "Unknown Error"
                 # Was the FAILING call a refusal? Captured at the failure
                 # site for the same reason `failed_fname` is: the strike
@@ -25863,6 +26159,7 @@ class GhostAgent:
                     # built 8 tasks"); with the dense model it cut work the
                     # owner had asked for and made it argue the rule (13 of 35
                     # project requests after 10-25).
+                    mood_note_task_result(str(request_id_context.get() or ""), fname, str_res)   # §4UW
                     if (not _proj_task_closed_this_req
                             and _manage_projects_closed_a_task(fname, str_res)):
                         _proj_task_closed_this_req = True
@@ -26120,7 +26417,9 @@ class GhostAgent:
                     # "[FALLBACK HINT for manage_projects]" to a status
                     # payload that merely QUOTED a failed build's banner.
                     from ..tools.tool_failure import exec_exit_code as _exec_exit_code
-                    _hint_code = _exec_exit_code(str_res)
+                    # §4UY C17: another tool's result has a banner only in its head envelope
+                    _hint_code = (_exec_exit_code(str_res) if fname == "execute"
+                                  else (1 if _outcome.exit_code_failed else None))
                     if ((_failure_shaped
                          or (_hint_code is not None and _hint_code != 0))
                             and not _outcome.is_rejection):
@@ -26413,16 +26712,11 @@ class GhostAgent:
                                     )})
                         except Exception:
                             pass
-                    # Edit-run futility breaker (2026-07-18). Every existing
-                    # breaker watches FAILURES or identical observations —
-                    # all-success thrash at the GOAL level was invisible: the
-                    # xrick session rewrote extract_data.py 5x and reran it
-                    # 5x (each run exit 0, counts still wrong) for 33 minutes
-                    # until the thinking-loop guard killed the request. On
-                    # the 3rd rewrite + 2nd rerun of the same code file, one
-                    # strategy-shift steer: record confirmed facts NOW,
-                    # verify a minimal slice, switch approach class. Tracked
-                    # for ALL requests, project-bound or not.
+                    # Per-file write / run counters for this request (`_script_iter`): the §4RA progress
+                    # earn and the §4RB stuck reading below use them. §4UY C5: the futility STEER they once
+                    # fed is gone — an old-model compensation whose one live firing since 11-12 was false
+                    # (an owner build, 11-13: every write part / edit booked as a rewrite, `node --check` as a
+                    # rerun; it told a web-app build to shrink to "one record/sprite/tile").
                     try:
                         _si = getattr(self.context, "_script_iter", None)
                         if isinstance(_si, dict) and fname:
@@ -26458,65 +26752,6 @@ class GhostAgent:
                                         _rec["runs"] += 1
                                         note_run_outcome(_rec, ok=not _res_is_error,
                                                          output=str(locals().get("str_res") or ""))
-                            # NOTE: deliberately does NOT check the risk
-                            # governor's latch. The deference is one-way by
-                            # design — this breaker names the specific file
-                            # being rewritten, so when it trips after a
-                            # generic risk steer it carries NEW information
-                            # and should still fire. The reverse is not true,
-                            # which is why the governor yields to this one.
-                            # §4IC: two tiers, one decision (`futility_tier`)
-                            # — the steer once, then the report once the
-                            # rewrite/rerun cycle went on regardless.
-                            _ft_kind, _bn, _rec = futility_tier(
-                                _si,
-                                getattr(self.context, "_futility_steer_done", False),
-                                getattr(self.context, "_futility_report_done", False))
-                            if _ft_kind == "steer":
-                                if _bn is not None:
-                                    if _rec is not None:
-                                        self.context._futility_steer_done = True
-                                        note_guard_event(self.context, str(getattr(ts, "req_id", "") or ""), "futility")   # §4TC
-                                        pretty_log(
-                                            "Futility Breaker",
-                                            f"'{_bn}' rewritten {_rec['writes']}x and "
-                                            f"rerun {_rec['runs']}x this request without "
-                                            "a declared result — steering strategy shift",
-                                            level="WARNING", icon=Icons.WARN,
-                                        )
-                                        messages.append({"role": "user", "content": (
-                                            f"SYSTEM ALERT (futility breaker): you have "
-                                            f"rewritten '{_bn}' {_rec['writes']} times and "
-                                            f"rerun it {_rec['runs']} times this request "
-                                            "and the goal is still not met. STOP patching "
-                                            "the same approach. Do these IN ORDER:\n"
-                                            "1. RECORD every fact you have CONFIRMED about "
-                                            "the data/format so far (exact structures, "
-                                            "counts, edge cases) in the project ledger "
-                                            "(manage_projects action=ledger) or a notes "
-                                            "file NOW — discoveries must survive this "
-                                            "request.\n"
-                                            "2. SHRINK the problem: make the script "
-                                            "process the SINGLE smallest unit (one "
-                                            "record/sprite/tile), print its parsed output "
-                                            "next to the raw source lines, and verify that "
-                                            "one unit end-to-end before scaling up.\n"
-                                            "3. If the approach CLASS keeps failing (e.g. "
-                                            "regex over nested structures), switch class — "
-                                            "a tokenizer / brace-counting walk / an "
-                                            "existing parser — instead of tuning the old "
-                                            "one.\n"
-                                            "4. If you are guessing an API's spelling "
-                                            "(argument names, spec keys, constructor "
-                                            "forms), STOP guessing: look it up first — "
-                                            "`search` the library's documentation, or "
-                                            "print its help()/docstrings/catalog — and "
-                                            "if the library still will not cooperate, "
-                                            "compute the result another way.\n"
-                                            "If the goal metric has not moved after ONE "
-                                            "more iteration, stop and report exactly what "
-                                            "is known and what is blocked."
-                                        )})
                     except Exception:
                         pass
                     try:
@@ -26571,8 +26806,13 @@ class GhostAgent:
                     # but it is NOT exempt here: the same mood set again with the
                     # same result is the no-progress repeat `self_state set_mood`
                     # was stopped for (alert on the 2nd, stop on the 3rd)
+                    # §4UY C11: a poll of work that is still running (`run collect`/`status` of a live job, a
+                    # promoted command) is UNRESOLVED — no observation of the code at all; booked here it drew
+                    # the change/debug final ("APPLY THE CHANGE … curl the URL"). The STILL RUNNING summary
+                    # below answers it.
                     if (fname and (not is_mutating or fname == "introspect")
-                            and not _res_is_error and not _intr):   # §4RZ step 5: nothing observed
+                            and not _res_is_error and not _intr     # §4RZ step 5: nothing observed
+                            and not _res_unresolved):
                         # threshold=2 (was 3): the SECOND identical
                         # read is already zero-information — nudge
                         # immediately, abort on the third (chess
@@ -26677,6 +26917,7 @@ class GhostAgent:
                         if exit_code_val != 0:
                             turn_has_failure = True
                             last_error_res = str_res
+                            last_error_reason = ""
                             failed_fname = fname
                             # BOTH flags are re-derived here — resetting only
                             # one left `failure_was_partial` stale from an
@@ -26853,6 +27094,7 @@ class GhostAgent:
                         # site it was made for.
                         turn_has_failure = True
                         last_error_res = str_res
+                        last_error_reason = str(getattr(_outcome, "reason_code", "") or "")   # §4UY N18
                         failed_fname = fname
                         failure_was_rejection = _outcome.is_rejection
                         failure_was_wall = _is_wall(_outcome)
@@ -26883,6 +27125,10 @@ class GhostAgent:
 
                 # (Metacog per-tool outcomes are now recorded inside
                 # the enumerate(results) loop above, keyed per result.)
+
+                # §4UY image-4: a call refused at dispatch was appended before the
+                # gathered results — every result now stands in call order
+                order_batch_tool_messages(messages, _batch_msg_start, tool_calls)
 
                 # §4JJ search-yield steer (the `search_yield_steer` arm was
                 # concluded, §4LF; since §4MO everyone is steered). Req e69cab30: 36 searches, none opened, nothing
@@ -27240,7 +27486,8 @@ class GhostAgent:
                     # containing it — and the argument-error split
                     # could not see what it was splitting on.
                     failure_text = last_error_res or last_error_preview
-                    failure_class, failure_match = classify_tool_failure(failure_text)
+                    failure_class, failure_match = classify_tool_failure(
+                        failure_text, reason_code=(last_error_reason if last_error_res else None))   # §4UY N18
                     # Capture the failure head for harness-dimension
                     # attribution at finalize time (bounded: 6 per turn).
                     _ftexts = getattr(self.context, "_turn_failure_texts", None)
@@ -27275,7 +27522,7 @@ class GhostAgent:
                         # ended a test-driven turn after 6–8 iterations. Only a
                         # failure whose output CHANGED is free: the same output
                         # again (nothing moved) still strikes, and the
-                        # no-progress breaker and futility steer still watch.
+                        # no-progress breaker still watches (§4UY C5: no futility steer).
                         pretty_log("Program Fail", f"{_fail_fname}: a fix-and-retry step (not a strike) -> "
                                    f"{last_error_preview[:120]}", icon=Icons.WARN, level="INFO")
                         diagnostic_msg = format_failure_context(failure_text, failure_class)
@@ -27964,9 +28211,14 @@ class GhostAgent:
         )
         final_ai_content = re.sub(r'<tool_response.*?>.*?(?:</tool_response.*?>|\Z)', '', final_ai_content, flags=re.DOTALL | re.IGNORECASE)
         final_ai_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', final_ai_content, flags=re.DOTALL)
-        final_ai_content = re.sub(r'(?m)^\s*(?:🔄|🟢|⏳|✅|❌|🛑|➖)\s*\[.*?\].*?\n?', '', final_ai_content)
-        final_ai_content = _scrub_task_status_runs(final_ai_content)  # § R1 A-F3
-        final_ai_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', final_ai_content)
+        # §4VC: the task-tree scrubs are GONE (both sites). They guarded against the model copying the
+        # agent's internal plan ("ACTIVE STRATEGY & PLAN") into its reply; no prompt carries that plan any
+        # more — the only rendered task tree is `manage_projects get`'s, the owner's own project — and they
+        # mangled what the owner asked to see: here the emoji rule cut the "⏳ [id]" off each task line and
+        # "✅ [README](docs/README.md) updated" lost its link text, an unanchored `task_\d+` cut the front off
+        # scheduled-task ids, and the twin in `_scrub_turn_reply` deleted a 3-task tree outright (11-20: the
+        # owner got an EMPTY code fence). Only the label strips below remain. The project BRIEFING still puts
+        # the owner's own task ids and statuses in the owner's prompt — showing them to the owner is fine.
         final_ai_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', final_ai_content)
         # Strip leaked Qwen Generative-Reward-Model JSON. These keys
         # are not produced anywhere in Ghost — verified via grep,
@@ -28200,10 +28452,11 @@ class GhostAgent:
             pretty_log("Unshown Image", "the reply showed no generated image — appended the last one",
                        icon=Icons.IMAGE_GEN)
         # §4QX: the system shows what the picture shows (after the unshown-image
-        # link, which decides which picture is shown)
-        _ol_note = _owned_look_note(final_ai_content, tools_run_this_turn)
-        if _ol_note:
-            final_ai_content = (final_ai_content or "").rstrip() + _ol_note
+        # link, which decides which picture is shown) — §4UY image-1: DIRECTLY
+        # under the picture's link, the one rule a streamed reply placed it by
+        _ol_placed = _place_owned_look_lines(final_ai_content, tools_run_this_turn)
+        if _ol_placed != (final_ai_content or ""):
+            final_ai_content = _ol_placed
             pretty_log("Unshown Image", "the system showed the look line under the picture",
                        icon=Icons.IMAGE_GEN)
         # §4QG (493f8587): the tool knew the picture was two panels; the
@@ -28700,6 +28953,15 @@ class GhostAgent:
                             )
         except Exception as e:
             logger.debug(f"Verifier gate skipped: {e}")
+        try:                                       # §4UY N7: the sources, by the code — AFTER the verifier
+            from .link_grounding import sources_for_reply as _sources_for_reply
+            _src_note = _sources_for_reply(final_ai_content, tools_run_this_turn, last_user_content, self.context)
+            if _src_note:
+                final_ai_content = (final_ai_content or "").rstrip() + _src_note
+                pretty_log("Source Check", f"appended {_src_note.count(chr(10) + '- ')} source link(s) the reply "
+                           "did not carry", icon=Icons.TOOL_SEARCH, level="INFO")
+        except Exception as _sn_exc:  # noqa: BLE001 — never costs the reply
+            logger.debug("sources line skipped: %s", _sn_exc)
 
         # --- SIGNIFICANT-TURN RECORD (costly-turn note + episode) ---
         if was_complex_task or execution_failure_count > 0:
@@ -29477,6 +29739,7 @@ class GhostAgent:
                 if _tap is not None:
                     try:
                         _tap.bind(str(req_id or ""))
+                        _tap.set_looks(_owned_look_rows(tools_run_this_turn))   # §4UY image-1
                         _tap.begin_generation(unsafe=reply_tap_unsafe)
                     except Exception:  # noqa: BLE001 — never costs the turn
                         _tap = None
@@ -30429,32 +30692,9 @@ class GhostAgent:
                 _strip_think_blocks(ui_content),
                 call_turn=bool(tool_calls) and not is_final_generation).strip()
 
-            # --- HALLUCINATION & LEAK SCRUBBERS ---
+            # --- HALLUCINATION & LEAK SCRUBBERS --- (§4VC: one named helper, driven by its tests)
             if ui_content:
-                # 1. Hard Truncation for System Prompt Bleed
-                # Shared strong/weak bleed helper (§ R1 A-F3) — same
-                # rules as the finalize twin so the two sites cannot
-                # drift (the wrapper-split lesson).
-                ui_content = _truncate_prompt_bleed(ui_content)
-
-                # 2. Regex scrubbers for XML and Execution Artifacts
-                ui_content = re.sub(r'<tool_response>.*?(?:</tool_response>|$)', '', ui_content, flags=re.DOTALL | re.IGNORECASE)
-                ui_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', ui_content, flags=re.DOTALL)
-
-                # 3. Task Tree Regurgitation Scrubbers
-                # Old pattern was `^\s*(?: )\s*\[.*?\].*?\n?` which
-                # stripped any indented `[label]` prefix — that
-                # mangled legitimate indented markdown links
-                # ('  [docs](https://x)' → '(https://x)'). Tightened
-                # to require a task-shape token inside the
-                # brackets (a `task_NN` id or one of the status
-                # keywords) so markdown links survive.
-                ui_content = re.sub(r'(?m)^\s*\[(?:task_\d+|IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\b[^\]]*\].*?\n?', '', ui_content)
-                ui_content = _scrub_task_status_runs(ui_content)  # § R1 A-F3
-                ui_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', ui_content)
-                ui_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', ui_content)
-
-                ui_content = ui_content.strip()
+                ui_content = _scrub_turn_reply(ui_content)
 
             # CRITICAL: Preserve the raw XML tags in the assistant's internal message context so it remembers!
             # BUT STRIP <think> blocks to prevent cognitive looping!
@@ -31299,8 +31539,22 @@ class GhostAgent:
                             # (§4KS R3: never for a channel member — a
                             # member's research is verified AFTER the reply,
                             # §4LH, so there is nothing to await here.)
+                            # §4UY image-2 (reviews M1, r2 #2): an image-only turn still
+                            # waits when an arm whose refute IS repaired in the turn
+                            # refutes it (`IN_TURN_REPAIRABLE_ARMS`: reply shape, turn
+                            # state, file artifact) — asked here only when the turn is
+                            # image-only (no model, a few file reads at most)
+                            try:
+                                _pure_refs = (tuple(self._repairable_refutes(
+                                    _judge_text, last_user_content, tools_run_this_turn,
+                                    self._captured_project_id()).values())
+                                    if _only_unrepairable_checks_armed(tools_run_this_turn) else ())
+                            except Exception:  # noqa: BLE001 — unknown = wait, as before
+                                _pure_refs = (True,)
                             if _should_await_repair_verdict(
-                                    _rbudget, _lt, _unverified) \
+                                    _rbudget, _lt, _unverified,
+                                    tools_run=tools_run_this_turn,
+                                    pure_refutes=_pure_refs) \
                                     and not requester_is_member():
                                 try:
                                     _vtask = _glog.spawn_task(
@@ -31341,6 +31595,10 @@ class GhostAgent:
                                             and not self._verdict_is_no_claim(_vr)
                                         )
                                     else:
+                                        pretty_log("Verifier Gate",       # §4UY image-2: say the wait ran out
+                                                   f"verdict not in after the {_rbudget:.0f}s wait — the reply "
+                                                   "goes now, the verdict lands after it",
+                                                   icon=Icons.VERIFIER_LAB)
                                         self._attach_late_verdict_handler(
                                             _vtask, current_trajectory_id,
                                             _stable_conv_fp,
@@ -31654,7 +31912,7 @@ class GhostAgent:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _mood_owner_arrived(self) -> None:
+    def _mood_owner_arrived(self, text=None) -> None:
         """§4TC (review): an OWNER's request has arrived — the quiet, if there
         was one, is over. Boredom is never written into the mood, so there
         is nothing to carry into this turn: `SelfModel.owner_arrived` writes
@@ -31662,14 +31920,28 @@ class GhostAgent:
         ("the quiet ended") and stamps the owner's presence in the mood's own
         state file (the quiet is measured from that stamp, so a restart does
         not change it). It never writes the agent's activity clocks. Only a
-        real owner request (`mood_moves_on_this_request`). Never raises."""
+        real owner request (`mood_moves_on_this_request`). Never raises.
+
+        §4UW: ``text`` — the message that arrived: when it OPENS like a
+        correction (`user_correction.has_correction_phrase`, the judge's own
+        phrase gate), the lift of a return after a long quiet is not given."""
         try:
             if not mood_moves_on_this_request(self.context):
                 return
+            with _MOOD_MEMO_LOCK:
+                # §4UW (review r2): a request id a client sends again is a new turn — a cut of it is read
+                _MOOD_TURN_READ.pop(str(request_id_context.get() or ""), None)
             sm = _mood_model(self.context)
             if sm is not None:
+                complaint = False
+                try:
+                    from ..distill.user_correction import has_correction_phrase as _hcp
+                    # (a row the bot labelled as another person's opens with that label, never like one)
+                    complaint = bool(_hcp(self._msg_text({"content": text})))
+                except Exception:  # noqa: BLE001
+                    complaint = False
                 sm.owner_arrived(request_id=str(request_id_context.get() or ""),
-                                 conversation=_mood_conversation())
+                                 conversation=_mood_conversation(), complaint=complaint)
         except Exception as e:  # noqa: BLE001 — the mood never breaks a request
             logger.debug("mood owner-arrival skipped: %s: %s", type(e).__name__, e)
 
@@ -31686,6 +31958,10 @@ class GhostAgent:
         an upstream error) is handed back and re-sent (§4SB) — the request
         that re-sends it does not read it a second time (`_mood_queued_read`)."""
         try:
+            if not queued:
+                # §4UW (review r1): a request id a client sends again starts with no reading of its own
+                from ..selfhood import sentiment as _sent
+                _sent.forget_reading(str(request_id_context.get() or ""))
             if not mood_moves_on_this_request(self.context) or _is_foreign_row(content):
                 return
             if not _mood_queued_read(_mood_conversation(), content, queued=queued):
@@ -31706,6 +31982,9 @@ class GhostAgent:
                 sm = _mood_model(self.context)
                 if sm is not None:
                     from ..utils.logging import spawn_bg as _spawn_bg
+                    if not queued:
+                        # §4UW: the correction judge's gate may wait for this message's reading
+                        _sentiment.expect_reading(str(request_id_context.get() or ""))
                     _spawn_bg(_sentiment.score_message(
                         content, sm.root, request_id=str(request_id_context.get() or ""),
                         tor_proxy=getattr(self.context, "tor_proxy", None),
@@ -31782,6 +32061,14 @@ class GhostAgent:
         # §4QG: which member (the API sets it from `X-Ghost-Member`)
         _member_token = requester_member_context.set(
             parse_requester_member(requester_member) or requester_member_context.get())
+        # §4UY (review 7): a non-streamed turn run INSIDE another request's turn never writes to the reply tap.
+        # A task turn of the owner's streamed turn (a coding leaf of `autoadvance`) inherited the owner's tap
+        # through the context and set quote_view / set_lead / note_trim on the owner's stream; it reaches the
+        # owner only as the running step's detail line (core/progress.py `_TaskTurnNarrator`)
+        from .reply_tap import reply_tap_context as _rtc_own
+        _nested_turn = getattr(token, "old_value", None) not in (None, "SYSTEM", contextvars.Token.MISSING)
+        _own_tap_token = (_rtc_own.set(None)
+                          if _nested_turn and not (isinstance(body, dict) and body.get("stream")) else None)
         # §4EZ (2026-09-06): the turn's POPULATION rides a second contextvar
         # so every pretty_log line of this turn — including the ones below
         # that precede the BEGIN frame, and the spawn_bg work that inherits
@@ -31838,7 +32125,10 @@ class GhostAgent:
         if req_id != request_id_context.get():
             request_id_context.set(req_id)          # §4OG-4 (g): every contextvar reader sees the uniquified id (reader C M2)
         # §4TX r4: after the id is final (the reaction ledger keys this message by it)
-        self._mood_owner_arrived()                  # §4TC: an owner's request ends the quiet
+        self._mood_owner_arrived(                   # §4TC: an owner's request ends the quiet
+            ((body.get("messages") or [{}])[-1] or {}).get("content")
+            if isinstance(body, dict) and isinstance(body.get("messages"), list)
+            and isinstance((body.get("messages") or [None])[-1], dict) else None)
         # §4RZ: a hold the user sends after THIS moment withdraws this
         # request's yes — noted at REGISTRATION, before the turn lock, so a
         # hold sent while it waits counts (r4) and an old one does not (r5)
@@ -31915,7 +32205,9 @@ class GhostAgent:
                 # §4JP: say on the turn's first lines whether a client deadline
                 # is known — the live evidence that the header made it here.
                 _cdl = float(_glog.client_deadline_context.get() or 0.0)
-                if _cdl > 0:
+                # §4UY P22: a turn run inside another request (a project task's turn) inherits the client's
+                # header but has no deadline of its own — "client deadline 0 s" was printed for every one
+                if _cdl > 0 and _glog.request_deadline_s(str(req_id or "")) > 0:
                     # §4RA: the budget IN FORCE (the server cap may be lower than the header)
                     pretty_log("Client Deadline",
                                client_deadline_line(_glog.request_deadline_s(str(req_id or "")),
@@ -31924,7 +32216,7 @@ class GhostAgent:
                 if hard_limit_applies(_cdl):
                     # §4SD: a finite client timeout is a hard limit (stopped in the finally)
                     _hard_watch = _glog.spawn_bg(watch_hard_limit(str(req_id), _turn_reg, client_s=_cdl),
-                                               name="hard-limit")
+                                               name="hard-limit", service=True)
                 messages, model, stream_response = body.get("messages", []), body.get("model", "qwen3.8-27b"), body.get("stream", False)
                 if requester_is_member():
                     # A member's turn does not stream (R8): the streamed drain
@@ -32136,9 +32428,9 @@ class GhostAgent:
                 self.context._turn_failure_texts = []
                 self.context._pre_tool_segments = []      # §4LH
                 self.context._offproject_steer_done = False
-                # Edit-run futility tracking: basename -> {writes, runs} for
-                # code files this request. See the futility breaker in the
-                # dispatch pipeline.
+                # Per-file write/run counters: key -> {writes, runs, progress, …}
+                # for code files this request, read by the §4RA progress earn
+                # and the §4RB stuck reading (§4UY C5: no futility breaker).
                 self.context._script_iter = {}
                 self.context._extension_logged = 0.0                # §4RA: last extension logged
                 self.context._fetch_memo = {}                       # §4OE-4: what this request fetched
@@ -32147,11 +32439,7 @@ class GhostAgent:
                     self.context._url_provenance.note_text(last_user_content or "")
                 except Exception:  # noqa: BLE001
                     pass
-                self.context._futility_steer_done = False
-                # §4ID: the report tier and the breaker-closed flag are
-                # per-request too (§4IC left the first one sticky: after
-                # one report the tier could never fire again).
-                self.context._futility_report_done = False
+                # §4ID: the breaker-closed flag is per-request (§4UY C5: the futility steer and its flags are gone)
                 self.context._breaker_forced_final = False
                 self.context._breaker_reason = None
                 self.context._report_write_used = False            # §4OE-1b: per request (review CRIT 1)
@@ -34108,6 +34396,8 @@ class GhostAgent:
                         request_state=request_state,
                     )
                     try:
+                        if _progress is not None:                    # §4UY S3: the step shows as it STARTS
+                            _progress.before_batch(tool_calls)
                         _dispatch_should_break = await self._dispatch_and_process_tool_batch(_ts)
                         if _progress is not None:                    # §4UT: the batch as a step
                             _progress.after_batch(list(_ts.tools_run_this_turn or [])[_progress_rows:],
@@ -34397,6 +34687,11 @@ class GhostAgent:
                 requester_member_context.reset(_member_token)          # §4QG
             except Exception:  # noqa: BLE001 — same
                 pass
+            if _own_tap_token is not None:                             # §4UY review 7
+                try:
+                    _rtc_own.reset(_own_tap_token)
+                except Exception:  # noqa: BLE001 — same
+                    pass
             if _scope_token is not None:                               # §4SX B0
                 from .request_scope import reset as _scope_reset
                 _scope_reset(_scope_token)
@@ -34522,6 +34817,133 @@ class GhostAgent:
     @classmethod
     def _verdict_is_no_claim(cls, v) -> bool:
         return getattr(v, "reasoning", None) in cls._NO_CLAIM_REASONINGS
+
+    def _pure_mechanical_refutes(self, final_ai_content, last_user_content, tools_run) -> tuple:
+        """(reply-shape refute, turn-state refute) of a reply — the two pure
+        arms (no model, no I/O), each None when it finds nothing; the request
+        with what the user added mid-turn, whose request rules then stand down
+        (§4RZ step 2). ONE reader for the verdict and for the loop-exit wait
+        gate (§4UY image-2: both refutes are repaired inside the turn)."""
+        _qd = _queued_delivered_any()
+        _ask = (_queued_current_ask(last_user_content or "", added_max=2000)
+                if _qd else last_user_content)
+        return (self._reply_shape_refutation(final_ai_content, _ask, tools_run, request_rules=not _qd),
+                self._turn_state_refutation(final_ai_content, _ask, tools_run, request_rules=not _qd))
+
+    def _file_artifact_check(self, claim_src, tools_run_this_turn, project_id=None) -> tuple:
+        """The FILE-ARTIFACT arm (2026-07-16): (ran, refute or None, report,
+        to_check, soft). Files the turn wrote must exist and not be empty;
+        files the reply claims must not be empty; and when the reply admits its
+        write was dropped (§4GN), its claimed files must exist. Reads at most
+        16 paths, no model. ONE method for the verdict and for the loop-exit
+        wait gate (§4UY image-2, review r2 #2)."""
+        # never for a member (§4LH final review, CRIT): a file name in the
+        # member's reply was looked up in the OWNER's sandbox, and "claimed
+        # but empty" told the member that the owner's file exists
+        if requester_is_member():
+            _claimed, (_mutated, _retired) = [], ([], [])
+        else:
+            _claimed = _claimed_deliverable_files(claim_src)
+            _mutated, _retired = _fs_path_ledger(tools_run_this_turn)
+        # ⚠ THE LEDGER IS THE ONLY ABSENCE-GRADE EVIDENCE. The hard,
+        # missing-refuting list is built from tool confirmations alone;
+        # prose claims ride the `soft` (emptiness-only) arm alongside the
+        # retired paths. Every attested false FILE-ARTIFACT refute came
+        # from a prose capture on a turn that ran no file tool, while
+        # prose contributed a file the ledger lacked on 7 of 1,855
+        # recorded turns — a trade that buys the whole false-refute class
+        # for almost nothing. Prose keeps its teeth for emptiness: a
+        # claimed file that exists at 0 bytes still refutes. (This also
+        # retires the claim/mutated interleave — with one source for the
+        # hard list there is nothing to interleave.)
+        _seen_keys, _to_check = set(), []
+        for _cand in _mutated:
+            _k = _fs_norm(_cand)
+            if _k not in _seen_keys:
+                _seen_keys.add(_k)
+                _to_check.append(_cand)
+        # ⚠ ONE EXCEPTION TO "THE LEDGER IS THE ONLY ABSENCE-GRADE
+        # EVIDENCE" (§4GN, 2026-09-14). The false-refute class above
+        # comes from turns that ran NO file tool — a reply may mention a
+        # file that predates it. A turn whose own note says its
+        # `file_system` call was DROPPED at the finish line is not that
+        # turn: it attempted the write, the write did not run, and a
+        # claim that the file exists is knowably false. Measured on
+        # req da4c17ba: a 24-minute investigation ended "The report is
+        # saved to /workspace/…md", the log said `Dropping 1 tool_call(s)
+        # — final-generation turn (names=['file_system'])`, the sandbox
+        # had no such file, and FILE-ARTIFACT reported "clean … checked
+        # for emptiness only — no files written this turn". Arming the
+        # absence leg here refutes it and hands the repair loop the one
+        # thing the user actually wanted: the file.
+        if _dropped_write_admitted(claim_src):
+            for _cand in _claimed:
+                _k = _fs_norm(_cand)
+                if _k not in _seen_keys:
+                    _seen_keys.add(_k)
+                    _to_check.append(_cand)
+        _to_check = _to_check[:8]
+        # Soft = written-then-removed paths (absence is what "removed"
+        # means, but a re-created-EMPTY one is a real defect) + the
+        # prose claims not already covered by the ledger. Retired first:
+        # they are ledger-grounded and rarer.
+        _soft, _soft_keys = [], set()
+        for _cand in list(_retired) + [c for c in _claimed]:
+            _k = _fs_norm(_cand)
+            if _k in _seen_keys or _k in _soft_keys:
+                continue
+            _soft_keys.add(_k)
+            _soft.append(_cand)
+        _soft = _soft[:8]
+        if not (_to_check or _soft):
+            return False, None, {}, _to_check, _soft
+        # ⚠ RACE-FREE SCOPING — see _scoped_sandbox_for. All three
+        # ground-truth arms scope through the one spawn-captured id.
+        _host_dir = self._scoped_sandbox_for(project_id)
+        # ⚠ Its SIBLING already un-scopes: `_execute_web_artifact`
+        # uses `sbx.parent.parent if sbx.parent.name == "projects"`
+        # because a turn's writes can land at the sandbox ROOT while
+        # the binding still reads as scoped. Passing it as a FALLBACK
+        # root keeps one verdict, and `_verify_file_artifacts`
+        # refuses a hit under another project so the wider search
+        # cannot certify a namesake.
+        _sbx = Path(str(_host_dir))
+        _extra = ([str(_sbx.parent.parent)]
+                  if _sbx.parent.name == "projects" else [])
+        _rep = {}
+        # removals of the SCOPE project's files within the last 15
+        # minutes (matching _locate_entry_page's recency-gate
+        # precedent) explain a missing written file without implying
+        # failure. Per-project dict, carrying the deleted list —
+        # see workspace_cleanup._mark_removal for the four ways the
+        # single-tuple version failed.
+        _swept = _fresh_removal_marks(self.context)
+        _fa = self._verify_file_artifacts(
+            _to_check, _host_dir, soft=_soft, extra_roots=_extra,
+            file_claims=set(_claimed), report=_rep,
+            alt_spellings=_fs_wrote_pair_alts(tools_run_this_turn),
+            removable_keys=_keys_removable_after_write(
+                tools_run_this_turn),
+            swept_removals=_swept)
+        return True, _fa, _rep, _to_check, _soft
+
+    def _repairable_refutes(self, reply, last_user_content, tools_run, project_id=None) -> dict:
+        """§4UY image-2 (review r2 #2): {arm: refute or None} for EVERY verdict
+        arm whose refute is repaired inside the turn and that is cheap and pure
+        (no model, at most a few file reads) — `IN_TURN_REPAIRABLE_ARMS`. The
+        loop-exit wait gate skips the wait on an image-only turn only when all
+        are None. An arm that raises reads as a refute (unknown = wait)."""
+        out: dict = {}
+        try:
+            out["reply-shape"], out["turn-state"] = self._pure_mechanical_refutes(
+                reply, last_user_content, tools_run)
+        except Exception:  # noqa: BLE001
+            out["reply-shape"] = out["turn-state"] = True
+        try:
+            out["file-artifact"] = self._file_artifact_check(reply, tools_run, project_id)[1]
+        except Exception:  # noqa: BLE001
+            out["file-artifact"] = True
+        return out
 
     def _reply_shape_refutation(self, final_ai_content: str, request_text: str = "",
                                 tools_run=None, *, request_rules: bool = True):
@@ -35069,7 +35491,11 @@ class GhostAgent:
         # because the clause test reads it; the ~98% of turns that clear
         # neither still pay no LLM call.
         if not is_correction_candidate(current_user_text, prev_assistant):
-            return None
+            # §4UW: … or the emotion model read displeasure in it (the reading of this request's own
+            # message; None at once when none is on its way) — the judge then decides, for the mood only
+            if not is_correction_candidate(current_user_text, prev_assistant,
+                                           displeased=await self._mood_message_displeased()):
+                return None
         verifier = getattr(self.context, "verifier", None)
         if verifier is None or getattr(verifier, "llm_client", None) is None:
             return None
@@ -35096,6 +35522,18 @@ class GhostAgent:
         except Exception:  # noqa: BLE001
             return None
         return parse_adjudication(text)
+
+    async def _mood_message_displeased(self) -> bool:
+        """§4UW: did the emotion model read displeasure in THIS request's own message
+        (`selfhood.mood.sounds_displeased`)? Waits a moment for a reading that is on its way
+        (`selfhood.sentiment.reading_for`); False when none was expected (not an owner request, the
+        service off) or none came. Never raises."""
+        try:
+            from ..selfhood import sentiment as _sentiment
+            from ..selfhood.mood import sounds_displeased as _sd
+            return _sd(await _sentiment.reading_for(str(request_id_context.get() or "")))
+        except Exception:  # noqa: BLE001 — a gate never breaks the judge's task
+            return False
 
     async def _promote_prior_turn_after_judge(self, messages, last_user_content) -> None:
         """§4NF: the user-correction judge + the prior turn's relabel, off the
@@ -35499,6 +35937,9 @@ class GhostAgent:
             # with six newlines). Counted so the "nothing visible emitted"
             # test below stays honest.
             _scrub_dropped_lead_ws = 0
+            # §4UY image-1: the look line goes out under its picture the moment
+            # the picture's block has ended (the rule finalize uses)
+            _look_placer = LookPlacer(_owned_look_rows(stream_tools_snapshot))
             # § R3 A-D3 incremental-scrub state (see the emission block).
             _scrub_view_cache = full_content if _stream_scrub_active else ""
             _scrub_tail_open = False
@@ -35645,6 +36086,8 @@ class GhostAgent:
                     # that long.
                     _safe_view = _scrubbed_view[
                         :_emit_safe_end(_scrubbed_view, _scrubbed_emitted_len)]
+                    # §4UY image-1: a picture's block end is not known yet — its whitespace waits
+                    _safe_view = _safe_view[:_look_placer.hold(_safe_view, _scrubbed_emitted_len, len(_safe_view))]
                     _to_emit = _safe_view[_scrubbed_emitted_len:]
                     if (_to_emit and not _to_emit.strip()
                             and (_scrubbed_emitted_len - _scrub_dropped_lead_ws) <= len(stream_prefix or "")):
@@ -35653,6 +36096,7 @@ class GhostAgent:
                         _scrubbed_emitted_len = len(_safe_view)
                         _to_emit = ""
                     if _to_emit:
+                        _to_emit = _look_placer.take(_safe_view, _scrubbed_emitted_len, len(_safe_view))
                         _synthetic = {
                             "id": f"chatcmpl-{req_id}",
                             "object": "chat.completion.chunk",
@@ -35766,9 +36210,10 @@ class GhostAgent:
                     # § R2 M4: the flush reuses the hold-back classifier so a
                     # dangling scrub-target opener at abnormal stream end is
                     # SUPPRESSED (durable content keeps it), never emitted raw.
-                    _tail_rem = _final_view[
-                        _scrubbed_emitted_len:
-                        _emit_safe_end(_final_view, _scrubbed_emitted_len)]
+                    _tail_end = _emit_safe_end(_final_view, _scrubbed_emitted_len)
+                    # §4UY image-1: the view is whole now — a link on its last line is placed too
+                    _tail_rem = _look_placer.take(_final_view, _scrubbed_emitted_len,
+                                                  max(_scrubbed_emitted_len, _tail_end), final=True)
                     if _tail_rem:
                         _synthetic = {
                             "id": f"chatcmpl-{req_id}",
@@ -35785,6 +36230,13 @@ class GhostAgent:
                         _scrubbed_emitted_len = len(_final_view)
                 except Exception:
                     pass  # flush is best-effort; never break end-of-stream
+            # §4UY image-1: the SHOWN views carry the look lines where the client saw
+            # them (the client view here, the treated record below). Never the raw
+            # `full_content`: it is re-parsed for tool calls, and a line placed there
+            # landed inside a write call's content and in the file (review r2 #1)
+            _sent_rows = [r for r in _look_placer.rows if r[1] in _look_placer.placed]
+            if _sent_rows and isinstance(locals().get("_final_view"), str):
+                _final_view = place_owned_looks(_final_view, _sent_rows)
 
             # §4O B-MAJOR-1: an upstream abort cut the final answer short.
             # Mark the DURABLE content truncated so the episode/trajectory/
@@ -36208,6 +36660,24 @@ class GhostAgent:
             except Exception as _cn_exc:  # noqa: BLE001
                 logger.debug("streamed source check skipped: %s", _cn_exc)
 
+            # §4UY N7: the sources a research answer was built from, after the answer (same rule as finalize)
+            try:
+                from .link_grounding import sources_for_reply as _sources_for_reply
+                _src_base = locals().get("_final_view")
+                if not isinstance(_src_base, str):
+                    _src_base = full_content or ""
+                _src_note = _sources_for_reply(_src_base + "\n\n" + str(locals().get("_ff_retry_text") or ""),
+                                               stream_tools_snapshot, str(last_user_content or ""), self.context)
+                if _src_note:
+                    yield f"data: {json.dumps({'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': created_time, 'model': stream_model, 'choices': [{'index': 0, 'delta': {'content': _src_note}, 'finish_reason': None}]})}\n\n".encode('utf-8')
+                    full_content = (full_content or "") + _src_note
+                    if locals().get("_stream_effective_content"):
+                        _stream_effective_content = _stream_effective_content + _src_note
+                    pretty_log("Source Check", f"appended {_src_note.count(chr(10) + '- ')} source link(s) the "
+                               "streamed reply did not carry", icon=Icons.TOOL_SEARCH, level="INFO")
+            except Exception as _sn_exc:  # noqa: BLE001
+                logger.debug("streamed sources line skipped: %s", _sn_exc)
+
             # §4MM: an image shown that this request did not generate
             try:
                 if not requester_is_member():
@@ -36420,6 +36890,14 @@ class GhostAgent:
                             f"was delivered as it was)",
                             icon=Icons.BRAIN_SUM,
                         )
+                    # §4UY image-1: the record carries the look lines the client was
+                    # sent — in the treated view only (the fail-open below keeps the
+                    # raw text untouched: see the flush above, review r2 #1)
+                    if _sent_rows and isinstance(_treated_content, str):
+                        # on the view, BEFORE the notes appended after it (Sources, …): as the client got it
+                        _lv = locals()          # (not inside the comprehension: its own scope)
+                        _post_notes = [_lv.get(_k) for _k in STREAM_POST_VIEW_NOTES]
+                        _treated_content = place_owned_looks_before_notes(_treated_content, _sent_rows, _post_notes)
                 except Exception as _tr_exc:  # noqa: BLE001
                     # Fail-open to the raw text: a treated view that raises
                     # must not cost the turn its record (the same contract
@@ -36748,6 +37226,10 @@ class GhostAgent:
                         _sv_source,
                         flags=re.DOTALL | re.IGNORECASE,
                     ).strip()
+                    # §4UY N7 r2: the verifier judges the reply, not the code's sources list under it
+                    _sv_src = str(locals().get("_src_note") or "").strip()
+                    if _sv_src and _sv_claim.endswith(_sv_src):
+                        _sv_claim = _sv_claim[:-len(_sv_src)].rstrip()
                     _sv_tool = _find_substantive_tool_for_verifier(
                         stream_tools_snapshot)
                     if getattr(self.context.args,
@@ -36817,10 +37299,17 @@ class GhostAgent:
                                 req_id=req_id,
                                 trajectory_id=current_trajectory_id,
                             ))
+                        _lv_tag = locals()      # the notes the stream appended after its view
+                        _sv_shown = place_owned_looks_before_notes(
+                            _sv_source, _sent_rows, [_lv_tag.get(_k) for _k in STREAM_POST_VIEW_NOTES])
                         self._attach_late_verdict_handler(
                             _sv_task, current_trajectory_id,
                             # §4LK: bound to the answer it corrects (_reply_tag)
-                            (f"{stream_conv_fp}|r{_reply_tag(_sv_source)}"   # what the client stored
+                            # what the client stored — with the look lines the stream sent
+                            # (review r3 #1: the tag of the bare text never met the
+                            # history, and the correction never surfaced), before the
+                            # notes appended after the view (seam review); the claim stays raw
+                            (f"{stream_conv_fp}|r{_reply_tag(_sv_shown)}"
                              if stream_conv_fp else stream_conv_fp),
                             force_correction=True,
                             project_id=_drain_pid,
@@ -37146,7 +37635,7 @@ class GhostAgent:
                 try:
                     _shown = (reply or "") + _unshown_image_note(reply or "", tools_run,
                                                                  getattr(self.context, "sandbox_dir", None))
-                    _shown = _shown + _owned_look_note(_shown, tools_run)          # §4QX
+                    _shown = _place_owned_look_lines(_shown, tools_run)          # §4QX / §4UY image-1
                 except Exception:  # noqa: BLE001
                     _shown = reply or ""
                 _fc.record_turn(rid, reply or "", request or "", " ".join(ctx_parts), ran, names, path=path,
@@ -37156,15 +37645,16 @@ class GhostAgent:
             logger.debug("failure census rows skipped: %s", _fc_exc)
 
     async def _journal_append_safe(self, kind: str, payload: dict,
-                                   timeout: float = 10.0) -> None:
-        """Bounded, best-effort journal append.
+                                   timeout: float = 10.0):
+        """Best-effort journal append, off the caller's path.
 
-        The journal write is a sync file op pushed to a thread; without a
-        timeout a hung disk parks the event loop awaiting the thread until
-        the biological watchdog's opaque "activity timeout" fires. Journal
+        The journal write is a sync file op pushed to a thread. Journal
         entries are an idle-time work queue, never load-bearing for the
-        turn — so on timeout/error we log WHICH write was dropped and move
-        on instead of stalling the request.
+        turn — so the write runs as a background task (returned; None when
+        the gates below withhold it): the caller never waits, appends keep
+        their order, a write slower than ``timeout`` s is logged as still
+        pending (a thread cannot be cancelled — it is never "dropped"), and
+        an error is logged with WHICH write failed.
         """
         journal = getattr(self.context, "journal", None)
         if journal is None:
@@ -37185,21 +37675,42 @@ class GhostAgent:
             # The one writer backstops its callers' `turn_may_teach` (§4KJ R10).
             logger.debug("journal append('%s') skipped: a member's turn never teaches", kind)
             return
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(journal.append, kind, payload),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            pretty_log(
-                "Journal Stalled",
-                f"append('{kind}') exceeded {timeout:.0f}s — entry dropped "
-                "(journal I/O hung?)",
-                level="WARNING", icon=Icons.WARN,
-            )
-        except Exception as exc:
-            logger.warning("journal append('%s') failed: %s: %s",
-                           kind, type(exc).__name__, exc)
+        # §4UY image-5: OFF the reply path. Live 76e8b1d0 the reply waited the
+        # full 10 s here and the log said "entry dropped" — but `wait_for`
+        # cannot cancel a thread: the write went on and landed. Now the write
+        # is a background task (`spawn_bg`: held until done, its error logged,
+        # awaited by the shutdown drain), the appends of this agent run one
+        # after another in the order they were asked for (each waits for the
+        # one before), and a slow one is reported as what it is.
+        append = journal.append
+        prev = getattr(self, "_journal_tail", None)
+
+        async def _write():
+            if prev is not None and not prev.done():
+                # review m2: wait for the earlier write at most ``timeout`` s — one hung
+                # write must not hold every later entry (nor the shutdown drain) behind it.
+                # `asyncio.wait` neither cancels nor raises: the earlier write's fate is its own
+                await asyncio.wait({prev}, timeout=timeout)
+            fut = asyncio.ensure_future(asyncio.to_thread(append, kind, payload))
+            done, _ = await asyncio.wait({fut}, timeout=timeout)
+            if not done:
+                pretty_log(
+                    "Journal Stalled",
+                    f"append('{kind}') still pending after {timeout:.0f}s — the write "
+                    "thread was not cancelled; the entry lands when the disk answers",
+                    level="WARNING", icon=Icons.WARN,
+                )
+            try:
+                await fut
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("journal append('%s') failed: %s: %s",
+                               kind, type(exc).__name__, exc)
+
+        from ..utils.logging import spawn_bg as _spawn_journal
+        task = _spawn_journal(_write(), name=f"journal-{kind}")
+        if task is not None:
+            self._journal_tail = task
+        return task
 
     async def _record_episode_safe(self, user_text, tools, ai_text,
                                    *, verifier_verdict=None,
@@ -37511,7 +38022,7 @@ class GhostAgent:
 
     def _mood_turn_signals(self, msgs, real_request: str, req_id: str, *,
                            duration_s: float = 0.0, lockdown: bool = False,
-                           completed: bool = True):
+                           completed: bool = True, failed: bool = False):
         """§4TC: what happened in THIS turn, as the mood reads it — from
         signals the loop already has: the turn's tool calls and which of
         them failed (the corpus's own reconstruction, so "failed" means here
@@ -37526,7 +38037,14 @@ class GhostAgent:
         a refusal that is the system working as designed
         (`MOOD_BLIND_REASONS`: outside content, a member's or a non-owner's
         call). And when the owner SET the mood or the manner in this turn,
-        `owner_set` says so: his word holds for the turn."""
+        `owner_set` says so: his word holds for the turn.
+
+        §4UW: an `autoadvance` batch reports the tasks its task turns closed
+        and the ones they left FAILED (`mood_payload_tasks`); a batch that
+        left a task FAILED is PARTIAL, and its own row is not counted as a
+        failed call beside them (the failed tasks are the trouble).
+        ``completed`` False: the turn was cut from outside; ``failed``: the
+        turn's record says the request failed."""
         from ..selfhood.mood import TurnSignals
         from .link_grounding import fetched_urls
         turn = list(msgs or [])[self._this_turn_boundary(msgs, real_request) + 1:]
@@ -37540,13 +38058,17 @@ class GhostAgent:
             sources = len(fetched_urls(rows))
         except Exception:  # noqa: BLE001
             sources = 0
-        failed = [c for c in calls if c.error]
-        excused = sum(1 for c in failed if mood_excuses_failure(c.result or c.error))
+        tasks_failed = sum(mood_tasks_failed(c) for c in calls)
+        failed_calls = [c for c in calls if c.error and not mood_tasks_failed(c)]
+        excused = sum(1 for c in failed_calls
+                      if mood_excuses_failure(c.result or c.error, getattr(c, "declared_reason", None)))
         return TurnSignals(
             tool_calls=len(calls),
-            failures=len(failed) - excused,
+            failures=len(failed_calls) - excused,
             excused=excused,
             tasks_done=sum(mood_tasks_done(c) for c in calls),
+            tasks_failed=tasks_failed,
+            failed=bool(failed),
             guards=len(guard_events_for(self.context, req_id)),
             sources=sources,
             duration_s=float(duration_s or 0.0),
@@ -37606,6 +38128,8 @@ class GhostAgent:
                     _n, _a, obj = entry
                     _content = str(m.get("content") or "")
                     obj.result = _content[:4000]
+                    # §4UY N18: the reason the tool DECLARED (not a row field: memory only, for the mood reader)
+                    obj.declared_reason = str(getattr(m.get("content"), "reason_code", "") or "")
                     try:
                         obj.duration_s = float(getattr(m.get("content"), "duration_s", None) or 0.0)
                     except (TypeError, ValueError):
@@ -37745,7 +38269,7 @@ class GhostAgent:
                                    else bool(getattr(self.context, "_pressure_lockdown", False))),
                 project_id=project_id, elapsed_s=elapsed_s,
                 trajectory_id=trajectory_id, temperature=temperature,
-                aborted=True)        # §4TC: an abort from outside is not something that happened to me
+                aborted=True)        # §4TC: the cut is not something that happened to me (§4UW: what came before it is)
         except Exception as _exc:  # noqa: BLE001 — recording must never break the unwind
             logger.warning("aborted-turn record skipped for %s: %s: %s",
                            req_id, type(_exc).__name__, _exc)
@@ -37986,8 +38510,9 @@ class GhostAgent:
         runs post-semaphore (the SSE drain) MUST pass its semaphore-time
         snapshot instead: the live flag there describes whichever request
         holds the semaphore now, not this turn. ``aborted`` (§4TC): the turn
-        was cut from outside (`_record_aborted_turn`) — it is recorded, and
-        it does not move the mood.
+        was cut from outside (`_record_aborted_turn`) — it is recorded; the
+        cut itself moves nothing, the trouble the turn had already had and
+        the tasks it had finished do (§4UW).
 
         No-op when `ctx.trajectory_collector` isn't wired. Walks the
         final `messages` list to reconstruct the tool-call sequence
@@ -38140,6 +38665,7 @@ class GhostAgent:
             _extra["mood_shade"] = _shade_heard
         with _MOOD_MEMO_LOCK:                                   # the request is over: a client that sends the
             _MOOD_SHADE_BY_REQ.pop(str(req_id or ""), None)     # same id again starts a new one (review r3)
+            _MOOD_TASK_DONE_REQ.pop(str(req_id or ""), None)    # §4UW: … and has closed no task yet
         # §4OG-2 (b): the DELIVERABLE decides before any shape rule — a green
         # last run, or a file this turn wrote that the reply hands over
         try:
@@ -38509,8 +39035,8 @@ class GhostAgent:
         # A plain chat turn changes nothing. Only a real owner request —
         # never a probe, a member's turn, a scheduled task, a job wake, a
         # sub-agent, self-play, a bench run or a leaf
-        # (`mood_moves_on_this_request`) — and never a turn that was cut from
-        # outside. Separate try: the mood is secondary to the record. Runs on
+        # (`mood_moves_on_this_request`). A turn cut from outside is read too
+        # (§4UW: its trouble and its finished tasks only). Separate try: the mood is secondary to the record. Runs on
         # both streamed and non-streamed turns — this method is the shared
         # trajectory-append path (and, like the capture above, only when a
         # trajectory_collector is wired: the early return at the top of this
@@ -38523,18 +39049,29 @@ class GhostAgent:
                     # the end of this turn (a turn that was cut included)
                     _sm_mood.owner_turn_ended(request_id=str(req_id or ""),
                                               conversation=_mood_conversation())
-                    if not aborted:
-                        # See the docstring: None = in-semaphore caller, read
-                        # live; the SSE drain passes its semaphore-time snapshot.
-                        _plock = (pressure_lockdown
-                                  if pressure_lockdown is not None
-                                  else bool(getattr(
-                                      self.context, "_ctx_pressure_lockdown",
-                                      False)))
-                        _sm_mood.note_owner_turn(self._mood_turn_signals(
-                            msgs, user_request, req_id,
-                            duration_s=float(traj_kwargs.get("duration_s") or 0.0),
-                            lockdown=bool(_plock)))
+                    # See the docstring: None = in-semaphore caller, read
+                    # live; the SSE drain passes its semaphore-time snapshot.
+                    _plock = (pressure_lockdown
+                              if pressure_lockdown is not None
+                              else bool(getattr(
+                                  self.context, "_ctx_pressure_lockdown",
+                                  False)))
+                    # §4UW (review 11-18: five cut owner turns in a week were skipped whole, one with 9
+                    # failed calls of 26; a turn the record labelled FAILED earned a reward): a turn cut
+                    # from outside is not blamed or credited for the cut — the trouble it already had and
+                    # the tasks it finished count (`completed` False); a turn whose own record says the
+                    # request failed says so (`failed`). The cut's own marker files the row FAILED too:
+                    # `mood.turn_events` reads the label for a finished turn only.
+                    if not _mood_turn_already_read(str(req_id or ""), bool(aborted)):
+                        _sm_mood.note_owner_turn(
+                            self._mood_turn_signals(
+                                msgs, user_request, req_id,
+                                duration_s=float(traj_kwargs.get("duration_s") or 0.0),
+                                lockdown=bool(_plock) and not aborted,
+                                completed=not aborted,
+                                failed=(traj.outcome == Outcome.FAILED.value)),
+                            # read above, before the request's memo entry was dropped
+                            shade_heard=_shade_heard)
             elif (not aborted and mood_job_tasks_count(self.context)):
                 # §4UB (evaluation: project work a job finished never registered): the wake-up of a job the
                 # OWNER started that closed project tasks DONE — that event only; the job's own failures and

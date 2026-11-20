@@ -67,9 +67,7 @@ def _after_write(name, kwargs, res=OK):
     # round 3 A: what an honest model writes — none of these was a check before
     "pytest || true", "pytest; echo $?", "pytest && echo PASS || echo FAIL", "pytest &",
     "for f in tests/*.py; do python $f; done", "if pytest -q; then echo ok; fi", 'echo "$(pytest -q)"',
-    "x=$(python app.py)", "mypy src", "ruff check .", "python -m mypy app", "eslint .", "npx eslint .",
-    "shellcheck run.sh", "htmlhint index.html", "tsc --noEmit", "node --check app.js", "php -l index.php",
-    "black --check app.py",
+    "x=$(python app.py)",
     # round 3 B: continuation lines
     "pytest \\\n  -q tests", "ls &&\npytest", "cat log |\npython parse.py",
 ])
@@ -83,14 +81,19 @@ def test_a_run_that_checks_the_build_counts(cmd):
     "python -m pip install -r requirements.txt", "python -m http.server 8000", "cp a.py b.py", "chmod +x run.sh",
     "curl https://example.com", "git status", "mkdir -p build", "bash -c 'ls'", "playwright install chromium",
     "npx playwright install", "python -m playwright install",
+    # §4UY P6: a linter / type checker / syntax check reads the code, it never RUNS it (these counted before)
+    "mypy src", "ruff check .", "python -m mypy app", "eslint .", "npx eslint .", "shellcheck run.sh",
+    "htmlhint index.html", "tsc --noEmit", "node --check app.js", "php -l index.php", "black --check app.py",
+    "python -m py_compile a.py", "bash -n run.sh",
 ])
 def test_a_command_that_checks_nothing_does_not_count(cmd):
     assert not _after_write("execute", {"command": cmd}).verified, cmd
 
 
-def test_a_failed_run_still_ran():
+def test_a_failed_run_is_not_a_check():
+    # §4UY P6 (was test_a_failed_run_still_ran): a run that exited 1 is evidence of a bug, not of a working build
     fail = ToolOutcome("EXIT CODE: 1\nSTDOUT/STDERR:\nboom", status=OutcomeStatus.FAILED)
-    assert _after_write("execute", {"command": "pytest"}, fail).verified
+    assert not _after_write("execute", {"command": "pytest"}, fail).verified
     refused = ToolOutcome.rejected("Error: the sandbox refused it", world_changed=False)
     assert not _after_write("execute", {"command": "pytest"}, refused).verified
 
@@ -133,7 +136,7 @@ def test_prose_written_after_a_check_does_not_void_it(call):
 def test_inside_one_command_the_order_counts():
     assert PT.shell_check_events("echo x > a.py && python a.py") == ["w", "c"]
     assert PT.shell_check_events("pytest && sed -i s/a/b/ a.py") == ["c", "w"]
-    assert PT.shell_check_events("eslint --fix .") == ["c", "w"]
+    assert PT.shell_check_events("eslint --fix .") == ["w"]        # §4UY P6: a linter is no run
     assert _after_write("execute", {"command": "echo x > a.py && python a.py"}).verified
     assert not _after_write("execute", {"command": "python a.py && echo x > a.py"}).verified
 
@@ -174,8 +177,9 @@ def test_execute_of_a_file_or_inline_code_and_the_other_tools():
     w.note("lab", {"action": "exec", "cmd": "pytest"}, OK)
     w.note("lab", {"action": "exec", "cmd": "echo x > /srv/app/cfg"}, OK)   # the lab's file, not the workspace
     assert w.verified
-    assert _after_write("lab", {"action": "http", "path": "/"}, ToolOutcome("HTTP 500", status=OutcomeStatus.FAILED)
-                        ).verified                                 # any response
+    assert not _after_write("lab", {"action": "http", "path": "/"},
+                            ToolOutcome("HTTP 500", status=OutcomeStatus.FAILED)
+                            ).verified                             # §4UY P6: a failing response is no check
     assert _after_write("lab", {"action": "screenshot"}, ToolOutcome.ok("png")).verified
     assert not _after_write("lab", {"action": "http"}, ToolOutcome.rejected("LAB ERROR (not_allowed): no")).verified
     assert _after_write("run", {"action": "collect"}).verified

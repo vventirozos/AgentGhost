@@ -37,7 +37,6 @@ from pathlib import Path
 
 import pytest
 
-from ghost_agent.core import coding_loop as CL
 
 
 # ── 1. the survival verdict does not depend on the caller ────────────────
@@ -103,104 +102,10 @@ def _leaf_ctx(tmp_path):
                            llm_client=object(), args=SimpleNamespace(model="m"))
 
 
-def test_a_HALF_read_workspace_is_named_in_the_result(monkeypatch, tmp_path):
-    """The gates ran on what could be seen and passed, so the attempt is a
-    success — but the record must say the reading was partial, because the
-    files that were NOT seen are ungated and unregistered. Retrying instead
-    would be worse: the next attempt's `before` absorbs this attempt's files
-    and they would never be reported at all."""
-    import asyncio
-
-    async def fake_turn(context, *, leaf_id, prompt, is_background, **kw):
-        (tmp_path / "seen.py").write_text("x = 1\n")
-        return "done\nVERIFY: true\nSUMMARY: wrote one file"
-    monkeypatch.setattr(CL, "run_leaf_turn", fake_turn)
-
-    async def no_smoke(tool_runner, written):
-        return None
-    monkeypatch.setattr("ghost_agent.core.build_gates.smoke_gate", no_smoke)
-
-    real = CL.snapshot_workspace
-    state = {"n": 0}
-
-    def half_read(root):
-        # every reading after the leaf turn is incomplete, and it SAW a file
-        snap = dict(real(root))
-        state["n"] += 1
-        if state["n"] > 1:
-            snap[CL._SNAPSHOT_INCOMPLETE] = "OSError reading 'unseen.py'"
-        return snap
-    monkeypatch.setattr(CL, "snapshot_workspace", half_read)
-
-    async def runner(name, args):
-        return "EXIT CODE: 0"
-    res = asyncio.run(CL.build_coding_task_agentic(
-        _leaf_ctx(tmp_path), "write one file", tool_runner=runner))
-    assert res.ok is True and res.files == ["seen.py"]
-    assert "INCOMPLETE" in res.ledger_note, res.ledger_note
-    assert "neither gated nor registered" in (res.detail or ""), res.detail
 
 
-def test_a_COMPLETE_reading_says_nothing_of_the_kind(monkeypatch, tmp_path):
-    """Control: the note must not carry the warning on an ordinary attempt."""
-    import asyncio
-
-    async def fake_turn(context, *, leaf_id, prompt, is_background, **kw):
-        (tmp_path / "seen.py").write_text("x = 1\n")
-        return "done\nVERIFY: true\nSUMMARY: wrote one file"
-    monkeypatch.setattr(CL, "run_leaf_turn", fake_turn)
-
-    async def no_smoke(tool_runner, written):
-        return None
-    monkeypatch.setattr("ghost_agent.core.build_gates.smoke_gate", no_smoke)
-
-    async def runner(name, args):
-        return "EXIT CODE: 0"
-    res = asyncio.run(CL.build_coding_task_agentic(
-        _leaf_ctx(tmp_path), "write one file", tool_runner=runner))
-    assert res.ok is True
-    assert "INCOMPLETE" not in res.ledger_note, res.ledger_note
-    # …in the DETAIL too: the note and the detail are two conditions, and a
-    # warning that fires on every attempt is noise that teaches nothing.
-    assert "neither gated nor registered" not in (res.detail or ""), res.detail
 
 
-def test_a_TRANSIENT_read_failure_is_retried_not_reported(monkeypatch, tmp_path):
-    """The failure is in the READING, not in the attempt: a descriptor
-    squeeze or a file that moved under the walk is transient, and one re-read
-    costs nothing next to re-running a leaf turn. First read incomplete,
-    second read clean → an ordinary success with no warning anywhere."""
-    import asyncio
-
-    async def fake_turn(context, *, leaf_id, prompt, is_background, **kw):
-        (tmp_path / "seen.py").write_text("x = 1\n")
-        return "done\nVERIFY: true\nSUMMARY: wrote one file"
-    monkeypatch.setattr(CL, "run_leaf_turn", fake_turn)
-
-    async def no_smoke(tool_runner, written):
-        return None
-    monkeypatch.setattr("ghost_agent.core.build_gates.smoke_gate", no_smoke)
-
-    real = CL.snapshot_workspace
-    state = {"n": 0}
-
-    def flaky(root):
-        snap = dict(real(root))
-        state["n"] += 1
-        if state["n"] == 2:           # the first post-turn reading only
-            snap[CL._SNAPSHOT_INCOMPLETE] = "OSError: transient"
-        return snap
-    monkeypatch.setattr(CL, "snapshot_workspace", flaky)
-
-    async def runner(name, args):
-        return "EXIT CODE: 0"
-    res = asyncio.run(CL.build_coding_task_agentic(
-        _leaf_ctx(tmp_path), "write one file", tool_runner=runner))
-    assert state["n"] >= 3, (
-        "the incomplete reading was never re-read — the loop reports an "
-        "unknown it could have resolved by looking again")
-    assert res.ok is True and res.files == ["seen.py"]
-    assert "INCOMPLETE" not in res.ledger_note, res.ledger_note
 
 
 # ── 2./3. an unreadable file is an unknown, not an unchanged one ─────────
@@ -216,19 +121,5 @@ def _blind_one_file(monkeypatch, module, victim):
     return _fake
 
 
-def test_a_file_the_snapshot_cannot_read_marks_it_incomplete(tmp_path, monkeypatch):
-    (tmp_path / "ok.py").write_text("print(1)\n")
-    (tmp_path / "locked.py").write_text("print(2)\n")
-    import ghost_agent.tools.file_system as FS
-    monkeypatch.setattr(FS, "read_bytes_nofollow_fd",
-                        _blind_one_file(monkeypatch, FS, "locked.py"))
-    snap = CL.snapshot_workspace(tmp_path)
-    assert "ok.py" in snap
-    assert "locked.py" not in snap
-    assert CL.snapshot_incomplete(snap), (
-        "the unreadable file vanished from the reading with no marker — "
-        "indistinguishable from a file that did not change")
-    # and the paths it DID see still travel as paths, never the sentinel
-    assert CL._SNAPSHOT_INCOMPLETE not in CL.diff_snapshots({}, snap)
 
 

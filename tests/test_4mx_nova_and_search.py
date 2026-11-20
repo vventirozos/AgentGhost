@@ -520,7 +520,6 @@ def test_a_low_relevance_batch_is_not_saved_as_project_findings(monkeypatch):
     monkeypatch.setattr(S, "_race_search_wave", AsyncMock(return_value=rows))
     monkeypatch.setattr(S, "_cache_get", lambda k: None)
     monkeypatch.setattr(S, "_cache_put", lambda k, v: None)
-    monkeypatch.setattr(S, "wiki_supplement_wanted", lambda q: False)
     monkeypatch.setattr(S.importlib.util, "find_spec", lambda n: True)
     saved = []
     monkeypatch.setattr(S, "_record_project_findings", lambda *a: saved.append(a) or "research/x.md")
@@ -540,7 +539,6 @@ def test_the_search_output_carries_the_label(monkeypatch):
     monkeypatch.setattr(S, "_race_search_wave", AsyncMock(return_value=rows))
     monkeypatch.setattr(S, "_cache_get", lambda k: None)
     monkeypatch.setattr(S, "_cache_put", lambda k, v: None)
-    monkeypatch.setattr(S, "wiki_supplement_wanted", lambda q: False)
     monkeypatch.setattr(S.importlib.util, "find_spec", lambda n: True)
     out = asyncio.run(S.tool_search_ddgs("Revolut customer data breach", None))
     assert out.startswith(S.LOW_RELEVANCE_NOTE) and out.count("### ") == 3
@@ -567,7 +565,10 @@ def test_the_tool_text_names_the_real_engines_and_a_keyword_range():
     for name in ("web_search", "deep_research"):
         t = json.dumps(next(d for d in TOOL_DEFINITIONS if d["function"]["name"] == name),
                        ensure_ascii=False)
-        assert "Mojeek" not in t and "Yandex" in t and "3–6 keywords" in t
+        # §4UY N17: no engine is named at all — the raced set changes (`benched_engines`), and the
+        # names in the text went stale (brave had not won since 10-07, duckduckgo 0 of 213 waves)
+        assert "3–6 keywords" in t
+        assert not any(e in t.lower() for e in ("mojeek", "yandex", "brave", "yahoo", "duckduckgo"))
 
 
 # ── r3 review fixes ───────────────────────────────────────────────────

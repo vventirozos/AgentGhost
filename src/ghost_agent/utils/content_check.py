@@ -98,6 +98,61 @@ def _office_export(suffix: str, kind: str, head: bytes) -> bool:
     return False
 
 
+#: §4UY N8: native code — a binary the loader runs or imports by its name (a `sitecustomize.so` beside a script)
+NATIVE_CODE_SUFFIXES = frozenset({".exe", ".dll", ".so", ".dylib", ".jar", ".apk", ".whl", ".msi"})
+
+
+def server_name_may_stand(name: str) -> bool:
+    """§4UY N8: may a SERVER-chosen file name (Content-Disposition) be the saved name? Only for a document or
+    media type — a format whose bytes the download checks against the name (`body_mismatch`) and that no
+    toolchain loads by name. Code, config and text (`conftest.py`, `sitecustomize.py`, `pytest.ini`,
+    `package.json`, `.npmrc`) and native code are loaded BY NAME from the project folder: for those the
+    server gives the type only, never the name. A principle (document/media vs everything else), not a list
+    of dangerous names."""
+    suf = Path(str(name or "")).suffix.lower()
+    return bool(suf) and (suf in _EXPECTED_KIND or suf in _BINARY_ONLY) and suf not in NATIVE_CODE_SUFFIXES
+
+
+#: §4UY N8 r3: names a toolchain loads from the folder they sit in (test runners, interpreters, package managers,
+#: build tools) — lower case
+TOOLCHAIN_NAMES = frozenset({
+    "conftest.py", "sitecustomize.py", "usercustomize.py", "setup.py", "noxfile.py", "manage.py", "__init__.py",
+    "__main__.py", "pytest.ini", "setup.cfg", "tox.ini", "pyproject.toml", "pipfile", "requirements.txt",
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "makefile", "gnumakefile", "dockerfile",
+    "containerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml", "gemfile",
+    "rakefile", "cargo.toml", "go.mod", "build.gradle", "settings.gradle", "pom.xml", "cmakelists.txt",
+    "justfile", "procfile", "vagrantfile", "jenkinsfile", "brewfile"})
+#: …and the suffixes of code: a file the shell, an interpreter or a loader runs or imports by name
+LOADED_SUFFIXES = frozenset({
+    ".py", ".pyw", ".pyc", ".pyo", ".pyx", ".pth", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts",
+    ".sh", ".bash", ".zsh", ".ksh", ".csh", ".fish", ".command", ".rb", ".pl", ".pm", ".php", ".phtml", ".phar",
+    ".lua", ".tcl", ".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".wsf", ".applescript", ".scpt", ".r", ".jl",
+    ".go", ".rs", ".java", ".class", ".kt", ".kts", ".scala", ".groovy", ".gradle", ".swift", ".c", ".cc",
+    ".cpp", ".h", ".hpp", ".el", ".vim", ".awk", ".desktop", ".service", ".plist", ".mk", ".cmake",
+    ".ini", ".cfg", ".toml", ".env"}) | NATIVE_CODE_SUFFIXES
+#: the suffix appended to such a name
+LANDING_SUFFIX = ".download"
+
+
+def toolchain_loads(name: str) -> bool:
+    """§4UY N8 r3: is ``name`` (its final component) one a toolchain loads by name — a dotfile (`.env`,
+    `.npmrc`), a known build/test/package file (`TOOLCHAIN_NAMES`), or code (`LOADED_SUFFIXES`)?"""
+    n = Path(str(name or "")).name.lower()
+    if not n:
+        return False
+    if n.startswith(".") or n in TOOLCHAIN_NAMES:
+        return True
+    return Path(n).suffix in LOADED_SUFFIXES
+
+
+def landing_name(name: str) -> str:
+    """§4UY N8 r3: THE final name of a path-less download (the caller named no path; the URL or the server
+    chose it): a name a toolchain loads (`toolchain_loads`) never lands as itself — `conftest.py` is saved as
+    `conftest.py.download`. Every path-less download site asks this, after every name source is combined."""
+    name = str(name or "")
+    return name + LANDING_SUFFIX if toolchain_loads(name) else name
+
+
 #: Content-Type → extension, for a download whose URL name has none (`arxiv.org/pdf/2401.12345`)
 CONTENT_TYPE_EXT: Dict[str, str] = {
     "application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
@@ -151,12 +206,15 @@ def body_mismatch(filename: str, content_type: Optional[str], head: bytes, total
     kind = sniff_kind(head)
     if total == 0 or kind == "empty":
         return "the body is EMPTY (0 bytes)"
+    if kind == "html/xml":
+        # §4UY N13: an HTML body that is a WALL (a bot check, consent page, paywall stub) is not the file under
+        # ANY name — saved as `.html` it read SUCCESS. THE page classifier judges it (`classify_page`).
+        _title, _text = _head_title_text(head)
+        _wall = challenge_reason(None, _title, _text)
+        if _wall:
+            return f"the body is an HTML page ({_wall}), not the {suffix or 'file'} content"
     expected = _EXPECTED_KIND.get(suffix)
     if suffix in _OFFICE_TEXT_OK and kind in ("html/xml", "text") and _office_export(suffix, kind, head):
-        if kind == "html/xml":
-            _title, _text = _head_title_text(head)
-            if challenge_reason(None, _title, _text):
-                return f"the body is an HTML page, not a {suffix} file"
         return ""
     if expected or suffix in _BINARY_ONLY:
         if kind == "html/xml" or (ct == "text/html" and kind in _TEXTLIKE):
@@ -199,67 +257,178 @@ def _head_title_text(head: bytes):
 
 
 # ── challenge / interstitial pages ──────────────────────────────────────
+# §4UY N5: the ONE classifier of "a wall in front of the content". Three used to disagree on the same page
+# (`search.is_bot_check_page`, `challenge_reason`, `browser_routes.blocked_page_reason`): the live 51-char
+# HTTP-200 "Please wait while your request is being verified..." was a bot check to the first, a page to the
+# other two, and the browser booked it STATUS: OK and cleared the host's memo. Every reader now asks
+# `classify_page` (the search page reads, deep research, dark-web research, `helpers.fetch`, download's
+# body check, the quarantine and the browser); the two old names are thin renderers of its answer.
 
-#: body phrases of a page that stands in front of the content. Checked only on SHORT pages (an article that
-#: quotes "Just a moment" is long).
-_CHALLENGE_TEXT_RE = re.compile(
+#: a TITLE that is the wall itself — anchored, so a story whose title only MENTIONS one is a story; it counts
+#: only over a page with little text (`_TITLE_WALL_MAX_CHARS`)
+CHALLENGE_TITLE_RE = re.compile(
+    r"^\s*(?:just a moment|security verification|attention required|"
+    r"access (?:to this page has been )?denied|verify you are human|"
+    r"are you a human|checking your browser|please enable cookies|"
+    r"403 forbidden|401 authorization required|429 too many requests|"
+    r"one moment, please|bot verification|"
+    # §4UN-fetch r1: a bare BRAND word is a wall only as the WHOLE title — "Cloudflare outage takes down X"
+    # and "CAPTCHA farms are booming" are news stories
+    r"(?:cloudflare|ddos-guard|captcha|incapsula)\s*[.!]?\s*$|"
+    # §4HV (req d121dcc6): Hetzner's "Heray" gate; word-bounded so "Security Checklist …" is an article
+    r"security check\b|checking that you are not a robot|robot check\b|"
+    r"human verification|"
+    # §4UN-fetch: Anubis, Google/YouTube's EU consent wall, Imperva, the "one more step" interstitials
+    r"making sure you(?:'|’)?re not a bot|before you continue(?: to (?:google|youtube)[\w ]*)?\s*$|"
+    r"request unsuccessful|one more step\b|please wait while (?:we verify|your request)|"
+    r"pardon our interruption|performing security verification)",
+    re.IGNORECASE)
+#: a URL that is the wall (Cloudflare's challenge tokens and path, Heray's proof-of-work, Google's consent host)
+CHALLENGE_URL_RE = re.compile(r"__cf_chl|/cdn-cgi/challenge|/_ray/pow\b|^https?://consent\.(?:google|youtube)\.",
+                              re.I)
+#: body phrases of a page that stands in front of the content: a bot check / refusal. Like every wall phrase
+#: they count only as the page's MAIN content (`_wall_phrase`), each kind under its own size bound.
+#: The interstitial's own words about itself (review r2) — a challenge page explains itself at length
+#: (Anubis: 1,276 chars; a Cloudflare "Just a moment…" page ~2k), so these count on pages under
+#: `_CHALLENGE_TEXT_MAX`:
+_BOT_INTERSTITIAL_RE = re.compile(
     r"making sure you(?:'|’)?re not a bot|anubis\b.*\bproof[- ]of[- ]work|"
-    r"before you continue to (?:google|youtube)|we use cookies and data to deliver and maintain google|"
-    r"incapsula incident id|request unsuccessful\. incapsula|ddos-guard|ddos protection by|"
-    r"checking (?:if the site connection is secure|your browser before accessing)|"
-    r"enable javascript and cookies to continue|verify(?:ing)? you are (?:a )?human|"
-    r"you need to enable javascript to run this app|please (?:turn on|enable) javascript|"
-    r"javascript is (?:required|disabled)|this (?:site|page) requires javascript|"
-    r"press (?:&|and) hold to confirm you are|are you a robot\??|unusual traffic from your computer network",
+    r"checking (?:if the site connection is secure|your browser(?: before accessing)?)|"
+    r"verify(?:ing)? you are (?:a )?human|verifies you are not a bot|performing security verification|"
+    r"request is being verified|just a moment(?:\.\.\.|…)|enable javascript and cookies to continue|"
+    r"press (?:&|and) hold(?: (?:the|this) button)? to (?:confirm|verify|prove)",
     re.I | re.S)
-_CHALLENGE_URL_RE = re.compile(r"__cf_chl|/cdn-cgi/challenge|/_ray/pow\b|^https?://consent\.(?:google|youtube)\.",
-                               re.I)
-_CHALLENGE_TEXT_MAX = 3000
+#: …and the words a page may also say ABOUT a wall (a how-to: "Error 1020: Access Denied is shown when…") —
+#: these count only on a short page (`_PHRASE_WALL_MAX_CHARS`), like the consent and paywall phrases
+_BOT_PHRASE_RE = re.compile(
+    r"incapsula incident id|request unsuccessful\. incapsula|ddos-guard|ddos protection by|"
+    r"attention required!|are you a robot\??|unusual traffic from your computer network|"
+    r"blocked by network security|error(?: code)?:?\s*1020\b|access denied[^\n]{0,40}\b1020\b",
+    re.I | re.S)
+#: a consent wall: Google/YouTube's, or a short page that is only a cookie/privacy choice
+_CONSENT_PHRASE_RE = re.compile(
+    r"before you continue to (?:google|youtube)|we use cookies and data to deliver and maintain google|"
+    r"we value your privacy|(?:accept|agree to)(?: all)? cookies to continue|"
+    r"manage (?:your )?(?:cookie|privacy) (?:preferences|choices|settings)", re.I)
+#: a paywall stub: the page says the content is for subscribers / members
+_PAYWALL_PHRASE_RE = re.compile(
+    r"subscribe (?:now )?to (?:continue|keep) reading|to (?:continue|keep) reading,? (?:please )?"
+    r"(?:subscribe|log in|sign in|become a (?:subscriber|member))|"
+    r"this (?:article|content|story|page) is (?:only )?(?:available )?(?:exclusively )?(?:for|to) "
+    r"(?:paid )?(?:subscribers|members)|already a subscriber\?|subscribers only\b", re.I)
+#: a JavaScript-only shell (no content without a browser)
+_JS_PHRASE_RE = re.compile(
+    r"you need to enable javascript to run this app|please (?:turn on|enable) javascript|"
+    r"javascript is (?:required|disabled)|this (?:site|page) requires javascript", re.I)
 #: §4UN-fetch r1: a wall TITLE counts only over this little text (a 1,100-char news story titled "Access
 #: denied: court rules…" or "CAPTCHA farms are booming" is the story)
 _TITLE_WALL_MAX_CHARS = 600
-#: a wall PHRASE in the body counts on a page this short, or within its first `_PHRASE_HEAD_CHARS` characters
-#: (a story quoting "verify you are human" deep in its text is the story)
+#: §4UY review: a wall PHRASE counts only as the page's MAIN content — the page is SHORT (under this many
+#: characters: a wall has little else to say) AND the phrase opens it (starts within its opening,
+#: `_PHRASE_OPENING_CHARS` or the first half, whichever is longer). Review r2: the bound is per kind — an
+#: interstitial's own words (`_BOT_INTERSTITIAL_RE`) under `_CHALLENGE_TEXT_MAX`, everything else under this. A long how-to ("Error 1020: Access Denied is shown when…", "Press and hold the volume up
+#: button…") is content, and so is a short page whose footer links "privacy choices".
 _PHRASE_WALL_MAX_CHARS = 800
-_PHRASE_HEAD_CHARS = 300
+_PHRASE_OPENING_CHARS = 160
+_CHALLENGE_TEXT_MAX = 3000
+
+
+def _wall_phrase(rx, body: str, size: int, max_chars: int = _PHRASE_WALL_MAX_CHARS) -> str:
+    """The wall phrase of ``rx`` that is ``body``'s main content (a page under ``max_chars`` that opens with
+    it), or ""."""
+    if size >= max_chars:
+        return ""
+    lead = len(body) - len(body.lstrip())
+    for m in rx.finditer(body):
+        if m.start() - lead > max(_PHRASE_OPENING_CHARS, size / 2):
+            continue
+        if size >= _PHRASE_WALL_MAX_CHARS and _quoted(body, m.start()):
+            continue               # review r2: a longer page that QUOTES the phrase is about the wall
+        return m.group(0).strip()[:40]
+    return ""
+
+
+def _quoted(body: str, at: int) -> bool:
+    """The match at ``at`` sits inside a quotation on its line (an odd number of quote marks before it)."""
+    line = body[body.rfind("\n", 0, at) + 1:at]
+    straight = sum(line.count(q) for q in "\"'") - len(re.findall(r"\w'\w", line))   # not an apostrophe
+    # r3: a curly apostrophe between word characters ("you’re") closes no quotation
+    curly = sum(line.count(q) for q in "“‘«") - (sum(line.count(q) for q in "”’»")
+                                                  - len(re.findall(r"\w’\w", line)))
+    return straight % 2 == 1 or curly > 0
+#: a refusal status (the document answered it) — the page under it is not the content
+REFUSAL_STATUSES = frozenset({401, 403, 407, 429, 451, 503})
 #: under this many characters a page has no readable content (a JavaScript shell, an empty frame)
 NEAR_EMPTY_CHARS = 120
 
+#: the kinds `classify_page` returns
+WALL_BOT, WALL_CONSENT, WALL_PAYWALL, WALL_JS, WALL_REFUSAL = (
+    "bot challenge", "consent wall", "paywall", "javascript-only", "refusal")
 
-def challenge_reason(status: Optional[int], title: str = "", text: str = "", url: str = "") -> str:
-    """Why this fetched page is a wall in front of the content — "" when it may be read. ``text`` is the
-    visible text; ``status`` the HTTP status when known."""
+
+def classify_page(status: Optional[int] = None, title: str = "", text: Optional[str] = None, url: str = "",
+                  length: Optional[int] = None) -> tuple:
+    """THE wall classifier: ``(kind, detail)`` — ``("", "")`` when the page may be read.
+
+    ``text`` is the page's visible text (None when the reader did not get it); ``length`` the page's full
+    text size when the reader knows it and ``text`` is only a preview (the browser). With neither, the size
+    is UNKNOWN and a title decides nothing (§4LN: a screenshot of a page titled "Cloudflare…" banned the host).
+    A refusal ``status`` decides on its own — the kind says whether the page under it is a challenge."""
     title = str(title or "")
-    text = str(text or "")
     url = str(url or "")
+    txt = None if text is None else str(text)
     try:
-        from ..tools.browser_routes import _CHALLENGE_TITLE_RE as _title_re
-    except Exception:  # noqa: BLE001
-        _title_re = None
-    if _CHALLENGE_URL_RE.search(url):
-        return "consent wall" if "consent." in url.lower() else "bot challenge"
-    short = len(text) < _CHALLENGE_TEXT_MAX
-    if _title_re is not None and _title_re.match(title) and len(text) < _TITLE_WALL_MAX_CHARS:
-        return f"bot challenge ({title.strip()[:40]})"
-    m = None
-    if short:
-        for _m in _CHALLENGE_TEXT_RE.finditer(text[:_CHALLENGE_TEXT_MAX]):
-            # r2: a JavaScript notice counts only on a near-empty page ("Please enable JavaScript to see
-            # comments" heads many real stories); other wall phrases also count at the very top
-            if len(text) < _PHRASE_WALL_MAX_CHARS or (
-                    _m.start() < _PHRASE_HEAD_CHARS and "javascript" not in _m.group(0).lower()):
-                m = _m
-                break
-    if m:
-        what = m.group(0).lower()
-        if "javascript" in what:
-            return "a JavaScript-only page (no content without a browser)"
-        if "before you continue" in what or "cookies and data" in what:
-            return "consent wall"
-        return f"bot challenge ({what[:40]})"
-    if status in (401, 403, 429, 451, 503) and short:
-        return f"HTTP {status} refusal page"
-    return ""
+        size = int(length) if length is not None else (len(txt.strip()) if txt is not None else None)
+    except (TypeError, ValueError):
+        size = len(txt.strip()) if txt is not None else None
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
+    if CHALLENGE_URL_RE.search(url):
+        if "consent." in url.lower():
+            return WALL_CONSENT, "consent url"
+        return WALL_BOT, "challenge url"
+    if size is not None and size < _TITLE_WALL_MAX_CHARS and CHALLENGE_TITLE_RE.match(title):
+        return WALL_BOT, title.strip()[:40]
+    body = (txt or "")[:_CHALLENGE_TEXT_MAX]
+    if body and size is not None:
+        for kind, rx, bound in ((WALL_BOT, _BOT_INTERSTITIAL_RE, _CHALLENGE_TEXT_MAX),
+                                (WALL_BOT, _BOT_PHRASE_RE, _PHRASE_WALL_MAX_CHARS),
+                                (WALL_CONSENT, _CONSENT_PHRASE_RE, _PHRASE_WALL_MAX_CHARS),
+                                (WALL_PAYWALL, _PAYWALL_PHRASE_RE, _PHRASE_WALL_MAX_CHARS),
+                                (WALL_JS, _JS_PHRASE_RE, _PHRASE_WALL_MAX_CHARS)):
+            hit = _wall_phrase(rx, body, size, bound)
+            if hit:
+                return kind, hit
+    if status in REFUSAL_STATUSES:
+        return WALL_REFUSAL, f"HTTP {status}"
+    return "", ""
+
+
+def challenge_reason(status: Optional[int], title: str = "", text: Optional[str] = "", url: str = "",
+                     length: Optional[int] = None) -> str:
+    """Why this fetched page is a wall in front of the content — "" when it may be read (`classify_page`,
+    worded for a fetch's error line). A refusal status counts here only over a short page (a fetch reader
+    that got a long 503 body has the body)."""
+    kind, detail = classify_page(status, title, text, url, length)
+    if not kind:
+        return ""
+    if kind == WALL_REFUSAL:
+        size = length if length is not None else len(str(text or "").strip())
+        return f"{detail} refusal page" if size < _CHALLENGE_TEXT_MAX else ""
+    if kind == WALL_JS:
+        return "a JavaScript-only page (no content without a browser)"
+    if kind == WALL_CONSENT:
+        return "consent wall"
+    if kind == WALL_PAYWALL:
+        return f"paywall ({detail.lower()})"
+    return f"bot challenge ({detail.lower()})"
+
+
+def is_wall_text(text: str) -> bool:
+    """A fetched page's TEXT alone is a wall (the readers that have no title, url or status)."""
+    return bool(classify_page(None, "", str(text or ""), "")[0])
 
 
 # ── readers ─────────────────────────────────────────────────────────────

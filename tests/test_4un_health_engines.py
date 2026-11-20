@@ -32,12 +32,17 @@ def _line(now):
 def test_the_wave_line_is_tallied_per_engine():
     t = 1_000_100.0
     _wave(" | engines: duckduckgo=blocked yandex=win brave=conn-error yahoo=unfinished", t)
-    _wave(" | engines: duckduckgo=blocked yandex=empty brave=blocked yahoo=empty yandex-h=blocked yahoo-h=win", t + 1)
+    # §4VA: the engine table's names only — the Brave onion, and Wikipedia beside the race (the old
+    # hedge labels ``yandex-h`` / ``yahoo-h`` and the DuckDuckGo onion are gone, and no longer counted)
+    _wave(" | engines: duckduckgo=blocked yandex=empty brave=blocked yahoo=empty brave_onion=win wikipedia=added"
+          " yandex-h=win duckduckgo_onion=win", t + 1)
     h = S.engine_health(now=t + 10)
     assert h["waves"] == 2 and h["won"] == 2
     assert h["engines"]["yandex"] == {"win": 1, "empty": 1}
     assert h["engines"]["duckduckgo"] == {"blocked": 2}
-    assert h["engines"]["yahoo-h"] == {"win": 1}
+    assert h["engines"]["brave_onion"] == {"win": 1}
+    assert h["engines"]["wikipedia"] == {"added": 1}
+    assert "yandex-h" not in h["engines"] and "duckduckgo_onion" not in h["engines"]
 
 
 def test_only_the_last_24_hours_count():
@@ -75,26 +80,28 @@ def test_the_health_line_reports_and_never_judges():
 
 def test_an_engine_outrun_by_the_winner_is_not_a_loss():
     # review r1 MAJOR: built from what the race really writes when yandex wins first
-    tasks = {1: "duckduckgo", 2: "yandex", 3: "brave", 4: "yahoo", 5: "duckduckgo_onion"}
+    # (§4VA: yandex's three circuits are three attempts of ONE engine — one token)
+    tasks = {1: "duckduckgo", 2: "yandex", 3: "yandex", 4: "yandex", 5: "brave", 6: "yahoo", 7: "brave_onion"}
     t = 1_000_000.0 + 3600
     for i in range(10):
-        _wave(S._engines_token(tasks, [], winner="yandex"), t + i)
+        _wave(S._engines_token(tasks, [], winner="yandex", supplement={"wikipedia": "added"}), t + i)
     _wave(S._engines_token(tasks, [("brave", "ConnectError: x"), ("duckduckgo", "No results found.")],
-                           late=["duckduckgo_onion"]), t + 20)
+                           supplement={"wikipedia": "timeout"}), t + 20)
     text, problems, _u = _line(now=t + 60)
     assert "yandex: 10 won, 1 outrun" in text
     assert "brave: 0 won, 1 unreachable, 10 outrun" in text
-    assert "duckduckgo_onion: 0 won, 10 outrun, 1 cut off" in text
+    assert "brave_onion: 0 won, 11 outrun" in text
+    assert "wikipedia (beside the race): 1 unreachable, 10 added rows" in text      # never "won"
     assert text.index("yandex:") < text.index("brave:")       # winners first
     assert problems == []
 
 
-def test_a_backup_try_is_named_and_a_weak_batch_is_said():
+def test_a_weak_batch_is_said():
     t = 1_000_000.0 + 3600
-    _wave(" | engines: yandex=low-relevance yahoo=empty yandex-h=error", t)
+    _wave(" | engines: yandex=low-relevance yahoo=empty brave_onion=error", t)
     text, _p, _u = _line(now=t + 5)
     assert "1 tried, 0 found results, 1 only weak matches" in text
-    assert "yandex (backup try): 0 won, 1 error" in text
+    assert "brave_onion: 0 won, 1 error" in text
 
 
 def test_a_long_run_says_last_24_h():

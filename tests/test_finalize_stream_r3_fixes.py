@@ -15,7 +15,7 @@ import pytest
 
 from ghost_agent.core.agent import (
     _emit_safe_end, _frag_is_forming_tag, _inline_think_open,
-    _scrub_task_status_runs, _scrub_tail_is_open)
+    _scrub_tail_is_open)
 from unittest.mock import MagicMock
 
 from tests.test_finalize_stream_pins import (
@@ -144,25 +144,8 @@ class TestBannerShapeNotName:
         assert "Process finished successfully." in out
 
 
-# ── R3 B-D2: majority-shaped runs ────────────────────────────────────────────
-
-class TestMajorityShapedRuns:
-    def test_one_id_in_prose_does_not_poison_run(self):
-        text = ("Current standing:\n- Ship the report (DONE)\n"
-                "- Fix the task_7 regression (IN_PROGRESS)\n"
-                "- Update docs (PENDING)\nMore prose.")
-        assert _scrub_task_status_runs(text) == text
-
-    def test_markdown_link_lead_is_not_task_shaped(self):
-        text = ("[README](docs/readme.md) refreshed (DONE)\n"
-                "[CHANGELOG](docs/log.md) updated (DONE)\n"
-                "[LICENSE](LICENSE) checked (DONE)\nAll set.")
-        assert _scrub_task_status_runs(text) == text
-
-    def test_majority_shaped_run_still_stripped(self):
-        tree = "\n".join(f"[task_{i}] step (IN_PROGRESS)" for i in range(4))
-        text = f"head\n{tree}\ntail"
-        assert _scrub_task_status_runs(text) == "head\ntail"
+# §4VC: the task-status run scrubber was removed; tests/test_4vc_task_lines_reach_the_owner.py pins
+# that task lines reach the owner.
 
 
 # ── R3 B-D3: dual-dialect fences ─────────────────────────────────────────────

@@ -1,7 +1,6 @@
 {
   "_comment": "Error-class findings tolerated at the time of writing. Regenerate with scripts/lint.py --write-baseline, which refuses to grow this file. Every entry is a pylint inference limit or a known finding \u2014 see notes. The slack ceiling is ALLOWED_SLACK in scripts/lint.py, not a key here.",
   "entries": {
-    "missing-kwoa|src/ghost_agent/core/agent.py|Missing mandatory keyword argument 'tool_runner' in function call": 1,
     "no-member|src/ghost_agent/distill/schema.py|Class 'ToolCall' has no '__dataclass_fields__' member": 1,
     "no-member|src/ghost_agent/distill/schema.py|Class 'Trajectory' has no '__dataclass_fields__' member": 1,
     "no-member|src/ghost_agent/utils/sanitizer.py|Class 'msg' has no 'lower' member": 1,
@@ -62,7 +61,6 @@
     "unused-import|src/ghost_agent/tools/registry.py|Unused import json": 1,
     "unused-import|src/ghost_agent/tools/registry.py|Unused tool_unified_forget imported from memory": 1,
     "unused-import|src/ghost_agent/tools/search.py|Unused import copy": 1,
-    "unused-import|src/ghost_agent/tools/search.py|Unused import json": 1,
     "unused-import|src/ghost_agent/tools/workspace.py|Unused Optional imported from typing": 1,
     "unused-import|src/ghost_agent/tools/workspace_track.py|Unused Optional imported from typing": 1,
     "unused-import|src/ghost_agent/utils/sanitizer.py|Unused import io": 1,
@@ -81,7 +79,6 @@
     "unused-variable|src/ghost_agent/tools/system.py|Unused variable 'cat'": 1
   },
   "notes": {
-    "missing-kwoa|core/agent.py": "INFERENCE LIMIT. `_aa_build(*a, **kw)` forwards to build_coding_task; pylint cannot prove `tool_runner` is in kw. Not a defect.",
     "no-member|__dataclass_fields__": "INFERENCE LIMIT. pylint does not synthesise the dataclass-generated attribute. Not a defect.",
     "no-member|utils/sanitizer.py": "INFERENCE LIMIT. `e.msg` on a SyntaxError is a str; pylint mis-infers it as the stdlib `msg` module. Not a defect.",
     "no-self-argument": "DELIBERATE. Nested context-manager classes name the receiver `self_inner` so it cannot shadow the enclosing `self`. Not a defect.",

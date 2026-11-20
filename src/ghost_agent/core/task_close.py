@@ -75,6 +75,7 @@ class Verdict:
     refused: List[Refusal] = field(default_factory=list)
     waived: Dict[str, str] = field(default_factory=dict)        # gate → the model's reason
     overridden: List[Refusal] = field(default_factory=list)     # gates the owner's click went over
+    notes: List[Refusal] = field(default_factory=list)          # advisories: the close stands (§4UY P7 r2)
 
     @property
     def first(self) -> Optional[Refusal]:
@@ -171,15 +172,79 @@ def _failed_leaves(tree, tid: str, _seen=None) -> List[str]:
     return out
 
 
-def gate_deliverable(workspace, description: str) -> Optional[Refusal]:
+_DELIVERABLE_FIX = ("write the declared file at that path — or, if the plan changed, pass a "
+                    "`description` that ends with → the real path — or, if the task no longer "
+                    "makes a file, override={\"deliverable\": \"<why, in a sentence>\"} for that one task")
+
+
+def gate_deliverable(workspace, description: str, *, since: Optional[float] = None,
+                     touched=()) -> Optional[Refusal]:
+    """The declared file must be there with content; with ``since`` also the §4UY P7 stale check
+    (`gate_stale_deliverable`)."""
     from .task_deliverable import deliverable_problem
     problem = deliverable_problem(workspace, description)
-    if not problem:
+    if problem:
+        return Refusal("deliverable", problem, _DELIVERABLE_FIX)
+    return gate_stale_deliverable(workspace, description, since=since, touched=touched)
+
+
+def gate_stale_deliverable(workspace, description: str, *, since: Optional[float] = None,
+                           touched=()) -> Optional[Refusal]:
+    """§4UY P7: a declared file that already existed before the task was created (``since``) and that this
+    request's own successful tool calls did not write, read or run (``touched``) — existence alone closed a task
+    that named a pre-existing file with no work at all; the result's prose is no evidence (review). Where it
+    refuses and where it only notes is `_stale_mode` (review 2: a fuzzy judge must not gate the owner)."""
+    from .task_deliverable import stale_deliverable_problem
+    problem = stale_deliverable_problem(workspace, description, since=since, touched=touched)
+    return Refusal("deliverable", problem, _DELIVERABLE_FIX, sub="stale") if problem else None
+
+
+#: §4UY P7 review 2: the advisory the owner's own close carries instead of a refusal
+STALE_NOTE = ("the declared file predates this task and nothing in this request touched it — say in the result "
+              "what changed")
+
+
+def _stale_mode(store, task_id: str, node, actor: str) -> str:
+    """§4UY P7 review 2 — "off": an owner-kind task (the owner did it themselves) · "note": a close in the
+    OWNER's own turn, in a task turn of the owner's own batch (`_owner_task_turn`), or by the advancer for the
+    owner's batch (``advancer_owner``) — advisory, the close stands (review 3) · "refuse": an unattended /
+    scheduled / idle close (the case the finding is about)."""
+    try:
+        kind = str(getattr(node, "kind", "") or (store.get_task(task_id) or {}).get("kind") or "")
+    except Exception:  # noqa: BLE001
+        kind = ""
+    if kind.strip().lower() == "owner":
+        return "off"
+    if actor == "advancer_owner":
+        return "note"
+    if actor in ("model", "rollup"):
+        try:
+            from ..tools.projects import _owner_task_turn, _owner_turn_now
+            if _owner_turn_now() or _owner_task_turn():
+                return "note"
+        except Exception:  # noqa: BLE001
+            pass
+    return "refuse"
+
+
+def _touched_now() -> set:
+    """The files this request's own successful tool calls wrote, read or ran (`task_deliverable.touched_in`)."""
+    try:
+        from ..utils.logging import request_id_context
+        from .task_deliverable import touched_in
+        return touched_in(str(request_id_context.get() or ""))
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _task_since(store, task_id: str) -> Optional[float]:
+    """When the task was created (its declared file must be newer, or touched by this request's own tool
+    calls — `_touched_now`) — None unknown."""
+    try:
+        v = float((store.get_task(task_id) or {}).get("created_at") or 0.0)
+        return v or None
+    except Exception:  # noqa: BLE001
         return None
-    return Refusal("deliverable", problem,
-                   "write the declared file at that path — or, if the plan changed, pass a "
-                   "`description` that ends with → the real path — or, if the task no longer "
-                   "makes a file, override={\"deliverable\": \"<why, in a sentence>\"} for that one task")
 
 
 def _trusted_kind(store, project_id, task_id, node) -> str:
@@ -271,9 +336,26 @@ def check_close(store, project_id: str, tree, task_id: str, *, actor: str,
     except Exception:  # noqa: BLE001
         ws = None
     files = [f for f in (files or []) if f]
+    v = Verdict(ok=True)
+
+    def _deliverable():
+        r = gate_deliverable(ws, judged_desc)
+        if r is not None:
+            return r
+        mode = _stale_mode(store, task_id, node, actor)
+        if mode == "off":
+            return None
+        r = gate_stale_deliverable(ws, judged_desc, since=_task_since(store, task_id), touched=_touched_now())
+        if r is not None and mode == "note":
+            from .task_deliverable import declared_deliverable
+            v.notes.append(Refusal("deliverable", f"{declared_deliverable(judged_desc)}: {STALE_NOTE}", "",
+                                   sub="stale"))
+            return None
+        return r
+
     checks = {
         "dependencies": lambda: gate_dependencies(tree, task_id),
-        "deliverable": lambda: gate_deliverable(ws, judged_desc),
+        "deliverable": _deliverable,
         "model_run": lambda: gate_model_run(store, project_id, stored_desc,
                                             files=files, result_text=result,
                                             kind=_trusted_kind(store, project_id, task_id, node)),
@@ -281,7 +363,6 @@ def check_close(store, project_id: str, tree, task_id: str, *, actor: str,
                                           constraints=list(constraints or [])),
         "postconditions": lambda: gate_postconditions(tree, node, result or live_evidence),
     }
-    v = Verdict(ok=True)
     for gate in GATE_ORDER:
         if gate in skip:
             continue

@@ -12,7 +12,11 @@ looks on the face and everything that reads them stay as they are):
 
 A shade is set only by an event that MOVED the mood (an event held by the owner's set mood sets none), it
 lasts ``TTL_S``, and a later shade replaces it. It is heard ONCE: the next reply to the owner on a private
-surface carries one short line (``line``), and no reply after it does — a moment, not a state. The face
+surface carries one short line (``line``), and no reply after it does — a moment, not a state. §4UW: the
+reply that is being written when the moment happens is that reply when it can be — a request that has heard
+no shade asks again at every step, so the turn that closes a project task reports it with its pride (the
+turn's own shade is then set already heard), and a correction judged while its reply is still being worked
+on is heard by that reply. The face
 shows the same moment (``/api/health`` carries the shade and when it was set). It never moves the pair, the
 reaction ledger or what anyone else hears.
 
@@ -49,7 +53,8 @@ _WHAT = {
     RELIEVED: "relief — something of yours that had gone wrong has just gone through",
     PROUD: "a quiet pride — a piece of work you were carrying is finished",
     # §4UH-e2e review: not "your LAST reply" — a correction is judged in the background after the reply to it
-    # has started (its own reply cannot hear it), so the reply that does is one later; a thumb may be on any reply
+    # has started (§4UW: a reply of several steps hears it at its next step; a one-step reply cannot, and the
+    # reply that does is one later); a thumb may be on any reply
     CHASTENED: "you are a little chastened — the owner has just marked one of your replies down",
 }
 LINE = ("RIGHT NOW, FOR THIS REPLY ONLY: {what}. Let it show lightly in HOW you phrase this reply — a word, "

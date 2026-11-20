@@ -273,7 +273,7 @@ def test_briefing_r1_minor_wording(store):
     pid = store.create_project("Web OS 2", goal="a browser desktop")
     ProjectPlan(store, pid).add_task("task a")
     b = build_project_briefing(store, pid)
-    assert "only a NEW message from the user changes it" in b              # m4 queued
+    assert "NEW message from the user; that message re-opens the decision" in b   # m4 queued (§4UY P4 r3 table)
     assert "'first plan it, then build it' asks for both" in b               # m3
     assert "A task turn's 'do this ONE task now' is the go-ahead" in b      # task turns
 

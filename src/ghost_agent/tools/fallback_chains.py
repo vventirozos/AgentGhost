@@ -18,14 +18,10 @@ logger = logging.getLogger("GhostAgent")
 # Fallback chains: tool_name → list of (fallback_tool, hint) pairs.
 # When tool_name fails, suggest the first applicable fallback.
 FALLBACK_CHAINS = {
-    "deep_research": [
-        ("web_search", "Try a simpler web_search with a focused query instead of deep_research."),
-        ("recall", "Check if the answer is already in memory using recall."),
-    ],
-    "web_search": [
-        ("deep_research", "Try deep_research for a more thorough investigation."),
-        ("recall", "Check if you already have this information in memory."),
-    ],
+    # web_search / deep_research: NO chain (§4UY N1) — each sent the model to the other, which races
+    # the SAME engines (2 live calls: a 16 s failure and 71 s for nothing); their failures name their
+    # own next step (tests/test_4uy_internet.py enumerates the table against
+    # `link_grounding.RESEARCH_TOOLS`).
     "execute": [
         ("file_system", "Read the file first with file_system to check for syntax errors before re-executing."),
     ],
@@ -50,8 +46,6 @@ def get_fallback_chain_hint(failed_tool: str, error_text: str = "") -> Optional[
 
     for fallback_tool, hint in chain:
         # Skip if the error suggests the fallback would also fail
-        if fallback_tool == "web_search" and "captcha" in error_lower:
-            continue
         if fallback_tool == "execute" and "docker" in error_lower:
             continue
         return f"FALLBACK SUGGESTION: {hint}"

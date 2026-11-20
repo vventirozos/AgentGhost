@@ -506,7 +506,7 @@ async def test_a_gate_word_task_runs_with_the_rest(tctx):
     await tool_manage_projects(tctx, action="create", title="Gate first")
     pid = tctx.current_project_id
     await tool_manage_projects(tctx, action="task_decompose", subtasks=[
-        "Approve the research budget", "research topic A", "research topic B"])
+        "Approve the research budget", "research topic A", "research topic B"], go_ahead=True)   # §4UY P4
     out = json.loads(await tool_manage_projects(tctx, action="autoadvance", count="all"))
     st = {t["description"]: t["status"] for t in tctx.project_store.list_tasks(pid)}
     assert set(st.values()) == {"DONE"}
@@ -519,7 +519,8 @@ async def test_a_gate_word_task_runs_with_the_rest(tctx):
 async def test_tool_names_a_waiting_task_on_any_stop(tctx, monkeypatch):
     await tool_manage_projects(tctx, action="create", title="Waiting")
     pid = tctx.current_project_id
-    await tool_manage_projects(tctx, action="task_decompose", subtasks=["research topic A"])
+    await tool_manage_projects(tctx, action="task_decompose", subtasks=["research topic A"],
+                               go_ahead=True)                                          # §4UY P4
     tid = tctx.project_store.add_task(pid, "Publish the notes")
     tctx.project_store.update_task(tid, status="NEEDS_USER")
 
@@ -581,7 +582,7 @@ async def test_an_earlier_failure_outranks_the_gate_on_a_real_store(tctx):
     await tool_manage_projects(tctx, action="create", title="Old failure")
     pid = tctx.current_project_id
     await tool_manage_projects(tctx, action="task_decompose", subtasks=[
-        "research topic Z", "Approve the research budget", "research topic A"])
+        "research topic Z", "Approve the research budget", "research topic A"], go_ahead=True)   # §4UY P4
     z = next(t["id"] for t in tctx.project_store.list_tasks(pid) if t["description"] == "research topic Z")
     tctx.project_store.update_task(z, status="FAILED", failure_reason="earlier run")
     out = json.loads(await tool_manage_projects(tctx, action="autoadvance", count="all"))

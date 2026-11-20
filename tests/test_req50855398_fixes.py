@@ -33,9 +33,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 
 import pytest
 
-from ghost_agent.core.coding_executor import (
-    build_coding_task, _maybe_unescape_double_escaped, _unescape_common,
-)
+from ghost_agent.core.coding_executor import build_coding_task
 from ghost_agent.core.agent import _notify_promise_backstop
 from ghost_agent.core.autonomous_activity import ActivityLog, SEVERITY_NOTIFY
 from ghost_agent.tools.file_system import (
@@ -179,31 +177,10 @@ def test_backstop_wired_into_finalize_and_stream():
 # Double-escaped content: bounded repair + named diagnosis.
 
 
-def test_unescape_common_basics():
-    assert _unescape_common("a\\nb") == "a\nb"
-    assert _unescape_common('say \\"hi\\"') == 'say "hi"'
-    assert _unescape_common("tab\\there") == "tab\there"
-    # An escaped backslash + n is a LITERAL backslash-n, not a newline.
-    assert _unescape_common("a\\\\nb") == "a\\nb"
 
 
-def test_maybe_unescape_repairs_incident_shape():
-    fixed = _maybe_unescape_double_escaped(ESCAPED_PROGRAM, "data_generator.py")
-    assert fixed is not None
-    assert "\n" in fixed
-    import ast
-    ast.parse(fixed)  # the bound: output must parse
 
 
-def test_maybe_unescape_leaves_normal_content_alone():
-    assert _maybe_unescape_double_escaped(VALID_PROGRAM, "x.py") is None
-    # single-line but PARSES (a one-liner script) → untouched
-    assert _maybe_unescape_double_escaped("x = 1", "x.py") is None
-    # non-python → untouched
-    assert _maybe_unescape_double_escaped(ESCAPED_PROGRAM, "x.md") is None
-    # escaped-looking but still broken after unescape → refused (None)
-    assert _maybe_unescape_double_escaped(
-        "def f(:\\n    pass\\n" * 3, "x.py") is None
 
 
 class _SpecLLM:
@@ -237,20 +214,6 @@ class _DiskRunner:
         return ""
 
 
-async def test_build_writes_repaired_content_not_escaped():
-    spec = json.dumps({"files": [{"path": "data_generator.py",
-                                  "content": ESCAPED_PROGRAM}],
-                       "verify": "", "summary": "gen"})
-    runner = _DiskRunner()
-    ctx = SimpleNamespace(llm_client=_SpecLLM(spec),
-                          args=SimpleNamespace(model="m"))
-    res = await build_coding_task(ctx, "Implement data_generator.py",
-                                  tool_runner=runner, existing_files={})
-    assert res.ok
-    written = runner.files["data_generator.py"]
-    assert "\n" in written and "\\n" not in written.replace("\\\\n", "")
-    import ast
-    ast.parse(written)
 
 
 def test_syntax_feedback_names_double_escape(tmp_path):

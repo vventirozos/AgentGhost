@@ -28,6 +28,7 @@ import pytest
 from ghost_agent.core.llm import LLMClient, NodeCircuitBreaker
 from ghost_agent.core.node_throughput import DistillPlan, NodeThroughput
 from ghost_agent.tools import search as search_mod
+from ghost_agent.core.node_throughput import BUDGET_UTILISATION
 from ghost_agent.tools.search import tool_deep_research
 
 PAGE = "Qwen 3.6 35B-A3B runs at 16GB in Q4_K_M. " * 3000  # ~126k chars
@@ -188,18 +189,35 @@ class TestThePerURLClockStartsWhenTheURLStarts:
             await asyncio.sleep(1.0)
             return PAGE
 
-        client = StubClient()
-        await _run(client, hrefs=[f"https://a.com/{i}" for i in range(8)],
-                   fetch=slow)
+        class Timed(StubClient):
+            def plan_distill(self, budget_s, **kwargs):
+                self.at = getattr(self, "at", []) + [time.monotonic()]
+                return super().plan_distill(budget_s, **kwargs)
+
+        client = Timed()
+        t0 = time.monotonic()
+        out = await _run(client, hrefs=[f"https://a.com/{i}" for i in range(8)],
+                         fetch=slow)
+        # §4UZ: the per-URL window (6 s here) now covers the FETCH only, so no
+        # wave of fetches is starved by the one before it: all eight load.
+        # The distill budget is no longer cut out of that window — it is the
+        # phase's remaining time shared among the pages still waiting (pinned
+        # in tests/test_4uz_research_distill.py), so the old "every budget
+        # within 0.5 s of the others and below the per-URL window" no longer
+        # describes it: the stub answers at once, and each later page is
+        # offered a larger share of the time the earlier ones did not use.
+        assert out.count("[EDGE EXTRACTED FACTS]") == 8, out[:400]
         assert len(client.budgets) == 8
-        spread = max(client.budgets) - min(client.budgets)
-        assert spread < 0.5, f"budgets drifted across waves: {client.budgets}"
-        assert min(client.budgets) > 1.5
-        # ⚠ A CEILING TOO. With only a floor and a spread bound, replacing the
-        # per-URL deadline with a CONSTANT (`monotonic() + (budget_s and 55.0)`)
-        # passes both — every budget is then a fixed ~52.5s, uniform and large.
-        # The budget must be bounded by the window the semaphore issued.
-        assert max(client.budgets) < search_mod._PER_URL_TIMEOUT_S, client.budgets
+        # review r1: the exact figure, so a constant budget cannot pass — each
+        # page's plan is BUDGET_UTILISATION of (phase left - the report's
+        # reserve) / pages still waiting, at the moment its turn came.
+        # (`t0` is taken before the stubbed search: the phase clock starts
+        # within the tolerance of it.)
+        phase_end = t0 + search_mod._RESEARCH_PHASE_TIMEOUT_S - search_mod.RESEARCH_ASSEMBLY_S
+        for i, (b, at) in enumerate(zip(client.budgets, client.at)):
+            want = BUDGET_UTILISATION * (phase_end - at) / (8 - i)
+            assert b == pytest.approx(want, abs=0.5), (i, b, want)
+        assert client.budgets[7] > 4 * client.budgets[0]
 
     @pytest.mark.asyncio
     async def test_the_phase_deadline_declines_late_urls_rather_than_posting(
@@ -394,8 +412,22 @@ class TestTheQueueAllowance:
         # remaining time cannot pay for.
         offered = client.budgets[0]
         _, kwargs = client.payloads[0]
+        # §4UZ: one distill at a time (the default) never queues behind its
+        # own wave at the node's gate, so the plan gets the whole budget...
+        # (review r1: sized for BUDGET_UTILISATION of it — the call's limit keeps the headroom)
+        assert offered == pytest.approx(kwargs["total_budget"] * BUDGET_UTILISATION, abs=0.5)
+
+    @pytest.mark.asyncio
+    async def test_a_wider_queue_keeps_the_allowance(self, monkeypatch):
+        # ...and a queue wider than one (GHOST_DISTILL_WIDTH) can queue there
+        # again, so its plans keep the allowance out of the budget.
+        monkeypatch.setenv("GHOST_DISTILL_WIDTH", "3")
+        client = StubClient()
+        await _run(client)
+        offered = client.budgets[0]
+        _, kwargs = client.payloads[0]
         assert offered == pytest.approx(
-            kwargs["total_budget"] - search_mod._QUEUE_ALLOWANCE_S, abs=0.5)
+            (kwargs["total_budget"] - search_mod._QUEUE_ALLOWANCE_S) * BUDGET_UTILISATION, abs=0.5)
 
     @pytest.mark.asyncio
     async def test_the_permit_wait_is_bounded_by_the_allowance(self):
@@ -515,22 +547,29 @@ class TestTheFanOutIsDeclared:
     """The wave is planned before any of it is in flight."""
 
     @pytest.mark.asyncio
-    async def test_deep_research_declares_its_semaphore_width(self):
+    @pytest.mark.parametrize("width", [1, 3])
+    async def test_deep_research_declares_the_queue_width(self, monkeypatch, width):
         # Without this the node looks IDLE to every plan in the wave and each
         # is sized as if it had the box to itself — measured live as four
         # ~19,936-char plans built at ~306/32 tok/s that then ran at 115/11.
+        # §4UZ: what is declared is the distill queue's width (one at a time
+        # by default), no longer the fetch semaphore's 3.
+        monkeypatch.setenv("GHOST_DISTILL_WIDTH", str(width))
         client = StubClient()
         await _run(client, hrefs=[f"https://a.com/{i}" for i in range(4)])
         assert client.fanouts, "no plan was requested"
-        assert all(f == 3 for f in client.fanouts), client.fanouts
+        assert all(f == width for f in client.fanouts), client.fanouts
 
     @pytest.mark.asyncio
-    async def test_darkweb_declares_its_own_fetch_width(self):
-        # §4UN-darkres: 4 onion pages at a time (was 2); the plans declare that width
+    @pytest.mark.parametrize("width", [1, 3])
+    async def test_darkweb_declares_the_queue_width(self, monkeypatch, width):
+        # §4UZ: onion pages are still FETCHED 4 at a time, but their distills go through the
+        # same queue as deep_research's — the plans declare its width, not the fetch width
+        monkeypatch.setenv("GHOST_DISTILL_WIDTH", str(width))
         client = StubClient(_plan(chars=6_000, tokens=200))
         await _run_dw(client)
-        assert client.fanouts and all(f == dw_mod._RESEARCH_FETCH_WIDTH == 4 for f in client.fanouts), \
-            client.fanouts
+        assert dw_mod._RESEARCH_FETCH_WIDTH == 4
+        assert client.fanouts and all(f == width for f in client.fanouts), client.fanouts
 
 
 class TestPlanDistillRaisesForBusyNodes:
@@ -636,7 +675,10 @@ class TestConcurrencyIsMeasuredOnTheLivePath:
         return c, node
 
     @pytest.mark.asyncio
-    async def test_a_three_way_wave_is_stored_as_a_solo_equivalent_rate(self):
+    async def test_a_three_way_wave_is_stored_as_a_solo_equivalent_rate(self, monkeypatch):
+        # §4UZ: with the distill queue at width 3 — the regime in which a 3-way reading is one a plan
+        # may be made from (at the default width of 1 such readings never set a plan rate on their own)
+        monkeypatch.setenv("GHOST_DISTILL_WIDTH", "3")
         # ⚠ DRIVEN THROUGH `_do_chat_completion`, NOT A HAND-ROLLED IMITATION.
         # A first version of this test acquired the permit itself and called
         # `_on_node_success` directly — and a mutant that moved the capture

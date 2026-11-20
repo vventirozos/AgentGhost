@@ -77,6 +77,34 @@ LOOK_TIMEOUT_S = 90.0
 #: before any look was timed: the collage verdict's default (same node, same shape)
 LOOK_DEFAULT_S = 30.0
 RECENT_LOOK_SECONDS = collections.deque(maxlen=3)
+#: §4UY image-3: the look the tool took at a picture, by the sha256 of the
+#: picture's bytes — the verifier's check of that same picture reads it instead
+#: of looking again (live 76e8b1d0: a second look on the main slot, after the
+#: conversation was saved off it, 2.27 GB). Bounded; in-process (the verifier
+#: runs in this process, during the turn or right after it).
+RENDER_LOOKS: "collections.OrderedDict[str, str]" = collections.OrderedDict()
+RENDER_LOOKS_MAX = 64
+
+
+def _bytes_key(image_bytes) -> str:
+    import hashlib
+    return hashlib.sha256(bytes(image_bytes)).hexdigest() if image_bytes else ""
+
+
+def note_render_look(image_bytes, scene) -> None:
+    """Remember the tool's look ``scene`` for exactly these picture bytes."""
+    key, scene = _bytes_key(image_bytes), " ".join(str(scene or "").split())
+    if not key or not scene:
+        return
+    RENDER_LOOKS[key] = scene
+    RENDER_LOOKS.move_to_end(key)
+    while len(RENDER_LOOKS) > RENDER_LOOKS_MAX:
+        RENDER_LOOKS.popitem(last=False)
+
+
+def render_look_for(image_bytes) -> str:
+    """The tool's look at exactly these picture bytes, or ""."""
+    return RENDER_LOOKS.get(_bytes_key(image_bytes), "") if image_bytes else ""
 #: §4QT: WHERE the look runs. The vision pool is the main server itself
 #: (`--visual-nodes` = `--upstream-url`, `-np 1`): a look there is 3 s, but it
 #: evicts the owner's conversation from the one slot and the reply re-prefills
@@ -113,7 +141,7 @@ CHECK_CRITIC_ARM = "check_critic"
 #: description is taken away from the model. Paired replay (12 prompts × 3):
 #: replies with unsupported claims 22/36 → 9/36, hidden mismatches 4 → 3,
 #: WRONG 2 → 2, turn −5 s. ON by GHOST_LOOK_OWNED=1 or the probe arm `look_owned`
-#: (both imply the look); the line itself is appended by `agent._owned_look_note`.
+#: (both imply the look); the line itself is placed under the picture by `agent.owned_look_insertions`.
 LOOK_OWNED_ENV = "GHOST_LOOK_OWNED"
 LOOK_OWNED_ARM = "look_owned"
 LOOK_CRITIC_TIMEOUT_S = 30.0
@@ -1178,6 +1206,8 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                 pretty_log("Image Generation",
                            (f"looked at the render ({RECENT_LOOK_SECONDS[-1]:.0f}s): {_seen[:120]}" if _seen else
                             "look gave no usable scene — picture kept, not described"), icon=Icons.IMAGE_GEN)
+        if image_bytes and _seen:
+            note_render_look(image_bytes, _seen)        # §4UY image-3: the verifier reads it, never looks again
 
         # When a project is active sandbox_dir is scoped to <root>/projects/<id>;
         # the /api/download route resolves against the ROOT, so prefix the link.

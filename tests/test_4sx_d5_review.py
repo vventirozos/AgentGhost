@@ -140,7 +140,7 @@ async def test_collect_normalises_the_exit_like_the_wake_and_strips_the_marker(t
     import ghost_agent.tools.execute as EX
     seen = []
 
-    def norm(cmd, code, out=""):
+    def norm(cmd, code, out="", failures=None):      # §4UY C9: the trap's recorded failures ride along
         seen.append((cmd, code))
         return 0                                     # e.g. a `| head` that closed the pipe early
     monkeypatch.setattr(EX, "_normalise_exit", norm)

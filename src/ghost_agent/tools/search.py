@@ -15,6 +15,7 @@ from ..utils.aio import wait_for as _cancel_safe_wait_for
 
 logger = logging.getLogger("GhostAgent")
 from ..core.node_throughput import (
+    DistillWave, distill_queue, is_distill_timeout,
     CHARS_PER_TOKEN, MIN_CHARS as _MIN_DISTILL_CHARS, env_float,
     log_plan as log_distill_plan)
 
@@ -32,181 +33,294 @@ _JUNK_DOMAINS = [
     "csdn.net", "sohu.com", "sina.com", "forums.att.com",
 ]
 
-# Search engines raced over Tor. Engine reachability over Tor is
-# EXIT-NODE-dependent and BAD: measured 2026-07-08 (42 probes, 7 engines ×
-# 2 queries × 3 fresh circuits each) the per-(engine,circuit) success rate
-# was ~10% — brave 2/6, yahoo 1/6, mojeek 1/6, everything else 0/6 — and
-# WHICH engine wins flips from circuit to circuit. Two structural
-# consequences drive the design here:
-#   1. RACE, don't fan out on one circuit. ddgs's own multi-backend mode
-#      runs every engine through the ONE proxy set on the DDGS instance,
-#      so a blocked exit IP fails all engines TOGETHER (correlated
-#      failure — exactly what we can't afford at 10% per ticket). Instead
-#      _race_search_wave fires one single-engine ddgs call PER ENGINE,
-#      each tagged onto its OWN Tor circuit, first non-empty wins:
-#      6 independent ~10% tickets ≈ 47% per wave vs ~10% correlated.
-#   2. Keep the set WIDE; fast failures are cheap lottery tickets.
-#      yahoo is back (re-measured 2026-07-08: fails FAST, ~1.4-2.2s
-#      RequestError — the old "hangs until timeout" behaviour is gone —
-#      and it actually won a probe). Still excluded:
-#        * wikipedia  — treats region="wt-wt" as language "wt" and builds
-#          `https://wt.wikipedia.org/...`, which doesn't exist: always a
-#          ConnectError.
-#        * grokipedia — typeahead API, 0/6 on real queries.
-# §4HR (2026-09-16): mojeek and google RETIRED from the race. Seven days of
-# live waves (09-09→09-16, 509 wins): yandex 386, yahoo 77, brave 43,
-# duckduckgo 3, mojeek 0, google 0. mojeek — the July "reliable slow
-# winner" — conn-errored or timed out in 53 of the 56 no-winner waves and,
-# because a wave ends only when its LAST engine gives up, its 18 s budget
-# made every failed wave cost a median 18 s while the actual winners answer
-# in 2-3 s. A ticket that never wins is not a ticket. Re-add an engine only
-# with a fresh per-exit measurement; the slow tier in _DDGS_ENGINE_TIMEOUT
-# stays for that.
-_RACE_ENGINES: Tuple[str, ...] = ("duckduckgo", "yandex", "brave", "yahoo")
-# Legacy comma-joined form (kept for callers/docs that referenced the old
-# single-call multi-backend constant).
-_TOR_BACKENDS = ",".join(_RACE_ENGINES)
+# Search engines raced over Tor — ONE table (§4VA, 2026-11-19).
+#
+# Engine reachability over Tor is EXIT-NODE-dependent: a block follows the exit IP, not the engine, so
+# engines must never share a circuit (`_race_search_wave` gives every attempt its own SOCKS identity) and
+# an engine that works is worth asking on SEVERAL fresh circuits at once.
+#
+# Measured on the live system 11-12 → 11-19 (256 waves, 53 % with a winner): duckduckgo 0 wins (221
+# blocked), brave clearnet 0 wins (177 blocked), yandex 30 % wins (48 % blocked), yahoo 16 % (36 % empty,
+# 15 % off-topic). Probes that day: yandex won 6 of 18 single tries but 5 of 6 queries on THREE fresh
+# circuits at once; Brave's ONION service returned a results page for 21 of 22 queries (median 6.1 s,
+# range 4.5–9 s, no block page); Wikipedia's search API answered every query, with encyclopedia
+# articles only. Hence:
+#   * ``circuits`` — how many fresh circuits race the engine in one wave (yandex 3). The first usable
+#     batch wins; the engine has ONE outcome per wave, its best attempt's (`_best_attempt`).
+#   * ``kind`` — "ddgs" (through the ddgs library, on the race pool's threads), "direct" (fetched by
+#     this module with `_direct_fetch`, a cancellable coroutine) or "supplement" (never raced, never
+#     a winner: its rows are appended after the winner's — see `_wikipedia_rows`).
+#   * ``timeout`` — the attempt's own bound, seconds; the wave deadline is the slowest RACED engine's
+#     plus `_RACE_WAVE_GRACE` (`_race_wave_deadline`).
+#   * ``salt`` — the circuit tag (unique per engine; circuit i > 0 appends ``c<i>``).
+# duckduckgo, brave and yahoo stay so they can recover; the bench (`benched_engines`, kept across
+# restarts) sits out the ones that only refuse. History: §4HR retired mojeek and google (0 wins of
+# 509); §4UN-onion's DuckDuckGo onion won 0 of 72 live and is gone (§4VA), as is the §4LH hedge
+# (yandex+yahoo again after 6 s — three circuits from the start is that idea done early).
+# Re-add an engine only with a fresh per-exit measurement.
+_DDGS_FAST_ENGINE_TIMEOUT = 12
+BRAVE_ONION_HOST = "search.brave4u7jddbv7cyviptqjc7jusxh72uik7zt6adtckl5f4nwy2v72qd.onion"
+BRAVE_ONION_ENGINE = "brave_onion"
+WIKIPEDIA_ENGINE = "wikipedia"
 
-# Per-request ddgs timeout, in seconds. CRITICAL for Tor reliability and
-# measured directly: the engine that actually returns results over Tor
-# (usually mojeek) responds in ~10-18s through a Tor circuit, while the
-# others fail fast (~1-6s). The previous 8s ceiling KILLED mojeek mid-
-# request — producing "error sending request for url (mojeek...)" — so
-# EVERY engine came back empty and the search failed even though results
-# were reachable; the agent then burned minutes on retries that could
-# never win. 18s comfortably clears mojeek's Tor latency; the fast-failing
-# engines still fail fast, so a successful search costs ~12-18s and only an
-# all-circuits-blocked search pays the full timeout. Do not drop below ~15.
+
+@dataclass(frozen=True)
+class EngineSpec:
+    name: str
+    kind: str                # "ddgs" | "direct" | "supplement"
+    circuits: int
+    timeout: float
+    salt: str
+
+
+ENGINE_TABLE: Dict[str, EngineSpec] = {s.name: s for s in (
+    EngineSpec("duckduckgo", "ddgs", 1, _DDGS_FAST_ENGINE_TIMEOUT, "duck"),
+    EngineSpec("yandex", "ddgs", 3, _DDGS_FAST_ENGINE_TIMEOUT, "yand"),
+    EngineSpec("brave", "ddgs", 1, _DDGS_FAST_ENGINE_TIMEOUT, "brav"),
+    EngineSpec("yahoo", "ddgs", 1, _DDGS_FAST_ENGINE_TIMEOUT, "yaho"),
+    # slower than yandex but reliable: the page takes a median 6.1 s (up to ~9 s) and its wrapped
+    # links ~2.5 s more (measured 11-19) — 16 s for the whole attempt (`_brave_onion_search`)
+    EngineSpec(BRAVE_ONION_ENGINE, "direct", 1, 16, "bron"),
+    EngineSpec(WIKIPEDIA_ENGINE, "supplement", 1, 8, "wiki"),
+)}
+#: the engines a wave races, in launch order (derived from the table; the supplement is not one)
+_RACE_ENGINES: Tuple[str, ...] = tuple(s.name for s in ENGINE_TABLE.values() if s.kind != "supplement")
+
+# The slow-tier budget of the retired mojeek (10-18 s through a circuit). Kept as the wave deadline's
+# fallback when nothing is raced, and as the number darkweb_search's own timeouts are argued from.
 _DDGS_TOR_TIMEOUT = 18
 
-# Per-engine timeout override (2026-07-15). The 2026-07-08 measurement (above)
-# attributes the 12-18s latency to MOJEEK — the reliable slow winner; the other
-# engines either win FAST or fail fast (~1-6s). A race loser's thread is
-# uncancellable (it runs to its ddgs timeout on the dedicated _RACE_POOL), so
-# giving the fast engines a shorter ceiling frees their thread ~6s sooner on a
-# blocked wave without costing wins (a non-mojeek win arrives well under 12s).
-# mojeek keeps the full budget so it can still win late, and the wave deadline
-# stays sized off mojeek (_DDGS_TOR_TIMEOUT + grace). Measure per-exit before
-# tightening the fast engines further; do NOT shorten mojeek below ~15.
-_DDGS_ENGINE_TIMEOUT = {"mojeek": 18, "duckduckgo_onion": 20}
-_DDGS_FAST_ENGINE_TIMEOUT = 12
 
-# §4UN-onion (2026-11-13, operator-approved): DuckDuckGo's ONION service races as an EXTRA engine.
-# Measured that day (primp, impersonate=random, a fresh SOCKS identity per request, POST /html/ with q):
-# clearnet html.duckduckgo.com through Tor exits answered 1 of 35 searches (34 × HTTP 202); the onion
-# answered 7 of 35 (20 × 202, 8 timeouts at 30 s; replies took 7–17 s; HTTPS verified with the default
-# CA). It rides its own circuit (socks5h — the onion name is resolved by Tor, never locally) with a 20 s
-# ddgs timeout, but the WAVE DEADLINE stays sized off the clearnet engines (`_race_wave_deadline`): a
-# round another engine wins never waits for it, and an onion answer later than the deadline is dropped
-# (logged "duckduckgo_onion abandoned"). Ships OFF: only ``GHOST_SEARCH_DDG_ONION=1`` (on/true/yes) races it.
-DDG_ONION_HOST = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion"
-DDG_ONION_ENGINE = "duckduckgo_onion"
-#: engines raced IN ADDITION to `_RACE_ENGINES` (not in the wave-deadline max)
-_EXTRA_RACE_ENGINES: Tuple[str, ...] = (DDG_ONION_ENGINE,)
-_ddg_onion_state: Dict[str, Any] = {"ok": None}
+def _engine_spec(engine: str) -> EngineSpec:
+    """The table row of an engine; a name the table does not hold is a one-circuit ddgs engine on the
+    fast tier (the shape every engine had before the table)."""
+    spec = ENGINE_TABLE.get(engine)
+    if spec is None:
+        spec = EngineSpec(str(engine), "ddgs", 1, _DDGS_FAST_ENGINE_TIMEOUT, str(engine)[:4])
+    return spec
 
 
-#: §4UN-onion final review: the onion-only wait (every clearnet engine refused, the onion still running)
-#: happens at most ONCE per search, and not at all once the onion timed out in it —
-#: a search state set by `tool_search_ddgs` / `tool_deep_research` (a wave outside one gets a fresh state)
-import contextvars as _cv_onion
-_ONION_SEARCH: "_cv_onion.ContextVar[Optional[Dict[str, Any]]]" = _cv_onion.ContextVar(
-    "ghost_onion_search_state", default=None)
-
-
-def _ddg_onion_on() -> bool:
-    """Ships OFF (operator, 11-13: through Tor the onion answered 7 of 35 searches early that day, then
-    0 of 72 — every one a 202 block). Only an explicit "1" / "on" / "true" / "yes" races it."""
-    return os.environ.get("GHOST_SEARCH_DDG_ONION", "").strip().lower() in ("1", "on", "true", "yes")
-
-
-def _unwrap_ddg_href(href: str) -> str:
-    """A DuckDuckGo result link as the page's own address: ``…/l/?uddg=<url>&rut=…`` — absolute,
-    protocol-relative (``//duckduckgo.com/l/…``, ``//<onion>/l/…``) or relative (``/l/…``) — → ``<url>``;
-    a protocol-relative link → https. ddgs has ALREADY percent-decoded the href once, so nothing is
-    decoded again (r1: ``%2526`` in the page stays ``%26``); ``rut=`` is dropped wherever it stands."""
-    h = str(href or "").strip()
-    m = re.match(r"(?:(?:https?:)?//(?:[\w-]+\.)*(?:duckduckgo\.com|" + re.escape(DDG_ONION_HOST)
-                 + r"))?/l/\?(.*)$", h)
-    if m:
-        q = m.group(1)
-        i = q.find("uddg=")
-        if i >= 0 and (i == 0 or q[i - 1] == "&"):
-            prefix, target = q[:i], q[i + len("uddg="):]
-            # final review: only DDG's OWN rut goes — before uddg, or (when none stood there) the last
-            # parameter, which DDG appends; a rut inside the target URL is the target's
-            if not re.search(r"(?:^|&)rut=", prefix):
-                target = re.sub(r"&rut=[^&]*$", "", target)
-            return target
-    if h.startswith("//"):
-        h = "https:" + h
-    return h
-
-
-def register_ddg_onion() -> bool:
-    """Register ``duckduckgo_onion`` — ddgs's DuckDuckGo html engine against the onion base URL — in the
-    ddgs engine map the DDGS class reads (once; idempotent). False, and the engine is NOT raced, when the
-    installed ddgs no longer has that shape: an unknown backend name makes ddgs race EVERY engine ("auto")."""
-    if _ddg_onion_state["ok"] is not None:
-        return bool(_ddg_onion_state["ok"])
-    ok = False
-    try:
-        import ddgs.ddgs as _ddgs_mod
-        from ddgs.engines import ENGINES
-        from ddgs.engines.duckduckgo import Duckduckgo
-
-        class DuckduckgoOnion(Duckduckgo):
-            """DuckDuckGo's onion service (§4UN-onion)."""
-            name = DDG_ONION_ENGINE
-            search_url = f"https://{DDG_ONION_HOST}/html/"
-
-            def post_extract_results(self, results):
-                out = []
-                for r in results:
-                    try:
-                        # r1: around ddgs's normalising __setattr__ — it would decode the href again
-                        object.__setattr__(r, "href", _unwrap_ddg_href(r.href))
-                    except Exception:  # noqa: BLE001
-                        continue
-                    if not r.href.startswith(("http://", "https://")):
-                        continue                          # a relative link that was not a redirect
-                    host = (r.href.split("/", 3)[2]).lower()
-                    if host == DDG_ONION_HOST or host == "duckduckgo.com" or host.endswith(".duckduckgo.com"):
-                        continue                          # its own ads (y.js) and internal links
-                    out.append(r)
-                return super().post_extract_results(out)
-
-        ok = (getattr(Duckduckgo, "search_method", None) == "POST"
-              and str(getattr(Duckduckgo, "search_url", "")).endswith("/html/")
-              and getattr(_ddgs_mod, "ENGINES", None) is ENGINES and "text" in ENGINES)
-        if ok:
-            ENGINES["text"][DDG_ONION_ENGINE] = DuckduckgoOnion
-    except Exception as exc:  # noqa: BLE001 — a missing engine degrades the race, never search
-        logger.debug("duckduckgo onion engine not registered: %s", exc)
-        ok = False
-    if not ok:
-        pretty_log("Search Engine", "duckduckgo_onion NOT registered: the installed ddgs changed its "
-                   "DuckDuckGo engine or engine map — not raced", icon=Icons.TOOL_SEARCH, level="WARNING")
-    _ddg_onion_state["ok"] = ok
-    return ok
+def engines_switched_off() -> frozenset:
+    """``GHOST_SEARCH_ENGINES_OFF`` — a comma list of table names the operator switched off (an engine or
+    the supplement), read per wave. Unknown names are ignored."""
+    raw = os.environ.get("GHOST_SEARCH_ENGINES_OFF", "")
+    return frozenset(n for n in (p.strip().lower() for p in raw.split(",")) if n in ENGINE_TABLE)
 
 
 def raced_engines(proxy: Optional[str]) -> Tuple[str, ...]:
-    """The engines a wave races: `_RACE_ENGINES`, plus the DuckDuckGo onion when the switch is on, the
-    engine is registered and the wave has a Tor proxy to reach it through."""
-    if not (_ddg_onion_on() and proxy and register_ddg_onion()):
-        return _RACE_ENGINES
-    return _RACE_ENGINES + _EXTRA_RACE_ENGINES
+    """The engines a wave races: `_RACE_ENGINES` less the ones switched off, less — without a Tor proxy —
+    the ones that are onion services, less the benched ones (`benched_engines`, §4UY N9). The bench's
+    two-engine floor counts the engines that CAN race here (r1: with two switched off, benching two more
+    left one)."""
+    _off = engines_switched_off()
+    able = tuple(e for e in _RACE_ENGINES if e not in _off and (proxy or e not in _ONION_ONLY_ENGINES))
+    _bench = benched_engines(among=able)
+    return tuple(e for e in able if e not in _bench)
+
+
+#: engines that exist only as an onion service: not raced without a Tor proxy
+_ONION_ONLY_ENGINES = frozenset({BRAVE_ONION_ENGINE})
+
+#: §4UY N9: an engine whose last ENGINE_BENCH_AFTER decisive outcomes were all refusals or transport
+#: failures — never a win, never even an empty answer — sits out, and one answer brings it back.
+#: Live 11-13 → 11-18: duckduckgo 0 wins / 213 blocked, brave 0 / 171 (brave has not won since 10-07);
+#: each still added a "refused" to every wave, which tipped the reword-or-retry choice toward "transport".
+#: §4VA: the outcomes are KEPT ACROSS RESTARTS (`bench_file`). On 11-19 the agent restarted six times and
+#: the in-memory ledger never reached 30, so the two engines that never win raced all day. 30 stays: an
+#: engine has one outcome per wave however many circuits it rode, the live rate is ~37 waves a day, and
+#: yandex on three circuits is refused on all three in ~1 wave of 9 — thirty in a row does not happen
+#: to a live engine.
+#: THE WAY OUT (§4VA r1 — a kept bench had none: the probe was a per-process wave counter that restarts
+#: at 0, kept rows never aged, and a probe wave another engine won left the probed engine "unfinished";
+#: a file of 30 old yandex refusals raced yandex in 0 of 48 waves over 8 restarts):
+#:   * a benched engine whose last decisive outcome is older than ENGINE_BENCH_PROBE_AFTER_S is raced
+#:     again (a PROBE) — by the clock, whatever the process's wave count (one wave in
+#:     ENGINE_BENCH_PROBE_EVERY still probes every benched engine, as before);
+#:   * on a probe wave the probed engine's attempts are left to finish when another engine wins first,
+#:     and their outcome is booked for the bench (`_finish_probes`) — off the caller's clock;
+#:   * rows older than ENGINE_BENCH_MAX_AGE_S are not read from the file.
+#: Two hours (operator, r1: at 30 minutes and ~37 waves a day a dead engine was probed on most searches'
+#: first wave): a dead engine costs one refused request per two hours of searching.
+#: A PROBE IS EVIDENCE FOR THE BENCH ONLY: the wave is judged as if the probed engine had sat out — its
+#: refusal (or empty answer) enters neither the retry-or-reword tally nor any text the model reads; on
+#: the durable engines line it reads ``engine=probe-<outcome>``. A probe that WINS is a win like any.
+ENGINE_BENCH_AFTER = 30
+ENGINE_BENCH_PROBE_EVERY = 10
+ENGINE_BENCH_PROBE_AFTER_S = 7200.0
+ENGINE_BENCH_MAX_AGE_S = 86400.0
+#: …and those outcomes span at least this long: a burst of refusals in one bad Tor minute is not a dead engine
+ENGINE_BENCH_MIN_SPAN_S = 600.0
+#: at least this many of the engines that can race always race (no bench below it)
+ENGINE_BENCH_MIN_RACED = 2
+#: decisive outcomes kept per engine in the bench file (a little more than the rule reads)
+ENGINE_BENCH_KEEP = 40
+#: a bench file larger than this is not read (ours is a few KB)
+BENCH_FILE_MAX_BYTES = 262_144
+_ANSWER_OUTCOMES = frozenset(("win", "empty", "off-topic", "low-relevance"))
+_REFUSAL_OUTCOMES = frozenset(("blocked", "conn-error", "timeout", "error"))
+#: "waves": bench questions asked by this process; "extra": bench-only rows [(t, engine, outcome)] — what
+#: the last process kept and the late outcomes of probes (never a wave of `engine_health`); "probing":
+#: the engines the last question let race as a probe
+_bench_state: Dict[str, Any] = {"waves": 0}
+
+
+def benched_engines(now: Optional[float] = None, among: Optional[Tuple[str, ...]] = None) -> frozenset:
+    """§4UY N9: the engines of ``among`` (default: every raced engine) that sit out THIS wave. Counts
+    each call as a wave. The first call of a process reads what the last one kept (`_bench_load_once`).
+    The engines it lets race as a probe are `probed_engines()` until the next call."""
+    _bench_load_once()
+    now = time.time() if now is None else float(now)
+    among = tuple(_RACE_ENGINES if among is None else among)
+    _bench_state["waves"] = _bench_state.get("waves", 0) + 1
+    _bench_state["probing"] = frozenset()
+    last = _bench_recent()
+    dead = {e for e in among
+            if len(last.get(e, ())) >= ENGINE_BENCH_AFTER and not any(o in _ANSWER_OUTCOMES for _t, o in last[e])
+            and last[e][0][0] - last[e][-1][0] >= ENGINE_BENCH_MIN_SPAN_S}
+    if len(among) - len(dead) < ENGINE_BENCH_MIN_RACED:
+        return frozenset()
+    if _bench_state["waves"] % ENGINE_BENCH_PROBE_EVERY == 0:
+        probing = set(dead)
+    else:
+        probing = {e for e in dead if now - last[e][0][0] > ENGINE_BENCH_PROBE_AFTER_S}
+    # r2: ONE probe of an engine at a time — while one is in flight (not booked yet, its timeout not
+    # passed) later waves leave the engine benched (27 watchers and a full pool, reproduced)
+    flying = _bench_state.setdefault("in_flight", {})
+    probing = {e for e in probing if flying.get(e, 0.0) <= now}
+    for e in probing:
+        flying[e] = now + float(_engine_timeout(e)) + _RACE_WAVE_GRACE
+    _bench_state["probing"] = frozenset(probing)
+    return frozenset(dead - probing)
+
+
+def probed_engines() -> frozenset:
+    """The benched engines the last `benched_engines` call let race (a probe)."""
+    return _bench_state.get("probing") or frozenset()
+
+
+def _bench_recent(keep: Optional[int] = None) -> Dict[str, List[Tuple[float, str]]]:
+    """Per raced engine, its last ``keep`` (default ENGINE_BENCH_AFTER) decisive outcomes, newest first —
+    from this process's waves and the bench-only rows."""
+    keep = ENGINE_BENCH_AFTER if keep is None else int(keep)
+    _decisive = _ANSWER_OUTCOMES | _REFUSAL_OUTCOMES
+    rows = [(float(t), e, o) for t, pairs in list(_ENGINE_WAVES) for e, o in pairs]
+    rows += [(float(t), e, o) for t, e, o in list(_bench_state.get("extra") or ())]
+    rows.sort(key=lambda r: r[0], reverse=True)
+    last: Dict[str, List[Tuple[float, str]]] = {}
+    for t, e, o in rows:
+        if e in _RACE_ENGINES and o in _decisive:
+            lst = last.setdefault(e, [])
+            if len(lst) < keep:
+                lst.append((t, o))
+    return last
+
+
+def _bench_note(engine: str, outcome: str, now: Optional[float] = None) -> None:
+    """A bench-only outcome (a probe that finished after its wave): counted by the bench, kept in the
+    file, never a wave of `engine_health`."""
+    if engine not in _RACE_ENGINES or outcome not in (_ANSWER_OUTCOMES | _REFUSAL_OUTCOMES):
+        return
+    (_bench_state.get("in_flight") or {}).pop(engine, None)     # the probe is booked: the next may fly
+    extra = _bench_state.setdefault("extra", [])
+    extra.append((time.time() if now is None else float(now), engine, outcome))
+    del extra[:-ENGINE_BENCH_KEEP * 16]
+    _bench_save()
+
+
+def _system_dir() -> str:
+    home = (os.environ.get("GHOST_HOME") or "").strip() or os.path.join(os.path.expanduser("~"), "Data", "AI", "Data")
+    return os.path.join(home, "system")
+
+
+def bench_file() -> str:
+    """§4VA: where the bench's outcomes outlive a restart — ``$GHOST_HOME/system/search_engine_bench.json``:
+    ``{"version": 1, "engines": {name: [[unix time, outcome], …]}}``, newest last, at most
+    ENGINE_BENCH_KEEP per engine. Engine names and outcomes only; never a query."""
+    return os.path.join(_system_dir(), "search_engine_bench.json")
+
+
+def _bench_load_once() -> int:
+    """Read the bench file into the bench-only rows, once per process (the flag lives in `_bench_state`).
+    They are never waves of this process (`engine_health` does not see them). Rows older than
+    ENGINE_BENCH_MAX_AGE_S, from the future, or not of the table's shape are not taken; a missing,
+    oversized, unreadable or mis-shaped file is no rows — never an error. Returns the number taken."""
+    if _bench_state.get("loaded"):
+        return 0
+    _bench_state["loaded"] = True
+    rows: List[Tuple[float, str, str]] = []
+    try:
+        path = bench_file()
+        if os.path.getsize(path) > BENCH_FILE_MAX_BYTES:
+            logger.info("search engine bench file not read (over %d bytes) — starting empty", BENCH_FILE_MAX_BYTES)
+            return 0
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        engines = data.get("engines") if isinstance(data, dict) else None
+        _now = time.time()
+        for name, outs in (engines.items() if isinstance(engines, dict) else ()):
+            if name not in _RACE_ENGINES or not isinstance(outs, list):
+                continue
+            for item in outs[-ENGINE_BENCH_KEEP:]:
+                if (isinstance(item, (list, tuple)) and len(item) == 2
+                        and isinstance(item[0], (int, float)) and not isinstance(item[0], bool)
+                        and _now - ENGINE_BENCH_MAX_AGE_S <= float(item[0]) <= _now + 60.0
+                        and item[1] in (_ANSWER_OUTCOMES | _REFUSAL_OUTCOMES)):
+                    rows.append((float(item[0]), name, item[1]))
+    except FileNotFoundError:
+        return 0
+    except Exception as exc:  # noqa: BLE001 — a damaged bench file is an empty bench
+        logger.info("search engine bench file not read (%s) — starting empty", str(exc)[:80])
+        return 0
+    _bench_state.setdefault("extra", []).extend(sorted(rows))
+    if rows:
+        logger.info("search engine bench: %d kept outcome(s) of %d engine(s) read", len(rows),
+                    len({r[1] for r in rows}))
+    return len(rows)
+def _bench_write(path: str, snapshot: Dict[str, List[List[Any]]]) -> None:
+    """The disk half of `_bench_save` (runs on `_BENCH_IO`). Never raises."""
+    try:
+        from ..utils.json_store import write_json_atomic
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_json_atomic(path, {"version": 1, "engines": snapshot}, indent=0)
+    except Exception as exc:  # noqa: BLE001 — a bench that cannot be kept is this process's bench only
+        logger.debug("search engine bench not written: %s", exc)
+
+
+def _bench_save() -> None:
+    """Hand the bench's rows to the one writer thread — the caller (a wave that just ended) never waits
+    for the disk. The snapshot is taken here, on the caller's thread, so the writer reads no shared state."""
+    try:
+        snapshot = {e: [[t, o] for t, o in reversed(outs)]
+                    for e, outs in _bench_recent(ENGINE_BENCH_KEEP).items()}
+        _bench_state["pending"] = _BENCH_IO.submit(_bench_write, bench_file(), snapshot)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("search engine bench save skipped: %s", exc)
+
+
+def bench_flush(timeout: float = 10.0) -> bool:
+    """Wait for the last queued bench write (shutdown, tests). True when nothing is left to write."""
+    fut = _bench_state.get("pending")
+    if fut is None:
+        return True
+    try:
+        fut.result(timeout=timeout)
+        return True
+    except Exception:  # noqa: BLE001
+        return fut.done()
 
 
 def _engine_salt(engine: str) -> str:
-    """The circuit salt of an engine (the first four letters; the onion has its own — "duck" is taken)."""
-    return "dgon" if engine == DDG_ONION_ENGINE else engine[:4]
+    """The circuit salt of an engine (its table row's; unique per engine)."""
+    return _engine_spec(engine).salt
 
 
-def _engine_timeout(engine: str) -> int:
-    return _DDGS_ENGINE_TIMEOUT.get(engine, _DDGS_FAST_ENGINE_TIMEOUT)
+def _circuit_salt(engine: str, circuit: int) -> str:
+    """The salt of circuit ``circuit`` (0-based) of an engine: distinct per (engine, circuit)."""
+    return _engine_salt(engine) + (f"c{circuit}" if circuit else "")
 
+
+def _engine_timeout(engine: str) -> float:
+    return _engine_spec(engine).timeout
 # Small in-process TTL cache so the model's habit of firing many
 # near-identical queries in one turn doesn't re-pay the full Tor round
 # trip each time. Keyed on the normalized (sanitized, lower-cased) query.
@@ -884,15 +998,12 @@ def _carries_subject(result: Dict, tokens: List[str]) -> bool:
     return result_coverage(result, tokens[1:]) * (len(tokens) - 1) >= 1
 
 
-def prune_off_topic(query: str, results: List[Dict]) -> Tuple[List[Dict], bool]:
-    """(results to show, low_relevance). Order is preserved; dropped rows
-    are those under ``_MIN_RESULT_COVERAGE`` or in another script than a
-    Latin query. A query with fewer than 2 content words is not judged; a
-    row with no title/snippet text is not judged (no evidence either way)."""
-    rows = list(results or [])
+def _score_rows(query: str, rows: List[Dict]) -> Optional[List[Tuple[int, Dict, bool, float]]]:
+    """(index, row, passes, coverage) per row — the per-row relevance rule of `prune_off_topic`.
+    None when the query is not judged (fewer than 2 content words)."""
     tokens = [t for t in _rel_tokens(query) if not _YEAR_RE.fullmatch(t)]
-    if len(tokens) < 2 or not rows:
-        return rows, False
+    if len(tokens) < 2:
+        return None
     latin_query = _nonlatin_share(query) <= 0.3
     scored = []
     for i, r in enumerate(rows):
@@ -907,6 +1018,18 @@ def prune_off_topic(query: str, results: List[Dict]) -> Tuple[List[Dict], bool]:
         ok = (cov >= _MIN_RESULT_COVERAGE or subject) and not (
             latin_query and _nonlatin_share(prose) > 0.3 and not subject)
         scored.append((i, r, ok, cov))
+    return scored
+
+
+def prune_off_topic(query: str, results: List[Dict]) -> Tuple[List[Dict], bool]:
+    """(results to show, low_relevance). Order is preserved; dropped rows
+    are those under ``_MIN_RESULT_COVERAGE`` or in another script than a
+    Latin query. A query with fewer than 2 content words is not judged; a
+    row with no title/snippet text is not judged (no evidence either way)."""
+    rows = list(results or [])
+    scored = _score_rows(query, rows) if rows else None
+    if scored is None:
+        return rows, False
     kept = {i for i, _r, ok, _c in scored if ok}
     judged = [(r, ok) for _i, r, ok, _c in scored
               if f"{r.get('title') or ''}{r.get('body') or ''}".strip()]
@@ -1079,48 +1202,33 @@ def _failure_category(msg: str) -> str:
 # the caller wait forever.
 _RACE_WAVE_GRACE = 4
 
-#: §4LH hedge: 97% of yandex wins land inside 6 s, while a wave nobody wins
-#: waits the full deadline (13% of first waves; median 12 s, then a 1 s
-#: sleep and wave 2). At 6 s with no winner, the two engines that win most
-#: often are launched again on FRESH circuits inside the same wave and the
-#: same deadline. ``GHOST_SEARCH_HEDGE_S=0`` disables.
-_RACE_HEDGE_AT_S = 6.0
-#: §4UN-web: yahoo replaces brave — 30 days live (10-14→11-13, 1,728 rounds): yandex 453 wins, yahoo 322,
-#: yandex-h 87, duckduckgo 20, brave and brave-h 0
-_RACE_HEDGE_ENGINES = ("yandex", "yahoo")
-
-
-def _race_hedge_at() -> float:
-    try:
-        v = float(os.environ.get("GHOST_SEARCH_HEDGE_S", _RACE_HEDGE_AT_S))
-    except ValueError:
-        return _RACE_HEDGE_AT_S
-    return v if v > 0 else 0.0
-
 
 def _race_wave_deadline() -> float:
     """§4HR: the wave deadline is sized off the engines actually RACED —
-    the slowest raced engine's ddgs timeout plus grace — not off the slow
-    tier constant. With mojeek retired that is 12 + 4 s, was 18 + 4."""
+    the slowest raced engine's own timeout (the table's) plus grace — not
+    off the slow tier constant. §4VA: that covers the Brave onion's whole
+    attempt, so a wave nobody has won is never called empty while it is
+    still inside its timeout; a win ends the wave at once whatever is left."""
     if not _RACE_ENGINES:
         return _DDGS_TOR_TIMEOUT + _RACE_WAVE_GRACE
     return max(_engine_timeout(e) for e in _RACE_ENGINES) + _RACE_WAVE_GRACE
 
 # Dedicated pool for race threads. Cancelling a loser only cancels the
 # asyncio wrapper — the thread runs its ddgs call to completion (up to the
-# full 18s timeout) — so a few concurrent waves of 6 engines saturated the
-# loop's shared to_thread pool (min(32, cpu+4)) and stalled every OTHER
-# to_thread user in the process (found 2026-07-15). This pool is ISOLATED
-# (only search-race threads), so sizing it generously can't starve
-# unrelated work. Sized for 8 concurrent waves (was 4): deep_research fans
-# out AND swarm/delegation workers each fire searches, so >4 concurrent
-# waves is realistic, and an over-subscribed wave sits QUEUED here while
-# its own 22s deadline ticks down — returning [] having made zero network
-# requests. (The deeper fix is a cancellable racer so losers don't linger
-# up to 18s each; until then, headroom is the mitigation.)
+# engine's timeout) — so a few concurrent waves saturated the loop's shared
+# to_thread pool (min(32, cpu+4)) and stalled every OTHER to_thread user in
+# the process (found 2026-07-15). This pool is ISOLATED (only search-race
+# threads), so sizing it generously can't starve unrelated work. Sized for 8
+# concurrent waves: deep_research fans out and delegation workers each fire
+# searches, and an over-subscribed wave sits QUEUED here while its own
+# deadline ticks down — returning [] having made zero network requests.
+# §4VA: one thread per ddgs CIRCUIT of the table (the direct engines and the
+# supplement are coroutines and take none).
 from concurrent.futures import ThreadPoolExecutor as _TPE
-_RACE_POOL = _TPE(max_workers=(len(_RACE_ENGINES) + len(_EXTRA_RACE_ENGINES) + len(_RACE_HEDGE_ENGINES)) * 8,
+_RACE_POOL = _TPE(max_workers=sum(s.circuits for s in ENGINE_TABLE.values() if s.kind == "ddgs") * 8,
                   thread_name_prefix="search-race")
+#: §4VA: the one thread that writes the bench file (`_bench_save`) — never a race thread, never the loop
+_BENCH_IO = _TPE(max_workers=1, thread_name_prefix="search-bench")
 # §4PD: ddgs runs EVERY engine call on one class-level executor it sizes at
 # cpu+4 (18 here) — a third of this pool. Past ~3 concurrent waves an engine
 # call queued there until its own timeout and "timed out" having made no
@@ -1200,6 +1308,11 @@ def _fetch_error_is_retryable(err: str) -> bool:
 # ones 11,576/233 in 130.9s — +40% wall for +126% page coverage and +63%
 # output. In the RETRY regime the old set produced ZERO distillations at all.
 # Typical measured completion is 105-131s. Tune with GHOST_WEB_SUMMARY_S.
+#
+# §4UZ: now the CEILING of one page's distill budget. The budget itself is
+# the page's share of the time the phase has left (`DistillWave`), and the
+# worker takes one distill at a time by default — measured 2026-11-19, this
+# node does not scale with parallel requests (N at once = N x the solo time).
 _WEB_SUMMARY_TIMEOUT_S = env_float("GHOST_WEB_SUMMARY_S", 65.0)
 
 # ⚠ THE WHOLE PHASE NEEDS A CLOCK, not just each URL. Every `_bounded()`
@@ -1271,10 +1384,18 @@ _MIN_URL_BUDGET_S = _FETCH_ATTEMPT_TIMEOUT + 2.0
 # (`_MIN_SLOT_WAIT + _MIN_HTTP_FLOOR` = 5.0 + 3.0), so any value BELOW 8 is
 # silently ignored there while still being subtracted from the planner's
 # budget — the plan would over-reserve. Keep this at or above 8.
+#
+# §4UZ: distills now go through the worker's one queue (`DistillWave`). With
+# the default width of 1 a distill never waits behind its own call at the
+# node's gate, so the plan gets the whole budget and this is only the
+# `slot_wait` bound; with GHOST_DISTILL_WIDTH > 1 it is taken out of the
+# planner's budget as described above.
 _QUEUE_ALLOWANCE_S = 16.0
 
-# The per-call distill fan-out, mirrored at module scope so the budget pins
-# can check `waves x per-URL <= phase` without executing a research call.
+# The per-call FETCH width (the semaphore in `_deep_research_core`), mirrored
+# at module scope so the budget pins can check `waves x per-URL <= phase`
+# without executing a research call. §4UZ: it is no longer the distill
+# fan-out — distills go through the worker's queue (`distill_width`).
 _DISTILL_FANOUT_FOR_TESTS = 3
 
 # Ceiling on ONE url: fetch (≤2 circuits) + LLM distillation.
@@ -1300,6 +1421,36 @@ _DDGS_DEFECT_IDIOM = ('parts = (x.strip() for x in item.xpath(value))',
 _ddgs_patch_state: Dict[str, Any] = {"applied": None}
 
 
+_HEADING_TAGS = frozenset(("h1", "h2", "h3", "h4", "h5", "h6"))
+
+
+def first_heading_parts(parts) -> list:
+    """§4UY N16: a result's TITLE is one heading. An engine whose title path reaches every heading of a
+    result item (yahoo's ``…//h3//text()``; a result with sitelinks has several) glued them into one —
+    live fact_check: "What is the Boiling Point of Water? - WorldAtlasBoiling Point by Altitude: …". The
+    text nodes of the FIRST heading are kept; nodes with no heading ancestor (or plain strings) are kept
+    as they come."""
+    parts = list(parts or [])
+    first = None
+    out = []
+    for x in parts:
+        el = x.getparent() if hasattr(x, "getparent") else None
+        head = None
+        while el is not None:
+            if str(getattr(el, "tag", "")).lower() in _HEADING_TAGS:
+                head = el
+                break
+            el = el.getparent()
+        if head is None:
+            out.append(x)
+            continue
+        if first is None:
+            first = head
+        if head is first:
+            out.append(x)
+    return out
+
+
 def _fixed_extract_results(self, html_text: str):
     """`BaseSearchEngine.extract_results` with the nodes' own whitespace
     kept: join the raw text() nodes, THEN collapse runs."""
@@ -1310,6 +1461,8 @@ def _fixed_extract_results(self, html_text: str):
         result = self.result_type()
         for key, value in self.elements_xpath.items():
             parts = item.xpath(value)
+            if key == "title":
+                parts = first_heading_parts(parts)                # §4UY N16
             data = " ".join("".join(str(x) for x in parts).split())
             setattr(result, key, data)
         results.append(result)
@@ -1373,9 +1526,47 @@ _CHALLENGE_MARKERS = (
 #: posts there, or the page redirects there; a footer "Privacy" link to the
 #: same host is on ordinary pages
 _CHALLENGE_REDIRECT_RE = re.compile(
-    r"<form\b[^>]*\baction\s*=\s*[\"']?https?://consent\.yahoo\.com"
-    r"|<meta\b[^>]*http-equiv\s*=\s*[\"']?refresh[^>]*consent\.yahoo\.com"
-    r"|(?:window\.|document\.)?location(?:\.href)?\s*=\s*[\"']https?://consent\.yahoo\.com", re.I)
+    r"(?:window\.|document\.)?location(?:\.href)?\s{0,8}=\s{0,8}[\"']https?://consent\.yahoo\.com", re.I)
+_CONSENT_ACTION_RE = re.compile(r"https?://consent\.yahoo\.com", re.I)
+
+
+def _challenge_redirect(low: str) -> bool:
+    """The page posts to, refreshes to or scripts its way to Yahoo's consent wall. §4VA r1: the form and
+    meta tags are read with `_tag_attrs` (the one regex, with ``[^>]*`` twice, took seconds on a page of
+    unclosed tags — and the Brave onion's page is classified with this too)."""
+    for attrs in _tag_attrs(low, "form"):
+        if _CONSENT_ACTION_RE.match(_attr(attrs, "action")):
+            return True
+    for attrs in _tag_attrs(low, "meta"):
+        if _attr(attrs, "http-equiv").lower() == "refresh" and "consent.yahoo.com" in attrs:
+            return True
+    return bool(_CHALLENGE_REDIRECT_RE.search(low))
+
+
+_BLOCK_OPEN_RE = re.compile(r"<(script|style)\b")
+
+
+def _drop_script_and_style(low: str) -> str:
+    """``low`` without its ``<script>…</script>`` and ``<style>…</style>`` blocks (an unclosed one is
+    left as it is) — one pass with str.find; the lazy ``.*?`` regex was quadratic on unclosed openers."""
+    out: List[str] = []
+    pos = 0
+    while True:
+        m = _BLOCK_OPEN_RE.search(low, pos)
+        if m is None:
+            out.append(low[pos:])
+            break
+        close = f"</{m.group(1)}>"
+        j = low.find(close, m.end())
+        if j < 0:
+            out.append(low[pos:])
+            break
+        out.append(low[pos:m.start()])
+        out.append(" ")
+        pos = j + len(close)
+    return "".join(out)
+
+
 #: TEXT markers: read only on a SHORT page (a challenge page is a few lines,
 #: an empty results page with a long footer is not) and with the query's own
 #: text removed first — the search box and the links echo it ("recaptcha v3
@@ -1416,14 +1607,84 @@ def engine_page_is_challenge(html_text: str, query: str = "") -> bool:
     decides; a text marker counts only on a short page, after the query's own
     text is removed (r1)."""
     low = str(html_text or "")[:200_000].lower()
-    if any(m in low for m in _CHALLENGE_MARKERS) or _CHALLENGE_REDIRECT_RE.search(low):
+    if any(m in low for m in _CHALLENGE_MARKERS) or _challenge_redirect(low):
         return True
     rest = _strip_query_echo(low, query)
-    text = re.sub(r"<script\b.*?</script>|<style\b.*?</style>", " ", rest, flags=re.S)
-    text = " ".join(re.sub(r"<[^>]+>", " ", text).split())
+    text = _drop_script_and_style(rest)
+    text = " ".join(re.sub(r"<[^<>]+>", " ", text).split())           # linear (r1): never ``<[^>]+>``
     if len(text) > CHALLENGE_TEXT_MAX_CHARS:
         return False
     return any(m in text for m in _CHALLENGE_TEXT_MARKERS)
+
+
+#: §4UY N9: one HTTP-200 zero-result page per engine per process is kept for the operator (yahoo's 93 live
+#: "empty" answers are probably an unrecognised consent page — that needs one captured body, which an
+#: offline fix cannot have). r2 (review): only the page's STRUCTURE is kept (`page_structure`: tags, class and
+#: id names, the size of each text run) — never its text, attributes or links, where the query echoes in
+#: forms no strip can enumerate (partial words, encodings). At most this many bytes are kept.
+EMPTY_SAMPLE_MAX_BYTES = 64_000
+_EMPTY_SAMPLED: set = set()
+#: §4VA r1: ``[^<>]*`` — with ``[^>]*`` a page of unclosed ``<a `` took the regex to the end of the page from every one
+_STRUCT_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]{0,30})\b([^<>]*)>|([^<]+)", re.S)
+_STRUCT_ATTR_RE = re.compile(r"""\b(class|id)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.I)
+_STRUCT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,60}$")
+
+
+def page_structure(html_text: str, query: str = "") -> str:
+    """§4UY N9 r2: an HTML page as its outline only — one line per tag (`<div class="a b">`), each text run
+    as ``#text N`` (its length). Class/id values that are not plain identifiers, or that hold a word of the
+    query (3+ letters, any case), are dropped; script and style bodies are not read."""
+    qwords = {w for w in re.findall(r"\w{3,}", str(query or "").lower())}
+    out: List[str] = []
+    skip = None
+    for m in _STRUCT_TAG_RE.finditer(str(html_text or "")):
+        close, tag, attrs, text = m.group(1), (m.group(2) or "").lower(), m.group(3) or "", m.group(4)
+        if text is not None:
+            if skip is None and text.strip():
+                out.append(f"#text {len(text.strip())}")
+            continue
+        if skip is not None:
+            if close and tag == skip:
+                skip = None
+                out.append(f"</{tag}>")
+            continue
+        if close:
+            out.append(f"</{tag}>")
+            continue
+        names = []
+        for am in _STRUCT_ATTR_RE.finditer(attrs[:_TAG_ATTR_MAX]):
+            for v in (am.group(2) or am.group(3) or am.group(4) or "").split():
+                if _STRUCT_NAME_RE.match(v) and not any(w in v.lower() for w in qwords):
+                    names.append(f"{am.group(1).lower()}:{v}")
+        out.append(f"<{tag}{(' ' + ' '.join(names)) if names else ''}>")
+        if tag in ("script", "style") and not attrs.rstrip().endswith("/"):
+            skip = tag
+    return "\n".join(out)
+
+
+def empty_page_sample_dir() -> str:
+    return os.path.join(_system_dir(), "search_empty_samples")
+
+
+def keep_empty_page_sample(engine: str, html_text: str, query: str) -> Optional[str]:
+    """§4UY N9: write ``<engine>-empty.txt`` (the page's structure only, `page_structure`) once per engine
+    per process; the path, or None. Never raises."""
+    name = re.sub(r"[^a-z0-9_-]", "", str(engine or "").lower())[:24] or "engine"
+    if name in _EMPTY_SAMPLED or os.environ.get("GHOST_SEARCH_EMPTY_SAMPLES", "1") == "0":
+        return None
+    _EMPTY_SAMPLED.add(name)
+    try:
+        body = page_structure(str(html_text or "")[:EMPTY_SAMPLE_MAX_BYTES * 4], query)
+        body = body.encode("utf-8", "ignore")[:EMPTY_SAMPLE_MAX_BYTES]
+        d = empty_page_sample_dir()
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{name}-empty.txt")
+        with open(path, "wb") as fh:
+            fh.write(body)
+        logger.info("search engine %s answered an empty results page — sample kept at %s", name, path)
+        return path
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _guarded_engine_search(self, query, region="us-en", safesearch="moderate", timelimit=None, page=1, **kwargs):
@@ -1444,6 +1705,8 @@ def _guarded_engine_search(self, query, region="us-en", safesearch="moderate", t
     results = self.post_extract_results(self.extract_results(html_text))
     if not results and engine_page_is_challenge(html_text, query):
         raise RuntimeError(f"blocked: challenge page from {getattr(self, 'name', 'engine')}")
+    if not results:
+        keep_empty_page_sample(str(getattr(self, "name", "") or "engine"), html_text, query)
     return results
 
 
@@ -1492,39 +1755,474 @@ def region_for_query(query: str) -> str:
     return "gr-el" if _GREEK_SCRIPT_RE.search(query or "") else _DEFAULT_REGION
 
 
-# ── Encyclopedic supplement (2026-09-21, §4JO) ─────────────────────
-# Surveyed over Tor (17 recorded Greek queries × 2 circuits): the race's
-# yandex answers 30/34 but treats a figure as a model number; bing 25/34
-# with the SAME pages at a 17.9 s median (a race member that slow re-creates
-# the §4HR failed-wave cost); google and mojeek 0/34. What no web engine
-# gives a Greek proper-noun ask is the encyclopedic answer itself:
-# el.wikipedia's full-text search over Tor answered "Δημήτρης Κουφοντίνας",
-# "Ελεγκτικό Συνέδριο", "Οδός Μιχαήλ Βόδα" and the Tempi paraphrase in ~1 s
-# with the article intro, and nothing on the long figure-laden queries
-# (correctly). So: for a SHORT Greek-script query (≤ WIKI_SUPPLEMENT_MAX_
-# TOKENS content words) one lookup runs in PARALLEL with the first wave on
-# its own circuit, never delays it, and an article whose title/intro carries
-# the query's SUBJECT (the leading content word — the §4IL "any distinctive
-# token" rule reads every Greek word as distinctive, so "Πλωτό νοσοκομείο"
-# would pass for "Τζάνειο Νοσοκομείο") is placed FIRST in the batch; when
-# the web wave fails, it is the batch.
-WIKI_SUPPLEMENT_MAX_TOKENS = 6
-WIKI_SUPPLEMENT_TIMEOUT = 8
-WIKI_EXTRACT_CHARS = 700
-_WIKI_LANG = {"gr-el": "el"}
+# ── Engines this module fetches itself (§4VA) ──────────────────────
+# The Brave onion and Wikipedia are not ddgs engines: one GET each through `_direct_fetch` — the tree's
+# one HTTP convention (curl_cffi AsyncSession, a streamed body drained with aiter_content and closed with
+# `aclose_curl_response`), a session per request (no cookie outlives it), the proxy resolved fail-closed
+# (`resolve_egress_proxy`) and as socks5h, so Tor resolves every name. A coroutine: cancelling the wave
+# aborts the transfer (a ddgs thread cannot be stopped).
+# FETCHED BYTES ARE HOSTILE (r1): every parse or classification of them runs OFF the event loop
+# (`_off_loop`), scans tags with `_tag_attrs` (str.find, attribute text capped) instead of an
+# unbounded ``[^>]*``, and caps every field before a regex reads it — a page of 100 KB of ``<a `` or
+# ``<meta http-equiv=refresh `` froze the loop for ten seconds.
+DIRECT_BODY_MAX_BYTES = 2_000_000
+_DIRECT_CLOSE_WAIT_S = 3.0
+_TAG_ATTR_MAX = 2000
+_URL_MAX = 2000
+_ATTR_VALUE_RE = {}
 
 
-def wiki_supplement_wanted(query: str) -> bool:
-    """A short Greek-script query — the shape the encyclopedia answers."""
-    if region_for_query(query) not in _WIKI_LANG:
-        return False
-    return 0 < len(_rel_tokens(query)) <= WIKI_SUPPLEMENT_MAX_TOKENS
+class EngineUnfinished(RuntimeError):
+    """An attempt that ran out of ITS time after the engine had answered (the Brave page arrived, its
+    links did not): booked ``unfinished`` — neither a refusal nor an answer."""
 
 
-#: §4UN-web: Wikipedia's API answers 429 over Tor to a browser-impersonating client and 200 to a plain one
-#: (§4QF, measured for `subject_photos`); the lookup used `impersonate="chrome"` and never checked the
-#: status, so `r.json()` raised on the 429 body — 0 of 22 eligible Greek queries in 30 days got an article
+async def _off_loop(fn, *args):
+    """Run a parse/classify step of fetched bytes on the default executor (never on the event loop)."""
+    return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
+
+def _tag_attrs(text: str, name: str):
+    """The attribute text of every ``<name …>`` tag of ``text``, in order — found with str.find, each at
+    most `_TAG_ATTR_MAX` characters (a tag that does not close within that is skipped). Linear in the
+    page whatever it holds."""
+    low = text.lower()
+    needle = "<" + name.lower()
+    pos = 0
+    while True:
+        i = low.find(needle, pos)
+        if i < 0:
+            return
+        pos = i + len(needle)
+        nxt = low[pos:pos + 1]
+        if nxt and (nxt.isalnum() or nxt in "-_:"):        # "<abbr" is not "<a"
+            continue
+        end = text.find(">", pos, pos + _TAG_ATTR_MAX)
+        if end < 0:
+            continue
+        yield text[pos:end]
+        pos = end
+
+
+def _attr(attrs: str, name: str) -> str:
+    """One attribute's value from a tag's (capped) attribute text; "" when absent."""
+    rx = _ATTR_VALUE_RE.get(name)
+    if rx is None:
+        rx = _ATTR_VALUE_RE[name] = re.compile(
+            r"""(?:^|[\s"'])""" + re.escape(name) + r"""\s{0,8}=\s{0,8}(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""", re.I)
+    m = rx.search(attrs[:_TAG_ATTR_MAX])
+    return (m.group(1) or m.group(2) or m.group(3) or "") if m else ""
+
+
+def _socks5h(proxy: Optional[str]) -> Optional[str]:
+    """The proxy as socks5h (Tor resolves every name). FAIL CLOSED (r1): any scheme that is not socks5 /
+    socks5h, in any case, is refused — an ``http://`` or ``SOCKS5://`` proxy string must not become a
+    request that resolves names locally or leaves another way."""
+    if not proxy:
+        return proxy
+    scheme, sep, rest = str(proxy).partition("://")
+    if not sep or scheme.lower() not in ("socks5", "socks5h"):
+        raise ConnectionError("connect: proxy scheme refused (only socks5/socks5h)")
+    return "socks5h://" + rest
+
+
+async def _direct_fetch(url: str, proxy: Optional[str], timeout: float, *, headers: Optional[Dict[str, str]] = None,
+                        impersonate: Optional[str] = None, follow: bool = True,
+                        max_bytes: int = DIRECT_BODY_MAX_BYTES) -> Tuple[int, str, str]:
+    """(status, body text, Location header) of one GET. Raises on a transport failure or past
+    ``timeout``. ``follow=False`` returns a redirect as it is (its Location, unvisited)."""
+    if os.environ.get("GHOST_SEARCH_NO_NETWORK") == "1":
+        # the test suite's own switch (tests/conftest.py sets it for the whole session): whatever was
+        # imported when, however the function was reached, nothing is dialled
+        raise RuntimeError("search._direct_fetch reached with GHOST_SEARCH_NO_NETWORK=1 (no scripted transport)")
+    import curl_cffi.requests as creq
+    from urllib.parse import urlparse as _up
+    from ..utils.egress_guard import resolve_egress_proxy as _rep
+    from ..utils.helpers import aclose_curl_response
+    proxy = _socks5h(_rep(proxy, url))
+    if not proxy and (_up(url).hostname or "").lower().endswith(".onion"):
+        raise ConnectionError("connect: an onion address needs the Tor proxy")
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    async def _get() -> Tuple[int, str, str]:
+        async with creq.AsyncSession(impersonate=impersonate, proxies=proxies, timeout=timeout) as c:
+            r = await c.get(url, headers=headers, stream=True, allow_redirects=follow)
+            status = int(r.status_code)
+            location = str(r.headers.get("location") or "")
+            buf = bytearray()
+            try:
+                async for chunk in r.aiter_content():       # never iter_content (curl_cffi async contract)
+                    if chunk:
+                        buf.extend(chunk)
+                        if len(buf) >= max_bytes:
+                            break
+            finally:
+                try:
+                    await _cancel_safe_wait_for(aclose_curl_response(r), _DIRECT_CLOSE_WAIT_S)
+                except asyncio.TimeoutError:
+                    pass
+            return status, bytes(buf[:max_bytes]).decode("utf-8", errors="replace"), location
+
+    return await _cancel_safe_wait_for(_get(), float(timeout) + 1.0)
+
+
+# ── The Brave onion (§4VA) ─────────────────────────────────────────
+# Brave Search's own hidden service. Probed 11-19: 21 of 22 queries came back HTTP 200 with a results page
+# (median 6.1 s over Tor), no challenge. The page's result list: one ``<div class="snippet" data-type="web">``
+# per result, holding ``.result-content > a[href]`` (with the ``.search-snippet-title`` inside it) and the
+# description in ``.generic-snippet .content`` (a Q&A result has ``.inline-qa-answer`` instead).
+# THE LINK: on about a third of the pages the anchor's href is the page's own address; on the rest it is
+# a WRAPPED link on the onion itself (``/go/v1/<token>``) and the address appears nowhere in the page
+# (the ``cite`` shows a breadcrumb, not a URL — never rebuilt into one: an invented link is worse than a
+# missing row). Measured 11-19 over Tor: a wrapped link answers HTTP 200 in 1.9–2.7 s (no Location, no
+# refresh) with a ~23 KB interstitial, "Check this link", that redirects by script and names the target
+# in ``<a class="destination" href="…">``. So the links of the rows that can be SHOWN (the first
+# BRAVE_ONION_SHOWN) are asked once each, BRAVE_ONION_RESOLVE_WIDTH at a time, on the circuit that
+# fetched the page (`_resolve_brave_links`), and the target is read from the interstitial
+# (`_brave_link_target`); a row whose link does not resolve is dropped, and a page that parsed but
+# gave fewer than BRAVE_ONION_MIN_ROWS addresses is an ``error`` (``unfinished`` when it was the
+# attempt's time that ran out). An address — the page's own or a link's target — is taken only when it
+# is one a reader could open (`_brave_page_address`). The results page itself is not followed through a
+# redirect: a 3xx is a refusal. Sent as the tree's browser profile (`helpers._FETCH_IMPERSONATE`: its
+# own User-Agent and client hints), like every page fetch.
+BRAVE_ONION_HEADERS = {"Accept-Language": "en-US,en;q=0.8"}
+BRAVE_ONION_PARSE_MAX_CHARS = 1_500_000
+#: on a page with wrapped links, the rows that can be shown — only their links are asked
+BRAVE_ONION_SHOWN = 8
+#: wrapped links asked at once
+BRAVE_ONION_RESOLVE_WIDTH = 6
+#: a page that parsed must give at least this many addresses (or all it has, when it has fewer)
+BRAVE_ONION_MIN_ROWS = 3
+_BRAVE_GO_BODY_MAX_BYTES = 100_000
+_BRAVE_TITLE_MAX, _BRAVE_BODY_MAX = 300, 1000
+#: a wrapped link, exactly (r1): nothing else on the onion is ever asked
+_BRAVE_GO_PATH_RE = re.compile(r"/go/v1/[A-Za-z0-9_-]{1,1024}")
+#: hosts an interstitial names that are never a result (XML namespaces, schema vocabularies)
+_BRAVE_STATIC_HOSTS = frozenset({"www.w3.org", "w3.org", "schema.org", "www.schema.org", "ogp.me",
+                                 "purl.org", "xmlns.com"})
+_BRAVE_SNIPPET_SELECTORS = (".generic-snippet .content", ".inline-qa-answer", ".snippet-description",
+                            ".snippet-content")
+_BRAVE_REFRESH_URL_RE = re.compile(r"""url\s{0,8}=\s{0,8}["']?(https?://[^\s"'<>]{1,2000})""", re.I)
+_BRAVE_LOCATION_RE = re.compile(
+    r"""location(?:\.href|\.replace)?\s{0,8}[=(]\s{0,8}["'](https?://[^\s"'<>]{1,2000})["']""", re.I)
+_BRAVE_ANY_URL_RE = re.compile(r"""https?://[^\s"'<>\\)]{1,2000}""", re.I)
+
+
+_NUMERIC_LABEL_RE = re.compile(r"(?:0x[0-9a-f]*|[0-9]+)", re.I)
+_DOTTED_QUAD_RE = re.compile(r"(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])")
+
+
+def _brave_own_host(host: str) -> bool:
+    h = (host or "").lower()
+    _onion_root = BRAVE_ONION_HOST.split(".", 1)[1]
+    return h == _onion_root or h.endswith("." + _onion_root) or h == "brave.com" or h.endswith(".brave.com")
+
+
+def _brave_page_address(href: str) -> Optional[str]:
+    """``href`` when it is a result's address, else None: ONE line of at most `_URL_MAX` characters with
+    no whitespace or control character, http(s), no userinfo (``https://brave.com@evil.example/``), not
+    one of Brave's own hosts, and public by the predicate the Sources list uses
+    (`link_grounding.is_public_source_url`: never loopback, a private or tailnet address, an onion)."""
+    from urllib.parse import urlsplit as _us
+    h = str(href or "").strip()
+    if not h or len(h) > _URL_MAX or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in h):
+        return None
+    if not h.lower().startswith(("http://", "https://")):
+        return None
+    try:
+        parts = _us(h)
+        host = parts.hostname or ""
+        if parts.username is not None or parts.password is not None or "@" in parts.netloc or "\\" in h:
+            return None
+    except ValueError:
+        return None
+    if not host or _brave_own_host(host):
+        return None
+    # r2: the host in ONE spelling — a compatibility form (``①②⑦.0.0.1``, full-width letters) is refused,
+    # and an all-numeric host must be a canonical dotted quad (``127.1``, ``0177.0.0.1``, ``0x7f.1`` are
+    # addresses a resolver reads differently from the predicate below)
+    if unicodedata.normalize("NFKC", host) != host:
+        return None
+    if all(_NUMERIC_LABEL_RE.fullmatch(lab) for lab in host.split(".")) and not _DOTTED_QUAD_RE.fullmatch(host):
+        return None
+    from ..core.link_grounding import is_public_source_url
+    return h if is_public_source_url(h) else None
+
+
+def parse_brave_onion(html_text: str) -> List[Dict]:
+    """The result rows of a Brave results page, in page order: ``{"title", "href", "body"}`` — or, for a
+    row whose link is wrapped, ``href`` None and ``go`` (the wrapped link's path). A page without the
+    result markup (a changed layout, an error page) is [] — never an exception."""
+    try:
+        import html as _html
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(str(html_text or "")[:BRAVE_ONION_PARSE_MAX_CHARS], "html.parser")
+        blocks = soup.select('[data-type="web"]') or soup.select(".result-wrapper")
+        rows: List[Dict] = []
+        seen: set = set()
+        for b in blocks:
+            title_el = b.select_one(".search-snippet-title")
+            a = (title_el.find_parent("a", href=True) if title_el is not None else None) \
+                or b.select_one(".result-content a[href]") or b.find("a", href=True)
+            if a is None:
+                continue
+            raw = str(a.get("href") or "").strip()
+            href = _brave_page_address(raw)
+            go = raw if (href is None and _BRAVE_GO_PATH_RE.fullmatch(raw)) else None
+            if href is None and go is None:
+                continue
+            if (href or go) in seen:
+                continue
+            seen.add(href or go)
+            title = ""
+            if title_el is not None:
+                title = str(title_el.get("title") or "")[:_BRAVE_TITLE_MAX * 4] or title_el.get_text("", strip=True)
+            body = ""
+            for sel in _BRAVE_SNIPPET_SELECTORS:
+                el = b.select_one(sel)
+                if el is not None:
+                    body = " ".join(el.get_text("")[:_BRAVE_BODY_MAX * 4].split())[:_BRAVE_BODY_MAX]
+                    if body:
+                        break
+            row: Dict[str, Any] = {"title": " ".join(_html.unescape(title[:_BRAVE_TITLE_MAX * 4]).split())[:_BRAVE_TITLE_MAX],
+                                   "href": href, "body": body}
+            if go:
+                row["go"] = go
+            rows.append(row)
+        return rows
+    except Exception as exc:  # noqa: BLE001 — an unparsable page is an empty page
+        logger.debug("brave onion page not parsed: %s", exc)
+        return []
+
+
+def _read_brave_page(html_text: str, query: str) -> Tuple[str, List[Dict]]:
+    """("rows", rows) / ("blocked", []) / ("empty", []) for a results page that came back 200 — the
+    parse and the two classifications `_guarded_engine_search` applies to a ddgs engine, in ONE step so
+    all of it runs off the loop."""
+    rows = parse_brave_onion(html_text)
+    if rows:
+        return "rows", rows
+    if engine_page_is_challenge(html_text, query):
+        return "blocked", []
+    keep_empty_page_sample(BRAVE_ONION_ENGINE, html_text, query)
+    return "empty", []
+
+
+def _brave_link_target(status: int, location: str, body: str = "") -> Optional[str]:
+    """Where a wrapped Brave link leads — an address `_brave_page_address` takes, else None. From the
+    interstitial the link answers with (HTTP 200): the ``href`` of its ``<a class="destination">``;
+    failing that (a changed layout), the ONE external address the page names apart from namespace
+    hosts — two different ones is no answer. Secondary: a redirect's Location, a refresh page's target."""
+    import html as _html
+    if 300 <= int(status or 0) < 400:
+        return _brave_page_address(location)
+    if int(status or 0) != 200 or not body:
+        return None
+    text = body[:_BRAVE_GO_BODY_MAX_BYTES]
+    for attrs in _tag_attrs(text, "a"):
+        if "destination" in _attr(attrs, "class").split():
+            return _brave_page_address(_html.unescape(_attr(attrs, "href")))
+    for attrs in _tag_attrs(text, "meta"):
+        if _attr(attrs, "http-equiv").lower() == "refresh":
+            m = _BRAVE_REFRESH_URL_RE.search(_html.unescape(_attr(attrs, "content")))
+            if m:
+                return _brave_page_address(m.group(1))
+    m = _BRAVE_LOCATION_RE.search(text)
+    if m:
+        return _brave_page_address(_html.unescape(m.group(1)))
+    from urllib.parse import urlsplit as _us
+    found: set = set()
+    for m in _BRAVE_ANY_URL_RE.finditer(text):
+        try:
+            if (_us(m.group(0)).hostname or "").lower() in _BRAVE_STATIC_HOSTS:
+                continue
+        except ValueError:
+            continue
+        u = _brave_page_address(_html.unescape(m.group(0)))
+        if u:
+            found.add(u)
+            if len(found) > 1:
+                return None
+    return next(iter(found), None)
+
+
+async def _resolve_brave_links(rows: List[Dict], proxy: Optional[str], budget: float) -> int:
+    """Fill ``href`` of the rows whose link is wrapped — each link asked once, not followed,
+    BRAVE_ONION_RESOLVE_WIDTH at a time, on the page's circuit — within ``budget`` seconds. A row is
+    marked ``asked`` once its link ANSWERED (whatever it said). Returns how many resolved."""
+    gate = asyncio.Semaphore(BRAVE_ONION_RESOLVE_WIDTH)
+
+    async def _one(row: Dict) -> None:
+        try:
+            async with gate:
+                status, body, location = await _direct_fetch(
+                    f"https://{BRAVE_ONION_HOST}{row['go']}", proxy, budget, headers=dict(BRAVE_ONION_HEADERS),
+                    impersonate=_brave_impersonate(), follow=False, max_bytes=_BRAVE_GO_BODY_MAX_BYTES)
+            row["asked"] = True
+            row["href"] = await _off_loop(_brave_link_target, status, location, body)
+        except Exception as exc:  # noqa: BLE001 — an unresolved link is a dropped row
+            row["asked"] = True
+            logger.debug("brave onion link not resolved: %s", _brief_engine_error(exc))
+
+    jobs = [asyncio.ensure_future(_one(r)) for r in rows]
+    try:
+        if jobs:
+            await asyncio.wait(jobs, timeout=max(0.0, budget))
+    finally:
+        for j in jobs:
+            if not j.done():
+                j.cancel()
+    return sum(1 for r in rows if r.get("href"))
+
+
+def _brave_impersonate() -> str:
+    from ..utils.helpers import _FETCH_IMPERSONATE
+    return _FETCH_IMPERSONATE
+
+
+async def _brave_onion_search(query: str, proxy: Optional[str], timeout: float, max_results: int = 20) -> List[Dict]:
+    """One Brave-onion attempt, whole inside ``timeout``: the results page, then its wrapped links. Rows
+    in the shape every engine returns. Raises ``blocked: …`` on a non-200 answer (a redirect included —
+    not followed) or a challenge page — the same two rules `_guarded_engine_search` applies to a ddgs
+    engine; a page with no result is [] (its structure is kept once for the operator, as for the others)."""
+    from urllib.parse import urlencode
+    t0 = time.monotonic()
+    status, html_text, _loc = await _direct_fetch(
+        f"https://{BRAVE_ONION_HOST}/search?" + urlencode({"q": query}), proxy, timeout,
+        headers=dict(BRAVE_ONION_HEADERS), impersonate=_brave_impersonate(), follow=False)
+    if status != 200:
+        raise RuntimeError(f"blocked: HTTP {status} from {BRAVE_ONION_ENGINE}")
+    kind, rows = await _off_loop(_read_brave_page, html_text, query)
+    if kind == "blocked":
+        raise RuntimeError(f"blocked: challenge page from {BRAVE_ONION_ENGINE}")
+    if kind != "rows":
+        return []
+    rows = rows[:max(1, int(max_results))]
+    # only the links of the rows that can be shown are asked (rows after them are kept when the page
+    # itself gave their address)
+    wrapped = [r for r in rows[:BRAVE_ONION_SHOWN] if not r.get("href")]
+    resolved = 0
+    left = float(timeout) - (time.monotonic() - t0)
+    if wrapped and left > 0:
+        resolved = await _resolve_brave_links(wrapped, proxy, left)
+    out: List[Dict] = []
+    seen: set = set()
+    addressed = 0                                          # r2: the minimum counts ADDRESSES, before de-duplication
+    for r in rows:                                         # r1: two wrapped links can lead to one page
+        if not r.get("href"):
+            continue
+        addressed += 1
+        if _row_key(r) not in seen:
+            seen.add(_row_key(r))
+            out.append({"title": r["title"], "href": r["href"], "body": r["body"]})
+    # durable log, no query: how the wrapped links fare, wave by wave
+    logger.info("brave_onion page: %d row(s), %d wrapped link(s) asked, %d resolved, %d returned in %.1fs",
+                len(rows), len(wrapped), resolved, len(out), time.monotonic() - t0)
+    if addressed < min(BRAVE_ONION_MIN_ROWS, len(rows)):
+        if any(not r.get("asked") for r in wrapped):
+            # the page ARRIVED; its links did not all answer inside the attempt's time — not a refusal
+            raise EngineUnfinished(f"page in, {sum(1 for r in wrapped if not r.get('asked'))} link(s) not answered in time")
+        raise RuntimeError(f"{addressed} of {len(rows)} result link(s) resolved ({len(wrapped)} wrapped asked)")
+    return out
+
+
+# ── Wikipedia, a supplement (§4VA; replaces §4JO's Greek-only lookup) ─────
+# The search API answers over Tor with no key (probed 11-19: every query, ~1-2 s) — but only with
+# encyclopedia articles, so it is never a racer and never wins a wave. One lookup runs BESIDE every wave
+# (el.wikipedia for a query written mostly in Greek letters, en otherwise — `wikipedia_lang`): at most
+# WIKI_MAX_ROWS hits that are ABOUT THE QUERY'S SUBJECT (`wiki_article_on_topic` — §4JO's rule, r1) are
+# added to the winner's rows, marked ``"engine": "wikipedia"`` — after them; for a Greek query the best
+# one goes FIRST (`order_with_wikipedia`: §4JO's property, the owner writes Greek). With no winner the
+# wave is still lost (the caller retries as before) and the rows ride on the returned `WaveBatch`
+# (``.wikipedia``): a search that ends with no general winner shows them, said to be the encyclopedia only.
+# A failed or late lookup is silent: no operator line, only its token on the durable engines line
+# (``wikipedia=added|empty|off-topic|blocked|conn-error|timeout|unfinished``).
+#: §4UN-web / §4QF: Wikipedia's API answers 429 over Tor to a browser-impersonating client and 200 to a
+#: plain one — so this one request is sent plain
 WIKI_HEADERS = {"User-Agent": "curl/8.7.1"}
+WIKI_SEARCH_HITS = 8
+WIKI_MAX_ROWS = 2
+_WIKI_TITLE_MAX, _WIKI_SNIPPET_MAX = 300, 1000
+#: how long a wave that has ended (a winner, or nobody) waits for a lookup still out — a fast win is
+#: never held longer than this, and never past the wave's own deadline
+WIKI_WAIT_S = 1.5
+#: how a Wikipedia row is marked for the model (the row itself carries ``"engine": "wikipedia"``)
+WIKIPEDIA_TAG = "Wikipedia"
+WIKIPEDIA_LOW_TAG = "Wikipedia — this one matches the query, unlike the results above"
+WIKIPEDIA_ONLY_NOTE = ("NOTE: no general search engine answered — the ONLY sources below are Wikipedia "
+                       "articles that match the query. Treat coverage as limited; say so to the user, "
+                       "or search again later.")
+#: a supplement row must match MORE than this share of the query's content words (title + snippet) —
+#: the batch rule's 30 % lets one shared word of two or three through
+WIKI_MIN_COVERAGE = 0.5
+
+
+def _mostly_greek(text: str) -> bool:
+    """Most of the text's LETTERS are Greek (r1: one Greek character in an English query is not a
+    Greek query)."""
+    letters = [c for c in str(text or "") if c.isalpha()]
+    return bool(letters) and 2 * sum(1 for c in letters if _GREEK_RE.match(c)) > len(letters)
+
+
+def wikipedia_lang(query: str) -> str:
+    return "el" if _mostly_greek(query) else "en"
+
+
+def _strip_markup(text, limit: int = _WIKI_SNIPPET_MAX) -> str:
+    """Page text out of an API snippet: capped, tags gone (``<span class="searchmatch">``), entities
+    decoded, whitespace collapsed. What is left is untrusted page text like any row's. (``<[^<>]*>``:
+    linear — ``<[^>]*>`` was quadratic on a field of ``<``.)"""
+    import html as _html
+    s = str(text or "")[:limit * 8]
+    return " ".join(_html.unescape(re.sub(r"<[^<>]*>", "", s)).split())[:limit]
+
+
+def parse_wikipedia_hits(payload, lang: str) -> List[Dict]:
+    """The API's ``query.search`` hits as rows (title, snippet without markup, the article's address)."""
+    from urllib.parse import quote as _quote
+    hits = ((payload.get("query") or {}).get("search") if isinstance(payload, dict) else None) or []
+    rows: List[Dict] = []
+    for h in (hits if isinstance(hits, list) else [])[:WIKI_SEARCH_HITS * 2]:
+        title = _strip_markup(h.get("title"), _WIKI_TITLE_MAX) if isinstance(h, dict) else ""
+        if not title:
+            continue
+        rows.append({"title": title, "body": _strip_markup(h.get("snippet")),
+                     "href": f"https://{lang}.wikipedia.org/wiki/" + _quote(title.replace(" ", "_"), safe="/:(),'!*"),
+                     "engine": WIKIPEDIA_ENGINE})
+    return rows
+
+
+def _read_wikipedia_body(body: str, lang: str) -> List[Dict]:
+    return parse_wikipedia_hits(json.loads(body), lang)
+
+
+async def _wikipedia_search(query: str, proxy: Optional[str], timeout: float, max_results: int = WIKI_SEARCH_HITS) -> List[Dict]:
+    """One search on the query's Wikipedia. Raises ``blocked: …`` on a non-200 answer."""
+    from urllib.parse import urlencode
+    lang = wikipedia_lang(query)
+    url = f"https://{lang}.wikipedia.org/w/api.php?" + urlencode({
+        "action": "query", "list": "search", "format": "json", "srlimit": int(max_results),
+        "srprop": "snippet|titlesnippet", "srsearch": query})
+    status, body, _loc = await _direct_fetch(url, proxy, timeout, headers=dict(WIKI_HEADERS), follow=False,
+                                             max_bytes=200_000)
+    if status != 200:
+        raise RuntimeError(f"blocked: HTTP {status} from {WIKIPEDIA_ENGINE}")
+    return await _off_loop(_read_wikipedia_body, body, lang)
+
+
+# §4UN-web: the text the owner's request typed, when anonymous mode scrubbed it (lower-cased) before the
+# engines saw it — (query sent, query as typed). Read only for what casing carries: a name's capitals
+# (the encyclopedia subject, `_wiki_subject_tokens`).
+import contextvars as _contextvars
+_QUERY_AS_TYPED: "_contextvars.ContextVar[Optional[Tuple[str, str]]]" = _contextvars.ContextVar(
+    "ghost_query_as_typed", default=None)
+
+
+def _typed_original(query: str) -> Optional[str]:
+    v = _QUERY_AS_TYPED.get()
+    if v and v[0] == query and v[1] != query:
+        return v[1]
+    return None
 
 
 #: §4UN-web r1: capitalised words that name what is ASKED about the subject,
@@ -1546,28 +2244,30 @@ def _wiki_generic(tok: str) -> bool:
 
 
 def _wiki_subject_tokens(query: str, original: Optional[str] = None) -> List[str]:
-    """The tokens an article must carry to be about the query (folded).
+    """The tokens an article's TITLE must carry to be about the query (folded).
 
-    The NAME the owner typed: every capitalised word of the original text — the
-    first word only when the next one is capitalised too (a two-word name, not
-    sentence case) — all required. With no capitals (a lower-cased query), the
-    leading distinctive token, as before. §4UN-web: the bare leading-token rule
-    took a verb as the subject — with no Greek dictionary every Greek word is
-    distinctive, so "Πότε πέθανε ο Καζαντζάκης" required "πεθανε"."""
+    The NAME as typed: every capitalised word of the original text, all required. The FIRST word counts
+    only when it is a content word (sentence case starts a question with a capital: "Πότε πέθανε ο
+    Καζαντζάκης" must not require "ποτε" — but "Αλκιβιάδου 154 Πειραιάς" does require the street, r1).
+    Words that name what is asked ABOUT the subject ("βιογραφία", "history") and years are not it.
+    With no capitals (a lower-cased query): the leading distinctive token, else the leading content word."""
     words = str(original or query or "").split()
     cores = [w.lstrip(_LEAD_PUNCT).rstrip(_TRAIL_PUNCT) for w in words]
     caps = []
     for k, c in enumerate(cores):
         if not _CAP_WORD_RE.fullmatch(c):
             continue
-        if k == 0 and not (len(cores) > 1 and _CAP_WORD_RE.fullmatch(cores[1])):
+        if k == 0 and not _rel_tokens(c):                  # a capitalised question/function word
             continue
         caps.append(c)
     toks = [t for c in caps for t in _rel_tokens(c) if not _YEAR_RE.fullmatch(t) and not _wiki_generic(t)]
     if toks:
         return list(dict.fromkeys(toks))
-    dist = distinctive_tokens(query)
-    return dist[:1]
+    dist = [t for t in distinctive_tokens(query) if not _wiki_generic(t) and not t.isdigit()]
+    if dist:
+        return dist[:1]
+    rest = [t for t in _rel_tokens(query) if not _YEAR_RE.fullmatch(t) and not _wiki_generic(t)]
+    return rest[:1]
 
 
 def _wiki_token_found(tok: str, words: set, flat: str) -> bool:
@@ -1580,85 +2280,111 @@ def _wiki_token_found(tok: str, words: set, flat: str) -> bool:
 
 
 def wiki_article_on_topic(query: str, article: Dict, original: Optional[str] = None) -> bool:
-    """The article's title or intro carries the query's SUBJECT (every token
-    of `_wiki_subject_tokens`) — not merely any word of it."""
+    """§4JO's SUBJECT rule, for every supplement row in both languages (§4VA r1 — the batch rule alone
+    let "Πλωτό νοσοκομείο" lead a search for "Τζάνειο Νοσοκομείο", and "Python (genus)" join one for
+    "python asyncio gather"): the article's TITLE carries every subject token of the query
+    (`_wiki_subject_tokens`), and — for a query of two or more content words — title and snippet match
+    MORE than WIKI_MIN_COVERAGE of them. A query with no subject token keeps no article.
+    A QUESTION-FORM query ("who wrote the odyssey") therefore usually keeps none: a rule that also took
+    any title whose words all stand in the query was tried and removed (r2 confirmation: it kept
+    "Ελλάδα" for "πληθωρισμός στην Ελλάδα 2026" and "Release" for "python 3.14 release date" — a missing
+    optional row is harmless, a wrong leading row is not)."""
     subj = _wiki_subject_tokens(query, original)
     if not subj:
         return False
-    text = _rel_fold(f"{article.get('title') or ''} {article.get('body') or ''}")
-    words = set(re.findall(r"\w+", text, re.UNICODE))
-    flat = re.sub(r"\W+", "", text, flags=re.UNICODE)
-    return all(_wiki_token_found(t, words, flat) for t in subj)
+    title = _rel_fold(str(article.get("title") or ""))
+    words = set(re.findall(r"\w+", title, re.UNICODE))
+    flat = re.sub(r"\W+", "", title, flags=re.UNICODE)
+    if not all(_wiki_token_found(t, words, flat) for t in subj):
+        return False
+    tokens = [t for t in _rel_tokens(query) if not _YEAR_RE.fullmatch(t) and not _wiki_generic(t)]
+    if len(tokens) >= 2 and not result_coverage(article, tokens) > WIKI_MIN_COVERAGE:
+        return False
+    return True
 
 
-def _wiki_lookup(query: str, proxy: Optional[str], original: Optional[str] = None) -> List[Dict]:
-    """Synchronous (runs on the race pool): ONE call — full-text search with
-    the top hits' intro extracts (generator=search) — on the language's
-    Wikipedia, as a plain client (§4UN-web). A refusal is logged and is []."""
-    import curl_cffi.requests as creq
-    from urllib.parse import quote as _quote
-    lang = _WIKI_LANG[region_for_query(query)]
-    base = f"https://{lang}.wikipedia.org/w/api.php"
-    proxies = {"https": proxy, "http": proxy} if proxy else None
-    r = creq.get(base, params={"action": "query", "generator": "search", "gsrsearch": query, "gsrlimit": 2,
-                               "prop": "extracts", "exintro": 1, "explaintext": 1, "exlimit": 2,
-                               "redirects": 1, "format": "json", "utf8": 1},
-                 headers=dict(WIKI_HEADERS), proxies=proxies, timeout=WIKI_SUPPLEMENT_TIMEOUT)
-    status = getattr(r, "status_code", 200)
-    if status != 200:
-        pretty_log("Wiki Supplement", f"{lang}.wikipedia answered HTTP {status} — no encyclopedia lookup this time",
-                   level="INFO", icon=Icons.SKIP)
-        return []
-    pages = ((r.json() or {}).get("query") or {}).get("pages") or {}
-    ordered = sorted((p for p in pages.values() if isinstance(p, dict)),
-                     key=lambda p: int(p.get("index") or 99))
+def _row_key(r: Dict) -> str:
+    """A row's address for de-duplication: no scheme, no ``www.``, no fragment, no trailing slash,
+    percent-decoded; a Wikipedia article is one page whatever its mobile host or query string."""
+    from urllib.parse import unquote as _unq
+    u = str(r.get("href") or r.get("url") or "").split("#", 1)[0].strip()
+    u = re.sub(r"^https?://(?:www\.)?", "", u[:_URL_MAX], flags=re.I)
+    host, _slash, path = u.partition("/")
+    host = host.lower()
+    if host.endswith("wikipedia.org"):
+        host = host.replace(".m.wikipedia.org", ".wikipedia.org")
+        path = path.split("?", 1)[0]
+    return (host + "/" + _unq(path).replace(" ", "_")).rstrip("/").lower()
+
+
+def wikipedia_rows(query: str, hits: List[Dict], have=(), original: Optional[str] = None) -> List[Dict]:
+    """The supplement's rows for a batch: about the query's subject (`wiki_article_on_topic` — stricter
+    than the batch's relevance rule on every count: the subject in the TITLE, more than half the query's
+    words, no best-of-the-rest allowance), not already among ``have``, at most WIKI_MAX_ROWS.
+    ``original``: the query as typed, when the one sent lost its capitals."""
+    seen = {_row_key(r) for r in have or ()}
     out: List[Dict] = []
-    for pg in ordered[:2]:
-        title = str(pg.get("title") or "").strip()
-        extract = str(pg.get("extract") or "").strip()
-        if not title or not extract:
+    for r in hits or []:
+        if not wiki_article_on_topic(query, r, original):
             continue
-        article = {"title": f"{title} — Βικιπαίδεια", "body": " ".join(extract[:WIKI_EXTRACT_CHARS].split()),
-                   "href": f"https://{lang}.wikipedia.org/wiki/{_quote(title.replace(' ', '_'))}"}
-        if wiki_article_on_topic(query, article, original):
-            out.append(article)
+        k = _row_key(r)
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(r)
+        if len(out) >= WIKI_MAX_ROWS:
+            break
     return out
 
 
-#: How long a search that the web has already answered waits for the
-#: encyclopedia (three Tor round trips run ~4-5 s; the wave itself ~2-3 s).
-#: When every web ticket failed the wait is the lookup's own full budget.
-WIKI_SUPPLEMENT_WAIT_AFTER_WIN = 6.0
+class WaveBatch(list):
+    """What a wave returns: the rows (a plain list to every caller — empty when nobody won), plus
+    ``wikipedia``, the supplement's rows of this wave: already placed in a winner's batch; NOT part
+    of a low-relevance batch or of a lost wave, where the caller decides (`wave_wikipedia`)."""
+
+    def __init__(self, rows=(), wikipedia=()):
+        super().__init__(rows)
+        self.wikipedia: List[Dict] = list(wikipedia or ())
 
 
-async def _wiki_supplement(task, budget: float) -> List[Dict]:
-    """The lookup's articles within ``budget`` seconds, or [] — a failure
-    or a late answer never sinks or delays the search (the thread finishes
-    on its own; nothing waits for it)."""
-    if task is None:
-        return []
-    try:
-        return await asyncio.wait_for(asyncio.shield(task), timeout=budget)
-    except Exception as e:  # noqa: BLE001
-        logger.debug("wiki supplement skipped: %s", e)
-        return []
+def wikipedia_first(query: str) -> bool:
+    """§4JO's property, kept (§4VA): for a query in Greek the encyclopedia leads the batch —
+    the web engines read a Greek name as a product or a place, and el.wikipedia has the article."""
+    return _mostly_greek(query)
 
 
-def merge_wiki_first(wiki: List[Dict], web: List[Dict]) -> List[Dict]:
-    """Encyclopedia articles first, then the web batch minus duplicates."""
-    if not wiki:
-        return list(web or [])
-    seen = {w.get("href") for w in wiki}
-    return list(wiki) + [r for r in (web or []) if (r.get("href") or r.get("url")) not in seen]
+def order_with_wikipedia(query: str, web: List[Dict], wiki: List[Dict]) -> List[Dict]:
+    """THE order of a batch that has Wikipedia rows: after the web rows — except that for a Greek query
+    (`wikipedia_first`) the BEST one leads. Only one (r1): a second stays last, so the pages web_search
+    reads and fact_check's counter-search slots are not both taken by the encyclopedia."""
+    wiki = list(wiki)
+    if wiki and wikipedia_first(query):
+        return wiki[:1] + list(web) + wiki[1:]
+    return list(web) + wiki
 
 
+def wave_wikipedia(rows) -> List[Dict]:
+    """The Wikipedia rows that came with a wave's result ([] for a plain list)."""
+    return list(getattr(rows, "wikipedia", None) or [])
+
+
+def is_wikipedia_row(r: Dict) -> bool:
+    return isinstance(r, dict) and r.get("engine") == WIKIPEDIA_ENGINE
+
+
+#: the search function of each engine this module fetches itself (table kind "direct" / "supplement"),
+#: by NAME — read at call time
+_DIRECT_SEARCH = {BRAVE_ONION_ENGINE: "_brave_onion_search", WIKIPEDIA_ENGINE: "_wikipedia_search"}
+
+
+def _direct_search(engine: str):
+    return globals()[_DIRECT_SEARCH[engine]]
 #: §4UN-web r1: how long the engines already in flight may take to beat a
 #: low-relevance batch (web_search only)
 LOW_RELEVANCE_GRACE_S = 3.0
-import contextvars as _cv_soft
-#: §4UN-web r1: True inside a web_search — its waves treat a low-relevance
-#: batch as a soft loss. Deep research and the counter-search race as before.
-_SOFT_LOW_RACE: "_cv_soft.ContextVar[bool]" = _cv_soft.ContextVar("ghost_soft_low_race", default=False)
+#: §4UY N2: EVERY race treats a low-relevance batch as a soft loss (web_search, deep research, the
+#: counter-search) — one relevance rule per wave. Deep research raced without it and read eight pages
+#: about the query's first word (20c7b536, 96a8424f).
 
 
 def _batch_coverage(query: str, rows: List[Dict]) -> float:
@@ -1670,23 +2396,33 @@ def _batch_coverage(query: str, rows: List[Dict]) -> float:
         return 0.0
 
 
+#: §4VA: an engine raced on several circuits has ONE outcome per wave — its most informative attempt's:
+#: an answer (it reached the index) before a refusal, a refusal before a transport failure
+_ATTEMPT_RANK = ("low-relevance", "off-topic", "empty", "blocked", "timeout", "conn-error", "error")
+
+
+def _best_attempt(msgs: List[str]) -> str:
+    """The failure message that stands for an engine's attempts in one wave (see `_ATTEMPT_RANK`)."""
+    return min(msgs, key=lambda m: _ATTEMPT_RANK.index(_failure_category(m)))
+
+
 async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                             max_results: int = 20, stats: Optional[Dict] = None,
-                            timelimit: Optional[str] = None, soft_low: Optional[bool] = None) -> List[Dict]:
-    """Race ALL engines in parallel, each on its OWN Tor circuit; the first
-    engine to return non-empty (junk-filtered) results wins the wave.
+                            timelimit: Optional[str] = None, soft_low: bool = True) -> List[Dict]:
+    """Race the table's engines in parallel, every attempt on its OWN Tor circuit; the first attempt
+    to return non-empty (junk-filtered), on-topic results wins the wave.
 
-    This is the core Tor-reliability mechanism (measured 2026-07-08, see
-    _RACE_ENGINES): per-(engine, circuit) success is ~10% and failures are
-    driven by the exit IP, so the engines must NOT share a circuit. One
-    single-engine ddgs call per engine, each with its own SOCKS-auth tag,
-    turns one correlated ~10% attempt into len(_RACE_ENGINES) independent
-    tickets (~47% per wave). Losers are cancelled as soon as a winner
-    lands; a fully-blocked wave costs at most the ddgs timeout + grace.
+    This is the core Tor-reliability mechanism (see ENGINE_TABLE): a refusal follows the exit IP, so
+    attempts must NOT share a circuit — one call per (engine, circuit), each with its own SOCKS-auth
+    tag; an engine with ``circuits`` > 1 is asked on that many fresh circuits at once and has one
+    outcome for the wave. Losers are cancelled as soon as a winner lands; a wave nobody wins costs at
+    most the slowest engine's timeout + grace. Wikipedia runs beside the race and never wins it.
+    Returns a `WaveBatch`.
     """
     from ddgs import DDGS
-    if soft_low is None:
-        soft_low = _SOFT_LOW_RACE.get()                   # §4UN-web r1: set by web_search only
+    if stats is not None:
+        stats["low_unheard"] = False                      # §4UY N3: set per wave (see `low_batch_unheard`)
+        stats["timelimit_ignored_by"] = None              # §4UY N12: set per wave by its winner
     _patch_ddgs_snippet_join()
     _patch_ddgs_block_detection()                         # §4UN-web: a refusal is "blocked", not "empty"
     _ensure_ddgs_threads()                                # §4PD
@@ -1699,8 +2435,6 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
         _eng_timeout = timeout or _engine_timeout(engine)
         kwargs: Dict[str, Any] = {"timeout": _eng_timeout}
         if proxy:
-            if engine == DDG_ONION_ENGINE and proxy.startswith("socks5://"):
-                proxy = "socks5h://" + proxy[len("socks5://"):]     # §4UN-onion: Tor resolves the onion name
             kwargs["proxy"] = proxy
         t_start = time.monotonic()
         try:
@@ -1728,99 +2462,152 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
 
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
-    tasks: Dict[Any, str] = {}
-    _onion_state = _ONION_SEARCH.get()
-    if _onion_state is None:
-        _onion_state = {}
+    tasks: Dict[Any, str] = {}                 # attempt → its engine (launch order)
+    circuit_of: Dict[Any, int] = {}
+    attempts_out: Dict[str, int] = {}          # engine → attempts still running
+    attempt_fail: Dict[str, List[str]] = {}    # engine → what its finished attempts said
 
-    def _launch(engine: str, salt: str, label: str, timeout: Optional[float] = None):
-        proxy = _proxy_for_attempt(tor_proxy, query, wave, salt=salt)
-        # Dedicated _RACE_POOL, NOT to_thread: uncancellable loser threads
-        # must queue against other WAVES, not against the process-wide
-        # default executor every other to_thread caller shares.
-        task = asyncio.ensure_future(
-            loop.run_in_executor(_RACE_POOL, _run_engine, engine, proxy, timeout))
-        tasks[task] = label
+    def _launch(engine: str, circuit: int):
+        spec = _engine_spec(engine)
+        proxy = _proxy_for_attempt(tor_proxy, query, wave, salt=_circuit_salt(engine, circuit))
+        if spec.kind == "direct":
+            task = asyncio.ensure_future(_direct_search(engine)(query, proxy, spec.timeout, max_results))
+        else:
+            # Dedicated _RACE_POOL, NOT to_thread: uncancellable loser threads
+            # must queue against other WAVES, not against the process-wide
+            # default executor every other to_thread caller shares.
+            task = asyncio.ensure_future(
+                loop.run_in_executor(_RACE_POOL, _run_engine, engine, proxy, None))
+        tasks[task] = engine
+        circuit_of[task] = circuit
+        attempts_out[engine] = attempts_out.get(engine, 0) + 1
         return task
 
-    _engines = raced_engines(tor_proxy)                   # §4UN-onion: + the DuckDuckGo onion
+    _engines = raced_engines(tor_proxy)
+    _probed = probed_engines()                            # r1: benched engines this wave races as a probe
     for engine in _engines:
-        _launch(engine, _engine_salt(engine), engine)
+        for _c in range(max(1, int(_engine_spec(engine).circuits))):
+            _launch(engine, _c)
+
+    # §4VA: the supplement — beside the race, never in it
+    _wiki_task = None
+    _wiki_out: Dict[str, str] = {}
+    _wspec = ENGINE_TABLE.get(WIKIPEDIA_ENGINE)
+    if _wspec is not None and WIKIPEDIA_ENGINE not in engines_switched_off():
+        _wiki_task = asyncio.ensure_future(_direct_search(WIKIPEDIA_ENGINE)(
+            query, _proxy_for_attempt(tor_proxy, query, wave, salt=_wspec.salt), _wspec.timeout))
+        _wiki_out[WIKIPEDIA_ENGINE] = "unfinished"
+
+    async def _wiki_rows(have: List[Dict]) -> List[Dict]:
+        """The supplement's rows for this wave (never raises; a failure is its token only)."""
+        if _wiki_task is None:
+            return []
+        if not _wiki_task.done():
+            # r1: never past the wave's own deadline
+            _wait = min(WIKI_WAIT_S, deadline - (time.monotonic() - t0))
+            if _wait > 0:
+                await asyncio.wait({_wiki_task}, timeout=_wait)
+        if not _wiki_task.done():
+            return []
+        if _wiki_task.cancelled():                         # the lookup cancelled ITSELF: a failure of it, silent
+            _wiki_out[WIKIPEDIA_ENGINE] = "error"
+            return []
+        try:
+            hits = _wiki_task.result()
+            rows = wikipedia_rows(query, hits, have, _typed_original(query))
+        except Exception as e:  # noqa: BLE001 — silent: the supplement never sinks or marks a search
+            _cat = _failure_category(_brief_engine_error(e))
+            _wiki_out[WIKIPEDIA_ENGINE] = _cat if _cat in _REFUSAL_OUTCOMES else "error"
+            return []
+        _wiki_out[WIKIPEDIA_ENGINE] = "added" if rows else ("off-topic" if hits else "empty")
+        return rows
+
+    def _engine_failures(exclude: Optional[str] = None) -> List[Tuple[str, str]]:
+        """One (engine, message) per engine that lost — its best attempt's. An engine with a circuit
+        still out is not refused yet (it stays "unfinished") unless an attempt ANSWERED."""
+        out: List[Tuple[str, str]] = []
+        for engine, msgs in attempt_fail.items():
+            if engine == exclude or not msgs:
+                continue
+            best = _best_attempt(msgs)
+            if attempts_out.get(engine, 0) > 0 and _failure_category(best) not in _ANSWERED_KINDS:
+                continue
+            out.append((engine, best))
+        return out
+
+    def _stop_attempts(keep=()) -> None:
+        for task in tasks:
+            if task in keep:
+                continue
+            if task.done():
+                if not task.cancelled():
+                    # A loser that co-completed in the winner's batch never
+                    # had .result() called; sweep its exception so GC doesn't
+                    # log 'Task exception was never retrieved' at ERROR onto
+                    # the operator stream (found 2026-07-15).
+                    try:
+                        task.exception()
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
+                task.cancel()
 
     # Several searches can race concurrently in one agent turn; the query
     # tag on every wave log line keeps their interleaved output readable.
     qtag = truncate_query(query, 28)
     deadline = _race_wave_deadline()  # §4HR
     pending = set(tasks)
-    failures: List[Tuple[str, str]] = []
     timed_out = False
-    # §4UN-web (web_search only, ``soft_low``): a batch in which NOTHING passes the coverage floor
-    # is a soft loss — kept while the engines ALREADY IN FLIGHT get a short grace to do better
-    # (r1: racing on to the deadline plus a hedge took a low-relevance query from ~2 s to ~30 s);
-    # no hedge is started for it. Without ``soft_low`` (deep research, the counter-search) a low
-    # batch wins as before.
+    # §4UN-web (``soft_low``, every caller since §4UY N2): a batch in which NOTHING passes the
+    # coverage floor is a soft loss — kept while the engines ALREADY IN FLIGHT get a short grace to do
+    # better (r1: racing on to the deadline took a low-relevance query from ~2 s to ~30 s).
     fallback: Optional[Tuple[str, List[Dict]]] = None
     _fallback_score = -1.0
     _grace_end: Optional[float] = None
-    hedge_at = _race_hedge_at()
-    hedged = hedge_at <= 0
+    _kept: Any = ()                            # attempts of probed engines left running past the wave
     try:
         while pending:
+            if _probed and not any(tasks[t] not in _probed for t in pending):
+                break                                      # r2: only probes are still out — they go on in the background
             elapsed = time.monotonic() - t0
             remaining = deadline - elapsed
-            if not any(tasks[t] not in _EXTRA_RACE_ENGINES for t in pending):
-                # §4UN-onion r1: only an EXTRA engine (the onion) is still running. It never starts the
-                # hedge by itself; and when a clearnet engine ANSWERED (empty, off-topic, low relevance)
-                # the wave ends now — the onion is waited for (to the unchanged deadline) only when every
-                # clearnet engine was refused or unreachable. (Without this, every answered-empty wave ran
-                # to the full 16 s deadline.)
-                hedged = True
-                if fallback is not None or any(_failure_category(m) in _ANSWERED_KINDS for _, m in failures):
-                    break
-                # final review: this wait at most once per search, and never after the onion timed out
-                if _onion_state.get("onion_spent"):
-                    break
-                _onion_state["onion_spent"] = True
             if _grace_end is not None:
                 if elapsed >= _grace_end:
                     break
                 remaining = min(remaining, _grace_end - elapsed)
-                hedged = True                              # r1: no hedge for a low-relevance batch
             if remaining <= 0:
                 timed_out = True
                 break
-            if not hedged and elapsed >= hedge_at:
-                hedged = True
-                for engine in _RACE_HEDGE_ENGINES:
-                    # its own timeout ends with the first engines' (review
-                    # §4LH: a full 12 s from 6 s ran a no-winner wave to 16 s)
-                    pending.add(_launch(engine, engine[:4] + "h", f"{engine}-h",
-                                        timeout=max(1.0, _engine_timeout(engine) - elapsed)))
-                pretty_log("Web Search",
-                           f"no winner after {elapsed:.0f}s — hedging "
-                           f"{'+'.join(_RACE_HEDGE_ENGINES)} on fresh circuits ‹{qtag}›",
-                           icon=Icons.TOOL_SEARCH)
-                continue
-            wait_for = remaining if hedged else min(remaining, hedge_at - elapsed)
             done, pending = await asyncio.wait(
-                pending, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED)
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
             if not done:
                 if _grace_end is not None:
                     break                                  # the grace ran out: the low batch stands
-                if hedged:
-                    timed_out = True
-                    break
-                continue
+                timed_out = True
+                break
             for task in done:
                 engine = tasks[task]
-                try:
-                    valid = _filter_junk(task.result(), _omitted_by_engine.setdefault(engine, []),
-                                         _snippets_by_engine.setdefault(engine, []))
-                except Exception as e:  # noqa: BLE001 — a losing engine must never sink the wave
-                    failures.append((engine, _brief_engine_error(e)))
+                attempts_out[engine] -= 1
+                _om: List[str] = []
+                _sn: List[Dict] = []
+                if task.cancelled():
+                    # r1: a CancelledError raised INSIDE this attempt (a transport that cancels itself).
+                    # The wave's own cancellation arrives at the `await` above, never here — so this
+                    # one is the attempt's failure, not the caller's.
+                    attempt_fail.setdefault(engine, []).append("attempt cancelled itself")
                     continue
-                if stats is not None and _snippets_by_engine.get(engine):
-                    stats.setdefault("snippet_pool", []).extend(_snippets_by_engine[engine])
+                try:
+                    valid = _filter_junk(task.result(), _om, _sn)
+                except EngineUnfinished:
+                    continue                               # it answered, its time ran out: "unfinished"
+                except Exception as e:  # noqa: BLE001 — a losing attempt must never sink the wave
+                    attempt_fail.setdefault(engine, []).append(_brief_engine_error(e))
+                    continue
+                _eng_om = _omitted_by_engine.setdefault(engine, [])
+                _eng_om.extend(h for h in _om if h not in _eng_om)
+                _snippets_by_engine.setdefault(engine, []).extend(_sn)
+                if stats is not None and _sn:
+                    stats.setdefault("snippet_pool", []).extend(_sn)
                 if valid:
                     # Liveness is not relevance: an engine that answers
                     # fast with an unrelated page set would otherwise win
@@ -1834,7 +2621,7 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                             f"query term anywhere ‹{qtag}› — not counted as a "
                             f"win; racing on",
                             level="INFO", icon=Icons.SKIP)
-                        failures.append((engine, "off-topic"))
+                        attempt_fail.setdefault(engine, []).append("off-topic")
                         continue
                     valid = rank_on_topic(query, valid)          # §4IL: on-topic first
                     _soft = False
@@ -1844,7 +2631,7 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                         except Exception:  # noqa: BLE001 — a relevance bug never sinks a wave
                             _soft = False
                     if _soft:
-                        failures.append((engine, "low-relevance"))
+                        attempt_fail.setdefault(engine, []).append("low-relevance")
                         _score = _batch_coverage(query, valid)
                         if _score > _fallback_score:              # r1: the best low batch, not the first
                             fallback, _fallback_score = (engine, valid), _score
@@ -1858,40 +2645,49 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                     if stats is not None:
                         stats["omitted_hosts"] = list(_omitted_by_engine.get(engine, []))
                         stats["snippet_rows"] = list(_snippets_by_engine.get(engine, []))
+                        stats["timelimit_ignored_by"] = (engine if timelimit and not engine_honours_timelimit(engine)
+                                                         else None)         # §4UY N12
                         _engine_tally(stats, engine, "win")
+                    _n_circ = max(1, int(_engine_spec(engine).circuits))
                     pretty_log("Web Search",
                                f"{engine} won wave {wave} in {time.monotonic() - t0:.1f}s "
-                               f"({len(valid)} results) ‹{qtag}›", icon=Icons.TOOL_SEARCH)
-                    _log_wave_engines(wave, _engines_token(tasks, failures, winner=engine))
-                    return valid
-                failures.append((engine, "empty"))
+                               f"({len(valid)} results) ‹{qtag}›"
+                               + (f" [circuit {circuit_of[task] + 1}/{_n_circ}]" if _n_circ > 1 else ""),
+                               icon=Icons.TOOL_SEARCH)
+                    _lost = _engine_failures(exclude=engine)
+                    _kept = _finish_probes(tasks, attempt_fail, _probed - {engine}, query)
+                    _stop_attempts(_kept)                  # the losers go now, before the supplement's short wait
+                    _wiki = await _wiki_rows(valid)
+                    _log_wave_engines(wave, _engines_token(tasks, _lost, winner=engine, supplement=_wiki_out,
+                                                           probed=_probed))
+                    return WaveBatch(order_with_wikipedia(query, valid, _wiki), _wiki)
+                attempt_fail.setdefault(engine, []).append("empty")
+        _all_failures = _engine_failures()
+        # r1: the wave is judged as if a probed (benched) engine had sat out — unless its low batch is
+        # the one being returned
+        _probe_only = _probed - ({fallback[0]} if fallback is not None else set())
+        failures = [f for f in _all_failures if f[0] not in _probe_only]
+        _kept = _finish_probes(tasks, attempt_fail, _probed, query)
+        _wiki = await _wiki_rows(fallback[1] if fallback is not None else [])
+    except BaseException:
+        # the wave itself is cancelled or broke: everything goes — and a probe WE stop books nothing
+        # (r2: `_finish_probes` skips a stopped attempt)
+        _kept = ()
+        raise
     finally:
-        for task in tasks:
-            if task.done():
-                if not task.cancelled():
-                    # A loser that co-completed in the winner's batch never
-                    # had .result() called; sweep its exception so GC doesn't
-                    # log 'Task exception was never retrieved' at ERROR onto
-                    # the operator stream (found 2026-07-15).
-                    try:
-                        task.exception()
-                    except Exception:  # noqa: BLE001
-                        pass
-            else:
-                task.cancel()
-    # §4UN-onion: an EXTRA engine still running when the wave ended without a winner was dropped —
-    # named ("abandoned"), never a failure kind (`search_failure_counts` does not read it). Last round:
-    # only its own TIMEOUT spends the onion's one wait here (the wait itself spends it above) — a wave
-    # that merely ended while it ran (a clearnet engine answered) leaves the wait for a later wave
-    _late = [tasks[t] for t in pending if tasks.get(t) in _EXTRA_RACE_ENGINES]
-    if any(e in _EXTRA_RACE_ENGINES and _failure_category(m) == "timeout" for e, m in failures):
-        _onion_state["onion_spent"] = True
+        _stop_attempts(_kept)
+        if _wiki_task is not None:
+            if not _wiki_task.done():
+                _wiki_task.cancel()
+            elif not _wiki_task.cancelled():
+                try:
+                    _wiki_task.exception()
+                except Exception:  # noqa: BLE001
+                    pass
     if stats is not None:
         for engine, msg in failures:
             _engine_tally(stats, engine, _failure_category(msg))
-        for engine in _late:
-            _engine_tally(stats, engine, "abandoned")
-    if failures or timed_out or _late:
+    if failures or timed_out:
         # Operator stream gets ONE terse line — categories, not reprs:
         #   wave 0 ‹postgresql 20 features…›: no winner — 5 empty; mojeek conn-error
         # "empty" is the boring default so it's a bare count; engines are
@@ -1902,13 +2698,11 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
         for engine, msg in failures:
             cats.setdefault(_failure_category(msg), []).append((engine, msg))
         if stats is not None:
-            # final review: the extra engines (the onion) stay out of the counts that choose between a
-            # fresh-circuit retry and a rewording — they are measured per engine (`stats["engines"]`)
+            # one count per ENGINE per wave (§4VA: not per circuit) — these choose between a
+            # fresh-circuit retry and a rewording
             _tally = stats.setdefault("cats", {})
             for _c, _lst in cats.items():
-                _n = sum(1 for e, _ in _lst if e not in _EXTRA_RACE_ENGINES)
-                if _n:
-                    _tally[_c] = _tally.get(_c, 0) + _n
+                _tally[_c] = _tally.get(_c, 0) + len(_lst)
         parts: List[str] = []
         # §4UN-web: every category names its engines (the 30-day log could only COUNT 3,212 empties)
         for cat in ("empty", "blocked", "off-topic", "low-relevance"):
@@ -1920,8 +2714,6 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
         if "error" in cats:
             engines = "+".join(e for e, _ in cats["error"])
             parts.append(f"{engines} error: {cats['error'][0][1][:48]}")
-        if _late:
-            parts.append(f"{'+'.join(_late)} abandoned")
         if timed_out:
             parts.append(f"wave deadline {deadline}s")
         pretty_log("Search Wave Empty",
@@ -1930,16 +2722,90 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                    level="INFO", icon=Icons.SKIP)
         logging.getLogger(__name__).debug(
             "search wave %s ‹%s› detail: %s", wave, qtag,
-            "; ".join(f"{e}: {m}" for e, m in failures))
-    _log_wave_engines(wave, _engines_token(tasks, failures, late=_late))
+            "; ".join(f"{e}: {m}" for e, ms in attempt_fail.items() for m in ms))
+    _log_wave_engines(wave, _engines_token(tasks, _all_failures, supplement=_wiki_out, probed=_probe_only))
     if fallback is not None:
         if stats is not None:
+            stats["low_unheard"] = low_batch_unheard(fallback[0], failures)
+            stats["timelimit_ignored_by"] = (fallback[0] if timelimit and not engine_honours_timelimit(fallback[0])
+                                             else None)                     # §4UY N12
             stats["omitted_hosts"] = list(_omitted_by_engine.get(fallback[0], []))
             stats["snippet_rows"] = list(_snippets_by_engine.get(fallback[0], []))
-        return fallback[1]
-    return []
+        return WaveBatch(fallback[1], _wiki)
+    return WaveBatch([], _wiki)
 
 
+#: probes still finishing after their wave (kept referenced so the loop does not drop them)
+_PROBE_TASKS: set = set()
+
+
+def cancel_probes() -> int:
+    """Stop every probe still finishing in the background (shutdown): nothing more is booked. Returns
+    how many were stopped."""
+    live = [w for w in list(_PROBE_TASKS) if not w.done()]
+    for w in live:
+        w.cancel()
+    return len(live)
+
+
+def _finish_probes(tasks: Dict, attempt_fail: Dict[str, List[str]], probed, query: str):
+    """§4VA r1: on a probe wave, the attempts of a PROBED engine (a benched one raced to see whether it
+    came back) that are still out when the wave ends are left to finish — in the background, off the
+    caller's clock — and the engine's outcome is booked for the bench (`_bench_note`): an answer brings
+    it back, a refusal renews its rest. (Cancelled with the others, a probe a faster engine beat never
+    recorded anything, and the engine stayed benched for good.) Returns the attempts left running."""
+    kept = [t for t, e in tasks.items() if e in probed and not t.done()]
+    if not kept:
+        return ()
+    by_engine: Dict[str, List[Any]] = {}
+    for t in kept:
+        by_engine.setdefault(tasks[t], []).append(t)
+
+    async def _watch(engine: str, mine: List[Any], said: List[str]) -> None:
+        try:
+            await asyncio.wait(mine, timeout=_engine_timeout(engine) + _RACE_WAVE_GRACE)
+            msgs = list(said)
+            for t in mine:
+                if not t.done():
+                    continue
+                if t.cancelled():
+                    continue                               # r2: a stopped attempt says nothing about the engine
+                try:
+                    rows = _filter_junk(t.result())
+                    msgs.append("win" if rows and not _results_are_off_topic(query, rows) else
+                                ("off-topic" if rows else "empty"))
+                except EngineUnfinished:
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    msgs.append(_brief_engine_error(e))
+            if "win" in msgs:
+                _bench_note(engine, "win")
+            elif msgs:
+                _bench_note(engine, _failure_category(_best_attempt(msgs)))
+        finally:
+            for t in mine:
+                if not t.done():
+                    t.cancel()
+
+    for engine, mine in by_engine.items():
+        w = asyncio.ensure_future(_watch(engine, mine, list(attempt_fail.get(engine) or ())))
+        _PROBE_TASKS.add(w)
+        w.add_done_callback(lambda f: (_PROBE_TASKS.discard(f), f.cancelled() or f.exception()))
+    return tuple(kept)
+
+
+def low_batch_unheard(low_engine: str, failures: List[Tuple[str, str]]) -> bool:
+    """§4UY N3: True when a wave's low-relevance batch stands only because no OTHER web engine answered —
+    each was refused, unreachable, timed out or still running.
+    Live, 10 of 13 low batches were this: the engine that knew the query was merely refused on that
+    circuit, and a wave on fresh circuits is the one thing that can reach it. When another engine
+    answered (empty, off-topic, low too) the query itself is the cause, and the low batch stands."""
+    for engine, msg in failures or []:
+        if engine == low_engine:
+            continue
+        if _failure_category(msg) in _ANSWERED_KINDS:
+            return False
+    return True
 def truncate_query(query: str, limit: int = 35) -> str:
     return (query[:limit] + "..") if len(query) > limit else query  # type: ignore
 
@@ -2223,28 +3089,54 @@ def _prune_report(query: str, results: List[Dict]) -> Tuple[List[Dict], bool, st
 def _with_batch_notes(text: str, prune_note: str, stats: Optional[Dict]) -> str:
     """§4PD: the lines that say what the batch LOST — off-topic rows hidden,
     junk-listed hosts omitted — appended to the results the model gets."""
-    notes = [n for n in (prune_note, omitted_hosts_note((stats or {}).get("omitted_hosts"))) if n]
+    notes = [n for n in (prune_note, omitted_hosts_note((stats or {}).get("omitted_hosts")),
+                         timelimit_ignored_note((stats or {}).get("timelimit_ignored_by"))) if n]
     return text + ("\n\n" + "\n".join(notes) if notes else "")
 
 
-# §4UN-web: the text the owner's request typed, when anonymous mode scrubbed it
-# (lower-cased) before the engines saw it — (query sent, query as typed). Read
-# only for what casing carries: a name's capitals (the encyclopedia subject).
-import contextvars as _contextvars
-_QUERY_AS_TYPED: "_contextvars.ContextVar[Optional[Tuple[str, str]]]" = _contextvars.ContextVar(
-    "ghost_query_as_typed", default=None)
+_TIMELIMIT_HONOURED: Dict[str, bool] = {}
 
 
-def _typed_original(query: str) -> Optional[str]:
-    v = _QUERY_AS_TYPED.get()
-    if v and v[0] == query and v[1] != query:
-        return v[1]
-    return None
+def engine_honours_timelimit(engine: str) -> bool:
+    """§4UY N12: does this ddgs engine put a recency limit into its request? Read from the engine's OWN
+    request builder, offline: its payload with ``timelimit="w"`` against two without (keys that differ
+    between the two plain ones are per-request randomness, e.g. yandex's ``searchid``). False when it
+    cannot be told (an unknown engine is never claimed to have limited anything)."""
+    base = str(engine or "")
+    if base in _TIMELIMIT_HONOURED:
+        return _TIMELIMIT_HONOURED[base]
+    ok = False
+    try:
+        from types import SimpleNamespace
+        from ddgs.engines import ENGINES
+        cls = ENGINES["text"][base]
+        if not isinstance(cls, type):
+            return False                                  # not the library's engine class: never cached
+        inst = cls.__new__(cls)
+        inst.http_client = SimpleNamespace(client=SimpleNamespace(set_cookies=lambda *a, **k: None))
+        kw = dict(query="ghost probe", region="us-en", safesearch="moderate", page=1)
+        plain1, plain2 = dict(inst.build_payload(timelimit=None, **kw)), dict(inst.build_payload(timelimit=None, **kw))
+        limited = dict(inst.build_payload(timelimit="w", **kw))
+        noise = {k for k in set(plain1) | set(plain2) if plain1.get(k) != plain2.get(k)}
+        ok = any(limited.get(k) != plain1.get(k) for k in (set(limited) | set(plain1)) - noise)
+    except Exception:  # noqa: BLE001
+        ok = False
+    _TIMELIMIT_HONOURED[base] = ok
+    return ok
+
+
+def timelimit_ignored_note(engine: Optional[str]) -> str:
+    """§4UY N12: said when a time-limited ("latest", "today") wave was answered by an engine that ignores
+    the limit — live, yandex won 83 of 129 such waves and the result read as recent."""
+    if not engine:
+        return ""
+    return (f"NOTE: the recency limit was NOT applied — the engine that answered ({engine}) ignores it, so "
+            "these results may be old. Check each page's date before calling anything current.")
 
 
 #: §4UN-web freshness: words that ask about NOW → the engines that read a time
 #: limit (duckduckgo df, yahoo btf, brave tf; yandex ignores it) get one, on the
-#: FIRST wave only — the second wave and the hedge stay unrestricted
+#: FIRST wave only — the later waves stay unrestricted
 _FRESH_WEEK_RE = re.compile(r"\b(?:today|tonight|right\s+now|as\s+of\s+now|this\s+week|σήμερα|σημερα|"
                             r"τώρα|τωρα|απόψε|αποψε|αυτή\s+την\s+εβδομάδα)\b", re.I | re.UNICODE)
 #: r1: "now" alone is a brand or a filler ("now tv", "how to know now what") —
@@ -2348,27 +3240,30 @@ _ANSWERED_KINDS = frozenset({"empty", "off-topic", "low-relevance"})
 
 
 def _engine_tally(stats: Dict, engine: str, outcome: str) -> None:
-    """§4UN-onion: per-engine outcomes of a search's waves — ``stats["engines"][engine][outcome]``
-    (win / blocked / empty / timeout / conn-error / abandoned / …), so each engine can be compared."""
+    """Per-engine outcomes of a search's waves — ``stats["engines"][engine][outcome]``
+    (win / blocked / empty / timeout / conn-error / …), so each engine can be compared."""
     e = stats.setdefault("engines", {}).setdefault(engine, {})
     e[outcome] = e.get(outcome, 0) + 1
 
 
 def _engines_token(tasks: Dict, failures: List[Tuple[str, str]], winner: Optional[str] = None,
-                   late=()) -> str:
-    """§4UN-onion r1: every raced engine's outcome on the wave line, one stable, greppable token each —
-    `` | engines: duckduckgo=blocked yandex=win duckduckgo_onion=abandoned`` (launch order; a hedge is
-    ``yandex-h``; an engine still running when another won is ``unfinished``). Read by
-    ``scripts/search_engine_stats.py``."""
+                   supplement: Optional[Dict[str, str]] = None, probed=()) -> str:
+    """Every raced engine's outcome on the wave line, one stable, greppable token each —
+    `` | engines: yandex=win yahoo=empty brave_onion=unfinished wikipedia=added`` (launch order; ONE
+    token per engine however many circuits it rode — §4VA; an engine still running when another won, or
+    when the wave ended, is ``unfinished``; the supplement's token comes last: ``added`` when its rows
+    joined the batch). Read by ``scripts/search_engine_stats.py``."""
     out: Dict[str, str] = {}
     for label in tasks.values():
-        out.setdefault(label, "unfinished")
+        # r2: a probe still out is the bench's business too — never an outcome of the wave
+        out.setdefault(label, (PROBE_PREFIX if label in probed else "") + "unfinished")
     for engine, msg in failures:
-        out[engine] = _failure_category(msg)
-    for engine in late or ():
-        out[engine] = "abandoned"                          # last round: was "late" (old logs keep it)
+        # r1: a benched engine raced as a probe — its outcome is the bench's, not the wave's
+        out[engine] = (PROBE_PREFIX if engine in probed else "") + _failure_category(msg)
     if winner:
         out[winner] = "win"
+    for name, outcome in (supplement or {}).items():
+        out[name] = outcome
     return " | engines: " + " ".join(f"{e}={o}" for e, o in out.items())
 
 
@@ -2389,27 +3284,41 @@ _ENGINE_HEALTH_WINDOW_S = 86400.0
 _PROCESS_T0 = time.time()
 _ENGINE_WAVES: "_deque" = _deque(maxlen=_ENGINE_LEDGER_MAX)    # (t, ((engine, outcome), …))
 _PAGE_READ_EVENTS: "_deque" = _deque(maxlen=_ENGINE_LEDGER_MAX)  # (t, outcome)
-_ENGINE_PAIR_RE = re.compile(r"^([a-z][a-z_]{1,23}(?:-h)?)=([a-z][a-z-]{1,15})$")
+_ENGINE_PAIR_RE = re.compile(r"^([a-z][a-z_]{1,23})=([a-z][a-z-]{1,23})$")
+#: how a probe's outcome reads on the engines line: ``duckduckgo=probe-blocked``
+PROBE_PREFIX = "probe-"
 #: only these names and outcomes are counted — anything else in a token is dropped, never printed
 _KNOWN_ENGINE_OUTCOMES = frozenset(("win", "blocked", "conn-error", "timeout", "error", "empty", "off-topic",
-                                    "low-relevance", "unfinished", "abandoned", "late"))
+                                    "low-relevance", "unfinished", "added"))
 
 
 def _known_engine(name: str) -> bool:
-    base = name[:-2] if name.endswith("-h") else name
-    return base in _RACE_ENGINES or base in _RACE_HEDGE_ENGINES or base in (
-        "duckduckgo", "yandex", "brave", "yahoo", "mojeek", "google", "bing", "wikipedia", "duckduckgo_onion")
+    """A name of the engine table (§4VA: the one list), or of the race as a test or caller set it."""
+    return name in ENGINE_TABLE or name in _RACE_ENGINES
 
 
 def _record_wave_engines(token: str, now: Optional[float] = None) -> None:
+    """One wave's outcomes into the in-memory ledger; and (§4VA) the bench's share of it to disk — off
+    this thread (`_bench_save`)."""
     try:
         body = str(token or "").split("| engines:", 1)[1]
     except IndexError:
         return
-    pairs = tuple(m.groups() for m in (_ENGINE_PAIR_RE.match(w) for w in body.split())
-                  if m and _known_engine(m.group(1)) and m.group(2) in _KNOWN_ENGINE_OUTCOMES)
+    found = [m.groups() for m in (_ENGINE_PAIR_RE.match(w) for w in body.split()) if m and _known_engine(m.group(1))]
+    pairs = tuple((e, o) for e, o in found if o in _KNOWN_ENGINE_OUTCOMES)
+    # a probe's outcome goes to the bench's own rows: never an outcome of this wave (`engine_health`)
+    probes = [(e, o[len(PROBE_PREFIX):]) for e, o in found if o.startswith(PROBE_PREFIX)]
+    if pairs or probes:
+        _bench_load_once()                                 # what the last process kept goes in FIRST
+    for e, o in probes:
+        _bench_note(e, o, now)
     if pairs:
+        for e, o in pairs:
+            if o in (_ANSWER_OUTCOMES | _REFUSAL_OUTCOMES):
+                (_bench_state.get("in_flight") or {}).pop(e, None)   # a probe that won, or a normal outcome
         _ENGINE_WAVES.append((time.time() if now is None else float(now), pairs))
+        if any(e in _RACE_ENGINES and o in (_ANSWER_OUTCOMES | _REFUSAL_OUTCOMES) for e, o in pairs):
+            _bench_save()
 
 
 def engine_health(window_s: float = _ENGINE_HEALTH_WINDOW_S, now: Optional[float] = None) -> Dict[str, Any]:
@@ -2446,15 +3355,8 @@ def search_failure_counts(stats: Optional[Dict]) -> Tuple[int, int, int]:
 
 
 async def tool_search_ddgs(query: str, tor_proxy: str):
-    """web_search's engine side (see `_tool_search_ddgs`): its race waves treat
-    a low-relevance batch as a soft loss (§4UN-web r1)."""
-    _tok = _SOFT_LOW_RACE.set(True)
-    _otok = _ONION_SEARCH.set({})                         # §4UN-onion: one onion-only wait per search
-    try:
-        return await _tool_search_ddgs(query, tor_proxy)
-    finally:
-        _ONION_SEARCH.reset(_otok)
-        _SOFT_LOW_RACE.reset(_tok)
+    """web_search's engine side (see `_tool_search_ddgs`)."""
+    return await _tool_search_ddgs(query, tor_proxy)
 
 
 async def _tool_search_ddgs(query: str, tor_proxy: str):
@@ -2475,6 +3377,9 @@ async def _tool_search_ddgs(query: str, tor_proxy: str):
     # query that would return nothing. This is the in-code backstop for
     # the LLM occasionally ignoring the "plain keywords only" guidance.
     query = _sanitize_query(query)
+    if _typed:
+        # the waves below ask `_typed_original` with the SANITISED query (tool_search resets the variable)
+        _QUERY_AS_TYPED.set((query, _typed))
 
     # Log with TOR status and truncated query
     pretty_log("Web Search", query, icon=Icons.TOOL_SEARCH)
@@ -2516,45 +3421,45 @@ async def _tool_search_ddgs(query: str, tor_proxy: str):
     # them (_race_search_wave / _proxy_for_attempt) — search reachability
     # over Tor is exit-node-dependent, so fresh independent exits are what
     # actually beat a block, and it's far cheaper than NEWNYM.
-    # Encyclopedic supplement (§4JO): launched alongside the first wave on
-    # its own circuit; awaited only once a wave has answered (or both
-    # failed), so it never delays the web batch.
-    _wiki_task = None
-    if wiki_supplement_wanted(query):
-        import functools as _functools
-        _wiki_task = asyncio.get_running_loop().run_in_executor(
-            _RACE_POOL, _functools.partial(_wiki_lookup, query, _proxy_for_attempt(tor_proxy, query, 0, salt="wiki"),
-                                           **({"original": _typed} if _typed else {})))
-        # §4PD: a lookup that fails after the wait is a retrieved exception, not
-        # an asyncio "Future exception was never retrieved" ERROR line
-        _wiki_task.add_done_callback(lambda t: (t.exception() if not t.cancelled() else None))
+    # Wikipedia (§4VA) rides with every wave (`_race_search_wave`): a winner's batch ends with its rows;
+    # the rows of waves nobody won are kept here for a search that ends without a general winner.
+    _wiki_kept: List[Dict] = []
+
+    def _keep_wiki(rows: List[Dict]) -> List[Dict]:
+        _wiki_kept.extend(wave_wikipedia(rows))
+        return rows
 
     _shown_rows: List[Dict] = []                         # §4UN-read: the batch as listed, for the page reads
 
-    def _render(rows: List[Dict], wiki: Optional[List[Dict]] = None) -> Tuple[str, bool]:
+    def _render(rows: List[Dict]) -> Tuple[str, bool]:
         """The batch as the model gets it, judged against the ORIGINAL query
         (a reworded query's rows too — §4UN-web), with the `site:` host's
-        results first and the snippet-only rows last. (text, low)."""
-        rows, low, pnote = _prune_report(query, rows)
-        shown = merge_wiki_first(wiki or [], site_first(rows, _site_hosts))[:8]
-        _shown_rows[:] = [r for r in shown if r not in (wiki or [])]   # r1: the encyclopedia row is shown already
-        out = format_search_results(shown)
+        results first, then (§4VA) the batch's Wikipedia rows — after the web
+        rows, never instead of one — and the snippet-only rows last. (text, low)."""
+        _wiki_in = [r for r in rows if is_wikipedia_row(r)] + wave_wikipedia(rows)
+        rows, low, pnote = _prune_report(query, [r for r in rows if not is_wikipedia_row(r)])
+        web = site_first(rows, _site_hosts)[:8]
+        wiki = wikipedia_rows(query, _wiki_in, web, _typed)  # on topic for the ORIGINAL query; no page twice
+        if low:
+            # the note speaks of the web rows: it stays on top of them, the encyclopedia rows after
+            shown = web + wiki
+            out = LOW_RELEVANCE_NOTE + "\n\n" + format_search_results(web)
+            if wiki:
+                out += "\n\n" + format_search_results(wiki, start=len(web) + 1, tag=WIKIPEDIA_LOW_TAG)
+        else:
+            shown = order_with_wikipedia(query, web, wiki)    # Greek-script query: Wikipedia first
+            out = "\n\n".join(format_search_results([r], start=i, tag=WIKIPEDIA_TAG if is_wikipedia_row(r) else "")
+                              for i, r in enumerate(shown, 1))
+        _shown_rows[:] = shown
         snip = snippet_only_rows(query, _stats.get("snippet_rows") or [], shown)
         if snip:
             out += "\n\n" + format_search_results(snip, start=len(shown) + 1, tag=SNIPPET_ONLY_TAG)
-        if low and not wiki:
-            out = LOW_RELEVANCE_NOTE + "\n\n" + out
         _shown_hosts = {_junk_host(str(r.get("href") or r.get("url") or "")) for r in snip}
         _st = dict(_stats, omitted_hosts=[h for h in (_stats.get("omitted_hosts") or []) if h not in _shown_hosts])
         return _with_batch_notes(out, pnote, _st), low
 
     async def _answer(rows: List[Dict]) -> str:
-        nonlocal _wiki_task
-        _wiki = await _wiki_supplement(_wiki_task, WIKI_SUPPLEMENT_WAIT_AFTER_WIN); _wiki_task = None
-        if _wiki:
-            pretty_log("Wiki Supplement", f"el.wikipedia: {_wiki[0]['title'][:60]} — placed first",
-                       icon=Icons.TOOL_SEARCH)
-        out, low = _render(rows, _wiki)
+        out, low = _render(rows)
         out += await _read_section(low)
         if not low:                                       # §4PD: a low-relevance batch is not an answer to repeat for 5 min
             _cache_put(_cache_key, out)                   # §4UN-read: with its page reads, for the same 5 min
@@ -2576,13 +3481,16 @@ async def _tool_search_ddgs(query: str, tor_proxy: str):
     for wave in range(2):
         # (r1: a low-relevance batch is the wave's answer after the short in-wave grace — no
         # second wave for it; that took a low-relevance query to ~30 s)
-        valid_results = await _race_search_wave(query, tor_proxy, wave, stats=_stats,
-                                                **({"timelimit": _fresh} if _fresh and wave == 0 else {}))
+        valid_results = _keep_wiki(await _race_search_wave(
+            query, tor_proxy, wave, stats=_stats, **({"timelimit": _fresh} if _fresh and wave == 0 else {})))
         if valid_results:
             # r2: …except when the first wave was TIME-LIMITED ("latest X"): the unlimited wave
-            # may find the page the limit hid; the limited batch stands if it does not
-            if wave == 0 and _fresh and prune_off_topic(query, valid_results)[1]:
-                _limited_low = (valid_results, {k: _stats.get(k) for k in ("omitted_hosts", "snippet_rows")})
+            # may find the page the limit hid; the limited batch stands if it does not.
+            # §4UY N3: …or when the low batch stands only because every other engine was refused or
+            # unreachable on its circuit — the second wave runs on fresh circuits
+            if wave == 0 and (_fresh or _stats.get("low_unheard")) and prune_off_topic(query, valid_results)[1]:
+                _limited_low = (valid_results, {k: _stats.get(k) for k in ("omitted_hosts", "snippet_rows",
+                                                                            "timelimit_ignored_by")})
                 continue
             if wave == 1 and _limited_low is not None and prune_off_topic(query, valid_results)[1]:
                 break
@@ -2591,21 +3499,8 @@ async def _tool_search_ddgs(query: str, tor_proxy: str):
         if wave == 0:
             await asyncio.sleep(1)
     if _limited_low is not None:
-        _stats.update({k: v for k, v in _limited_low[1].items() if v is not None})
+        _stats.update({k: v for k, v in _limited_low[1].items() if v is not None or k == "timelimit_ignored_by"})
         return await _answer(_limited_low[0])
-    _wiki = await _wiki_supplement(_wiki_task, WIKI_SUPPLEMENT_TIMEOUT * 3)
-    if _wiki:
-        # Every web ticket failed; the encyclopedia alone is still an answer.
-        pretty_log("Wiki Supplement", f"el.wikipedia answered where every web engine failed: {_wiki[0]['title'][:60]}",
-                   icon=Icons.TOOL_SEARCH)
-        # …but SAY it is encyclopedia-only, and do NOT cache it (§4LZ B6): it
-        # read like normal results and a repeat query after the engines
-        # recovered got the same lone page for 300 s
-        clean_output = ("NOTE: every web search engine failed — the ONLY source below is "
-                        "the encyclopedia (el.wikipedia). Treat coverage as limited; say so "
-                        "to the user, or search again later.\n\n" + format_search_results(_wiki))
-        return clean_output
-
     _refused, _transport, _empty = search_failure_counts(_stats)
     _reworded: List[str] = []
     if _refused + _transport > _empty:
@@ -2614,7 +3509,7 @@ async def _tool_search_ddgs(query: str, tor_proxy: str):
         pretty_log("Search Retry", f"engines refused or unreachable ({_refused} blocked, {_transport} transport, "
                    f"{_empty} empty) — the same query on fresh circuits, not reworded ‹{truncate_query(query)}›",
                    icon=Icons.TOOL_SEARCH)
-        valid_results = await _race_search_wave(query, tor_proxy, 2, stats=_stats)
+        valid_results = _keep_wiki(await _race_search_wave(query, tor_proxy, 2, stats=_stats))
         if valid_results:
             return await _answer(valid_results)
     else:
@@ -2622,7 +3517,7 @@ async def _tool_search_ddgs(query: str, tor_proxy: str):
         _reworded = reformulate_keeping_meaning(query)
         for ridx, reformulated in enumerate(_reworded):
             pretty_log("Search Retry", f"Reformulated: {truncate_query(reformulated)}", icon=Icons.TOOL_SEARCH)
-            valid_results = await _race_search_wave(reformulated, tor_proxy, 10 + ridx, stats=_stats)
+            valid_results = _keep_wiki(await _race_search_wave(reformulated, tor_proxy, 10 + ridx, stats=_stats))
             if valid_results:
                 clean_output, _low = _render(valid_results)
                 clean_output += await _read_section(_low)
@@ -2630,6 +3525,15 @@ async def _tool_search_ddgs(query: str, tor_proxy: str):
                 if not _low:
                     _cache_put(_cache_key, result)
                 return result
+
+    # §4VA: no general engine won any wave — the Wikipedia rows the waves kept (on topic for the query as
+    # asked) are the answer there is. SAID to be the encyclopedia only, and never cached (§4LZ B6: it
+    # read like normal results and a repeat query after the engines recovered got the same pages for 300 s)
+    _wiki_only = wikipedia_rows(query, _wiki_kept, (), _typed)
+    if _wiki_only:
+        pretty_log("Wiki Supplement", f"no general engine answered — Wikipedia alone: {str(_wiki_only[0].get('title') or '')[:60]} "
+                   f"‹{truncate_query(query)}›", icon=Icons.TOOL_SEARCH)
+        return WIKIPEDIA_ONLY_NOTE + "\n\n" + format_search_results(_wiki_only, tag=WIKIPEDIA_TAG)
 
     # §4UN-web: the engines found the query only on sites this agent cannot read — their snippets are
     # the answer there is (a price, a headline), said so, never cached
@@ -2645,33 +3549,43 @@ async def _tool_search_ddgs(query: str, tor_proxy: str):
         # every engine failed because the PROXY is down, not because of the
         # query — "use fewer keywords" sent the model on a futile rewrite
         # loop (§4MD MINOR 1)
-        return ("ERROR: web search is unavailable — the Tor proxy is not reachable, so no "
-                "engine could be contacted. Rephrasing will not help. Tell the user web "
-                "search is down right now, and answer from your own knowledge only if you "
-                "say so.")
+        return _search_failed(
+            "ERROR: web search is unavailable — the Tor proxy is not reachable, so no "
+            "engine could be contacted. Rephrasing will not help. Tell the user web "
+            "search is down right now, and answer from your own knowledge only if you "
+            "say so.", "search_proxy_down")
     _refused, _transport, _empty = search_failure_counts(_stats)
     if (_refused + _transport) and (_refused + _transport) >= _empty:
         # §4PD: the waves MEASURED transport failures — "the query was too
         # specific" sent the model rewriting a query that was fine
-        return (
+        return _search_failed(
             f"ERROR: web search failed on TRANSPORT, not on the query — {_refused} engine answer(s) "
             f"were refusals (HTTP 403/429 or a captcha page) and {_transport} attempt(s) could not "
             f"connect or timed out over Tor ({_empty} answered empty). Rephrasing will not help right "
             "now. Retry the SAME query once after other work, or answer from your own knowledge and "
-            "say web search was unreachable."
-        )
+            "say web search was unreachable.",
+            "search_refused" if _refused >= _transport else "search_unreachable")
     if _stats.get("omitted_hosts") and not _empty and not _transport and not _refused:
-        return ("ERROR: web search found results only on " + ", ".join(_stats["omitted_hosts"][:4])
-                + " — sites this agent does not read over Tor — so nothing is shown. Search again "
-                "with the site's name as a plain keyword, or tell the user which site holds it.")
-    return (
+        return _search_failed(
+            "ERROR: web search found results only on " + ", ".join(_stats["omitted_hosts"][:4])
+            + " — sites this agent does not read over Tor — so nothing is shown. Search again "
+            "with the site's name as a plain keyword, or tell the user which site holds it.",
+            "search_only_unreadable_hosts")
+    return _search_failed(
         "ERROR: web search returned ZERO results — the engines answered, with nothing for this "
         "query" + (" or its reworded form" if _reworded else "") + ". DO NOT "
         "retry the same search. Instead: (a) drop to 2-4 PLAIN keywords (no "
         "quotes/operators/years), or (b) if you already have enough context, "
         "proceed with your own knowledge and state that web search was "
-        "unavailable, rather than looping on more searches."
-    )
+        "unavailable, rather than looping on more searches.", "search_zero_results")
+
+
+def _search_failed(text: str, reason_code: str):
+    """§4UY N18: a web_search failure as a DECLARED outcome — its class comes from ``reason_code``
+    (`tool_failure.DECLARED_FAILURE_CLASS`), set here where the waves counted what happened, not from the
+    words of the message."""
+    from .outcome import ToolOutcome
+    return ToolOutcome.failed(text, world_changed=False, reason_code=reason_code)
 
 def _proxy_reachable(proxy_url, timeout: float = 3.0) -> bool:
     """Does the proxy's port accept a TCP connection? True when there is no
@@ -3024,6 +3938,21 @@ def _bump_read(outcome: str, now: Optional[float] = None) -> None:
         _PAGE_READ_EVENTS.append((time.time() if now is None else float(now), outcome))
 
 
+#: §4UY N11: the head of the line that names the result pages web_search tried to open and could not read
+PAGE_READS_NOT_READ_HEAD = "NOT READ (the tool tried to open these result pages):"
+
+
+def page_reads_not_read_note(not_read: List[Tuple[str, str]]) -> str:
+    """§4UY N11: the pages web_search's own reader tried and could not use, with why — said in the result
+    (12 of 78 live reads failed and only the log knew; the model then answered from the snippets as if the
+    page had been read, or opened it again in the browser). "" when every tried page was read."""
+    if not not_read:
+        return ""
+    lines = [f"- {u[:300]} — {why}" for u, why in not_read[:WEB_READ_SCAN]]
+    return (PAGE_READS_NOT_READ_HEAD + "\n" + "\n".join(lines)
+            + "\nFor these, the snippet above is all there is — say so if the answer rests on one.")
+
+
 async def read_top_pages(query: str, rows: List[Dict], tor_proxy: Optional[str],
                          budget_s: Optional[float] = None) -> str:
     """§4UN-read: open the top readable results of ``rows`` and return the READ FROM PAGES section
@@ -3068,9 +3997,11 @@ async def read_top_pages(query: str, rows: List[Dict], tor_proxy: Optional[str],
             for t in tasks:
                 if not t.done():
                     t.cancel()
+        _not_read: List[Tuple[str, str]] = []           # §4UY N11: told, not only logged
         for t in pending:
             r = tasks[t]
             url = str(r.get("href") or r.get("url"))
+            _not_read.append((url, f"not loaded within {budget:g}s"))
             _bump_read("timeout")
             pretty_log("Search Page Read", f"timeout {_result_host(r) or url[:60]} — not read within "
                        f"{budget:g}s", level="INFO", icon=Icons.TOOL_PAGE_READ)
@@ -3090,12 +4021,14 @@ async def read_top_pages(query: str, rows: List[Dict], tor_proxy: Optional[str],
             host = _result_host(r)
             ms = int(took * 1000)
             if not isinstance(res, str) or isinstance(res, _FetchError):
+                _not_read.append((url, "the fetch failed"))
                 _bump_read("failed")
                 pretty_log("Search Page Read", f"failed {host} in {ms} ms — {str(res)[:90]}",
                            level="INFO", icon=Icons.TOOL_PAGE_READ)
                 continue
             text = str(res)
             if len(text.strip()) < RESEARCH_THIN_PAGE_CHARS or is_bot_check_page(text):
+                _not_read.append((url, "a stub, consent or bot-check page, not the document"))
                 _bump_read("thin")
                 pretty_log("Search Page Read", f"thin {host} in {ms} ms — {len(text.strip())} chars "
                            f"(a stub, consent or bot-check page)", level="INFO", icon=Icons.TOOL_PAGE_READ)
@@ -3104,6 +4037,7 @@ async def read_top_pages(query: str, rows: List[Dict], tor_proxy: Optional[str],
             # r1: a page in another script than the query (a Latin page for a Greek question) cannot be
             # judged by shared words — it is kept (it is one of the top-ranked results)
             if words and _greek_text(text) == q_greek and not any(_page_has_word(flat, w) for w in words):
+                _not_read.append((url, "none of the query's words on the page"))
                 _bump_read("off-topic")
                 pretty_log("Search Page Read", f"off-topic {host} in {ms} ms — none of the query's words "
                            f"on the page", level="INFO", icon=Icons.TOOL_PAGE_READ)
@@ -3118,10 +4052,11 @@ async def read_top_pages(query: str, rows: List[Dict], tor_proxy: Optional[str],
             _bump_read("read")
             pretty_log("Search Page Read", f"read {host} in {ms} ms — {len(focused)} of {len(text)} chars",
                        icon=Icons.TOOL_PAGE_READ)
+        _told = page_reads_not_read_note(_not_read)
         if not blocks:
-            return ""
+            return _told
         logger.info("web_search page reads: %d of %d in %.1fs", len(blocks), len(picks), time.monotonic() - t_start)
-        return WEB_READ_HEAD + "\n\n" + "\n\n".join(blocks)
+        return WEB_READ_HEAD + "\n\n" + "\n\n".join(blocks) + (("\n\n" + _told) if _told else "")
     except Exception:  # noqa: BLE001 — a read never costs the search
         logger.warning("web_search page read skipped after an unexpected error", exc_info=True)
         return ""
@@ -3274,18 +4209,12 @@ def is_video_page_url(url: str) -> bool:
 #: §4NJ: a WAF interstitial served instead of the page ("One moment, please…
 #: Please wait while your request is being verified…", 73 chars). It loaded,
 #: so it was distilled as a source and returned "no relevant information".
-_BOT_CHECK_RE = re.compile(
-    r"request is being verified|Just a moment(?:\.\.\.|…)|Checking your browser|"
-    r"Verify you are (?:a )?human|Attention Required!|enable JavaScript and cookies to continue",
-    re.I)
-BOT_CHECK_MAX_CHARS = 600
-
-
 def is_bot_check_page(text: str) -> bool:
-    """A bot-check page rather than the document: SHORT and carrying a
-    challenge phrase (an article that quotes one is long, and stays)."""
-    t = str(text or "").strip()
-    return 0 < len(t) <= BOT_CHECK_MAX_CHARS and bool(_BOT_CHECK_RE.search(t))
+    """A wall (bot check, consent page, paywall stub, JavaScript shell) rather than the document — THE page
+    classifier's answer on the text alone (§4UY N5: `content_check.classify_page`; this file had its own
+    phrase list, which disagreed with the browser's and the fetcher's on the same page)."""
+    from ..utils.content_check import is_wall_text
+    return is_wall_text(text)
 
 
 def _research_eligible(results: List[Dict]) -> List[Dict]:
@@ -3418,6 +4347,41 @@ def _research_split(results: List[Dict], limit: int, query: str = "",
     return picked, [r for _, r in rest]
 
 
+def research_batch_is_low(query: str, rows: List[Dict]) -> bool:
+    """§4UY N2: the web_search relevance rule (`prune_off_topic`'s low flag), applied to deep research's
+    batch: no result matches most of the query's words nor names its subject AND one more of them. A batch
+    with too little text to judge (under ``_REL_MIN_RESULT_CHARS`` of titles and snippets — the
+    off-topic rule's own floor) is not low: an absent snippet is no evidence."""
+    try:
+        prose = "".join(f"{r.get('title') or ''} {r.get('body') or ''}" for r in (rows or [])
+                        if isinstance(r, dict)).strip()
+        if len(prose) < _REL_MIN_RESULT_CHARS:
+            return False
+        return bool(prune_off_topic(query, list(rows or []))[1])
+    except Exception:  # noqa: BLE001 — a relevance bug never sinks the research
+        return False
+
+
+#: §4UY N2: the head of deep research's answer when every batch was low relevance (no page was read)
+RESEARCH_LOW_HEAD = "DEEP RESEARCH READ NO PAGES — low relevance"
+
+
+def research_low_relevance_report(query: str, rows: List[Dict], limit: int = 8) -> str:
+    """§4UY N2: what deep research says when the engines returned only low-relevance results: the result
+    titles and links (search snippets, not pages), and why nothing was read."""
+    lines = []
+    for r in list(rows or [])[:limit]:
+        title = " ".join(_clean_for_cpp(str(r.get("title") or "No Title")).split())[:140]
+        link = str(r.get("href") or r.get("url") or "")[:300]
+        lines.append(neutralise_report_grammar(f"- {title} — {link}"))
+    return (f"{RESEARCH_LOW_HEAD}: none of the search results matches most of the query's words "
+            f"(‹{truncate_query(query, 80)}›), so no page was read — reading them would have reported on "
+            "a different subject. The results, for reference (titles only, not read):\n"
+            + "\n".join(lines)
+            + "\n\nSearch again with fewer, more specific keywords (the subject plus its one key detail), "
+              "or open a result with `browser` only if its title is clearly about the question.")
+
+
 def research_reserves(results: List[Dict], limit: int = RESEARCH_MAX_SOURCES,
                       reserves: int = RESEARCH_MAX_RESERVES, query: str = "", question: str = "") -> List[Dict]:
     """§4NJ: the eligible results AFTER the ones `select_research_sources`
@@ -3545,6 +4509,19 @@ def page_meta_line(title: str = "", meta: Optional[dict] = None) -> str:
     return f'{PAGE_META_MARK} Date: {date}{kind} | Title: ' + (f'"{t}"' if t else "(none)")
 
 
+_PAGE_TITLE_RE = re.compile(r'\| Title: "([^"\n]*)"[ \t]*$')
+
+
+def page_line_title(block: str) -> str:
+    """§4UY N16: the title a ``### SOURCE`` block's `[PAGE]` line gives — the page's own (`page_meta`), or
+    the search row's when the page had none. "" when the block has no such line or says ``(none)``."""
+    lines = str(block or "").split("\n", 2)
+    if len(lines) < 2 or not lines[1].startswith(PAGE_META_MARK):
+        return ""
+    m = _PAGE_TITLE_RE.search(lines[1])
+    return m.group(1).strip() if m else ""
+
+
 def block_body(block: str) -> str:
     """A ``### SOURCE`` block's body — after its head line and its `[PAGE]` line."""
     parts = str(block or "").split("\n", 1)
@@ -3611,6 +4588,55 @@ async def run_research_slots(urls, reserves, bounded, *, phase_deadline: float,
     return await asyncio.gather(*[_slot(u) for u in urls], return_exceptions=True)
 
 
+_SENTINEL_LINE_RE = re.compile(r"^[\s\-*•]*NONE[\s.]*$")
+_EXTRACT_HEAD = "[EDGE EXTRACTED FACTS]:"
+
+
+def _fact_key(line: str) -> str:
+    """A fact line as compared for repeats: no bullet, no case, single spaces, no closing full stop."""
+    t = re.sub(r"^[\s\-*•\d.)]*", "", str(line or ""))
+    return " ".join(t.casefold().split()).rstrip(".")
+
+
+def tidy_extract(text: str) -> str:
+    """§4UY N15: an extractor's answer as it goes into a report — the "nothing relevant" sentinel (`NONE`)
+    removed from an answer that ALSO holds facts (live: facts, then a literal "NONE" line, read as a
+    source that both had and did not have facts), and a fact repeated word for word kept once. An answer
+    that is only the sentinel stays exactly "NONE"."""
+    lines = str(text or "").split("\n")
+    content = [ln for ln in lines if ln.strip() and not _SENTINEL_LINE_RE.match(ln)]
+    if not content:
+        return "NONE" if any(_SENTINEL_LINE_RE.match(ln) for ln in lines if ln.strip()) else str(text or "")
+    out: List[str] = []
+    seen = set()
+    for ln in lines:
+        if ln.strip() and _SENTINEL_LINE_RE.match(ln):
+            continue
+        k = _fact_key(ln)
+        if k and k in seen:
+            continue
+        if k:
+            seen.add(k)
+        out.append(ln)
+    return "\n".join(out).strip("\n")
+
+
+def tidy_extract_block(block):
+    """§4UY N15: `tidy_extract` on a ``### SOURCE`` block's extracted facts (any other block unchanged)."""
+    if not isinstance(block, str) or source_block_failed(block):
+        return block
+    i = block.find(_EXTRACT_HEAD)
+    if i < 0:
+        return block
+    head, facts = block[:i + len(_EXTRACT_HEAD)], block[i + len(_EXTRACT_HEAD):]
+    tail = ""
+    m = re.search(r"\n\[extract cut:[^\n]*\]\s*$", facts)
+    if m:
+        facts, tail = facts[:m.start()], facts[m.start():]
+    tidied = tidy_extract(facts)
+    return f"{head}\n{tidied}{tail}" + ("\n" if block.endswith("\n") and not tail else "")
+
+
 def slot_coverage(slots) -> tuple:
     """(attempted urls, their blocks, lost slots, slots, failed slots,
     replaced slots) — a slot that raised is LOST (its url padded as None); a
@@ -3619,7 +4645,7 @@ def slot_coverage(slots) -> tuple:
     attempted = [pair for s in slots if isinstance(s, list) for pair in s]
     lost = sum(1 for s in slots if not isinstance(s, list))
     urls = [u for u, _ in attempted] + [None] * lost
-    blocks = [c for _, c in attempted]
+    blocks = [tidy_extract_block(c) for _, c in attempted]              # §4UY N15: both research tools
     n_slots = sum(1 for s in slots if isinstance(s, list)) + lost
     failed_slots = sum(1 for s in slots if isinstance(s, list) and s
                        and isinstance(s[-1][1], str) and source_block_failed(s[-1][1]))
@@ -3887,7 +4913,8 @@ async def recheck_all_none(page_contents: list, urls: list, texts: dict, query: 
     in a row, every source "none", including on-topic pages; 8 of the 10
     judged extractor "misses" came from that window, and re-running the same
     prompt on the same text gave facts on 9 of 10). The other sources are
-    then re-extracted IN PARALLEL (``fanout``), each call capped at
+    then re-extracted through the worker's distill queue (§4UZ: `distill_queue`,
+    one at a time by default — ``fanout`` is no longer read), each call capped at
     ``per_call_s`` and started only while its plan fits before ``deadline``;
     a source is replaced only by an answer with facts. ``unchecked`` counts
     the sources left with a possibly-faulty "nothing relevant" (r1 MAJOR: the
@@ -3928,7 +4955,7 @@ async def recheck_all_none(page_contents: list, urls: list, texts: dict, query: 
         content = (r["choices"][0]["message"].get("content") or "").strip()
         if finish_fn is not None:
             content = await asyncio.to_thread(finish_fn, content, urls[i])      # r1: off the event loop
-        content = neutralise_report_grammar(content)
+        content = tidy_extract(neutralise_report_grammar(content))        # §4UY N15
         _orig = str(page_contents[i])
         _meta = block_body(_orig) != (_orig.split("\n", 1) + [""])[1]
         _meta_line = (_orig.split("\n", 2)[1] + "\n") if _meta else ""
@@ -3940,18 +4967,21 @@ async def recheck_all_none(page_contents: list, urls: list, texts: dict, query: 
         return out
     idx.remove(fits[0])
     idx.insert(0, fits[0])
+    _queue = distill_queue(llm_client)          # §4UZ: the same queue as the first extractions
     try:
-        first = await _one(idx[0])
+        async with _queue.slot(0, timeout=deadline - time.monotonic()) as _mine:
+            if not _mine or deadline - time.monotonic() < _needs(idx[0]):     # r1: fit re-checked after the wait
+                return out
+            first = await _one(idx[0])
     except Exception:  # noqa: BLE001 — a recheck must never cost the report
         return out
     if not distilled_block_has_facts(first):
         return out
     out.anomaly, out.contents[idx[0]], out.fixed = True, first, 1
-    sem = asyncio.Semaphore(max(1, int(fanout)))
 
     async def _rest(i):
-        async with sem:
-            if deadline - time.monotonic() < _needs(i):
+        async with _queue.slot(idx.index(i), timeout=deadline - time.monotonic()) as _mine:
+            if not _mine or deadline - time.monotonic() < _needs(i):
                 return i, None
             try:
                 b = await _one(i)
@@ -4117,25 +5147,77 @@ async def tool_deep_research(query: Optional[str] = None, *args, **kwargs):
         # extractor's to repeat, never "not in page text"
         kwargs.setdefault("number_context", str(query))
         query, _stale = _drop_stale_year_logged(query, "deep_research")
-    _otok = _ONION_SEARCH.set({})                         # §4UN-onion: one onion-only wait per research
-    try:
-        out = await _deep_research_core(query, *args, **kwargs)
-    finally:
-        _ONION_SEARCH.reset(_otok)
+    out = await _deep_research_core(query, *args, **kwargs)
     if _stale and isinstance(out, str):
         from .outcome import append_note
         out = append_note(out, "\n\n" + stale_year_note(_stale))
     return out
 
 
-async def _deep_research_core(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, workspace_model=None, source_titles: Optional[dict] = None, question: Optional[str] = None, deadline_s: Optional[float] = None, number_context: Optional[str] = None, **kwargs):
+#: §4UY N2 r2: said when the caller's time bound stopped the search before an answer
+RESEARCH_BOUND_CUT_TEXT = ("ERROR: deep research ran out of its time bound — the first search wave found nothing "
+                           "readable, and no time was left for another wave or a reworded query. The engines "
+                           "were not shown to be down. Answer from what you have, or search once more with "
+                           "more time.")
+
+
+def research_wave_fits(deadline_s, call_t0: float) -> bool:
+    """§4UY N2 r2: another search wave fits the caller's bound — a whole wave (`_race_wave_deadline`) plus
+    the report's assembly is still left. No bound: always. (Low batches now send deep research on to the
+    next wave and the reformulated forms; without this, fact_check's bound was spent on waves.)"""
+    try:
+        ds = float(deadline_s) if deadline_s is not None else None
+    except (TypeError, ValueError):
+        ds = None
+    if ds is None or ds != ds or ds <= 0:
+        return True
+    return call_t0 + ds - time.monotonic() >= _race_wave_deadline() + RESEARCH_ASSEMBLY_S
+
+
+def research_given_urls(urls) -> Tuple[List[str], List[str]]:
+    """§4UY N10: the pages the model names in deep_research's ``urls`` — (read, skipped). Read: http(s)
+    clearnet URLs, in order, deduplicated, at most RESEARCH_MAX_SOURCES; skipped (named in the report): an
+    onion address (darkweb_research reads those), any other scheme, a non-string. Every fetch still goes
+    through the fetcher's own checks (Tor, SSRF per hop, type)."""
+    read: List[str] = []
+    skipped: List[str] = []
+    if isinstance(urls, str):
+        urls = [urls]
+    for u in list(urls or [])[:3 * RESEARCH_MAX_SOURCES]:
+        t = str(u).strip() if isinstance(u, str) else ""
+        try:
+            from urllib.parse import urlsplit
+            sp = urlsplit(t)
+            host = (sp.hostname or "").lower()
+        except Exception:  # noqa: BLE001
+            sp, host = None, ""
+        if not t or sp is None or sp.scheme.lower() not in ("http", "https") or not host:
+            skipped.append(f"{str(u)[:120]} (not an http(s) address)")
+        elif host.endswith(".onion"):
+            skipped.append(f"{t[:120]} (an onion address — darkweb_research reads those)")
+        elif t not in read:
+            if len(read) < RESEARCH_MAX_SOURCES:
+                read.append(t)
+            else:
+                skipped.append(f"{t[:120]} (more than {RESEARCH_MAX_SOURCES} pages)")
+    return read, skipped
+
+
+async def _deep_research_core(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, workspace_model=None, source_titles: Optional[dict] = None, question: Optional[str] = None, deadline_s: Optional[float] = None, number_context: Optional[str] = None, urls=None, **kwargs):
     """§4UN-deep: ``question`` — the question behind the search words (fact_check's claim, or the model's
     own wording). It never reaches a search engine: it picks the parts of each page the extractor reads
     and tells the extractor what is asked. ``deadline_s`` — the whole call's own bound in seconds: the
     sources still running then are reported as not reached, and the report keeps every finished one
-    (fact_check used to cut the research from outside and lose all of them)."""
-    if not query:
+    (fact_check used to cut the research from outside and lose all of them). §4UY N10: ``urls`` — pages
+    to read FIRST (`research_given_urls`); the query's results fill the remaining slots, and without a
+    query only those pages are read."""
+    _given, _given_skipped = research_given_urls(urls) if urls else ([], [])
+    if not query and not _given:
+        if _given_skipped:
+            return ("SYSTEM ERROR: none of the 'urls' can be read here: " + "; ".join(_given_skipped[:4])
+                    + ". Give http(s) page addresses, or a 'query'.")
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
+    query = str(query or "")
     _call_t0 = time.monotonic()
     question = " ".join(str(question or "").split())[:2000]
     # r3: before the anonymous rewrite and the stale-year drop (see `tool_deep_research`)
@@ -4167,11 +5249,14 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
     # Strip Google-style operators the scraper backends choke on (runs
     # AFTER the optional anonymous re-authoring above so we sanitize
     # whatever query actually goes to the wire).
-    query = _sanitize_query(query)
+    _site_hosts = site_operator_hosts(query) if query else []   # §4UY N17: as web_search — listed first
+    query = _sanitize_query(query) if query else ""
 
-    pretty_log("Deep Research", query, icon=Icons.TOOL_DEEP)
+    pretty_log("Deep Research", query or f"{len(_given)} named page(s)", icon=Icons.TOOL_DEEP)
 
     urls = []
+    _reserve_urls: List[str] = []
+    valid_results: List[Dict] = []
 
     if not importlib.util.find_spec("ddgs"):
         return "CRITICAL ERROR: 'ddgs' library is missing. Search is impossible."
@@ -4180,8 +5265,24 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
     # its own Tor circuit and rotates all of them between waves (see
     # _race_search_wave / _RACE_ENGINES for the measured why).
     _search_note = ""                                  # §4PD: set when a reformulated query had to be used
-    for wave in range(2):
+    _low_rows: List[Dict] = []                         # §4UY N2: the best low-relevance batch seen, never read
+    _bound_cut = False                                 # §4UY N2 r2: the caller's bound stopped a wave
+    _wiki_kept: List[Dict] = []                        # §4VA: the Wikipedia rows of waves nobody won
+    _wiki_only = False
+    for wave in (range(2) if query else ()):
+        if wave and not research_wave_fits(deadline_s, _call_t0):       # §4UY N2 r2: the caller's bound
+            valid_results = []
+            _bound_cut = True
+            continue
         valid_results = await _race_search_wave(query, tor_proxy, wave, max_results=15)
+        _wiki_kept.extend(wave_wikipedia(valid_results))
+        if valid_results and _site_hosts:
+            valid_results = site_first(valid_results, _site_hosts)    # §4UY N17: that host's pages read first
+        if valid_results and research_batch_is_low(query, valid_results):
+            # §4UY N2: a batch none of whose results matches most of the query is not a source list
+            # (live: eight pages read about the query's first word) — the next wave or form may do better
+            _low_rows = _low_rows or list(valid_results)
+            valid_results = []
         if valid_results:
             # `.get(k, default)` returns None when the key EXISTS and is
             # None — and `_filter_junk` deliberately keeps such a row. The
@@ -4208,21 +5309,61 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         # them to fact_check as evidence. A dropped year is kept as a form
         # (a name + year query is the usual no-hit, and the stale-year rule
         # owns years).
-        _refs = research_fallback_queries(query)
+        _refs = research_fallback_queries(query) if query else []
         valid_results = []; _used_query = ""
         for _ri, _rq in enumerate(_refs):
+            if not research_wave_fits(deadline_s, _call_t0):              # §4UY N2 r2: the caller's bound
+                _bound_cut = True
+                pretty_log("Search Retry", f"deep_research: no time left for ‹{truncate_query(_rq)}›",
+                           icon=Icons.SKIP, level="INFO")
+                break
             pretty_log("Search Retry", f"deep_research: reformulated ‹{truncate_query(_rq)}›", icon=Icons.TOOL_SEARCH)
             valid_results = await _race_search_wave(_rq, tor_proxy, 10 + _ri, max_results=15)
+            _wiki_kept.extend(wave_wikipedia(valid_results))
+            if valid_results and research_batch_is_low(query, valid_results):   # judged on the ORIGINAL query
+                _low_rows = _low_rows or list(valid_results)
+                valid_results = []
             if valid_results:
                 _used_query = _rq
                 break
-        if not valid_results:
+        if not valid_results and query:
+            # §4VA: no general engine won a wave — the Wikipedia articles the waves kept (on topic for
+            # the query as asked) are the sources there are; the report says so
+            _wiki_rows = wikipedia_rows(query, _wiki_kept)
+            if _wiki_rows:
+                valid_results, _wiki_only, _used_query = _wiki_rows, True, ""
+                pretty_log("Deep Research", f"no general engine answered — reading {len(_wiki_rows)} Wikipedia "
+                           f"article(s) ‹{truncate_query(query)}›", icon=Icons.TOOL_DEEP)
+        if not valid_results and _low_rows and not _given:
+            pretty_log("Deep Research", f"only low-relevance results — no page read ‹{truncate_query(query)}›",
+                       icon=Icons.SKIP, level="INFO")
+            from .outcome import ToolOutcome
+            return ToolOutcome.failed(research_low_relevance_report(query, _low_rows), world_changed=False,
+                                      reason_code="research_low_relevance")
+        if not valid_results and not _given and _bound_cut:
+            # §4UY N2 r2: not "no engine answered" — the time bound stopped the search
+            from .outcome import ToolOutcome
+            return ToolOutcome.failed(
+                RESEARCH_BOUND_CUT_TEXT, world_changed=False, reason_code="research_time_bound")
+        if not valid_results and not _given:
             return ("CRITICAL ERROR: Deep Research search phase failed — no engine answered the query "
                     "or its reformulations (transport or index). Try web_search with 2-4 plain keywords.")
         urls = [u for u in ((r.get('href') or r.get('url') or '') for r in select_research_sources(valid_results, query=query, question=question or "")) if u]
         _reserve_urls = [u for u in ((r.get('href') or r.get('url') or '')
                                      for r in research_reserves(valid_results, query=query, question=question or "")) if u]
-        _search_note = f"[Reformulated query: '{_used_query}' — the original found nothing]\n"
+        if _wiki_only:
+            _search_note = ("[No general search engine answered — only Wikipedia articles that match the "
+                            "query were read; treat coverage as limited]\n")
+        elif _used_query:
+            _search_note = f"[Reformulated query: '{_used_query}' — the original found nothing]\n"
+        elif query:
+            _search_note = "[The query found nothing readable — only the pages named in `urls` were read]\n"
+    if _given:
+        # §4UY N10: the named pages first, in order; the query's results fill the remaining slots
+        urls = (_given + [u for u in urls if u not in _given])[:max(RESEARCH_MAX_SOURCES, len(_given))]
+        _reserve_urls = [u for u in _reserve_urls if u not in urls]
+    if _given_skipped:
+        _search_note += "[Not read (from `urls`): " + "; ".join(_given_skipped[:6]) + "]\n"
 
     if not urls: return "ERROR: No search results found. The internet might be blocking your request. Try a different query."
     _result_titles: Dict[str, str] = {}               # §4UN-deep M2: the [PAGE] line's title when the page has none
@@ -4271,8 +5412,10 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
     # so every caller and every role shares it. What remains here is what this
     # semaphore can actually govern: Tor circuits and page fetches for THIS
     # call.
+    # §4UZ: this semaphore now holds a page only while it is FETCHED. The
+    # distill is taken afterwards through the worker's one queue (`_wave`),
+    # one at a time by default — see `distill_width` in node_throughput.py.
     sem = asyncio.Semaphore(3)
-    _DISTILL_FANOUT = 3      # == the semaphore width above
     # Read from the module global at CALL time, so the operator (and the
     # budget tests) can move it without editing this function.
     PER_URL_TIMEOUT = _PER_URL_TIMEOUT_S
@@ -4284,6 +5427,11 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
     if _ds is not None and _ds == _ds and _ds > 0:
         # §4UN-deep m12: the caller's bound, less the time the report takes to put together
         _phase_deadline = min(_phase_deadline, _call_t0 + _ds - RESEARCH_ASSEMBLY_S)
+
+    # §4UZ: the distills of this call, in search-rank order, sized from the time left when each starts
+    _wave = DistillWave(llm_client, [str(u) for u in urls], deadline=_phase_deadline, ceiling_s=_WEB_SUMMARY_TIMEOUT_S,
+                        reserve_s=RESEARCH_ASSEMBLY_S, slot_allowance_s=_QUEUE_ALLOWANCE_S,
+                        max_chars=_report_share_chars, label="deep research")
 
     _page_texts: dict = {}     # url -> (text sent to the extractor, max_tokens) — §4NK recheck
     _page_meta: dict = {}      # url -> what the page says about itself (§4UN-deep M2)
@@ -4382,6 +5530,11 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         return content
 
     async def process_url(url, budget_s):
+        # §4UZ: the FETCH stage only — a failed source's block (a str), or
+        # `(url, text, head, raw_preview)` for `_distill`. The distill budget
+        # no longer comes out of this URL's own clock (kept below as history):
+        # it is issued by `_wave` when the page's turn at the worker comes.
+        #
         # ⚠ THE DISTILL BUDGET IS WHAT THE CLOCK LEAVES, NOT A CONSTANT.
         # R6 gave `darkweb_search.py` this treatment and left THIS, the
         # original, on a flat `_WEB_SUMMARY_TIMEOUT_S`. 45 is not the
@@ -4396,7 +5549,6 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         # `budget_s` is issued by `_bounded` AFTER the semaphore is acquired,
         # so it is time this URL actually HAS rather than time that was
         # already spent queueing behind three other URLs.
-        _url_deadline = time.monotonic() + budget_s
         # Shorten URL for log
         url = str(url)
         short_url = (url[:35] + "..") if len(url) > 35 else url
@@ -4435,7 +5587,27 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         raw_preview = (_clean_for_cpp(await asyncio.to_thread(focus_page_text, text, _focus, _raw_chars))
                        + ("\n[...truncated...]\n" if len(text) > _raw_chars else "\n"))
         raw_preview = neutralise_report_grammar(raw_preview)        # §4PD: page text is content (every return site)
+        return url, text, _head, raw_preview
 
+    async def _distill(url, text, _head, raw_preview):
+        """§4UZ: the page's turn at the worker — waits in rank order, never loses the page."""
+        if llm_client is None:
+            return f"{_head}{raw_preview}\n"
+        try:
+            async with _wave.turn(url) as _turn:
+                return await _distill_sized(url, text, _head, raw_preview, _turn)
+        except Exception as _dist_exc:                           # noqa: BLE001
+            # the net of `_fetch_bounded`, for a page that IS fetched: it stays in the report as raw text
+            try:
+                pretty_log("Summary Degraded",
+                           f"{str(url)[:60]}: internal error {type(_dist_exc).__name__} — "
+                           f"falling back to raw page text", level="WARNING", icon=Icons.WARN)
+            except Exception:                                   # noqa: BLE001
+                pass
+            return f"{_head}{raw_preview}\n"
+
+    async def _distill_sized(url, text, _head, raw_preview, _turn):
+        short_url = (url[:35] + "..") if len(url) > 35 else url
         # ⚠ SIZE THE REQUEST TO WHAT THE NODE CAN FINISH — not to a constant,
         # and not to the MAIN model's context window. The arithmetic that
         # stood here derived `url_char_limit` from `max_context`, which
@@ -4450,34 +5622,26 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         # the log window. `plan_distill` derives BOTH knobs (how much we send,
         # how much it may write) from throughput measured on the node itself.
         # See core/node_throughput.py.
-        _summary_budget = 0.0
-        plan = None
-        if llm_client is not None:
-            _summary_budget = min(
-                _WEB_SUMMARY_TIMEOUT_S,
-                _url_deadline - time.monotonic() - 2.0)
-            # ⚠ PLANNING MUST NOT BE ABLE TO LOSE THE URL. A client without
-            # `plan_distill` (an older or hand-rolled one) would raise here,
-            # escape `process_url`, and be swallowed by
-            # `gather(return_exceptions=True)` — dropping the source, which is
-            # the precise loss this rewrite exists to remove. Degrade to raw
-            # text instead, and say so.
-            try:
-                plan = llm_client.plan_distill(
-                    _summary_budget - _QUEUE_ALLOWANCE_S,
-                    max_chars=_report_share_chars,
-                    # ⚠ DECLARE THE FAN-OUT. Every URL in a wave is planned
-                    # before any of it is in flight, so the node looks idle to
-                    # all of them and each plan is sized as if it had the box
-                    # to itself. That is how four ~19,936-char plans built at
-                    # ~306/32 tok/s ended up running at 115/11 (req b86cdd59).
-                    concurrency=_DISTILL_FANOUT)
-            except Exception as _plan_exc:                      # noqa: BLE001
-                pretty_log("Summary Degraded",
-                           f"{short_url}: could not size the distill "
-                           f"({type(_plan_exc).__name__}) — falling back to "
-                           f"raw page text", level="WARNING", icon=Icons.WARN)
-                plan = None
+        # §4UZ: `_wave` made the plan when this page's turn came — from the
+        # time the phase has left, shared with the pages still waiting, at the
+        # queue's width (the declared fan-out; one at a time by default).
+        _summary_budget = _turn.budget_s
+        plan = _turn.plan
+        # ⚠ PLANNING MUST NOT BE ABLE TO LOSE THE URL. A client without
+        # `plan_distill` (an older or hand-rolled one) raises inside the wave,
+        # which hands the error over instead: degrade to raw text, and say so.
+        if plan is None and _turn.note:
+            # no time left when its turn came, or the wave gave up after two timeouts in a row
+            pretty_log("Summary Degraded", f"{short_url}: {_turn.note} — raw page text kept",
+                       level="WARNING", icon=Icons.WARN)
+            return f"{_head}{raw_preview}\n"
+        if _turn.error is not None:
+            _plan_exc = _turn.error
+            pretty_log("Summary Degraded",
+                       f"{short_url}: could not size the distill "
+                       f"({type(_plan_exc).__name__}) — falling back to "
+                       f"raw page text", level="WARNING", icon=Icons.WARN)
+            plan = None
 
         # ⚠ DECLINE, DO NOT POST. The predecessor computed the same shortfall
         # and then `raise`d a TimeoutError whose message said it was "taking
@@ -4527,8 +5691,10 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
             "temperature": 0.0,
             "max_tokens": _tokens
         }
+        _post_t0, _answered = time.monotonic(), False
         try:
-            summary_data = await llm_client.chat_completion(
+            # §4UZ: the per-URL `wait_for` no longer covers the distill, so the hard bound is here
+            summary_data = await _cancel_safe_wait_for(llm_client.chat_completion(
                 payload, use_worker=True,
                 # ⚠ The fallback is FREE — the `except`
                 # two lines below keeps the raw page text.
@@ -4559,7 +5725,9 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
                 # exceeded the outer `wait_for` anyway — measured URL
                 # LOSS at 55.00s on the shipped R5 code (R6 lens A).
                 total_budget=_summary_budget,
-                task_label="web summary")
+                task_label="web summary"), _summary_budget + 2.0)
+            _answered = True
+            _wave.report(_turn, True)
             # Say the SIZING, not just "done". The 40k-on-45s mismatch
             # survived for as long as it did because the stream showed a
             # timeout and never the arithmetic that guaranteed one.
@@ -4606,6 +5774,14 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
             # FIRST, and the telemetry cannot reach it.
             preview = neutralise_report_grammar(raw_preview)
             try:
+                if not _answered:
+                    # §4UZ: a call that ran into its TIME LIMIT teaches the tracker and the wave
+                    _wave.report(_turn, False, timed_out=is_distill_timeout(_sum_exc),
+                                 burned_s=time.monotonic() - _post_t0,
+                                 prompt_chars=len(safe_text), max_tokens=_tokens)
+            except Exception:                                   # noqa: BLE001
+                pass
+            try:
                 # ⚠ AFTER the assignment, and inside the guard. This import is
                 # telemetry-only, yet it was the FIRST statement in the
                 # handler — so a renamed helper, a partially-initialised
@@ -4626,6 +5802,18 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         return f"{_head}{preview}\n"
 
     async def _bounded(url):
+        """§4UZ: fetch (3 at a time), then the distill in the worker's queue. The page counts as
+        waiting for a distill from the start, and stops counting however this ends."""
+        _wave.expect(str(url))
+        try:
+            _got = await _fetch_bounded(url)
+            if isinstance(_got, str):
+                return _got                       # not fetched: a failed source's block
+            return await _distill(*_got)
+        finally:
+            _wave.drop(str(url))
+
+    async def _fetch_bounded(url):
         # ⚠ THE PER-URL CLOCK STARTS WHEN THE URL STARTS, NOT AT `gather`.
         # This used to be `wait_for(process_url(url), PER_URL_TIMEOUT)` with
         # `process_url` setting its own deadline on entry — but every
@@ -4697,7 +5885,7 @@ async def _deep_research_core(query: Optional[str] = None, anonymous: bool = Fal
         _recheck = await recheck_all_none(
             page_contents, urls, _page_texts, query, llm_client, model_name,
             deadline=_phase_deadline, slot_wait=_QUEUE_ALLOWANCE_S,
-            per_call_s=_WEB_SUMMARY_TIMEOUT_S, fanout=_DISTILL_FANOUT,
+            per_call_s=_WEB_SUMMARY_TIMEOUT_S,
             prompt_fn=_extract_prompt, finish_fn=_finish_extract)
         page_contents = _recheck.contents
         _recheck_line = recheck_note(_recheck)
@@ -4809,11 +5997,12 @@ _FACTCHECK_VERIFY_S = _env_seconds("GHOST_FACTCHECK_VERIFY_S", 150.0) or 150.0
 #: `_RESEARCH_PHASE_TIMEOUT_S`, but the search waves before it and anything
 #: that hangs outside that phase did not. The page-phase ceiling plus an
 #: allowance for everything before it at ITS own ceilings: two search waves
-#: and up to two reformulation waves (16 s each, a 1 s pause) and the
-#: anonymous query rewrite (12 s) = 77 s. Read at call time.
-_FACTCHECK_RESEARCH_ALLOWANCE_S = 90.0
+#: and up to two reformulation waves (20 s each since §4VA — the wave
+#: deadline follows the Brave onion's 16 s — and a 1 s pause) and the
+#: anonymous query rewrite (12 s) = 93 s. Read at call time.
+_FACTCHECK_RESEARCH_ALLOWANCE_S = 105.0
 #: §4TB: the WHOLE call (research + verify). 0 = the sum of the two halves'
-#: own ceilings (research ceiling + verify + the side call's save, ~580 s);
+#: own ceilings (research ceiling + verify + the side call's save, ~595 s);
 #: a smaller value clips the verify call, and the result is then the PARTIAL
 #: shape with the research in hand.
 _FACTCHECK_TOTAL_S = _env_seconds("GHOST_FACTCHECK_TOTAL_S", 0.0)
@@ -5100,7 +6289,7 @@ def factcheck_sources(report, titles: Optional[dict] = None) -> str:
         evidence = _fc_outside_line(body, FACTCHECK_EVIDENCE_CHARS)
         if not evidence:
             continue
-        title = _fc_outside_line(titles.get(url) or "", FACTCHECK_TITLE_CHARS)
+        title = _fc_outside_line(page_line_title(block) or titles.get(url) or "", FACTCHECK_TITLE_CHARS)
         row = (f"{len(rows) + 1}. {_fc_listed_url(url)}"
                + (f"\n   title: {title}" if title else "")
                + f"\n   evidence: {evidence}")
@@ -5248,12 +6437,17 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
     if _dr.status in (OutcomeStatus.FAILED, OutcomeStatus.REJECTED):
         if _counter_task is not None:
             _counter_task.cancel()
+        _fc_inner = str(getattr(_dr, "reason_code", "") or "")
         return ToolOutcome.failed(
-            f"FACT CHECK FAILED: no source could be fetched (timeout, block or "
-            f"unreachable — a transient network failure), so the claim was "
+            f"FACT CHECK FAILED: no source could be read ("
+            + ("the research's time bound stopped it — answer from what you have"
+               if _fc_inner == "research_time_bound" else
+               "timeout, block or unreachable — a transient network failure")
+            + "), so the claim was "
             f"NOT verified — treat it as unchecked, not as false.\n"
             f"[RESEARCH RESULTS]:\n{dr_result[:4000]}",
-            world_changed=False, reason_code="factcheck_research_failed")
+            # §4UY r3: the research's own reason (a time bound, low relevance, refusals) passes through
+            world_changed=False, reason_code=_fc_inner or "factcheck_research_failed")
     # §4PD: since round 3 deep_research never returns PARTIAL — partial
     # coverage and "no relevant facts" are OK outcomes with a reason code;
     # the arm below keyed on the status alone and was dead

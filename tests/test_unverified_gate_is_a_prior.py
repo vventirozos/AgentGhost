@@ -114,7 +114,8 @@ def test_the_targeted_shapes_are_the_producers_own():
     heads = [m.split("\n", 1)[0].strip() for m in rendered]
     whole = ("SUCCESS: Wrote ", "SUCCESS: auto-promoted operation=",
              "SUCCESS: Appended ",              # §4NU: a part is an untested mutation too
-             "SUCCESS: Finished ")              # §4SH: the empty last part closes that build
+             "SUCCESS: Finished ",              # §4SH: the empty last part closes that build
+             "SUCCESS: Restored ")              # §4UY C21: a kept version put back — whole-file
     for h in heads:
         if h.startswith(whole):
             continue

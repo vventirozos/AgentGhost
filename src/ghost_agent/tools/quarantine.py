@@ -395,7 +395,7 @@ def _not_the_file(url, final_url, kind: str, head: bytes, size: int) -> bool:
             pass
     suf = Path(name).suffix.lower() if name else ""
     if suf in _HTML_OK:
-        return False
+        return bool(body_mismatch(name, None, head, size))      # §4UY N13: a wall page is not the .html file
     if suf in _EXPECTED_KIND or suf in _BINARY_ONLY or suf in _TEXT_NOT_HTML:
         return bool(body_mismatch(name, None, head, size))
     return bool(re.match(rb"\s*(?:<!--.*?-->\s*)*<(?:!doctype\s+html|html|head|body)\b", head, re.I | re.S))

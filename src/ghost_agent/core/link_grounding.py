@@ -143,6 +143,21 @@ def _failed_browser_result(content) -> bool:
     return not (m and _is_own_host(m.group(1)))
 
 
+def trim_result_url(url: str) -> str:
+    """A URL as a tool result printed it, without the sentence punctuation after it: trailing `.`/`,` go, and
+    a trailing `)` goes only when the URL has no `(` it closes — `…/Python_(programming_language)` keeps its
+    own (2026-11-19: the Sources list showed that link cut)."""
+    u = str(url or "")
+    while u:
+        if u[-1] in ".,":
+            u = u[:-1]
+        elif u[-1] == ")" and u.count(")") > u.count("("):
+            u = u[:-1]
+        else:
+            break
+    return u
+
+
 def fetched_urls(tools_run) -> List[str]:
     """§4OE-4: the URLs this request actually READ — the URL/FINAL_URL line
     of every browser result that did not fail — in order, deduplicated."""
@@ -193,7 +208,7 @@ def fetched_urls(tools_run) -> List[str]:
             for block in re.split(r"(?m)^(?=###\s*SOURCE:)", text):
                 m = re.match(r"###\s*SOURCE:\s*(https?://\S+)", block)
                 if m and not source_block_failed(block):
-                    u = m.group(1).rstrip(".,)")
+                    u = trim_result_url(m.group(1))
                     if u not in out:
                         out.append(u)
             try:            # §4UN-deep: a page that loaded and held nothing relevant was still READ
@@ -203,7 +218,7 @@ def fetched_urls(tools_run) -> List[str]:
                 pass
             continue
         for m in re.finditer(r"(?m)^(?:FINAL_)?URL:\s*(https?://\S+)", text):
-            u = m.group(1).rstrip(".,)")
+            u = trim_result_url(m.group(1))
             if u not in out:
                 out.append(u)
     return out
@@ -235,6 +250,117 @@ def search_result_urls(tools_run) -> List[str]:
             if u not in out:
                 out.append(u)
     return out
+
+
+#: §4UY N7: at most this many links in the sources line
+SOURCES_MAX = 5
+#: §4UY N7: the head of the appended sources line (pages read) and of its snippet-only form
+SOURCES_HEAD = "Sources:"
+SOURCES_SNIPPET_HEAD = "Search results used (pages not opened):"
+SOURCES_NOTE_RE = re.compile(r"(?m)^(?:Sources:|Search results used \(pages not opened\):)[ \t]*$")
+#: §4UY N7 r2: the whole appended block (head + its "- " lines) — what a voice path drops
+SOURCES_BLOCK_RE = re.compile(r"(?m)^(?:Sources:|Search results used \(pages not opened\):)[ \t]*\n"
+                              r"(?:[ \t]*- [^\n]*(?:\n|$))*")
+#: §4UY N7 r2: a reply this short is an answer, not a report — no list under it
+SOURCES_MIN_REPLY_CHARS = 40
+#: §4UY N7 r2: the request fixed the WHOLE reply's form — "reply only with …", "just the number", "as JSON",
+#: "no links". Review r2: words that only shape the content ("just the top 3", "only the important parts",
+#: "exactly which one") do not, and "no sources of lithium" is a topic, not a form.
+OUTPUT_FORM_RE = re.compile(
+    r"\b(?:reply|respond|answer)\b(?:\s+back)?\s+(?:only|just|exactly)\s+with\b"
+    r"|\b(?:reply|respond|answer)\b(?:\s+with)?\s+(?:only|just)\s+(?:the|a|one)\s+(?:number|word|name|value|figure|digit|letter|line)\b"
+    r"|\b(?:just|only)\s+the\s+(?:number|word|name|value|figure|digits?)\b(?!\s+of\b)"
+    r"|\b(?:in|as)\s+(?:json|csv|yaml|xml)\b|\bjson\s+only\b|\bnothing else\b|\bone[- ]word answer\b"
+    r"|\b(?:no|without)\s+(?:links?|urls?|citations?)\b"
+    # r3: "no sources (please)", "without sources", "don't include (the) sources" — the word ends the clause
+    # ("no sources of lithium" is a topic)
+    r"|\b(?:no|without)\s+(?:the\s+)?sources\b(?!\s+(?:of|for|on|about|in|that|which|who)\b)"
+    r"|\b(?:do\s*n[o'’]?t|do\s+not|never)\s+(?:include|add|list|give|show|append|cite)\s+(?:the\s+|any\s+)?"
+    r"(?:sources|links|urls|citations)\b", re.I)
+_PRIVATE_SUFFIXES = (".local", ".localhost", ".internal", ".lan", ".home.arpa", ".ts.net", ".onion")
+
+
+def is_public_source_url(url: str) -> bool:
+    """§4UY N7 r2: a URL a reader could open on the internet — never loopback, a private or tailnet address, a
+    name with no dot, an onion, or a local name (the agent's own app in the browser is not a source)."""
+    try:
+        import ipaddress
+        from urllib.parse import urlsplit
+        host = (urlsplit(str(url or "")).hostname or "").lower().rstrip(".")
+    except Exception:  # noqa: BLE001
+        return False
+    if not host or host == "localhost" or host.endswith(_PRIVATE_SUFFIXES):
+        return False
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return "." in host
+
+
+def reply_takes_sources(reply: str, request: str = "") -> bool:
+    """§4UY N7 r2: a reply that may carry the list — at least SOURCES_MIN_REPLY_CHARS, not a bare JSON/code
+    answer, and the request did not fix the reply's form."""
+    text = str(reply or "").strip()
+    if len(text) < SOURCES_MIN_REPLY_CHARS:
+        return False
+    if (text[0] in "{[" and text[-1] in "}]") or (text.startswith("```") and text.endswith("```")):
+        return False
+    return not OUTPUT_FORM_RE.search(str(request or ""))
+
+
+def sources_note(reply: str, tools_run, request: str = "") -> str:
+    """§4UY N7: the sources a research answer was built from, appended by the code — of 95 live replies
+    built on the internet tools 0 carried a URL and 61 named no source at all; asking in the tool
+    descriptions ("cite the SOURCE URL for each claim") did not do it.
+
+    Only when a research tool (RESEARCH_TOOLS) ran this turn — a download or a file read alone is not
+    research — and the reply may carry a list (`reply_takes_sources`). The public pages this request READ
+    (`fetched_urls`: browser pages, deep research sources, the pages web_search opened, fact_check's listed
+    sources, downloads) — or, when it read none, the results its searches LISTED (`search_result_urls`,
+    said to be snippets); never a loopback/private/tailnet address (`is_public_source_url`). "" when the
+    reply already links one of them (the model cited on purpose), or when nothing is left. One line per
+    link, at most ``SOURCES_MAX``."""
+    text = str(reply or "")
+    if not reply_takes_sources(text, request):
+        return ""
+    if not any(isinstance(t, dict) and t.get("name") in RESEARCH_TOOLS for t in (tools_run or [])):
+        return ""
+    head, urls = SOURCES_HEAD, [u for u in fetched_urls(tools_run) if is_public_source_url(u)]
+    if not urls:
+        head, urls = SOURCES_SNIPPET_HEAD, [u for u in search_result_urls(tools_run) if is_public_source_url(u)]
+    if not urls:
+        return ""
+    cited = {_cite_norm(m.group(0)) for m in _URL_RE.finditer(text)}
+    if cited & {_cite_norm(u) for u in urls}:
+        return ""
+    seen: List[str] = []
+    for u in urls:
+        if _cite_norm(u) not in {_cite_norm(x) for x in seen}:
+            seen.append(u)
+    shown = seen[:SOURCES_MAX]
+    more = len(seen) - len(shown)
+    return ("\n\n" + head + "\n" + "\n".join(f"- {u}" for u in shown)
+            + (f"\n- (+{more} more)" if more > 0 else ""))
+
+
+def reply_is_contained(context) -> bool:
+    """§4UY N7 r2: a contained turn — a coding leaf or an isolated sub-agent run (`_subagent_allowed_tools`
+    set by `build_leaf_context` / `isolation`) — whose reply goes to code, not to a reader."""
+    if context is None:
+        return False
+    allowed = getattr(context, "_subagent_allowed_tools", None)
+    if isinstance(allowed, (set, frozenset, list, tuple)) and allowed:
+        return True
+    static = getattr(context, "trajectory_extra_static", None)
+    return isinstance(static, dict) and bool(static.get("leaf_id"))
+
+
+def sources_for_reply(reply: str, tools_run, request: str = "", context=None) -> str:
+    """§4UY N7 r2: THE call both final-reply sinks make (finalize, the streamed final) — `sources_note`
+    unless switched off (``GHOST_REPLY_SOURCES=0``) or the turn is contained (`reply_is_contained`)."""
+    if os.environ.get("GHOST_REPLY_SOURCES", "1") == "0" or reply_is_contained(context):
+        return ""
+    return sources_note(reply, tools_run, request)
 
 
 def _cite_norm(url: str) -> str:

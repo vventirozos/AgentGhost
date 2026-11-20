@@ -1,8 +1,8 @@
-import * as matrixGraphFace from './matrix_graph.js?v=19.33';
+import * as matrixGraphFace from './matrix_graph.js?v=19.34';
 import { initEffortSelector, effortForPayload } from './effort.js?v=1.2';   // §4RB
 import { createTokenCounter } from './tokens.js?v=1.3';   // token counter under the buttons
 import { turnCaption } from './turn_caption.js?v=1.1';
-import { StepList } from './progress.js?v=1.2';   // §4UT: the agent's steps   // what the status line under the reply shows
+import { StepList, progressMode } from './progress.js?v=1.3';   // §4UT: the agent's steps   // what the status line under the reply shows
 import { createBargeIn, isStopWord } from './bargein.js?v=1.5';   // talk over a spoken reply
 
 // --- Voice Globals ---
@@ -388,6 +388,12 @@ let currentChunkIndex = 0;
 let currentAgentMessageDiv = null;
 // §4UT: this reply's step list (progress.js) — made on its first progress frame, above the bubble
 let currentSteps = null;
+// §4UY S4: the turn is over for this page (ended, given up, recovered, or a new turn starts): its step list
+// stops working — folded, and kept where it stands even when its bubble went (S1). The one way a list ends.
+function _endSteps() {
+    if (typeof currentSteps !== 'undefined' && currentSteps) currentSteps.answer();
+    currentSteps = null;
+}
 let currentAccumulatedContent = "";
 // The AGENT's request id for the in-flight turn (from the SSE frames'
 // "chatcmpl-<id>" envelope) — the handle /api/feedback labels ride on.
@@ -1419,10 +1425,17 @@ function _stripRawOrphanReasoning(text) {
     return s.slice(m[0].length);
 }
 
+// §4UY N7: the agent's sources list ("Sources:" / "Search results used (pages not
+// opened):" and its "- <url>" lines, link_grounding.SOURCES_BLOCK_RE) is for the eye —
+// voice never reads it. Run BEFORE the markup cleanup (it drops the parentheses).
+function _stripSourcesList(text) {
+    return String(text ?? "").replace(/(^|\n)[ \t]*(?:Sources:|Search results used \(pages not opened\):)[ \t]*\n(?:[ \t]*- [^\n]*(?:\n|$))*/g, "$1");
+}
+
 // §4KP: display text → the sentences speech queues, cleaned like the live
 // voice path (markup, emphasis, brackets and links dropped).
 function _speechSentences(text) {
-    const clean = String(text ?? "").replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "");
+    const clean = _stripSourcesList(text).replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "");
     return clean.split(/(?<=[.?!;])\s+/).map(t => t.trim()).filter(t => /[\p{L}\p{N}]/u.test(t));
 }
 
@@ -2677,8 +2690,8 @@ async function reconcileFromSession(sid, handle) {
             currentAgentMessageDiv.remove();
             currentAgentMessageDiv = null;
         }
-        // §4UT r2: AFTER the bubble's fate — a list above a removed bubble goes with it, else it folds
-        if (typeof currentSteps !== 'undefined' && currentSteps) { currentSteps.answer(); currentSteps = null; }
+        // §4UT r2 / §4UY S1: AFTER the bubble's fate — the list folds and stays where it stands
+        if (typeof _endSteps === 'function') _endSteps();   // (guarded: older suites run this function extracted)
         clearInflightHandle(handle);
         // §4RZ r6a2: the recovery ended this page's lost turn (guarded: the
         // recovery is also run on its own, extracted, by older suites)
@@ -4213,7 +4226,7 @@ async function sendMessage(isResume = false, queuedText = null) {
 
         currentTaskId = null;
         currentTurnStartedAt = Date.now();
-        currentSteps = null;
+        if (typeof _endSteps === 'function') _endSteps();   // (guarded: older suites run this function extracted)
         currentChunkIndex = 0;
         currentAccumulatedContent = "";
         currentStreamPrefixLen = 0;
@@ -4313,6 +4326,9 @@ async function sendMessage(isResume = false, queuedText = null) {
         // turns it into the X-Ghost-Effort header)
         const _effort = effortForPayload(effortSelect);
         if (_effort) payload.reasoning_effort = _effort;
+        // §4UY S10: steps turned off — the agent sends the steps (the "steps hidden · show" line) but asks
+        // its side model for no sentences (the interface turns this into `X-Ghost-Progress: steps`)
+        if (progressMode() === 'off') payload.progress = 'off';
         // Durable sessions: when the workspace module holds an active
         // session id, bind the turn to it. The AGENT is the source of
         // truth for session history and merges tolerantly, so replaying
@@ -4512,7 +4528,7 @@ async function sendMessage(isResume = false, queuedText = null) {
 
                             if (!openThink && !openTool) {
                                 // Strip markdown, XML tags, and reasoning blocks
-                                let cleanBuffer = ttsBuffer.replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "");
+                                let cleanBuffer = _stripSourcesList(ttsBuffer).replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "");
 
                                 // Find natural sentence boundaries
                                 let boundaryMatch = cleanBuffer.match(/([.?!;]+[\s]+)/);
@@ -4718,6 +4734,7 @@ async function sendMessage(isResume = false, queuedText = null) {
                             'not reattach after 3 tries. The turn may still ' +
                             'be running — reload to pick it up.');
                         _netResumeTries = 0;
+                        if (typeof _endSteps === 'function') _endSteps();      // §4UY S4: the list pulsed for ever after the give-up
                         // ⚠ RELEASE THE HANDLE. The 5s inflight heartbeat
                         // kept writing `beat`, so `Date.now() - h.beat <
                         // 15000` stayed true forever and no other tab (or
@@ -4813,13 +4830,14 @@ async function sendMessage(isResume = false, queuedText = null) {
             }
         }
 
-        // §4UT: the turn is over — the step list folds (or goes, with a bubble that never got content).
-        // A resume coming continues the same turn: its list stays as it is.
+        // §4UT: the turn is over — the step list folds; with a bubble that never got content (a Stop or an
+        // error before any reply text) it stays where the bubble was (§4UY S1). A resume coming continues the
+        // same turn: its list stays as it is.
         if (currentSteps && !_turnStillLive) currentSteps.answer();
 
         // A resume is coming: it continues this half sentence, so it isn't said in halves.
         if (isTTSActive && ttsBuffer.trim().length > 0 && !_turnStillLive) {
-            let finalClean = ttsBuffer.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "").trim();
+            let finalClean = _stripSourcesList(ttsBuffer).replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").replace(/(<think>[\s\S]*?<\/think>|<tool_call[\s\S]*?(?:<\/tool_call>|$)|<[^>]+>|\*|_|`|#|\[|\]|\(|\)|!\[.*?\]\(.*?\))/gi, "").trim();
             if (/[\p{L}\p{N}]/u.test(finalClean)) queueTTS(finalClean);
             ttsBuffer = "";
         }
@@ -7567,7 +7585,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=9.17').catch(e => {
+import('./workspace.js?v=9.18').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

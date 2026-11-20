@@ -29,21 +29,27 @@ from ghost_agent.tools.search import (
 _VALID_TIMEOUTS = {_DDGS_TOR_TIMEOUT, _DDGS_FAST_ENGINE_TIMEOUT}
 
 
-def test_timeout_clears_mojeek_tor_latency():
-    # mojeek over Tor was measured at ~10-18s; 8s killed it. mojeek must
-    # comfortably clear that — never regress below the safe floor. The fast
-    # engines' shorter ceiling must still clear their ~1-6s fail window.
-    assert _engine_timeout("mojeek") >= 15
+def test_timeout_clears_tor_latency():
+    # 8s killed a slow engine mid-request (mojeek, 10-18s over Tor; retired
+    # §4HR). §4VA: every timeout is the engine table's — none may regress
+    # below the safe floor; the fast engines' ceiling must still clear their
+    # ~1-6s fail window.
+    from ghost_agent.tools.search import ENGINE_TABLE, _RACE_ENGINES
     assert _DDGS_TOR_TIMEOUT >= 15
     assert _DDGS_FAST_ENGINE_TIMEOUT >= 10
+    for eng in _RACE_ENGINES:
+        assert _engine_timeout(eng) == ENGINE_TABLE[eng].timeout >= 10, eng
 
 
-def test_mojeek_keeps_full_budget_fast_engines_shorter():
-    assert _engine_timeout("mojeek") == _DDGS_TOR_TIMEOUT
+def test_every_timeout_comes_from_the_table():
+    from ghost_agent.tools.search import ENGINE_TABLE
     for eng in ("yahoo", "yandex", "brave", "duckduckgo"):
         assert _engine_timeout(eng) == _DDGS_FAST_ENGINE_TIMEOUT
-    # An unknown engine falls back to the fast (conservative) ceiling.
-    assert _engine_timeout("somenewengine") == _DDGS_FAST_ENGINE_TIMEOUT
+    # §4VA: the Brave onion's page takes a median 6.1 s (up to ~9 s) and its
+    # wrapped links ~2.5 s more (measured 11-19) — its whole attempt gets 16
+    assert _engine_timeout("brave_onion") == ENGINE_TABLE["brave_onion"].timeout == 16
+    # A name the table does not hold (mojeek left it, §4HR) falls back to the fast ceiling.
+    assert _engine_timeout("mojeek") == _engine_timeout("somenewengine") == _DDGS_FAST_ENGINE_TIMEOUT
 
 
 @pytest.mark.asyncio

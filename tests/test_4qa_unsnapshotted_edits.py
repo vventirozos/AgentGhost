@@ -9,7 +9,6 @@ edits (exact-match, so a guessed anchor writes nothing); a failed attempt
 leaves the path in `touched`, so the next attempt's prompt shows the file."""
 from types import SimpleNamespace
 
-import pytest
 
 from ghost_agent.core import coding_executor as CE
 
@@ -40,62 +39,12 @@ class _Disk:
         return "SUCCESS"
 
 
-@pytest.mark.asyncio
-async def test_edits_to_a_file_outside_the_snapshot_are_read_then_applied():
-    disk = _Disk({"tools/h.py": "SCORE = lexicon(x)\n"})
-    snap, fresh, touched = {"a.md": "a"}, set(), set()
-    written, reason = await CE._apply_file(
-        disk, {"path": "tools/h.py", "edits": [{"find": "lexicon(x)", "replace": "embed(x)"}]},
-        snap, fresh, touched)
-    assert reason is None and written == "tools/h.py"
-    assert disk.files["tools/h.py"] == "SCORE = embed(x)\n"
-    assert disk.calls[0][1]["operation"] == "read"
-    assert "tools/h.py" in snap and "tools/h.py" in touched
 
 
-@pytest.mark.asyncio
-async def test_a_guessed_anchor_writes_nothing_and_marks_the_file_for_the_retry():
-    disk = _Disk({"tools/h.py": "SCORE = lexicon(x)\n"})
-    snap, fresh, touched = {}, set(), set()
-    written, reason = await CE._apply_file(
-        disk, {"path": "tools/h.py", "edits": [{"find": "score_words(", "replace": "embed("}]},
-        snap, fresh, touched)
-    assert written is None and "did not apply" in reason
-    assert disk.files["tools/h.py"] == "SCORE = lexicon(x)\n"
-    assert "tools/h.py" in touched            # refreshed into the next prompt
 
 
-@pytest.mark.asyncio
-async def test_edits_to_a_missing_file_say_so_and_write_nothing():
-    disk = _Disk({})
-    written, reason = await CE._apply_file(
-        disk, {"path": "nope.py", "edits": [{"find": "a", "replace": "b"}]}, {}, set(), set())
-    assert written is None and "does not exist" in reason and "content" in reason
-    assert [a["operation"] for _t, a in disk.calls] == ["read"]
 
 
-@pytest.mark.asyncio
-async def test_the_retry_prompt_shows_the_file_the_failed_attempt_edited(monkeypatch):
-    disk = _Disk({"tools/h.py": "SCORE = lexicon(x)\n"})
-    seen = []
-    anchors = iter(["score_words(", "lexicon(x)"])
-
-    async def _spec(llm, model, description, ledger, *, existing_files=None, **_kw):
-        seen.append(dict(existing_files or {}))
-        return ({"files": [{"path": "tools/h.py",
-                            "edits": [{"find": next(anchors), "replace": "embed(x)"}]}]}, False)
-
-    monkeypatch.setattr(CE, "_generate_build_spec", _spec)
-    from ghost_agent.core import coding_loop as CL
-    monkeypatch.setattr(CL, "executor_kind", lambda *a, **k: "spec")
-    await CE.build_coding_task(
-        SimpleNamespace(llm_client=object(), args=SimpleNamespace(model="m")),
-        "Replace lexicon metrics with embeddings", tool_runner=disk,
-        existing_files={"a.md": "a"}, max_attempts=2)
-    assert len(seen) == 2
-    assert "tools/h.py" not in seen[0]
-    assert seen[1].get("tools/h.py") == "SCORE = lexicon(x)\n"
-    assert disk.files["tools/h.py"] == "SCORE = embed(x)\n"
 
 
 # ── the snapshot keeps the files a task names ──────────────────────────────
@@ -148,59 +97,12 @@ def test_the_advancer_passes_the_task_description_to_the_snapshot():
 _BIG_MODULE = "".join(f"def f{i}(x):\n    return x + {i}\n\n" for i in range(200))
 
 
-@pytest.mark.asyncio
-async def test_a_shrinking_overwrite_of_an_unsnapshotted_file_is_refused():
-    # review repro: 6 KB, 200 defs, replaced by 22 bytes and reported written
-    disk = _Disk({"tools/h.py": _BIG_MODULE})
-    written, reason = await CE._apply_file(
-        disk, {"path": "tools/h.py", "content": "def f0(x):\n    pass\n"}, {}, set(), set())
-    assert written is None and "refused to overwrite tools/h.py" in reason
-    assert disk.files["tools/h.py"] == _BIG_MODULE
 
 
-@pytest.mark.asyncio
-async def test_an_unreadable_unsnapshotted_file_is_not_overwritten_blind():
-    too_large = ("Error: File 'tools/h.py' is too large to read entirely (612.0 KB) into your "
-                 "chat context window. Limit is 256.0 KB.")      # file_system's own wording
-
-    async def _runner(tool, args):
-        return too_large if args.get("operation") == "read" else "SUCCESS: wrote"
-    written, reason = await CE._apply_file(
-        _runner, {"path": "tools/h.py", "content": "x = 1\n"}, {}, set(), set())
-    assert written is None and "could not be read" in reason
 
 
-@pytest.mark.asyncio
-async def test_a_new_file_outside_the_snapshot_is_still_written():
-    disk = _Disk({})
-    written, reason = await CE._apply_file(
-        disk, {"path": "tools/new.py", "content": "x = 1\n"}, {}, set(), set())
-    assert reason is None and written == "tools/new.py" and disk.files["tools/new.py"] == "x = 1\n"
 
 
-@pytest.mark.asyncio
-async def test_the_retry_prompt_shows_the_PARTIAL_edits_a_failed_attempt_left(monkeypatch):
-    """Attempt 1 applies its first edit and fails on the second: the file on
-    disk changed, so attempt 2's prompt must show the edited text, not the
-    text read before the edit (the refresh between attempts)."""
-    disk = _Disk({"tools/h.py": "A = lexicon(x)\nB = words(y)\n"})
-    seen = []
-    specs = iter([
-        [{"find": "lexicon(x)", "replace": "embed(x)"}, {"find": "nope(", "replace": "z"}],
-        [{"find": "words(y)", "replace": "embed(y)"}],
-    ])
-
-    async def _spec(llm, model, description, ledger, *, existing_files=None, **_kw):
-        seen.append(dict(existing_files or {}))
-        return ({"files": [{"path": "tools/h.py", "edits": next(specs)}]}, False)
-
-    from ghost_agent.core import coding_loop as CL
-    monkeypatch.setattr(CE, "_generate_build_spec", _spec)
-    monkeypatch.setattr(CL, "executor_kind", lambda *a, **k: "spec")
-    await CE.build_coding_task(
-        SimpleNamespace(llm_client=object(), args=SimpleNamespace(model="m")),
-        "Replace lexicon metrics", tool_runner=disk, existing_files={"a.md": "a"}, max_attempts=2)
-    assert seen[1]["tools/h.py"] == "A = embed(x)\nB = words(y)\n"
 
 
 # ── review r19 m1/m2: sentence-final names; vendored trees; exact path first ──
@@ -230,33 +132,8 @@ _ROOT_NOTE = ("NOTE: 'main.py' is not in the current project's workspace; servin
               "reference it in other file/shell operations.\n")
 
 
-@pytest.mark.asyncio
-async def test_a_sandbox_root_file_of_the_same_name_is_not_the_projects_file():
-    big = "".join(f"def f{i}():\n    pass\n" for i in range(50))
-    writes = []
-
-    async def _runner(tool, args):
-        if args.get("operation") == "read":
-            return f"{_ROOT_NOTE}--- main.py CONTENTS ---\n{big}"     # file_system's fallback shape
-        writes.append(args)
-        return "SUCCESS: wrote main.py"
-    written, reason = await CE._apply_file(
-        _runner, {"path": "main.py", "content": "print('hi')\n"}, {}, set(), set())
-    assert reason is None and written == "main.py" and writes[0]["content"] == "print('hi')\n"
-    live, err = await CE._read_live_file(_runner, "main.py")
-    assert (live, err) == ("", "missing")
 
 
-@pytest.mark.asyncio
-async def test_a_sample_only_reply_means_the_file_exists():
-    sample = ("--- app.html SAMPLE ONLY (125 KB, looks machine-generated: long lines) ---\n"
-              "<html>…\n--- END SAMPLE (first 4 KB of 125 KB) ---\n")
-
-    async def _runner(tool, args):
-        return sample if args.get("operation") == "read" else "SUCCESS: wrote"
-    written, reason = await CE._apply_file(
-        _runner, {"path": "app.html", "content": "<html></html>"}, {}, set(), set())
-    assert written is None and "could not be read" in reason
 
 
 def test_basename_matches_leave_room_for_the_exact_path_and_dot_dirs_stay(tmp_path):
@@ -304,43 +181,8 @@ def test_a_root_level_exact_hit_cannot_take_the_slot_of_a_named_path(tmp_path):
     assert {"package.json", "zapp/package.json"} <= set(snap) and len(snap) == 6
 
 
-@pytest.mark.asyncio
-async def test_a_big_root_file_of_the_same_name_does_not_block_a_new_project_file():
-    """r21 m1: the whole read of a big ROOT file says "Error: too large"
-    without the fallback NOTE; a one-line ranged read carries it."""
-    writes = []
-
-    async def _runner(tool, args):
-        if args.get("operation") == "read":
-            if args.get("start_line"):
-                return f"{_ROOT_NOTE}--- notes.txt lines 1-1 ---\nx"
-            return "Error: File 'notes.txt' is too large to read entirely (612.0 KB)"
-        writes.append(args)
-        return "SUCCESS: wrote notes.txt"
-    written, reason = await CE._apply_file(
-        _runner, {"path": "notes.txt", "content": "new notes\n"}, {}, set(), set())
-    assert reason is None and written == "notes.txt"
-    written, reason = await CE._apply_file(
-        _runner, {"path": "notes.txt", "edits": [{"find": "a", "replace": "b"}]}, {}, set(), set())
-    assert written is None and "does not exist" in reason
 
 
-@pytest.mark.asyncio
-async def test_edits_to_a_big_project_file_apply_without_a_copy():
-    """r21 m2: exact-match edits need no copy of a too-large file."""
-    calls = []
-
-    async def _runner(tool, args):
-        calls.append(args.get("operation"))
-        if args.get("operation") == "read":
-            if args.get("start_line"):
-                return "--- app.js lines 1-1 ---\nvar a"
-            return "Error: File 'app.js' is too large to read entirely (612.0 KB)"
-        return "SUCCESS: replaced 1 occurrence"
-    snap = {}
-    written, reason = await CE._apply_file(
-        _runner, {"path": "app.js", "edits": [{"find": "var a", "replace": "let a"}]}, snap, set(), set())
-    assert reason is None and written == "app.js" and "replace" in calls and "app.js" not in snap
 
 
 def test_a_dot_slash_path_is_a_named_file():

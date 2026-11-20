@@ -18,6 +18,7 @@ clients add to a message (an attached file, a Slack mention) are taken out first
 from __future__ import annotations
 
 import asyncio
+import collections
 import datetime
 import json
 import os
@@ -200,11 +201,15 @@ def _failed(why: str, now: float) -> None:
 #: user mention (``<@U0123>``, ``<@U0123|name>``)
 _CLIENT_NOTES = (
     # anchored on the notes' fixed endings: a file name may itself hold ".]" (review r2)
-    re.compile(r"\[SYSTEM NOTE: The user attached a file named .*?(?:"
-               r"to interact with it\.\]|vision_analysis \(target='.*?'\)\.\]|"
-               r"could NOT be ingested \(too large or the fetch failed\)\.\]|found inside it\.\])", re.DOTALL),
-    re.compile(r"\(File just uploaded to the sandbox: [^\n]*\)"),
-    re.compile(r"<@[A-Z0-9]+(?:\|[^>]*)?>"),
+    # §4UY P5 (review r2 N-5): every span is BOUNDED — the open ones were quadratic on a text that repeats a note's
+    # opening and never closes it (500k chars: 25 s and 130 s). A note is far shorter: its fixed text is under
+    # 200 chars and a file name under 256
+    re.compile(r"\[SYSTEM NOTE: The user attached a file named .{0,700}?(?:"
+               r"to interact with it\.\]|vision_analysis \(target='.{0,300}?'\)\.\]|"
+               r"could NOT be ingested \(too large or the fetch failed\)\.\]|found inside it\.\]|"
+               r"as if you had read it\.\])", re.DOTALL),
+    re.compile(r"\(File just uploaded to the sandbox: [^\n]{0,700}\)"),
+    re.compile(r"<@[A-Z0-9]{1,40}(?:\|[^>\n]{0,200})?>"),
 )
 
 
@@ -394,6 +399,72 @@ def _feed_mood(answer: Dict[str, object], self_model, praised: bool, arrived: Op
         return 0.0, HELD_NO_MOOD
 
 
+# ── the reading of one request's message, for whoever waits for it (§4UW) ───
+#
+# The correction judge runs beside the turn and is let in by a phrase at the start of the message. A message
+# that does not open like a correction ("the dashboard is still empty") never reached it — yet the emotion
+# model has read it by then. The reading of each request's message is kept here for a moment, in memory.
+
+READINGS_MAX = 128
+#: how long the judge's gate waits for a reading that is on its way (the service answers in about 0.1 s)
+READING_WAIT_S = 3.0
+_READING_POLL_S = 0.05
+_READINGS: "collections.OrderedDict[str, Optional[dict]]" = collections.OrderedDict()
+_READINGS_LOCK = threading.Lock()
+_PENDING = None            # the slot of a message whose reading has not come back yet
+
+
+def expect_reading(request_id: str) -> None:
+    """A message of request ``request_id`` is about to be scored (called BEFORE the scoring is spawned, so a
+    waiter that starts right after it finds the slot)."""
+    rid = str(request_id or "")
+    if not rid:
+        return
+    with _READINGS_LOCK:
+        _READINGS[rid] = _PENDING
+        _READINGS.move_to_end(rid)
+        while len(_READINGS) > READINGS_MAX:
+            _READINGS.popitem(last=False)
+
+
+def forget_reading(request_id: str) -> None:
+    """Drop what is kept for ``request_id`` (a new request under an id that was used before)."""
+    with _READINGS_LOCK:
+        _READINGS.pop(str(request_id or ""), None)
+
+
+def _note_reading(request_id: str, emotions) -> None:
+    """The scoring of ``request_id``'s message is over: its emotion reading, or {} when there is none (the
+    service is off, failed, or carries no emotion model) — a waiter stops waiting either way. Only a slot that
+    was expected is filled, once."""
+    rid = str(request_id or "")
+    with _READINGS_LOCK:
+        # … and only once: a message the owner sent while the turn ran is scored under the same request id,
+        # and the reading the judge waits for is the request's own message's
+        if rid and rid in _READINGS and _READINGS[rid] is _PENDING:
+            _READINGS[rid] = dict(emotions) if isinstance(emotions, dict) else {}
+
+
+async def reading_for(request_id: str, *, wait_s: float = READING_WAIT_S) -> Optional[dict]:
+    """The emotion reading of ``request_id``'s message: at once when it is in, after at most ``wait_s`` when
+    it is on its way, None when none was expected, none came, or the wait ran out. Never raises."""
+    rid = str(request_id or "")
+    try:
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        while True:
+            with _READINGS_LOCK:
+                if rid not in _READINGS:
+                    return None
+                got = _READINGS[rid]
+            if got is not _PENDING:
+                return dict(got) or None
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(_READING_POLL_S)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def score_message(content, root, *, request_id: str = "", tor_proxy: Optional[str] = None,
                         self_model=None, praised: bool = False) -> bool:
     """Score one OWNER message (the caller decides that), feed the mood, write the journal row, log the rating.
@@ -401,9 +472,9 @@ async def score_message(content, root, *, request_id: str = "", tor_proxy: Optio
     try:
         arrived = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
         text = prepare_text(message_text(content))
-        if not text:
-            return False
-        answer = await classify(text, tor_proxy=tor_proxy)
+        answer = (await classify(text, tor_proxy=tor_proxy)) if text else None
+        # §4UW: whoever waits for this message's reading stops waiting here, on every way out
+        _note_reading(request_id, (answer or {}).get("emotions"))
         if answer is None:
             return False
         nudge, held = _feed_mood(answer, self_model, praised, arrived, request_id, text)
@@ -415,6 +486,7 @@ async def score_message(content, root, *, request_id: str = "", tor_proxy: Optio
         return True
     except Exception as exc:  # noqa: BLE001
         logger.debug("sentiment scoring skipped: %s", type(exc).__name__)
+        _note_reading(request_id, None)
         return False
 
 

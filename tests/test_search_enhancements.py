@@ -5,6 +5,13 @@ from unittest.mock import patch, MagicMock
 from src.ghost_agent.tools.registry import TOOL_DEFINITIONS
 from src.ghost_agent.tools.search import tool_search_ddgs, tool_deep_research
 
+
+def _wave_calls() -> int:
+    """§4VA: the ddgs calls of one wave — one per circuit of every ddgs engine of the table (yandex
+    rides three; the engines search.py fetches itself are switched off in the suite, conftest)."""
+    from src.ghost_agent.tools.search import _RACE_ENGINES, _engine_spec
+    return sum(_engine_spec(e).circuits for e in _RACE_ENGINES if _engine_spec(e).kind == "ddgs")
+
 def test_registry_descriptions():
     web_search = next((t for t in TOOL_DEFINITIONS if t["function"]["name"] == "web_search"), None)
     deep_research = next((t for t in TOOL_DEFINITIONS if t["function"]["name"] == "deep_research"), None)
@@ -123,7 +130,7 @@ async def test_tool_search_ddgs_empty_list_triggers_tor_cycle(mock_find_spec, mo
 
     assert "ZERO results" in result
     from src.ghost_agent.tools.search import reformulate_keeping_meaning   # §4UN-web
-    assert mock_ddgs_instance.text.call_count == (2 + len(reformulate_keeping_meaning("test query"))) * len(_RACE_ENGINES)
+    assert mock_ddgs_instance.text.call_count == (2 + len(reformulate_keeping_meaning("test query"))) * _wave_calls()
 
 
 @pytest.mark.asyncio
@@ -143,7 +150,7 @@ async def test_tool_deep_research_empty_list_triggers_tor_cycle(mock_find_spec, 
     # reformulation, every engine on its own circuit.
     from src.ghost_agent.tools.search import _RACE_ENGINES, _reformulate_query
     assert "CRITICAL ERROR: Deep Research search phase failed" in result
-    assert mock_ddgs_instance.text.call_count == (2 + len(_reformulate_query("test query"))) * len(_RACE_ENGINES)
+    assert mock_ddgs_instance.text.call_count == (2 + len(_reformulate_query("test query"))) * _wave_calls()
 
 
 @pytest.mark.asyncio
@@ -162,7 +169,7 @@ async def test_tool_search_ddgs_exception_logging(mock_find_spec, mock_ddgs, moc
 
     # (2 primary waves + 2 reformulation waves) × the full race set
     from src.ghost_agent.tools.search import _RACE_ENGINES, reformulate_keeping_meaning   # §4UN-web
-    assert mock_ddgs_instance.text.call_count == (2 + len(reformulate_keeping_meaning("test params"))) * len(_RACE_ENGINES)
+    assert mock_ddgs_instance.text.call_count == (2 + len(reformulate_keeping_meaning("test params"))) * _wave_calls()
 
     # The per-wave failure log aggregates every engine's error string.
     logs = [call.args[1] for call in mock_pretty_log.call_args_list]
@@ -183,7 +190,7 @@ async def test_tool_deep_research_exception_logging(mock_find_spec, mock_ddgs, m
     result = await tool_deep_research("test params", False, None)
 
     from src.ghost_agent.tools.search import _RACE_ENGINES, _reformulate_query
-    assert mock_ddgs_instance.text.call_count == (2 + len(_reformulate_query("test params"))) * len(_RACE_ENGINES)
+    assert mock_ddgs_instance.text.call_count == (2 + len(_reformulate_query("test params"))) * _wave_calls()
     assert "CRITICAL ERROR: Deep Research search phase failed" in result
 
     # Verify the exception string surfaced in the per-wave failure log

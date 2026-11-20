@@ -359,11 +359,47 @@ def _flush_stale_sweeps(exclude: str = "") -> int:
     return _run_deferred(stale)
 
 
+#: §4UY P16: tasks a request's model set IN_PROGRESS ({request id: [(store, task id)]}) — released at its end
+_REQUEST_CLAIMS: Dict[str, List[Tuple[Any, str]]] = {}
+
+
+def note_request_claim(store, request_id: str, task_id: str) -> None:
+    """§4UY P16: ``request_id`` set ``task_id`` IN_PROGRESS by hand (task_update RUNNING) — at the request's end
+    (`flush_deferred_sweeps`) a task still IN_PROGRESS goes back to PENDING. Outside a request: nothing."""
+    rid = str(request_id or "")
+    if not rid or rid == "SYSTEM" or not task_id:
+        return
+    with _DEFERRED_LOCK:
+        lst = _REQUEST_CLAIMS.setdefault(rid, [])
+        if not any(s is store and t == task_id for s, t in lst):
+            lst.append((store, str(task_id)))
+        while len(_REQUEST_CLAIMS) > 256:
+            _REQUEST_CLAIMS.pop(next(iter(_REQUEST_CLAIMS)))
+
+
+def release_request_claims(request_id: str) -> List[str]:
+    """§4UY P16: the tasks ``request_id`` set IN_PROGRESS and left there go back (`release_claim`: PENDING, or
+    the hold it came from). Returns the ids released. Never raises."""
+    with _DEFERRED_LOCK:
+        items = _REQUEST_CLAIMS.pop(str(request_id or ""), [])
+    out: List[str] = []
+    for store, tid in items:
+        try:
+            if str((store.get_task(tid) or {}).get("status") or "").upper() == "IN_PROGRESS":
+                store.release_claim(tid, failure_reason="set running in a request that ended without closing it")
+                out.append(tid)
+        except Exception:  # noqa: BLE001
+            logger.warning("task %s not released at its request's end", tid, exc_info=True)
+    return out
+
+
 def flush_deferred_sweeps(request_id: str) -> int:
     """§4UL (2e): run the DONE clean-up sweeps ``request_id`` deferred (a
     project that is no longer DONE is skipped). Called at the end of every
-    agent turn; never raises. Returns how many sweeps ran."""
+    agent turn; never raises. Returns how many sweeps ran. §4UY P16: first, the
+    tasks the request set running by hand and never closed go back."""
     try:
+        release_request_claims(request_id)
         with _DEFERRED_LOCK:
             items = _DEFERRED_SWEEPS.pop(str(request_id or ""), [])
         return _run_deferred(items) + _flush_stale_sweeps()
@@ -394,9 +430,13 @@ import weakref as _weakref  # noqa: E402
 _KNOWN_STORES: "_weakref.WeakSet" = _weakref.WeakSet()
 #: the owner's message of each running root request (the ask of its entries — never a task turn's prompt)
 _REQUEST_ASK: Dict[str, str] = {}
-_CHANGE_SKIP_NAMES = {"PROJECT_CHANGES.md", "PROJECT_MAP.md"}
-#: §4UM review M2: the agent-owned change log file's first line — a file of that name without it is the
-#: project's own and is never overwritten (a project's own CHANGELOG.md is ordinary content: its edits ARE changes)
+#: §4UY P10: where a PROJECT_CHANGES.md without the header (the model or the owner wrote over it) is kept before
+#: the log is rendered again — appended, never lost
+CHANGES_FOREIGN_NAME = "PROJECT_CHANGES.own.md"
+_CHANGE_SKIP_NAMES = {"PROJECT_CHANGES.md", "PROJECT_MAP.md", CHANGES_FOREIGN_NAME}
+#: §4UM review M2: the agent-owned change log file's first line. §4UY P10: a file of that name without it is kept
+#: (moved to CHANGES_FOREIGN_NAME) and the log is written again — before, one overwrite stopped the file for good
+#: (a project's own CHANGELOG.md is ordinary content: its edits ARE changes)
 CHANGES_FILE_HEADER = "<!-- written by the agent: this project's change log (§4UM). Edits here are overwritten. -->"
 #: entries rendered into the file (the store keeps them all)
 CHANGES_FILE_MAX = 200
@@ -823,9 +863,15 @@ def pending_change_files(store, project_id: str) -> set:
     return out
 
 
+#: the stored summary's length (`add_change` keeps at most this many characters)
+CHANGE_SUMMARY_MAX = 300
+
+
 def _reply_summary(reply: str) -> str:
     """§4UM review: the final reply as plain text (markdown, links and tool banners stripped, whitespace
-    collapsed), ≤300 chars — what the request said it did."""
+    collapsed) — what the request said it did. §4UY P11/P18: at most CHANGE_SUMMARY_MAX characters WITH its
+    ellipsis (the store's cut took the "…" off 6 of 9 live rows), ended at the last whole sentence that fits
+    when there is one, else at a word."""
     txt = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", str(reply or ""))
     kept = []
     for ln in txt.splitlines():
@@ -833,25 +879,61 @@ def _reply_summary(reply: str) -> str:
         if ln and not ln.startswith(("[exited", "<!--")):
             kept.append(ln)
     out = " ".join(" ".join(kept).split())
-    return out[:300].rstrip() + ("…" if len(out) > 300 else "")
+    if len(out) <= CHANGE_SUMMARY_MAX:
+        return out
+    head = out[:CHANGE_SUMMARY_MAX - 1]
+    ends = [m.end() for m in re.finditer(r"[.!?;](?=\s)", head)]
+    if ends and ends[-1] >= CHANGE_SUMMARY_MAX // 3:
+        whole = head[:ends[-1]].rstrip()
+        return whole + (" …" if len(whole) + 2 <= CHANGE_SUMMARY_MAX else "…")
+    cut = head.rsplit(" ", 1)[0] if " " in head[CHANGE_SUMMARY_MAX // 2:] else head
+    return cut.rstrip() + "…"
+
+
+#: §4UY P2: the roll-up statuses that mean "every planned task was done" — the old DONE close (before §4UM) and
+#: the READY finish. A FAILED / NEEDS_USER roll-up is not a finished plan.
+_FINISHED_ROLLUPS = ("DONE", "READY")
+
+
+def legacy_ready_at(store, project_id: str, before: Optional[float] = None) -> Optional[float]:
+    """§4UY P2: when the project's plan was FIRST finished by a roll-up event (the earliest DONE / READY
+    ``project_auto_rollup``), optionally only one strictly before ``before``; None when there is none. Reads every
+    roll-up event (a project's events can outnumber any window)."""
+    try:
+        with store._lock, store._connect() as conn:
+            rows = conn.execute("SELECT ts, payload_json FROM project_events WHERE project_id = ? AND type = "
+                                "'project_auto_rollup' ORDER BY ts ASC", (_canon_id(project_id),)).fetchall()
+    except Exception:  # noqa: BLE001
+        return None
+    for r in rows:
+        try:
+            st = str((json.loads(r["payload_json"] or "{}") or {}).get("new_status") or "").upper()
+            ts = float(r["ts"] or 0)
+        except (TypeError, ValueError):
+            continue
+        if st in _FINISHED_ROLLUPS and (before is None or ts < before):
+            return ts
+    return None
 
 
 def _was_ready_before(store, project_id: str, rid: str, t: float) -> bool:
     """The project's first plan was finished by ANOTHER request (``metadata.first_ready_at`` /
-    ``first_ready_req``) — or, finished before §4UM, an older roll-up event before ``t``."""
+    ``first_ready_req``) — or before that stamp / before ``t`` by an older finished roll-up (§4UY P2: a project
+    whose first plan finished before §4UM got the stamp at its NEXT finish, naming that later request — its work
+    was then read as "the first plan" and never logged)."""
     proj = store.get_project(project_id) or {}
     m = proj.get("metadata") or {}
-    if m.get("first_ready_at"):
+    try:
+        first_at = float(m.get("first_ready_at") or 0.0)
+    except (TypeError, ValueError):
+        first_at = 0.0
+    if first_at:
+        if legacy_ready_at(store, project_id, before=first_at - 1.0) is not None:
+            return True                         # finished before the stamp: the stamp is not the first plan's
         by = str(m.get("first_ready_req") or "")
         mine = {rid, request_root(rid)} if rid else set()
         return not (by and (by in mine or request_root(by) in mine))
-    for ev in store.list_events(project_id, limit=20, event_type="project_auto_rollup") or []:
-        try:
-            if float(ev.get("ts") or 0) < t:
-                return True
-        except (TypeError, ValueError):
-            continue
-    return False
+    return legacy_ready_at(store, project_id, before=t) is not None
 
 
 def _planned_in_request(store, project_id: str, rid: str, first_t: Optional[float] = None) -> bool:
@@ -1009,7 +1091,51 @@ def _diffed_files(e: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     for r in [r for r, f in files.items() if f["kind"] == "removed" and r not in snap]:
         if any(k.startswith(r.rstrip("/") + "/") for k in snap):
             files.pop(r)                        # a removed FOLDER: its files are listed one by one
+    _note_end_state(e, now)
     return files
+
+
+#: §4UY P8: the folder as an owner's request LEFT it, per root request — a background job that request started
+#: keeps writing after its flush; the job's wake turn diffs from here (`seed_from_starter`), so the job's files
+#: are that request's work continued, never nobody's. Bounded (newest kept).
+_END_STATES: Dict[str, Dict[str, Any]] = {}
+END_STATES_MAX = 64
+
+
+def _note_end_state(e: Dict[str, Any], now: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(now, dict) or not e.get("rid") or e.get("source", "owner") != "owner":
+        return
+    with _DEFERRED_LOCK:
+        _END_STATES.setdefault(str(e["rid"]), {})[f"{id(e['store'])}:{e['pid']}"] = {
+            "store": e["store"], "pid": e["pid"], "snap": now, "t": time.time(), "ask": e.get("ask") or ""}
+        while len(_END_STATES) > END_STATES_MAX:
+            _END_STATES.pop(next(iter(_END_STATES)))
+
+
+def seed_from_starter(starter_rid: str, rid: str) -> List[str]:
+    """§4UY P8: a background job's WAKE turn (``rid``) of the owner's request ``starter_rid`` — open its entry on
+    each project that request wrote, with the folder as the request left it as the snapshot and that time as its
+    start: the job's writes after the request ended are this entry's (were nobody's — the request had flushed, and
+    the wake's own snapshot came after them). Returns the project ids seeded. Never raises."""
+    out: List[str] = []
+    try:
+        key = _change_rid(rid)
+        with _DEFERRED_LOCK:
+            states = list((_END_STATES.pop(str(starter_rid or ""), {}) or {}).values())
+        for st in states:
+            with _DEFERRED_LOCK:
+                e = _pending_entry(st["store"], st["pid"], key, st.get("ask") or "")
+                if isinstance(e.get("snap"), dict):
+                    continue
+                e["snap"] = st["snap"]
+                e["snap_seq"] = _next_seq()
+                e["first"] = min(float(e["first"]), float(st["t"]))
+                _mark_wrote(e)
+                e["wrote_t"] = float(st["t"])   # the job's writes since the request ended are this entry's
+            out.append(st["pid"])
+    except Exception:  # noqa: BLE001
+        logger.debug("job wake not seeded from %s", starter_rid, exc_info=True)
+    return out
 
 
 def _covered(rel: str, f: Dict[str, Any], pushes: List[Dict[str, Any]]) -> bool:
@@ -1022,6 +1148,20 @@ def _covered(rel: str, f: Dict[str, Any], pushes: List[Dict[str, Any]]) -> bool:
         if (p["seq"] > f["seq"]) if f.get("seq") else (p["t"] >= f["t"]):
             return True
     return False
+
+
+def _manifest_added(store, project_id: str, entry: Dict[str, Any]) -> None:
+    """§4UY P11: a file a change ADDED enters the file manifest (it never did: the briefing's file map did not
+    know the app had a new part) — described by the change, unless the manifest already describes it."""
+    try:
+        mf = store.get_file_manifest(project_id)
+        why = str(entry.get("summary") or entry.get("ask") or "").strip()
+        for rel in entry.get("added") or []:
+            if rel not in mf:
+                store.describe_file(project_id, rel, f"added in change #{entry.get('num')}"
+                                    + (f": {why}" if why else ""), role="added")
+    except Exception:  # noqa: BLE001
+        logger.debug("added files not entered in the manifest for %s", project_id, exc_info=True)
 
 
 def _write_pending(e: Dict[str, Any], reply: str = "") -> int:
@@ -1079,6 +1219,7 @@ def _write_pending(e: Dict[str, Any], reply: str = "") -> int:
         e["files_done"] = True                  # a retry after a failed deploy write adds no second entry
         if entry:
             n += 1
+            _manifest_added(store, pid, entry)
             if e["reopened_from"]:
                 store.log_event(pid, None, "project_reopened",
                                 {"reason": f"reopened by change #{entry['num']}",
@@ -1304,9 +1445,10 @@ def change_line(e: Dict[str, Any]) -> str:
 
 
 def recent_change_lines(store, project_id: str, n: int = 5) -> List[str]:
-    """The last ``n`` change-log entries (changes and deploys), newest first."""
+    """The last ``n`` CHANGES, newest first — each says whether it is live. §4UY P11: deploy entries are not
+    changes (they took the slots: live, 2 changes of 9 visible); where the project is live is `live_line`."""
     try:
-        return [change_line(e) for e in store.list_changes(project_id, limit=n)]
+        return [change_line(e) for e in store.list_changes(project_id, limit=n, kind="change")]
     except Exception:  # noqa: BLE001
         return []
 
@@ -1362,6 +1504,19 @@ def live_line(store, project_id: str) -> str:
     return (f"Live at {li.get('url') or '(no url)'} (last deployed {_when(li.get('at'))}"
             + (f", includes change #{li['through']}" if li.get("through") else "") + tail + ")")
 
+
+
+def _note_trash(store, project_id: str, what: str) -> None:
+    d = getattr(store, "_deleted_folders", None)
+    if d is None:
+        d = {}
+        try:
+            store._deleted_folders = d
+        except Exception:  # noqa: BLE001
+            return
+    d[str(project_id)] = what
+    while len(d) > 64:
+        d.pop(next(iter(d)))
 
 class ProjectStore:
     """SQLite-backed store for projects, tasks, artifacts, and events.
@@ -1930,6 +2085,7 @@ class ProjectStore:
             return self.update_project(project_id, status=ProjectStatus.ARCHIVED.value)
 
         # Resolve the workspace path BEFORE deleting the row.
+        _note_trash(self, project_id, "none")     # §4UY P20 r3: what happened to its folder (`deleted_folder`)
         proj = self.get_project(project_id)
         ws_str = (proj or {}).get("workspace_dir")
         if not ws_str and self.sandbox_root:
@@ -1985,7 +2141,13 @@ class ProjectStore:
                         self._chmod_tree(ws_p, False)
                     except Exception:
                         pass
-                    shutil.rmtree(ws_p, ignore_errors=True)
+                    # §4UY P20: into the host's project trash (purged after PROJECT_TRASH_KEEP_DAYS), never a
+                    # bare rmtree — nothing asks before a delete (§4UK), so a wrong target must be recoverable
+                    if self._trash_workspace(project_id, ws_p):
+                        _note_trash(self, project_id, "trash")
+                    else:
+                        shutil.rmtree(ws_p, ignore_errors=True)
+                        _note_trash(self, project_id, "removed")
                     # ⚠ the whole tree just went — stamp the removal mark
                     # (deleted=None = "everything") so a verdict in flight
                     # for this project reports could-not-check instead of
@@ -2554,6 +2716,9 @@ class ProjectStore:
             if cur.rowcount == 0:
                 return
         holder: Dict[str, bool] = {}
+        # §4UY P2: a plan finished before §4UM (an older DONE / READY roll-up) — the first plan was THAT one, by no
+        # request this process knows; the request finishing now is a change
+        _legacy = legacy_ready_at(self, project_id)
 
         def _mark(meta):
             if meta.get("planned_done_at"):
@@ -2561,8 +2726,11 @@ class ProjectStore:
                 return meta
             meta["planned_done_at"] = _now()
             if not meta.get("first_ready_at"):           # never cleared: the first plan was built (and by which request)
-                meta["first_ready_at"] = meta["planned_done_at"]
-                meta["first_ready_req"] = _change_rid()
+                if _legacy is not None:
+                    meta["first_ready_at"], meta["first_ready_req"] = _legacy, ""
+                else:
+                    meta["first_ready_at"] = meta["planned_done_at"]
+                    meta["first_ready_req"] = _change_rid()
             return meta
 
         if self._atomic_metadata_update(project_id, _mark) is None or holder.get("already"):
@@ -2574,6 +2742,38 @@ class ProjectStore:
         # them (they replayed into every later request), new tasks re-arm them (add_task).
         self.retire_constraints(project_id, reason="planned work finished")
         self._fire_project_done(project_id)
+
+    def deleted_folder(self, project_id: str) -> str:
+        """§4UY P20 review 3: what the last hard delete of ``project_id`` did with its folder — "trash" (moved to
+        the host's project trash), "removed" (could not be moved: removed instead), "none" (no folder)."""
+        return str((getattr(self, "_deleted_folders", None) or {}).get(_canon_id(project_id), "none"))
+
+    def _trash_workspace(self, project_id: str, ws_p: Path) -> Optional[Path]:
+        """§4UY P20: move a deleted project's whole folder to ``<project trash>/<YYYYMMDD>/<id>-deleted-<HHMMSS>``
+        (the host's system dir, outside the sandbox; `workspace_cleanup.purge_project_trash` removes day folders
+        after PROJECT_TRASH_KEEP_DAYS). The path it went to, or None when it could not be moved."""
+        try:
+            from ..core.workspace_cleanup import project_trash_dir, purge_project_trash
+            trash = project_trash_dir(self)
+            if trash is None or trash.is_symlink():
+                return None
+            dest = trash / time.strftime("%Y%m%d") / (
+                re.sub(r"[^0-9A-Za-z_-]", "_", str(project_id)) + time.strftime("-deleted-%H%M%S"))
+            n = 1
+            while dest.exists():
+                n += 1
+                dest = dest.with_name(f"{dest.name.split('.')[0]}.{n}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(ws_p), str(dest))
+            try:
+                purge_project_trash(self)
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info("deleted project %s: its folder is in the trash at %s", project_id, dest)
+            return dest
+        except (OSError, shutil.Error) as e:
+            logger.warning("deleted project %s: folder not moved to the trash (removed instead): %s", project_id, e)
+            return None
 
     def project_state(self, project_id: str, proj: Optional[Dict[str, Any]] = None,
                       tasks: Optional[List[Dict[str, Any]]] = None) -> str:
@@ -2665,7 +2865,7 @@ class ProjectStore:
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (project_id, kind, num, ts, str(req_id or "")[:64], " ".join(str(ask or "").split())[:300],
                  json.dumps(_paths(added)), json.dumps(_paths(changed)), json.dumps(_paths(removed)),
-                 " ".join(str(summary or "").split())[:300], 1 if deployed else 0,
+                 " ".join(str(summary or "").split())[:CHANGE_SUMMARY_MAX], 1 if deployed else 0,
                  (float(deployed_at or ts) if deployed else None), str(url or "")[:300], "[]",
                  json.dumps(dict(meta or {}))[:4000]))
             conn.commit()
@@ -2801,8 +3001,8 @@ class ProjectStore:
     def render_changelog(self, project_id: str) -> Optional[str]:
         """Write the change log to ``PROJECT_CHANGES.md`` in the project folder (§4UM; newest first, the last
         CHANGES_FILE_MAX entries; atomic through a unique tmp name, no symlink followed, best effort). A file of
-        that name that does not start with CHANGES_FILE_HEADER is the project's own: nothing is written.
-        Returns the path written or None."""
+        that name that does not start with CHANGES_FILE_HEADER is kept (appended to CHANGES_FOREIGN_NAME, §4UY P10)
+        and the log written again. Returns the path written or None."""
         try:
             proj = self.get_project(project_id)
             if not proj:
@@ -2824,9 +3024,24 @@ class ProjectStore:
                 except OSError:
                     first = ""
                 if first != CHANGES_FILE_HEADER:
-                    logger.warning("%s: %s is not the agent's (no header) — left as it is; the change log "
-                                   "stays in the store", project_id, target.name)
-                    return None
+                    # §4UY P10: written over (by the model, a command, the owner) — what it holds is kept beside
+                    # it, and the agent's log takes its name back
+                    keep = ws_path / CHANGES_FOREIGN_NAME
+                    if keep.is_symlink():
+                        logger.warning("%s: %s is a link — the change log file is not written", project_id,
+                                       keep.name)
+                        return None
+                    try:
+                        body = target.read_text(encoding="utf-8", errors="replace")
+                        sep = (f"\n\n<!-- kept {time.strftime('%Y-%m-%d %H:%M')} from {target.name} -->\n"
+                               if keep.exists() and keep.stat().st_size else "")
+                        with open(keep, "a", encoding="utf-8") as fh:
+                            fh.write(sep + body)
+                    except OSError:
+                        logger.warning("%s: %s could not be kept — left as it is", project_id, target.name)
+                        return None
+                    logger.warning("%s: %s had no header — its text kept in %s, the change log written again",
+                                   project_id, target.name, keep.name)
             lines = [CHANGES_FILE_HEADER, f"# Changes — {proj.get('title') or project_id}", "",
                      "Every change the owner asked for, and every time the project went live. Newest first.", ""]
             entries = self.list_changes(project_id, limit=CHANGES_FILE_MAX)
@@ -3941,7 +4156,16 @@ class ProjectStore:
         ``note`` = the head of the final response (what was concluded);
         ``failure_dimension`` = harness dimension the turn's failures were
         attributed to (core/failure_dimension.py), empty on success."""
-        file_list = sorted({str(f).strip() for f in (files or []) if str(f).strip()})
+        # §4UY P19: project-relative, the one form every other record uses (live: "projects/<id>/js/x.json" beside
+        # "js/x.json"); a path outside the project keeps its own spelling
+        _pid = _canon_id(project_id)
+
+        def _wl_rel(f: str) -> str:
+            f = f.strip()
+            if re.match(rf"^/?(?:workspace/)?projects/{re.escape(_pid)}/", f.replace("\\", "/"), re.IGNORECASE):
+                return self._normalize_rel_path(_pid, f) or f
+            return f
+        file_list = sorted({_wl_rel(str(f)) for f in (files or []) if str(f).strip()})
         extra = len(file_list) - self.WORK_LOG_MAX_FILES
         payload = {
             "request": " ".join(str(request or "").split())[: self.WORK_LOG_REQUEST_CHARS],

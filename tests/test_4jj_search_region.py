@@ -52,7 +52,9 @@ async def test_the_wave_passes_the_mapped_region_to_every_engine(query, region):
     mod, inst = _mock_ddgs_module(by_engine)
     with patch.dict("sys.modules", {"ddgs": mod}), \
          patch("src.ghost_agent.tools.search._DDGS_TOR_TIMEOUT", 0.2), \
-         patch("src.ghost_agent.tools.search._DDGS_FAST_ENGINE_TIMEOUT", 0.2):
+         patch("src.ghost_agent.tools.search._engine_timeout", lambda e: 0.2):
         await _race_search_wave(query, None, 0)
-    assert set(seen) == set(_RACE_ENGINES)
+    # §4VA: every engine that goes through ddgs (the Brave onion takes no region and is off in the suite)
+    from src.ghost_agent.tools.search import _engine_spec
+    assert set(seen) == {e for e in _RACE_ENGINES if _engine_spec(e).kind == "ddgs"}
     assert set(seen.values()) == {region}

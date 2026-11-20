@@ -800,10 +800,13 @@ async def _resume_after_job(context, entry) -> bool:
         # said "EXIT CODE: 1 … if it failed, diagnose" and paged FAILED for
         # a `find … 2>/dev/null` that collect called DONE
         try:
-            from .tools.execute import _take_pipestatus, _normalise_exit
-            tail, _ = _take_pipestatus(tail)
-            if isinstance(code, int) and code != 0:
-                code = _normalise_exit(str(entry.get("command") or ""), code, tail)
+            from .tools.execute import _take_status, _normalise_exit, status_failures_of_job
+            tail, _, _ = _take_status(tail)
+            # §4UY C9: the failures the job's ERR trap recorded in its status file
+            _fails = await asyncio.to_thread(status_failures_of_job, entry.get("command"),
+                                             getattr(sup, "host_workspace", None))
+            if isinstance(code, int):
+                code = _normalise_exit(str(entry.get("command") or ""), code, tail, _fails)
         except Exception:  # noqa: BLE001
             pass
         # §4NS M1: the output is OUTSIDE content — it went into a user-role
@@ -1041,6 +1044,35 @@ async def _stop_biological_watchdog(bio, grace_s: Optional[float] = None) -> boo
     return True
 
 
+#: §4VA: how long the shutdown waits for the search-engine bench's last queued write
+SEARCH_BENCH_FLUSH_S = 3.0
+
+
+def warn_search_test_switch() -> bool:
+    """§4VA r2: ``GHOST_SEARCH_NO_NETWORK`` is the TEST SUITE's switch. Set in the agent's environment
+    it makes the Brave onion and Wikipedia refuse every request — silently, as engine ``error``s. One
+    WARNING at startup names it. True when it warned."""
+    if os.environ.get("GHOST_SEARCH_NO_NETWORK") != "1":
+        return False
+    pretty_log("Search Engine", "GHOST_SEARCH_NO_NETWORK=1 is set in the agent's environment — it is the test "
+               "suite's switch: the Brave onion and Wikipedia will refuse every request. Unset it and restart.",
+               icon=Icons.WARN, level="WARNING")
+    return True
+
+
+async def flush_search_bench(bound: Optional[float] = None) -> bool:
+    """§4VA: the search-engine bench's last queued write reaches the disk before the process goes (it is
+    written off the wave's thread). Waits at most ``bound`` seconds, off the loop; True when nothing is
+    left to write. Never raises into the shutdown."""
+    try:
+        from .tools.search import bench_flush, cancel_probes
+        cancel_probes()                       # r2: a probe still finishing books nothing after this point
+        return bool(await asyncio.to_thread(bench_flush, SEARCH_BENCH_FLUSH_S if bound is None else float(bound)))
+    except Exception as exc:  # noqa: BLE001 — shutdown must proceed
+        logger.debug("search bench flush skipped: %s", exc)
+        return False
+
+
 def shutdown_line(agent) -> str:
     """What the operator sees when the process drains: how long it ran and
     what it was doing. The bare "draining background work…" left three
@@ -1197,7 +1229,7 @@ async def lifespan(app):
     _cc = getattr(context.llm_client, "critic_clients", None)
     if (isinstance(_wc, list) and _wc) or (isinstance(_cc, list) and _cc):
         from .utils.logging import spawn_bg as _spawn_bg
-        _spawn_bg(context.llm_client.warm_up_workers(), name="node-warmup")
+        _spawn_bg(context.llm_client.warm_up_workers(), name="node-warmup", service=True)
         # Boot warmup only covers the FIRST request; a Tailscale peer's path
         # re-cools when the node idles between requests or during a long
         # tool phase, so keep it warm with a periodic ping. Tunable via
@@ -1208,7 +1240,7 @@ async def lifespan(app):
             _ka = 45.0
         if _ka > 0:
             _spawn_bg(context.llm_client.keepalive_workers(interval_s=_ka),
-                      name="node-keepalive")
+                      name="node-keepalive", service=True)
 
     pretty_log("System Boot", "Initializing components", icon=Icons.BOOT_AWAKE)
     # §4IC: the shutdown line reports uptime and in-flight turns — three
@@ -1331,7 +1363,7 @@ async def lifespan(app):
             if _jobs_on():
                 from .utils.logging import spawn_bg as _spawn_bg_jobs
                 _spawn_bg_jobs(_reap_sandbox_jobs(context),
-                               name="sandbox-job-reaper")
+                               name="sandbox-job-reaper")   # a WRITER (stamps + ledger): never cancelled mid-tick
         except Exception:
             logging.getLogger("GhostAgent").debug(
                 "sandbox-job reaper not started", exc_info=True)
@@ -1339,7 +1371,7 @@ async def lifespan(app):
         try:
             from .utils.logging import spawn_bg as _spawn_bg_apps
             from .tools.runs import watch_kept_apps as _watch_apps
-            _spawn_bg_apps(_watch_apps(context), name="kept-app-watch")
+            _spawn_bg_apps(_watch_apps(context), name="kept-app-watch", service=True)
         except Exception:
             logging.getLogger("GhostAgent").debug("kept-app watch not started", exc_info=True)
 
@@ -1423,7 +1455,7 @@ async def lifespan(app):
                         pretty_log("Store Hygiene", f"removed {_n} orphaned temp file(s) left by a killed write",
                                    icon=Icons.RETRY)
                 from .utils.logging import spawn_bg as _spawn_bg
-                _spawn_bg(_sweep(), name="temp-sweep")
+                _spawn_bg(_sweep(), name="temp-sweep", service=True)
         except Exception as _sw_exc:  # noqa: BLE001
             logger.debug("temp sweep skipped: %s", _sw_exc)
         pretty_log("Project Store", "Long-term project store initialized",
@@ -2240,7 +2272,7 @@ async def lifespan(app):
             and _llm_main.upstream_url):
         from .utils.logging import spawn_bg as _spawn_bg_main
         _warmup_task = _spawn_bg_main(agent.warm_up_main_prefix(),
-                                      name="main-prefix-warmup")
+                                      name="main-prefix-warmup", service=True)
         context._rewarm_task = _spawn_main_prefix_rewarm(agent, _spawn_bg_main)   # §4SA r2: cancelled before the shutdown save
 
     # Metacognition bundle: the validator-block counter (§4PT). None unless
@@ -2351,6 +2383,7 @@ async def lifespan(app):
     # awaited before the `yield`, and the server starts serving at the
     # `yield`: the socket waits with the banner (§4SY review — the earlier
     # comment here said only the log line waits).
+    warn_search_test_switch()       # §4VA r2: before the ready line, outside the announcer (it only announces)
     await _announce_ready_when_warm(_warmup_task)
 
     try:
@@ -2376,6 +2409,9 @@ async def lifespan(app):
                     model="", partial="")
         except Exception as _abx:  # noqa: BLE001 — shutdown must proceed
             logger.debug("shutdown abort-stamp skipped: %s", _abx)
+        # §4VA: the search-engine bench's last queued write reaches the disk before the process goes
+        # (it is written off the wave's thread; bounded, never raises)
+        await flush_search_bench()
         # Metacog teardown: the lifetime validator-block summary line.
         # `shutdown()` is idempotent and never raises.
         _mc = getattr(context, "metacog", None)

@@ -241,7 +241,12 @@
     <li>iptables rules in the container's OWN network namespace (the only place the original destination of a
     redirected connection survives): every TCP connection to the TransPort, every DNS query to the DNSPort, Tor's
     own traffic (matched by uid) and loopback exempted FIRST, everything else &mdash; other UDP, ICMP, all IPv6 &mdash;
-    REJECTed;</li>
+    REJECTed. One more loopback rule, for Tor's SOCKS port, decides nothing (the next rule exempts all loopback):
+    it <em>counts</em> the connections sandbox code opens through <code>TOR_PROXY</code>. With the redirect
+    counters it lets <code>execute</code> measure whether a run reached the network
+    (<code>net_connections</code>, read by a privileged exec before and after each run; §4UY N6, see
+    <a href="../infrastructure/safety.html">safety</a>). A sandbox created before this rule existed keeps its old
+    rules until it is recreated; until then SOCKS use is not counted and the code-text fallback decides;</li>
     <li>loaded through a <strong>privileged <code>docker exec</code></strong>: the container runs with Docker's default
     capability set, which lacks <code>NET_ADMIN</code>, so a command the model runs, root or not, cannot flush the rules
     (verified: "needs NET_ADMIN");</li>

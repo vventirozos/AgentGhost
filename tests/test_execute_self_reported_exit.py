@@ -1,27 +1,16 @@
-"""§4HZ — the status the run REPORTED beats the 0 the shell returned.
+"""§4HZ → §4UY C9/C10 — the run's status is the REAL exit code of the program that failed.
 
-THE LIVE FAILURE (reqs 0e6cf008 + d594668e, 2026-09-17). The model ends
-commands with `; echo "exit=$?"` / `echo "=== exit: $? ==="`. The LAST
-command is then an `echo`, bash returns 0, and the tool logged
-**execution ok · exit 0** over
+§4HZ (reqs 0e6cf008 + d594668e) adopted a status the OUTPUT printed (`exit=N` after a `$?` echo, bash's
+`Killed` line); §4PH added output signatures for a list (a traceback, `N failed`, `npm ERR!`). §4UX-2 C9/C10:
+both read prose — a failure behind `;` with no Python/pytest signature was EXIT CODE 0 (bare `echo $?`,
+`gcc …; ./a`, unittest `FAILED`, a node ReferenceError, npm ≥ 10 `npm error`, `go test`, `cargo test`,
+`… > out.log; tail -3 out.log`), and `0 failed, 12 passed` or a printed "exit code: 3" became failures.
 
-  * a Python traceback followed by `exit=1`;
-  * `bash: line 1:  1008 Killed  timeout 400 python3 …` (an OOM mid-run);
-  * `ERROR: No matching distribution found … === exit: 1 ===`.
-
-Consequences measured in the log: the strike counter fell from 4/6 to 1/6
-on one such line, System 3's chosen recovery ("capture the full pip
-output") was booked a success while changing nothing, and 8 of the day's
-30 "execution ok" lines carried failure text in their body.
-
-`set -o pipefail` (§4GE) cannot see this — there is no pipe. The echo
-itself is the exact signal: the command text contains `$?` and the output
-contains the number it printed. `cat crash.log` printing "exit=1" has no
-`$?` and stays what it is: data.
-
-Shell claims are executed against a real bash, as in
-tests/test_execute_pipefail.py; the container's literal strings from the
-log are pinned as unit rows beside them.
+Now the shell records every top-level failure itself (an ERR trap writing a status file the host reads back,
+`execute.read_status_file`) and the status is the LAST failure of a program that RUNS CODE
+(`_RUNNER_HEAD_RE`, review r1); a command that reads statuses itself (`$?`, PIPESTATUS, `trap`, `set -e`,
+`exec >`) gets no trap. Shell claims run against a real bash — the host's (3.2 on macOS; the sandbox runs
+5.2: the trap uses only 3.x features, `printf -v`, `+=`, `${a[@]:1}`) — through the production `_bash_c`.
 """
 import ast
 import inspect
@@ -35,92 +24,94 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 import pytest
 
 from ghost_agent.tools import execute as ex
-from ghost_agent.tools.execute import (_bash_c, _normalise_exit,
-                                       _self_reported_exit, tool_execute)
+from ghost_agent.tools.execute import _bash_c, _normalise_exit, _take_status, tool_execute
 
 
-def _run(command):
-    proc = subprocess.run(_bash_c(command), shell=True, capture_output=True, text=True)
-    out = proc.stdout + proc.stderr
-    return _normalise_exit(command, proc.returncode, out), out
+def _run(command, tmp_path=None):
+    import tempfile
+    d = tmp_path or tempfile.mkdtemp()
+    sf = os.path.join(str(d), ex.STATUS_DIRNAME, "a" * 32)
+    proc = subprocess.run(_bash_c(command, status_path=sf), shell=True, capture_output=True, text=True,
+                          cwd=str(d), executable="/bin/bash")
+    out, _codes, _ = _take_status(proc.stdout + proc.stderr)
+    return _normalise_exit(command, proc.returncode, out, ex.read_status_file(sf)), out
 
 
-# --- the live strings ----------------------------------------------------
+_FAIL = "python3 -c 'import sys; sys.exit(3)'"
 
-@pytest.mark.parametrize("command,code,output,expected", [
-    ('pip install ecmwf-api 2>&1\necho "=== exit: $? ==="', 0,
-     "ERROR: No matching distribution found for ecmwf-api\n=== exit: 1 ===", 1),
-    ('cd /workspace && timeout 400 python3 -u ifs_grid_oxford.py 2>&1; echo "exit=$?"', 0,
-     "T205: Nlon=308 …\nbash: line 1:  1008 Killed                  timeout 400 python3 -u ifs_grid_oxford.py 2>&1\nexit=137", 137),
-    ('cd /workspace && timeout 300 python3 - <<\'PYEOF\'\n...\nPYEOF\necho "exit=$?"', 0,
-     "near count: 149\nTraceback (most recent call last):\n  File \"<stdin>\", line 37\nIndexError: too many indices\nexit=1", 1),
-    # bash's own SIGKILL report, no echo at all (the 4-second OOM)
-    ("cd /workspace && python3 ifs_grid_oxford.py", 0,
-     "bash: line 1:   807 Killed                  python3 ifs_grid_oxford.py", 137),
-    # the last echo wins: a multi-probe script that summarises with 0
-    ('false; echo exit=$?; true; echo exit=$?', 0, "exit=1\nexit=0", 0),
-    # honest zero
-    ('python3 x.py; echo "exit=$?"', 0, "done\nexit=0", 0),
-    # no `$?` in the command → "exit=1" is data
-    ("cat crash.log", 0, "… the job said exit=1 and stopped", 0),
-    ("grep -n 'exit code: 2' build.log", 0, "12: exit code: 2", 0),
-    # a real non-zero is never lowered
-    ('python3 x.py; echo "exit=$?"', 2, "exit=0", 2),
-    # out-of-range or malformed reports are ignored
-    ('x; echo exit=$?', 0, "exit=999", 0),
-    ('x; echo exit=$?', 0, "exit=", 0),
-    # None / garbage exit codes pass through untouched
-    ('x; echo exit=$?', None, "exit=1", 1),
-    ('x; echo exit=$?', "abc", "exit=1", "abc"),
+
+@pytest.mark.parametrize("command,expected", [
+    # C9: a failure behind `;` / a `$?` echo, whatever the program printed
+    (f"{_FAIL}; echo done", 3),
+    # r1 (c): the command reads `$?` itself — no trap, it sees what it asked for
+    (f"{_FAIL}; echo $?", 0),
+    (f'{_FAIL}; echo "exit=$?"', 0),
+    (f"{_FAIL} > /tmp/_4uy_out.log; tail -3 /tmp/_4uy_out.log", 3),
+    ("python3 -c 'import nosuchmodule_xyz' 2>&1; echo done", 1),
+    ("python3 -c 'import sys; print(\"FAILED (failures=1)\"); sys.exit(1)'; ls >/dev/null", 1),   # unittest
+    # r1 (b): only a program that runs code counts behind `;`
+    ("node_missing_cmd_xyz --run; echo ok", 0),
+    ("rm /nonexistent_4uy_zz 2>/dev/null; echo ok", 0),
+    ("cp /nonexistent_4uy_zz . 2>/dev/null; echo ok", 0),
+    ("timeout 1 python3 -c 'import time; time.sleep(5)'; echo ok", 0),   # a bounded smoke run
+    ("gcc /nonexistent_4uy_zz.c 2>/dev/null; echo ok", None),          # a compiler: counts (if installed)
+    (f"for i in 1 2; do {_FAIL}; done; echo z", 3),
+    # C10: printed text is never a status
+    ("python3 -c 'print(\"0 failed, 12 passed\")'", 0),
+    ("echo 'exit code: 3'", 0),
+    ("echo 'exit=1'; echo \"$?\"", 0),
+    # handled / answered statuses
+    (f"{_FAIL} || true", 0),
+    (f"if {_FAIL}; then :; fi; echo z", 0),
+    ("ls /nonexistent_4uy_zz; echo hi", 0),
+    ("grep -q zzz /dev/null; echo after", 0),
+    ("python3 -c 'print(1)' | grep -q zzz; echo after", 0),
+    # the d6bff7a8 shape: the error path probed on purpose, read with `$?`, then more programs
+    (f'{_FAIL}; echo "exit=$?"; python3 -c "print(1)"; ls >/dev/null', 0),
+    # a pipe closed early by its reader, mid-list, is forgiven like the last one
+    ("yes | head -1; echo ok", 0),
+    (f"{_FAIL} 2>&1 | tail -1; echo x", 3),
+    # the shell's own non-zero stays
+    (_FAIL, 3),
+    ("false && true", 1),
 ])
-def test_self_reported_exit_table(command, code, output, expected):
-    assert _self_reported_exit(command, code, output) == expected
+def test_the_real_exit_code_decides(command, expected):
+    code, out = _run(command)
+    if expected is None:
+        assert code != 0, (command, out)
+    else:
+        assert code == expected, (command, out)
+    assert ex._FAILED_MARK not in out and ex._PIPESTATUS_MARK not in out
 
 
-# --- against a real shell ------------------------------------------------
-
-def test_traceback_then_echo_is_a_failure():
-    code, out = _run('python3 -c "import nosuchmodule_xyz" 2>&1; echo "exit=$?"')
-    assert "ModuleNotFoundError" in out and "exit=1" in out
-    assert code == 1
-
-
-def test_banner_variant_is_a_failure():
-    code, out = _run('false 2>&1\necho "=== exit: $? ==="')
-    assert code == 1
+def test_the_wrapper_keeps_dollar_question_mark_and_pipestatus_honest():
+    """The ERR trap must not change what the command itself sees: `$?` after a failure, and the stage
+    statuses the grep-tail trailer reads (the trap's own commands reset PIPESTATUS)."""
+    proc = subprocess.run(_bash_c(f'{_FAIL}; echo "rc=$?"'), shell=True, capture_output=True, text=True)
+    assert "rc=3" in proc.stdout
+    out, codes, failures = _take_status(subprocess.run(
+        _bash_c(f"{_FAIL} | grep zzz"), shell=True, capture_output=True, text=True).stdout)
+    assert codes == [3, 1]
 
 
-def test_honest_success_stays_zero():
-    code, _ = _run('true; echo "exit=$?"')
-    assert code == 0
+def test_take_status_strips_a_legacy_marker_and_never_reads_it():
+    """r1 (a): stdout is the user's — a printed marker is stripped from stored logs, never a status."""
+    out, codes, failures = _take_status("a\n__GHOST_FAILED=2:make all\nlate stderr line\n")
+    assert failures == []
+    assert "__GHOST_FAILED" not in out and "late stderr line" in out
 
 
-def test_data_that_looks_like_a_status_is_left_alone(tmp_path):
-    p = tmp_path / "crash.log"
-    p.write_text("worker died: exit=1\n")
-    code, out = _run(f"cat {p}")
-    assert "exit=1" in out and code == 0
+def _fake_exec(host_root, output, code, status_line=None):
+    """A sandbox stand-in: writes the run's status file (named in the wrapped command) like the EXIT trap."""
+    def run(cmd, *a, **kw):
+        m = ex._STATUS_FILE_RE.search(cmd)
+        if status_line and m:
+            d = host_root / ex.STATUS_DIRNAME
+            d.mkdir(exist_ok=True)
+            (d / m.group(1).rsplit("/", 1)[-1]).write_text(status_line + "\n")
+        return output, code
+    return run
 
-
-def test_sigkilled_child_is_reported_as_137_even_when_the_shell_says_0():
-    """bash prints its job line for a SIGKILLed foreground child and then
-    runs the trailing echo, which returns 0."""
-    code, out = _run('python3 -c "import os,signal; os.kill(os.getpid(), signal.SIGKILL)"; echo tail')
-    assert "Killed" in out, out
-    assert code == 137
-
-
-def test_pipe_forgiveness_applies_to_the_echoed_status_too():
-    """Under pipefail the echoed `$?` is the PIPELINE's raw status, so an
-    early-closed `| head -1; echo "exit=$?"` prints the SIGPIPE'd
-    producer's code (141 / 120 / 1 + BrokenPipeError). The self-report gets
-    the pipe rule's forgiveness by the same rule the shell code got."""
-    code, out = _run('python3 -c "print(\'x\\n\' * 200000)" | head -1; echo "exit=$?"')
-    assert "exit=0" not in out          # the echo really did report the SIGPIPE
-    assert code == 0
-
-
-# --- the tool result -----------------------------------------------------
 
 def _mgr(returns):
     mgr = MagicMock()
@@ -128,29 +119,37 @@ def _mgr(returns):
     return mgr
 
 
-async def test_tool_result_carries_the_reported_code(tmp_path):
-    result = await tool_execute(
-        command='pip install ecmwf-api 2>&1\necho "=== exit: $? ==="',
-        sandbox_dir=tmp_path,
-        sandbox_manager=_mgr(("ERROR: No matching distribution found\n=== exit: 1 ===", 0)))
-    assert "--- EXECUTION RESULT ---" in result
-    assert "EXIT CODE: 1" in result
-    assert "COMMAND RESULT" not in result
+async def test_tool_result_carries_the_earlier_programs_code_and_names_it(tmp_path):
+    mgr = MagicMock()
+    mgr.host_workspace = tmp_path
+    mgr.execute = MagicMock(side_effect=_fake_exec(tmp_path, "Error: Cannot find module 'x'\nok\n", 0,
+                                                   "1:1:node app.js"))
+    result = await tool_execute(command="node app.js; echo ok", sandbox_dir=tmp_path, sandbox_manager=mgr)
+    assert "EXIT CODE: 1" in str(result)
+    assert "`node app.js` earlier in it exited 1" in str(result)
+    assert not list((tmp_path / ex.STATUS_DIRNAME).iterdir())          # a foreground run's file is read once
 
 
-async def test_tool_result_without_the_echo_is_unchanged(tmp_path):
-    result = await tool_execute(
-        command="cat crash.log", sandbox_dir=tmp_path,
-        sandbox_manager=_mgr(("worker died: exit=1", 0)))
-    assert "--- COMMAND RESULT ---" in result and "EXIT CODE: 0" in result
+async def test_a_status_file_behind_a_planted_link_is_not_read(tmp_path):
+    """The status directory sits in the bind mount: a link the model planted there reads nothing."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / ("b" * 32)).write_text("9:9:python3 x.py\n")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ex.STATUS_DIRNAME).symlink_to(outside)
+    assert ex.read_status_file(ws / ex.STATUS_DIRNAME / ("b" * 32)) == []
+    (ws / ex.STATUS_DIRNAME).unlink()
+    (ws / ex.STATUS_DIRNAME).mkdir()
+    (ws / ex.STATUS_DIRNAME / ("b" * 32)).symlink_to(outside / ("b" * 32))
+    assert ex.read_status_file(ws / ex.STATUS_DIRNAME / ("b" * 32)) == []
+    assert (outside / ("b" * 32)).exists()
 
 
-async def test_tool_result_for_a_shell_reported_kill_is_137_with_the_oom_note(tmp_path):
-    result = await tool_execute(
-        command="python3 ifs_grid_oxford.py", sandbox_dir=tmp_path,
-        sandbox_manager=_mgr(("bash: line 1:   807 Killed                  python3 ifs_grid_oxford.py", 0)))
-    assert "EXIT CODE: 137" in result
-    assert "out of memory" in result
+async def test_tool_result_without_a_recorded_failure_is_unchanged(tmp_path):
+    result = await tool_execute(command="cat crash.log", sandbox_dir=tmp_path,
+                                sandbox_manager=_mgr(("worker died: exit=1\nTraceback (most recent call last):", 0)))
+    assert "--- COMMAND RESULT ---" in str(result) and "EXIT CODE: 0" in str(result)
 
 
 # --- enumeration: every model-shell adoption goes through the normaliser --
@@ -193,10 +192,11 @@ def _sandbox_adoptions(tree: ast.AST):
 
 
 def _normalisations(tree: ast.AST):
-    """(lineno, exit_name) for every `_normalise_exit(_, NAME, _)` call."""
+    """(lineno, exit_name) for every `_normalise_exit(_, NAME, …)` / `_read_shell_run(_, NAME, …)` call (§4UY:
+    the reader of one finished run, which normalises)."""
     out = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_normalise_exit":
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") in ("_normalise_exit", "_read_shell_run"):
             for a in node.args[1:2]:
                 if isinstance(a, ast.Name):
                     out.append((node.lineno, a.id))
@@ -243,22 +243,20 @@ def test_every_model_shell_adoption_is_normalised():
     un = _unnormalised(model_shell, _normalisations(tree))
     assert not un, f"sandbox exits adopted without _normalise_exit: {un}"
     assert len(model_shell) == 4, model_shell
-    assert {c for _, c, _ in model_shell} == {"cmd_str", "_remapped"}
+    assert {c for _, c, _ in model_shell} == {"cmd_str", "_re_cmd"}
 
 
-def test_pipe_rule_is_called_only_inside_the_one_normaliser():
-    """Every call to the pipe rule in the module sits inside
-    `_normalise_exit` (shell code, then the echoed code), which also calls
-    the self-report — walked on the tree, so a call hidden in a comment or
-    a string counts for nothing."""
+def test_pipe_rule_is_called_only_inside_the_normaliser_and_the_list_rule():
+    """Every call to the pipe rule sits inside `_normalise_exit` (the shell's code) or `_list_failure` (a
+    recorded failure of an earlier pipeline) — walked on the tree, so a call in a comment counts for nothing.
+    And every sandbox reader of a finished run calls `_take_status` (the marker lines are ours)."""
     module = ast.parse(inspect.getsource(ex))
     callers = {}
     for fn in ast.walk(module):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for node in ast.walk(fn):
-            if isinstance(node, ast.Call) and getattr(node.func, "id", "") in (
-                    "_normalise_pipe_exit", "_self_reported_exit"):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") in ("_normalise_pipe_exit", "_list_failure"):
                 callers.setdefault(node.func.id, []).append(fn.name)
-    assert callers["_normalise_pipe_exit"] == ["_normalise_exit", "_normalise_exit"]
-    assert callers["_self_reported_exit"] == ["_normalise_exit"]
+    assert sorted(callers["_normalise_pipe_exit"]) == ["_list_failure", "_normalise_exit"]
+    assert sorted(callers["_list_failure"]) == ["_normalise_exit", "_read_shell_run"]

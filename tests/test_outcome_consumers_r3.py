@@ -46,9 +46,10 @@ class TestADeclaredStatusIsNotReSniffed:
             'EXIT CODE: 1 ..."}}]}}'
         )
         assert ToolOutcome.ok(payload).exit_code_failed is False
-        # ...and an UNMIGRATED tool's identical text still gets the banner
-        # rule, because nobody has answered the question for it.
-        assert ToolOutcome.coerce(payload).exit_code_failed is True
+        # ...and §4UY C17: an UNMIGRATED tool's identical text no longer fails either — a banner counts only
+        # in the result's own head envelope (`outcome.envelope_exit_code`), never quoted inside a payload
+        assert ToolOutcome.coerce(payload).exit_code_failed is False
+        assert ToolOutcome.coerce("--- COMMAND RESULT ---\nEXIT CODE: 1\n" + payload).exit_code_failed is True
 
     def test_manage_projects_declares_its_successes(self):
         from ghost_agent.tools.outcome import OutcomeStatus
@@ -138,41 +139,6 @@ class TestTheUnattendedPathReadsTheStatus:
         assert _turn_had_tool_failure(
             [{"role": "tool", "content": "SUCCESS: stored"}]) is False
 
-    def test_the_coding_executor_does_not_mark_a_refused_write_applied(self):
-        """The FIFTH reader of "did this write land?", and the only one the
-        first sweep missed — four siblings were migrated and this was not,
-        which is the round-over-round pattern this work keeps reproducing.
-
-        36 live refusals slipped through on the typed path (14 `REJECTED:
-        that replace would introduce a syntax error`, 11 pre-flight guard
-        blocks, 5 empty-write blocks, 4 rejected SQL). The caller then does
-        `touched.add(path)` and advances the task — unattended — with the
-        file never written."""
-        from ghost_agent.core.coding_executor import (
-            _looks_like_write_error, _op_ok)
-        from ghost_agent.tools.outcome import ToolOutcome
-
-        for text in (
-            "REJECTED: that replace would introduce a syntax error",
-            "SYSTEM BLOCK — pre-flight guard: this exact call",
-            "SYSTEM BLOCK: SQL statement rejected by the validator",
-            "SYSTEM BLOCK: You invoked file_system operation='write' ...",
-        ):
-            refusal = ToolOutcome.rejected(text)
-            assert _looks_like_write_error(refusal) is True, text
-            assert _op_ok(refusal) is False, text
-
-        # a write that LANDED but does not parse is not a write ERROR — the
-        # file did change, and the syntax diagnostic is what reports it
-        landed = ToolOutcome.partial("SUCCESS: Wrote 10 chars to 'a.py'.",
-                                     world_changed=True)
-        assert _looks_like_write_error(landed) is False
-        assert _op_ok(landed) is True
-
-        # ADD-only: plain strings behave exactly as before
-        assert _looks_like_write_error("SUCCESS: Wrote 10 chars") is False
-        assert _op_ok("SUCCESS: Wrote 10 chars") is True
-        assert _looks_like_write_error("SYSTEM INSTRUCTION: not found") is True
 
 
     def test_the_shared_sniffer_reads_the_status_too(self):
@@ -249,6 +215,10 @@ class TestTheUnattendedPathReadsTheStatus:
             # §4RD: reads the container shell's stdout of a service launch,
             # before any tool result exists
             "_launch_redirect_failed",
+            # §4UY C9/C10: picks the exit status of a shell LIST from the
+            # bash ERR-trap marker in the raw stream, before any tool result
+            # exists (its `output` is the shell's stdout, not a result)
+            "_list_failure",
         }
 
         found = {}          # name -> (path, lineno, body)

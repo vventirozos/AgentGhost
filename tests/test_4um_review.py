@@ -136,14 +136,17 @@ def test_a_project_s_own_changelog_is_content_and_the_log_has_its_own_file(ctx, 
     assert not [p for p in ws.iterdir() if p.name.endswith(".tmp")]
 
 
-def test_a_foreign_project_changes_file_is_never_overwritten(ctx, store):
+def test_a_foreign_project_changes_file_is_kept_and_the_log_written_again(ctx, store):
+    # §4UY P10: before, a file without the header was left as it was — and the log was never rendered again
     pid, ws = _built(store)
     (ws / "PROJECT_CHANGES.md").write_text("the project's own notes\n")
     with _Owner(ctx, "req-own-2", "add a"):
         (ws / "a.js").write_text("1")
         TP.note_project_write(ctx, ws / "a.js")
     MP.flush_change_log("req-own-2", reply="ok")
-    assert (ws / "PROJECT_CHANGES.md").read_text() == "the project's own notes\n"
+    assert (ws / MP.CHANGES_FOREIGN_NAME).read_text() == "the project's own notes\n"
+    assert (ws / "PROJECT_CHANGES.md").read_text().startswith(MP.CHANGES_FILE_HEADER)
+    assert "add a" in (ws / "PROJECT_CHANGES.md").read_text()
     assert len(store.list_changes(pid)) == 1                              # the store still has it
 
 
@@ -197,7 +200,6 @@ def test_a_closed_project_reopens_only_at_a_write_tool_s_path_never_from_the_dif
 async def test_file_system_delete_and_rename_record_the_source_and_the_destination(ctx, store, tmp_path,
                                                                                    monkeypatch):
     import ghost_agent.tools.file_system as FS
-    monkeypatch.setattr(FS, "unread_delete_refusal", lambda *a, **k: None)    # §4TJ: not what this tests
     pid, ws = _built(store)
     (ws / "js").mkdir()
     (ws / "js" / "tetris.js").write_text("t")

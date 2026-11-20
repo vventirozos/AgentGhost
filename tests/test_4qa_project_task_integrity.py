@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 import pytest
 
 from ghost_agent.core import project_advancer as pa
-from ghost_agent.core.coding_executor import CodingResult, build_coding_task
+from ghost_agent.core.coding_executor import CodingResult
 from ghost_agent.core.task_deliverable import (
     declared_deliverable, deliverable_problem, hollow_document_reason, task_topic,
 )
@@ -205,49 +205,10 @@ async def test_declared_non_research_deliverable_is_not_web_searched(store, tmp_
 
 # ------------------------------------------- #2 hollow writes, existence verify
 
-class _SpecLLM:
-    def __init__(self, spec):
-        self.spec = json.dumps(spec)
-
-    async def chat_completion(self, payload, **_kw):
-        return {"choices": [{"message": {"content": self.spec}}]}
 
 
-def _disk_runner(ws, verify_output=CLEAN_PASS):
-    calls = []
-
-    async def runner(name, args):
-        calls.append((name, args))
-        if name == "file_system":
-            p = Path(ws) / args["path"]
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(args.get("content", ""), encoding="utf-8")
-            return f"Successfully wrote {args.get('path')}"
-        if name == "execute":
-            return verify_output
-        return "OK"
-
-    return runner, calls
 
 
-async def test_three_byte_document_is_refused(store, tmp_path):
-    # live: results/meta-reflection.md = "..." closed DONE on `test -f`
-    pid = store.create_project("P")
-    tid = store.add_task(pid, "Task 7.2: Reflect on observation → results/meta-reflection.md")
-    ws = store.ensure_workspace(pid)
-    ctx = _ctx(store, tmp_path, _SpecLLM({"files": [{"path": "results/meta-reflection.md", "content": "..."}],
-                                          "verify": "test -f results/meta-reflection.md",
-                                          "summary": "wrote it", "ledger": ""}))
-    runner, _ = _disk_runner(ws)
-
-    async def cls(_d):
-        return "coding"
-
-    await pa.advance_once(ctx, pid, tool_runner=runner, llm_classifier=cls,
-                          coding_executor=build_coding_task, owner_requested=True)
-    t = store.get_task(tid)
-    assert t["status"] == "FAILED"
-    assert "only a placeholder" in t["failure_reason"]
 
 
 def test_executor_floor_is_elision_only():
@@ -258,34 +219,8 @@ def test_executor_floor_is_elision_only():
     assert elided_document_reason("...", "a.py") is None
 
 
-@pytest.mark.parametrize("verify,verified", [
-    ("test -f notes.md", False),
-    ("test -s notes.md && echo 'OK'", False),
-    ("[ -f notes.md ] && ls notes.md", False),
-    ("grep -q 'measurable' notes.md", True),
-])
-async def test_existence_only_verify_is_not_verification(store, tmp_path, verify, verified):
-    pid = store.create_project("P")
-    ws = store.ensure_workspace(pid)
-    ctx = _ctx(store, tmp_path, _SpecLLM({
-        "files": [{"path": "notes.md", "content": "Observing the recursion changed it in three measurable ways."}],
-        "verify": verify, "summary": "wrote notes", "ledger": ""}))
-    runner, calls = _disk_runner(ws)
-    cres = await build_coding_task(ctx, "Write the notes", tool_runner=runner)
-    assert cres.ok is True
-    assert cres.verified is verified
-    assert any(n == "execute" for n, _ in calls)       # it still RAN
 
 
-async def test_existence_only_verify_still_fails_on_a_missing_file(store, tmp_path):
-    pid = store.create_project("P")
-    ws = store.ensure_workspace(pid)
-    ctx = _ctx(store, tmp_path, _SpecLLM({
-        "files": [{"path": "notes.md", "content": "Observing the recursion changed it in three measurable ways."}],
-        "verify": "test -f other.md", "summary": "wrote", "ledger": ""}))
-    runner, _ = _disk_runner(ws, "--- COMMAND RESULT ---\nEXIT CODE: 1\nSTDOUT/STDERR:\n")
-    cres = await build_coding_task(ctx, "Write the notes", tool_runner=runner)
-    assert cres.ok is False
 
 
 async def test_a_build_that_missed_the_declared_file_is_not_done(store, tmp_path):
@@ -1048,27 +983,8 @@ def test_owner_words_that_look_like_loop_rows_stay_in_the_arc():
         assert owner.split(":", 1)[-1].strip()[:12] in arc and "AUTO-DIAGNOSTIC" not in arc
 
 
-async def test_a_verify_only_existence_check_is_not_verified(store, tmp_path):
-    # MAJOR-3: {"files": [], "verify": "test -f …"} closed as verified
-    pid = store.create_project("P")
-    ws = store.ensure_workspace(pid)
-    (Path(ws) / "notes.md").write_text("...")
-    ctx = _ctx(store, tmp_path, _SpecLLM({"files": [], "verify": "test -f notes.md && echo OK",
-                                          "summary": "already there", "ledger": ""}))
-    runner, _ = _disk_runner(ws)
-    cres = await build_coding_task(ctx, "Write the notes", tool_runner=runner)
-    assert cres.verified is False
 
 
-@pytest.mark.parametrize("cmd,exist_only", [
-    ("echo 'running tests'\npython -m pytest -q", False),       # MAJOR-5
-    ("echo $(python t.py)", False),
-    ("ls `make`", False),
-    ("test -f a.md && echo OK", True),
-])
-def test_existence_only_is_one_plain_line(cmd, exist_only):
-    from ghost_agent.core.coding_executor import _EXISTENCE_ONLY_VERIFY_RE
-    assert bool(_EXISTENCE_ONLY_VERIFY_RE.match(cmd)) is exist_only
 
 
 @pytest.mark.usefixtures("close_ends_turn")
@@ -1197,18 +1113,6 @@ def test_a_symlinked_deliverable_is_named_as_one(tmp_path):
     assert "symbolic link" in deliverable_problem(ws, "Write it → results/r.md")
 
 
-async def test_an_append_that_leaves_only_a_placeholder_is_refused():
-    # M33: append "..." onto a missing .md wrote a 3-byte document
-    from ghost_agent.core.coding_executor import _apply_file
-    calls = []
-
-    async def runner(name, args):
-        calls.append(args.get("operation"))
-        return "Error: file not found" if args.get("operation") == "read" else "Successfully wrote"
-
-    written, why = await _apply_file(runner, {"path": "results/m.md", "append": "..."}, {})
-    assert written is None and "only a placeholder" in why
-    assert "write" not in calls
 
 
 async def test_an_old_root_file_named_like_the_folder_gets_no_note(tmp_path):
@@ -1703,10 +1607,16 @@ async def test_the_model_cannot_forge_a_brief_hash(store, tmp_path):
     f.write_text("# Owner's literature review\n")
     import hashlib
     forged = {"research/lit.md": hashlib.sha256(f.read_bytes()).hexdigest()}
-    await tool_manage_projects_for_model(_ctx(store, tmp_path), action="update", project_id=pid,
-                                         metadata={PRM.BRIEF_SHAS_META_KEY: forged, "note": "x"})
+    from ghost_agent.utils.logging import request_id_context
+    tok = request_id_context.set("req-owner-elena")   # §4UY P1: `update` is the owner's (the who-may-act gate)
+    try:
+        await tool_manage_projects_for_model(_ctx(store, tmp_path), action="update", project_id=pid,
+                                             metadata={PRM.BRIEF_SHAS_META_KEY: forged, "note": "x"})
+    finally:
+        request_id_context.reset(tok)
     meta = store.get_project(pid)["metadata"]
-    assert PRM.BRIEF_SHAS_META_KEY not in meta and meta.get("note") == "x"
+    # §4UY P1: the model's metadata is its own notes (metadata.notes) — never a system key
+    assert PRM.BRIEF_SHAS_META_KEY not in meta and meta.get("notes", {}).get("note") == "x"
     assert PRM.is_generated_brief(store, pid, "research/lit.md") is False
 
 

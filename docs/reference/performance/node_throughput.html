@@ -174,6 +174,122 @@
     "what is already running, plus me".</p>
   </div>
 
+  <h2 id="4uz">One distill at a time <span class="tag">2026-11-19 &sect;4UZ</span></h2>
+  <p><strong>What was wrong.</strong> A <code>deep_research</code> of 8 pages (probe, 2026-11-19): the first
+  three pages were sent to the worker together and each came back after about 25&nbsp;s. The next five plans
+  all read <code>distill declined (46.0s available but the smallest useful distill (6,000 chars + 128 tok)
+  needs 75.1s at 192/2 tok/s)</code>, the five pages went into the report as raw text, and the tool returned
+  after 54&nbsp;s of a 190&nbsp;s phase. A bench of the node with one prompt (about 4.9k tokens in, 200 out)
+  showed why:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>requests at once</th><th>each finished at</th><th>decode per request</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>17.5 s</td><td>48 tok/s (prefill 372)</td></tr>
+      <tr><td>3</td><td>about 48 s, all three</td><td>6&ndash;28 tok/s</td></tr>
+      <tr><td>5</td><td>61&ndash;81 s</td><td>4&ndash;40 tok/s</td></tr>
+    </tbody>
+  </table></div>
+  <p>N requests at once take N times the solo time and every answer arrives at the end. Sending pages
+  together gains nothing and delays the first result, and the interleaved decode reading it leaves
+  (a few tok/s) made the planner refuse the next batch.</p>
+  <p><strong>What happens now.</strong></p>
+  <ul>
+    <li><strong>Fetching stays parallel</strong> (3 pages at a time in deep_research, 4 in darkweb_research).
+      The fetch semaphore holds a page only while it is fetched.</li>
+    <li><strong>Distills go through one queue per worker node</strong> (<code>DistillQueue</code>, reached with
+      <code>distill_queue(llm_client)</code>). The key is the client's worker node URLs
+      (<code>worker_node_urls</code>), so a background or isolated turn, which wraps the client
+      (<code>BackgroundOnlyLLM</code>, <code>_BackgroundOnlyLLM</code>), reaches the same queue; a client
+      without nodes is keyed by the client under its wrappers (<code>unwrapped_client</code>). It is shared by
+      every call and every tool: deep_research (and
+      fact_check through it), darkweb_research, and the "nothing relevant" recheck
+      (<code>recheck_all_none</code>). It runs <code>GHOST_DISTILL_WIDTH</code> distills at a time, default 1,
+      read at call time (<code>distill_width()</code>, 1&ndash;8).</li>
+    <li><strong>Order.</strong> Among the pages whose text is ready, the best search rank goes first. A page
+      still being fetched does not hold the queue.</li>
+    <li><strong>Size.</strong> <code>DistillWave</code> plans a page when its turn comes:
+      <code>budget = (phase deadline &minus; now &minus; RESEARCH_ASSEMBLY_S) &times; min(width, waiting) &divide; waiting</code>,
+      at most <code>GHOST_WEB_SUMMARY_S</code>. <code>waiting</code> counts the pages of this call not yet
+      distilled, those still being fetched too; a page whose fetch failed stops counting. With time to
+      spare a page gets a large distill; with little, a smaller one.</li>
+    <li><strong>The floor.</strong> A refused plan now says the smallest budget it would accept
+      (<code>DistillPlan.min_budget_s</code>). When a page's share is below it and it still fits before the
+      deadline, the page gets exactly that. So a short phase distills the best-ranked pages at the smallest
+      useful size, and only the rest stay raw text. A page waiting when the time ends keeps its raw text
+      and its log line says "no time left to distil after the page loaded"; no source is dropped.</li>
+    <li><strong>Headroom.</strong> The budget is the call's hard time limit. The plan is sized for
+      <code>BUDGET_UTILISATION</code> (85%) of it, so a node up to about 1.5&times; slower than its own
+      figures still finishes.</li>
+    <li><strong>A timeout teaches.</strong> Only a call whose time limit fired counts
+      (<code>is_distill_timeout</code>: a <code>TimeoutError</code>, a client's own timeout class, or
+      <code>OffMainNodeUnavailable.timed_out</code>, which the client sets when a worker's request timed out).
+      A reset connection, a malformed answer or a refused permit changes nothing, however late it came.
+      A timeout returns no <code>timings</code>, so the wave (<code>DistillWave.report</code>) tells the
+      tracker what was asked and how long it did not fit in
+      (<code>LLMClient.note_distill_timeout</code> → <code>NodeThroughput.observe_timeout</code>: both plan
+      rates scaled down so the request would have ended exactly at the limit). The burned time is the caller's
+      wall time; a wait at the node's own gate is inside it and cannot be separated from outside the client.
+      The wave also halves the size of every later plan, again after each further timeout, down to the
+      planner's smallest plan (6,000 chars + 128 tok). A success does not restore the size within the call.</li>
+    <li><strong>The smallest plan's time limit</strong> is the page's share. When the share is below what
+      funds the smallest plan with headroom (minimum &divide; 0.85, about 13&nbsp;s at the measured rates),
+      the limit is that figure, taken at the rates the wave started with: a timeout does not raise the next
+      limit.</li>
+    <li><strong>When the wave gives up.</strong> When the smallest plan has timed out twice in a row
+      (<code>WAVE_MAX_TIMEOUTS</code>), each time with real slack: a limit of at least
+      <code>GIVE_UP_SLACK</code> = 2 &times; what the plan was expected to take at the rates the wave started
+      with. A timeout without slack still shrinks and teaches, and the wave goes on to the next page. The
+      wave also gives up after four timeouts in a row of any kind with no success between them
+      (<code>WAVE_MAX_ANY_TIMEOUTS</code>): a cold tracker plans from the priors, a share is only about
+      1.5&times; what they predict, and the slack rule alone never fired there. Once the wave has given up,
+      the pages still waiting keep their raw text at once.</li>
+    <li><strong>Simulated outcomes</strong> (virtual clock, 8 pages, node wall time as a multiple of its
+      reported rates; "warm" = the node's rates already measured):
+      <div class="scroll"><table>
+        <thead><tr><th>node</th><th>cold</th><th>warm</th></tr></thead>
+        <tbody>
+          <tr><td>1.0&times;</td><td>8 of 8, 166 s</td><td>8 of 8, 167 s</td></tr>
+          <tr><td>1.4&times;</td><td>8 of 8, 182 s</td><td>8 of 8, 182 s</td></tr>
+          <tr><td>1.5&times;</td><td>8 of 8, 185 s</td><td>8 of 8, 184 s</td></tr>
+          <tr><td>1.75&times;</td><td>7 of 8, 143 s</td><td>7 of 8, 143 s</td></tr>
+          <tr><td>2.0&times;</td><td>7 of 8, 156 s</td><td>7 of 8, 157 s</td></tr>
+          <tr><td>2.5&times;</td><td>7 of 8, 171 s</td><td>7 of 8, 171 s</td></tr>
+          <tr><td>3.0&times;, 4.0&times;, hung</td><td>0 of 8, 94 s (4 timeouts, gave up)</td><td>0 of 8, 71 s (3 timeouts, gave up)</td></tr>
+          <tr><td>4&times; for the first 40 s, then healthy; caller bound 100 s</td><td>&ndash;</td><td>5 of 8, 82 s (healthy: 8 of 8, 82 s)</td></tr>
+        </tbody>
+      </table></div></li>
+    <li><strong>Accepted limits.</strong>
+      <ul>
+        <li>A pessimistic reading from a timeout stays in the tracker and makes the next one to three calls
+          plan smaller, until solo readings and the slow tracker's half-life relax it (review n3).</li>
+        <li>The queue is keyed by the exact set of worker node URLs. Two clients whose node sets overlap but
+          differ get separate queues (review n4).</li>
+        <li>Two research calls sharing a node also share its speed readings: timeouts in one call make the
+          other call's summaries smaller (each call still counts its own timeouts for giving up) (review n5).</li>
+        <li>After a timeout the summaries of that call stay at the reduced size even when later pages
+          succeed; the next call starts from the tracker's readings (review n6).</li>
+      </ul></li>
+    <li><strong>The queue allowance.</strong> With width 1 the plan gets the whole budget: a distill no longer
+      waits behind its own call at the node's gate. With a wider queue the plan keeps
+      <code>_QUEUE_ALLOWANCE_S</code> out of the budget and declares the width as its concurrency, as before.</li>
+    <li><strong>What the slow tracker learns.</strong> A reading taken at a concurrency above the queue's width
+      updates the mean rate only. It no longer drops the slow tracker, which is what vetoed the plans above:
+      such a reading is converted to a solo figure by a two-point model this node does not follow. A solo
+      reading still drops the tracker at once, so a node that is slow on its own is planned for as before;
+      with the width at 3, a 3-way reading counts as before. A node that has given only above-width
+      readings is planned from the prior rates, not from their mean.</li>
+    <li><strong>Cancel.</strong> The queue starts no tasks. A waiting page is a future inside the caller's
+      task, so cancelling the call removes it; a turn granted in the same loop step is given back.</li>
+    <li><strong>Log.</strong> One <code>distill plan</code> line per call when its first page is planned:
+      pages to distill, seconds left, seconds per page, the ceiling and the width.</li>
+  </ul>
+  <p><strong>Cost.</strong> A call now uses the time it has. By the plan arithmetic at the bench rates, eight pages
+  that all load are distilled in about 150&ndash;175&nbsp;s (simulated in the tests, not yet measured
+  live; before: 54&nbsp;s with three distilled). Lower
+  <code>GHOST_RESEARCH_PHASE_S</code> for shorter calls with smaller distills.</p>
+  <p><strong>Pins:</strong> <code>tests/test_4uz_research_distill.py</code> (a virtual clock and a worker
+  that does not scale with parallel requests); mutants in <code>scripts/mutate_4uz.py</code>.</p>
+
   <p>Samples are normalised the other way, back to a solo equivalent, so a rate
   measured under load is not penalised twice. Two subtleties that cost real
   debugging:</p>
@@ -213,7 +329,7 @@
       <tr><td><code>LLMClient.plan_distill()</code></td><td>Picks the pool's most conservative feasible plan &mdash; we do not know which node round-robin will hand us.</td></tr>
       <tr><td><code>LLMClient._on_node_success()</code></td><td>The one place a healthy pool response is recorded: breaker reset <em>and</em> throughput sample.</td></tr>
       <tr><td><code>LLMClient._node_capacity()</code></td><td>Records the node's per-slot <code>n_ctx</code> from the <code>/props</code> probe it already runs.</td></tr>
-      <tr><td><code>tools/search.py</code>, <code>tools/darkweb_search.py</code></td><td>Size each per-source distillation; decline when the clock cannot pay for one.</td></tr>
+      <tr><td><code>tools/search.py</code>, <code>tools/darkweb_search.py</code></td><td>Size each per-source distillation; decline when the clock cannot pay for one. &sect;4UZ: through <code>DistillWave</code>, one at a time by default (<a href="#4uz">below</a>).</td></tr>
     </tbody>
   </table></div>
 
@@ -237,8 +353,9 @@
       <tr><td><code>GHOST_NODE_PREFILL_TOK_S</code></td><td>200</td><td>Prior prefill rate for an unmeasured node.</td></tr>
       <tr><td><code>GHOST_NODE_DECODE_TOK_S</code></td><td>26</td><td>Prior decode rate for an unmeasured node.</td></tr>
       <tr><td><code>GHOST_RESEARCH_PHASE_S</code></td><td>190</td><td>Backstop on a whole research call's fetch+distill phase. It must fund <code>(waves&minus;1) &times; per-URL + the start floor</code> &mdash; a pin fails if that ratio drifts, which is how a container that grew 25% while its consumer grew 45% came to ship.</td></tr>
-      <tr><td><code>GHOST_PER_URL_S</code></td><td>80</td><td>Ceiling on one URL: fetch (&le;2 circuits) + distillation.</td></tr>
-      <tr><td><code>GHOST_WEB_SUMMARY_S</code></td><td>65</td><td>Leash on one distillation. 45s could not fund a 4-way distill (53.6s of work), and this deployment runs at 4-way because the critic pool shares the worker's box.</td></tr>
+      <tr><td><code>GHOST_PER_URL_S</code></td><td>80</td><td>Ceiling on one URL's fetch (&le;2 circuits). &sect;4UZ: the distillation is no longer inside it.</td></tr>
+      <tr><td><code>GHOST_DISTILL_WIDTH</code></td><td>1</td><td>&sect;4UZ: how many page distills the worker runs at once, across all research calls (1&ndash;8; read at call time). Raise it only for a node that scales with parallel requests.</td></tr>
+      <tr><td><code>GHOST_WEB_SUMMARY_S</code></td><td>65</td><td>Ceiling on one distillation. &sect;4UZ: a page's budget is its share of the time the phase has left, at most this.</td></tr>
     </tbody>
   </table></div>
   <p>A malformed value falls back to the default rather than to zero &mdash; a <code>0</code>

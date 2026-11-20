@@ -17,7 +17,8 @@ from unittest.mock import patch, MagicMock
 from src.ghost_agent.tools.search import (
     _sanitize_query,
     _RACE_ENGINES,
-    _TOR_BACKENDS,
+    _circuit_salt,
+    _engine_spec,
     _cache_get,
     _cache_put,
     _proxy_for_attempt,
@@ -29,8 +30,9 @@ from src.ghost_agent.tools.search import (
 # 1. Engine race set
 # --------------------------------------------------------------------------
 def test_broken_engines_excluded_and_race_set_wide():
-    """`wikipedia` stays excluded: region='wt-wt' makes its engine build the
-    non-existent host `wt.wikipedia.org` (always a ConnectError over Tor).
+    """`wikipedia` is never RACED (§4VA: it is the table's supplement, fetched
+    by search.py itself — ddgs's own wikipedia engine builds the non-existent
+    host `wt.wikipedia.org` for region='wt-wt').
     `grokipedia` is a typeahead API — 0/6 on real queries. Everything else
     is IN, including `yahoo` (re-measured 2026-07-08: it now fails FAST,
     ~1.4-2.2s, instead of hanging, and actually won a probe). With ~10%
@@ -47,8 +49,11 @@ def test_broken_engines_excluded_and_race_set_wide():
     # 18 s budget sized every failed wave — retired, see search.py.
     assert "mojeek" not in _RACE_ENGINES
     assert "google" not in _RACE_ENGINES
-    # Legacy comma-joined constant stays derived from the race set.
-    assert _TOR_BACKENDS == ",".join(_RACE_ENGINES)
+    # §4VA: the race set is DERIVED from the one engine table (the legacy
+    # comma-joined `_TOR_BACKENDS` had no reader and is gone)
+    from src.ghost_agent.tools.search import ENGINE_TABLE
+    assert _RACE_ENGINES == tuple(n for n, s in ENGINE_TABLE.items() if s.kind != "supplement")
+    assert ENGINE_TABLE["wikipedia"].kind == "supplement"
 
 
 def test_race_gives_each_engine_its_own_circuit():
@@ -57,8 +62,10 @@ def test_race_gives_each_engine_its_own_circuit():
     must yield a distinct SOCKS identity per engine for the same
     (query, wave) — and distinct across waves for the same engine."""
     base = "socks5h://127.0.0.1:9050"
-    per_engine = {_proxy_for_attempt(base, "q", 0, salt=e[:4]) for e in _RACE_ENGINES}
-    assert len(per_engine) == len(_RACE_ENGINES)
+    # §4VA: …and every CIRCUIT of an engine raced on several its own identity
+    attempts = [(e, c) for e in _RACE_ENGINES for c in range(_engine_spec(e).circuits)]
+    per_attempt = {_proxy_for_attempt(base, "q", 0, salt=_circuit_salt(e, c)) for e, c in attempts}
+    assert len(per_attempt) == len(attempts) > len(_RACE_ENGINES)
     assert _proxy_for_attempt(base, "q", 0, salt="moje") != _proxy_for_attempt(base, "q", 1, salt="moje")
 
 

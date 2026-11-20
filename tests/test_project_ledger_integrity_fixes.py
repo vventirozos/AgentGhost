@@ -38,10 +38,7 @@ from ghost_agent.tools.projects import (
     _recheck_stale_parse_failure,
 )
 from ghost_agent.core.planning import ProjectPlan, TaskStatus, TaskTree
-from ghost_agent.core.coding_executor import (
-    build_coding_task, _py_parse_error, _py_append_guard,
-    _task_named_existing, _render_already_built, _generate_build_spec,
-)
+from ghost_agent.core.coding_executor import build_coding_task
 
 
 VALID_PY = (
@@ -306,41 +303,16 @@ async def test_task_next_names_parked_failed_tasks(context):
 # ===================================================================== D1
 # The coding executor must never corrupt a working Python file.
 
-def test_py_parse_error_roundtrip():
-    assert _py_parse_error(VALID_PY) is None
-    assert "indent" in (_py_parse_error(BROKEN_PY) or "")
 
 
-def test_py_append_guard_refuses_duplicate_implementation():
-    snippet = "def demo():\n    print('again')\n"
-    reason = _py_append_guard(VALID_PY, snippet, "core.py")
-    assert reason and "RE-DEFINES" in reason and "demo" in reason
 
 
-def test_py_append_guard_refuses_second_main_block():
-    snippet = "if __name__ == \"__main__\":\n    print('run')\n"
-    reason = _py_append_guard(VALID_PY, snippet, "core.py")
-    assert reason and "__main__" in reason
 
 
-def test_py_append_guard_refuses_merge_that_breaks_parse():
-    snippet = "def extra():\n      return 1\n    return 2\n"
-    reason = _py_append_guard(VALID_PY, snippet, "core.py")
-    assert reason and "would not parse" in reason
 
 
-def test_py_append_guard_allows_clean_extension():
-    snippet = "def save_model(path):\n    return path\n"
-    assert _py_append_guard(VALID_PY, snippet, "core.py") is None
 
 
-def test_py_append_guard_skips_broken_base_and_non_py():
-    # Mid-repair file: keep the old flow (post-write check reports it).
-    assert _py_append_guard(BROKEN_PY, "def demo():\n    pass\n",
-                            "core.py") is None
-    # Non-Python: HTML appends are isolated by design, not guarded here.
-    assert _py_append_guard("<html></html>", "def x():\n    pass\n",
-                            "index.html") is None
 
 
 class _SpecLLM:
@@ -418,43 +390,10 @@ async def test_build_refuses_broken_overwrite_of_working_py():
     assert runner.files["core.py"] == VALID_PY
 
 
-async def test_verify_only_spec_survives_reasoning_channel():
-    """A verify-only spec ('the deliverable already exists — prove it') in
-    the content channel must not be clobbered by reasoning-channel noise,
-    and must close the build with no writes."""
-    verify_only = json.dumps({"files": [], "verify": "python3 core.py",
-                              "summary": "core.py already implements this"})
-    llm = _SpecLLM(verify_only, reasoning="thinking about it…")
-    runner = _DiskRunner(files={"core.py": VALID_PY})
-    res = await build_coding_task(
-        _ctx(llm), "Implement: core.py - The AI model core",
-        tool_runner=runner, existing_files={"core.py": VALID_PY})
-    assert res.ok
-    assert res.files == []
-    assert runner.writes() == []
 
 
-def test_task_named_existing_matches_basename():
-    existing = {"core.py": VALID_PY, "research/notes.md": "notes"}
-    assert _task_named_existing(
-        "Implement: core.py - The AI model core", existing) == ["core.py"]
-    assert _task_named_existing("Implement: train.py", existing) == []
-    assert "ALREADY ON DISK" in _render_already_built(
-        "Implement: core.py - the core", existing)
-    assert _render_already_built("Design the architecture", existing) == ""
 
 
-async def test_spec_prompt_carries_already_built_steer():
-    verify_only = json.dumps({"files": [], "verify": "python3 core.py",
-                              "summary": "exists"})
-    llm = _SpecLLM(verify_only)
-    spec, was_empty = await _generate_build_spec(
-        llm, "m", "Implement: core.py - The AI model core", "",
-        existing_files={"core.py": VALID_PY})
-    assert not was_empty
-    assert spec.get("verify") == "python3 core.py"
-    assert "ALREADY ON DISK" in llm.prompts[0]
-    assert "core.py" in llm.prompts[0]
 
 
 # ===================================================================== D5
@@ -543,19 +482,6 @@ def test_parse_candidates_survive_marker_prefix_phrasing(context):
     assert [p.name for p in paths] == ["core.py"]
 
 
-async def test_verify_only_spec_with_kill_command_is_refused():
-    """files:[] + a kill-shaped verify would otherwise close the task with
-    ZERO checks (_run_verify skips kill verifies as a pass)."""
-    killer = json.dumps({"files": [],
-                         "verify": "pkill -f server; curl localhost:8000",
-                         "summary": "already running"})
-    runner = _DiskRunner(files={"core.py": VALID_PY})
-    res = await build_coding_task(
-        _ctx(_SpecLLM(killer)), "Implement: core.py",
-        tool_runner=runner, existing_files={"core.py": VALID_PY})
-    assert not res.ok
-    assert "verify-only spec refused" in res.summary
-    assert runner.writes() == []
 
 
 def test_parent_cascade_done_clears_stale_failure_reason():

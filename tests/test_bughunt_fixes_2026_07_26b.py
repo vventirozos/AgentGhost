@@ -27,31 +27,6 @@ from unittest.mock import MagicMock
 # coding_executor anchored classifiers
 # --------------------------------------------------------------------------
 
-class TestOpOkAnchored:
-    def test_failed_replace_on_success_named_file_is_not_ok(self):
-        from ghost_agent.core.coding_executor import _op_ok
-        out = ("SYSTEM INSTRUCTION: The search block was NOT found in "
-               "'payment_success.html'. Your remembered old_text does not "
-               "byte-match the current file.")
-        assert _op_ok(out) is False
-
-    def test_real_success_is_ok(self):
-        from ghost_agent.core.coding_executor import _op_ok
-        assert _op_ok("SUCCESS: Applied 2 SEARCH/REPLACE blocks to 'x.py'.")
-        assert _op_ok("SUCCESS: Wrote 40 chars to 'login_success.js'.")
-
-    def test_rejected_is_not_ok(self):
-        from ghost_agent.core.coding_executor import _op_ok
-        assert _op_ok("REJECTED: that replace would have written markers") is False
-
-    def test_write_error_security_is_anchored(self):
-        from ghost_agent.core.coding_executor import _looks_like_write_error
-        # A SUCCESS write to a file whose NAME contains the words is not an error.
-        assert _looks_like_write_error(
-            "SUCCESS: Wrote 12 chars to 'security error handler.py'.") is False
-        # A real security-error head IS an error.
-        assert _looks_like_write_error(
-            "Security Error: Path '../x' attempts to access outside sandbox.")
 
 
 # --------------------------------------------------------------------------

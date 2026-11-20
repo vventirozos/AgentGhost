@@ -37,7 +37,12 @@ concurrency changes — the failure mode of a hand-tuned constant
 from __future__ import annotations
 
 import os
+import asyncio
+import contextlib
+import heapq
+import itertools
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -147,6 +152,35 @@ SLOW_HALF_LIFE_S = 120.0
 # before trusting either curve outside 1..4.
 DECODE_CONCURRENCY_EXP = 1.0
 PREFILL_CONCURRENCY_EXP = 0.5
+
+# ── How many distills run at once (§4UZ) ───────────────────────────────────
+# ⚠ THIS NODE DOES NOT SCALE WITH PARALLEL REQUESTS. Measured 2026-11-19 on
+# the worker (llama.cpp, 4 slots), one ~4.9k-token prompt + 200 tokens out:
+#
+#     1 request   : 17.5 s            (prefill 372 tok/s, decode 48 tok/s)
+#     3 at once   : every one done at ~48 s   (decode 6-28 tok/s each)
+#     5 at once   : done at 61-81 s           (decode 4-40 tok/s each)
+#
+# N at once take N x the solo time and every answer arrives at the END, so a
+# fan-out buys nothing and delays the first result. It also taught the slow
+# tracker an interleaved "decode" of a few tok/s, and the next batch of plans
+# was declined whole (probe 11-19: 3 pages distilled, 5 declined, the tool
+# back after 54 s of a 190 s phase). Distills therefore go through ONE queue
+# (`DistillWave` / `distill_queue`), this many at a time. Read at CALL time.
+DISTILL_WIDTH_DEFAULT = 1
+DISTILL_WIDTH_MAX = 8
+
+
+def distill_width() -> int:
+    """How many distills the shared queue runs at once (`GHOST_DISTILL_WIDTH`,
+    default 1 = one at a time). Anything unparseable or below 1 is the default."""
+    try:
+        raw = (os.environ.get("GHOST_DISTILL_WIDTH") or "").strip()
+        w = int(raw) if raw else DISTILL_WIDTH_DEFAULT
+    except (TypeError, ValueError):
+        return DISTILL_WIDTH_DEFAULT
+    return min(DISTILL_WIDTH_MAX, w) if w >= 1 else DISTILL_WIDTH_DEFAULT
+
 
 # Sanity bounds on a learned rate. A backend that reports a bogus `timings`
 # block (a bool `prompt_ms`, a JSON `Infinity`) would otherwise poison the
@@ -294,6 +328,10 @@ class DistillPlan:
     decode_measured: bool = False
     #: Chars-per-token the plan was sized with (learned, not the constant).
     density: float = CHARS_PER_TOKEN
+    #: §4UZ: on a refusal for lack of TIME, the smallest budget that would
+    #: have been accepted at the same rates (0 = not that kind of refusal).
+    #: `DistillWave` floors a page's share at this.
+    min_budget_s: float = 0.0
 
     def describe(self) -> str:
         """One line for the operator stream. Says the NUMBERS, not a verdict."""
@@ -423,8 +461,21 @@ class NodeThroughput:
         slow_at_p = cur[5] if cur and len(cur) > 5 else self._now()
         slow_at_d = cur[6] if cur and len(cur) > 6 else self._now()
 
+        # ⚠ §4UZ: A READING TAKEN ABOVE THE QUEUE'S WIDTH TEACHES THE MEAN,
+        # NOT THE SLOW TRACKER. The slow tracker is "the worst this node did
+        # in the regime plans are made for"; a sample from N interleaved
+        # requests is turned into a solo figure by a two-point model
+        # (`rate * N^exp`) that this node does not follow (N at once: decode
+        # 4-40 tok/s per request), and one such figure — 6 tok/s where the
+        # node alone does 48 — vetoed every plan of the next batch. With the
+        # width at 3 a 3-way reading is still the planned regime and still
+        # counts; a node that is slow ALONE still drops the tracker at once.
+        _in_regime = max(1, int(concurrency or 1)) <= distill_width()
+
         def _slow(prev, sample):
             """Fall to a worse reading at once; climb back only slowly."""
+            if not _in_regime:
+                return prev
             if prev is None or sample < prev:
                 return sample
             return prev * (1 - SLOW_RECOVERY_BETA) + sample * SLOW_RECOVERY_BETA
@@ -439,7 +490,7 @@ class NodeThroughput:
                 prefill = rate if prefill is None else (
                     self.alpha * rate + (1 - self.alpha) * prefill)
                 slow_prefill = _slow(slow_prefill, rate)
-                if slow_prefill == rate:
+                if _in_regime and slow_prefill == rate:
                     slow_at_p = self._now()
                 learned = True
 
@@ -453,7 +504,7 @@ class NodeThroughput:
                 decode = rate if decode is None else (
                     self.alpha * rate + (1 - self.alpha) * decode)
                 slow_decode = _slow(slow_decode, rate)
-                if slow_decode == rate:
+                if _in_regime and slow_decode == rate:
                     slow_at_d = self._now()
                 learned = True
 
@@ -462,6 +513,37 @@ class NodeThroughput:
                                      slow_prefill, slow_decode,
                                      slow_at_p, slow_at_d]
         return learned
+
+    def observe_timeout(self, node_url: str, prompt_tokens: float,
+                        max_tokens: float, burned_s: float,
+                        concurrency: int = 1) -> bool:
+        """§4UZ (review r1): a distill ran into its time limit — learn from it.
+
+        A timeout returns no ``timings``, so the next page was planned from
+        the same rates and timed out the same way (a node 1.5x slower than
+        its own figures: 1 page distilled, 7 burned their whole share). What
+        is known is the work asked for and the time it did NOT fit in: the
+        node is at most as fast as would have finished exactly at the limit.
+        Both planning rates are scaled down by that one factor and folded in
+        as an ordinary reading, so the slow tracker drops at once.
+        """
+        try:
+            p_n, d_n, burned = float(prompt_tokens), float(max_tokens), float(burned_s)
+        except (TypeError, ValueError):
+            return False
+        if not node_url or burned <= 0 or p_n <= 0 or d_n <= 0:
+            return False
+        prefill, decode, _ = self.plan_rates(node_url)
+        prefill = self._scale(prefill, concurrency, PREFILL_CONCURRENCY_EXP, to_solo=False)
+        decode = self._scale(decode, concurrency, DECODE_CONCURRENCY_EXP, to_solo=False)
+        believed = p_n / prefill + d_n / decode
+        f = min(1.0, believed / burned)
+        return self.observe(node_url, {"timings": {
+            "prompt_n": max(p_n, MIN_PREFILL_SAMPLE_TOKENS),
+            "prompt_ms": 1000.0 * max(p_n, MIN_PREFILL_SAMPLE_TOKENS) / (prefill * f),
+            "predicted_n": max(d_n, MIN_DECODE_SAMPLE_TOKENS),
+            "predicted_ms": 1000.0 * max(d_n, MIN_DECODE_SAMPLE_TOKENS) / (decode * f),
+        }}, concurrency=concurrency)
 
     def note_context(self, node_url: str, n_ctx: Any) -> None:
         """Record a node's advertised per-slot context window."""
@@ -510,14 +592,24 @@ class NodeThroughput:
                 return 1.0
             return 0.5 ** (max(0.0, self._now() - at) / SLOW_HALF_LIFE_S)
 
-        def _eff(slow, mean, at):
+        # ⚠ §4UZ (review r1): READINGS TAKEN ABOVE THE QUEUE'S WIDTH NEVER SET
+        # A PLAN RATE ON THEIR OWN. A record written by `observe` (7 fields)
+        # whose slow reading is still None has heard ONLY such readings for
+        # that half; their mean is a figure the scaling model cannot convert
+        # (a cold 3-way reading vetoed the first solo plan; a 5-way history
+        # planned 768 tok). Plan from the prior until the node has answered
+        # once in the planned regime. (A record seeded with rates only — 3
+        # fields — keeps the mean, as before.)
+        observed = len(cur) > 3
+
+        def _eff(slow, mean, at, prior):
             if slow is None:
-                return mean
+                return prior if observed else mean
             w = _weight(at)
             return slow * w + mean * (1.0 - w)
 
-        return (_eff(slow_prefill, mean_prefill, slow_at_p),
-                _eff(slow_decode, mean_decode, slow_at_d),
+        return (_eff(slow_prefill, mean_prefill, slow_at_p, self.default_prefill_tok_s),
+                _eff(slow_decode, mean_decode, slow_at_d, self.default_decode_tok_s),
                 samples)
 
     def measured(self, node_url: str) -> Tuple[bool, bool]:
@@ -621,10 +713,10 @@ class NodeThroughput:
             ctx_chars = int(max(0, ctx - CTX_RESERVE_TOKENS - max_tokens) * k)
         ceil_chars = max(0, min(max_chars, ctx_chars))
 
-        def _refuse(reason: str) -> DistillPlan:
+        def _refuse(reason: str, min_budget_s: float = 0.0) -> DistillPlan:
             return DistillPlan(0, 0, False, reason, prefill_rate, decode_rate,
                                samples, 0.0, prefill_measured,
-                               decode_measured, k)
+                               decode_measured, k, min_budget_s)
 
         if ceil_chars < min_chars:
             return _refuse(
@@ -642,19 +734,20 @@ class NodeThroughput:
         # the smallest thing that fits.
         usable = float(budget_s) - SAFETY_MARGIN_S
         spendable = usable * BUDGET_UTILISATION
-        if usable <= 0:
-            return _refuse(f"only {budget_s:.1f}s of budget left")
-
         # Cost of the smallest request worth making.
         floor_prefill_s = (min_chars / k) / prefill_rate
         floor_decode_s = min_tokens / decode_rate
         floor_cost = floor_prefill_s + floor_decode_s
+        _least = floor_cost + SAFETY_MARGIN_S          # §4UZ: `min_budget_s`
+        if usable <= 0:
+            return _refuse(f"only {budget_s:.1f}s of budget left", _least)
+
         if floor_cost > usable:
             return _refuse(
                 f"{usable:.1f}s available but the smallest useful distill "
                 f"({min_chars:,} chars + {min_tokens} tok) needs "
                 f"{floor_cost:.1f}s at {prefill_rate:.0f}/{decode_rate:.0f} "
-                f"tok/s")
+                f"tok/s", _least)
 
         surplus = max(0.0, spendable - floor_cost)
         prefill_s = floor_prefill_s + surplus * SURPLUS_TO_PREFILL
@@ -684,3 +777,397 @@ def log_plan(label: str, plan: DistillPlan) -> None:
                    icon=Icons.NODE_WORKER if plan.feasible else Icons.WARN)
     except Exception:  # noqa: BLE001 — telemetry must never break a call
         pass
+
+
+# ── The distill queue (§4UZ) ───────────────────────────────────────────────
+# ONE implementation for every tool that sends page distills to the worker
+# (deep_research, fact_check through it, darkweb_research, the "nothing
+# relevant" recheck). Fetching stays parallel in the tools; what is serialised
+# here is the worker's time.
+
+class DistillQueue:
+    """Who distills next on one client's worker pool: `distill_width()` at a
+    time, lowest rank first among those waiting. No tasks of its own — a
+    waiter is a future inside the caller's task, so cancelling the caller
+    removes it and nothing is started afterwards."""
+
+    def __init__(self, loop=None) -> None:
+        self.loop = loop
+        self.running = 0
+        self._waiters: list = []
+        self._seq = itertools.count()
+
+    def _wake(self) -> None:
+        while self._waiters and self.running < distill_width():
+            _, _, fut = heapq.heappop(self._waiters)
+            if fut.done():                  # timed out or cancelled while it waited
+                continue
+            self.running += 1
+            fut.set_result(True)
+
+    async def acquire(self, rank: float = 0, timeout: Optional[float] = None) -> bool:
+        """Wait for a turn. True = it is yours (call `release`); False = the
+        timeout passed first."""
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        heapq.heappush(self._waiters, (rank, next(self._seq), fut))
+        self._wake()
+        handle = None
+        if not fut.done() and timeout is not None:
+            handle = loop.call_later(
+                max(0.0, float(timeout)),
+                lambda: fut.done() or fut.set_result(False))
+        try:
+            return await fut
+        except BaseException:
+            # cancelled: a turn granted in the same loop step goes back
+            if fut.done() and not fut.cancelled() and fut.result() is True:
+                self.release()
+            else:
+                fut.cancel()
+            raise
+        finally:
+            if handle is not None:
+                handle.cancel()
+
+    def release(self) -> None:
+        self.running = max(0, self.running - 1)
+        self._wake()
+
+    @contextlib.asynccontextmanager
+    async def slot(self, rank: float = 0, timeout: Optional[float] = None):
+        """``async with queue.slot(rank, timeout) as mine:`` — `mine` is False
+        when the timeout passed before a turn came."""
+        mine = await self.acquire(rank, timeout)
+        try:
+            yield mine
+        finally:
+            if mine:
+                self.release()
+
+
+_QUEUES: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_NODE_QUEUES: Dict[tuple, DistillQueue] = {}
+#: attributes a wrapper keeps the client it wraps under (`BackgroundOnlyLLM`,
+#: `_BackgroundOnlyLLM`: ``_inner``)
+_WRAPPED_CLIENT_ATTRS = ("_inner",)
+
+
+def worker_node_urls(llm_client: Any) -> tuple:
+    """The worker node URLs this client sends a distill to (sorted; empty when it has none or is not
+    a real client). Read through any wrapper: they delegate attribute reads."""
+    try:
+        pool = getattr(llm_client, "worker_clients", None)
+        if not isinstance(pool, (list, tuple)):
+            return ()
+        return tuple(sorted({str(n["url"]) for n in pool if isinstance(n, dict) and n.get("url")}))
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def unwrapped_client(llm_client: Any) -> Any:
+    """The client under its wrappers (a background or isolated turn wraps it)."""
+    seen = 0
+    while seen < 8:
+        try:
+            inner = next((vars(llm_client)[a] for a in _WRAPPED_CLIENT_ATTRS
+                          if a in vars(llm_client)), None)
+        except TypeError:
+            break
+        if inner is None:
+            break
+        llm_client, seen = inner, seen + 1
+    return llm_client
+
+
+def distill_queue(llm_client: Any) -> DistillQueue:
+    """The ONE queue of the worker node(s) this client distills on, on the
+    running loop — shared by every call, every tool and every wrapper of the
+    client. Keyed by what is actually shared: the worker node URLs (review r1:
+    a background or isolated turn WRAPS the client, and a queue keyed by the
+    client object gave each wrapper its own — two tools distilled at once
+    again). A client without worker nodes (a test double) is keyed by the
+    client under its wrappers; one that cannot be a weak key gets a queue of
+    its own for the call."""
+    loop = asyncio.get_running_loop()
+    urls = worker_node_urls(llm_client)
+    if urls:
+        q = _NODE_QUEUES.get(urls)
+        if q is None or q.loop is not loop:
+            q = _NODE_QUEUES[urls] = DistillQueue(loop)
+        return q
+    base = unwrapped_client(llm_client)
+    try:
+        q = _QUEUES.get(base)
+        if q is None or q.loop is not loop:
+            q = _QUEUES[base] = DistillQueue(loop)
+        return q
+    except TypeError:
+        return DistillQueue(loop)
+
+
+#: why a page got no plan although nothing went wrong (`DistillTurn.note`)
+NO_TIME_NOTE = "no time left to distil after the page loaded"
+GAVE_UP_NOTE = ("the worker kept running into its time limit (twice in a row on the smallest distill "
+                "with time to spare, or four times in a row) — the remaining pages are not distilled")
+
+#: §4UZ (review r1/r2): consecutive MINIMUM-size distills that hit their time
+#: limit before a wave stops asking. A larger plan that times out is not a
+#: reason to stop — the next one is smaller (a node that is merely busy, 2x
+#: slower than its figures, finishes the smallest plan in half a share).
+WAVE_MAX_TIMEOUTS = 2
+#: ... and timeouts in a row of ANY kind, with no success between them, that
+#: end the wave regardless of slack. A cold tracker plans from the priors, and
+#: a share is only ~1.5x what they predict, so the slack rule never fires:
+#: a hung or 3x-slow node burned all eight shares (187 s).
+WAVE_MAX_ANY_TIMEOUTS = 4
+#: §4UZ (review r2): a minimum-size timeout counts toward giving up only when
+#: its limit left real slack — at least this many times what the plan was
+#: expected to take before this wave's own timeouts lowered the rates. A
+#: short phase gives the smallest plan a bare limit (a share below the
+#: planner's minimum is raised only to minimum / utilisation), and two
+#: timeouts there say "busy for a moment", not "down".
+GIVE_UP_SLACK = 2.0
+
+
+def is_distill_timeout(exc: Any) -> bool:
+    """Did the distill call end because its TIME LIMIT fired?
+
+    Only that teaches the tracker and shrinks the wave (review r2: a
+    connection reset at 91 % of the limit was read as a slow node). True for
+    a ``TimeoutError`` (the caller's hard bound, a client's own timeout
+    class) and for `OffMainNodeUnavailable.timed_out` — the real client
+    folds a worker's httpx timeout into that exception and says so there.
+    """
+    try:
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return True
+        if getattr(exc, "timed_out", False) is True:
+            return True
+        return any(c.__name__.endswith(("Timeout", "TimeoutException", "TimeoutError"))
+                   for c in type(exc).__mro__)
+    except Exception:  # noqa: BLE001
+        return False
+#: the next page's planning budget after a timeout
+AFTER_TIMEOUT_SHRINK = 0.5
+
+
+@dataclass
+class DistillTurn:
+    """What one page may ask of the worker now. ``plan`` is None when no plan
+    was made — ``error`` (the planner raised) or ``note`` (no time left; the
+    wave gave up) says why — and the caller keeps the raw page text, as for a
+    plan that is not feasible. ``budget_s`` is the call's hard time limit; the
+    plan was sized for `BUDGET_UTILISATION` of it."""
+
+    plan: Any
+    budget_s: float
+    width: int = 1
+    error: Optional[BaseException] = None
+    note: str = ""
+    #: the plan is the planner's smallest (nothing smaller can be asked)
+    minimum: bool = False
+
+
+class DistillWave:
+    """The distills of ONE research call, taken through the client's queue.
+
+    ``keys`` are the pages in search-rank order (best first). A page counts as
+    waiting from the start — while it is still being fetched too — until its
+    `turn` ends or `drop` says it will not be distilled. When a page's turn
+    comes its budget is what the clock leaves, shared with those still
+    waiting::
+
+        budget = (deadline - now - reserve_s) x min(width, waiting) / waiting
+
+    capped at ``ceiling_s`` and floored at the planner's own minimum
+    (`DistillPlan.min_budget_s`) while that still fits before the deadline —
+    so a short phase distills the best-ranked pages at the smallest useful
+    size and declines only what is left, never the whole batch.
+    """
+
+    def __init__(self, llm_client: Any, keys=(), *, deadline: float,
+                 ceiling_s: float, reserve_s: float = 0.0,
+                 slot_allowance_s: float = 0.0,
+                 max_chars: Optional[int] = None,
+                 label: str = "research") -> None:
+        self.llm_client = llm_client
+        self.deadline = float(deadline)
+        self.ceiling_s = float(ceiling_s)
+        self.reserve_s = float(reserve_s)
+        self.slot_allowance_s = float(slot_allowance_s)
+        self.max_chars = max_chars
+        self.label = label
+        self.queue = distill_queue(llm_client) if llm_client is not None else None
+        self._rank: Dict[Any, int] = {}
+        self._waiting: set = set()
+        self._announced = False
+        self._timeouts = 0            # consecutive MINIMUM-size distills that hit their limit
+        self._shrink = 1.0            # this wave's plan size: halved by every timeout
+        self._row = 0                 # consecutive timeouts of any kind
+        self._slowed = 1.0            # by how much this wave's timeouts lowered the rates
+        self.gave_up = False
+        for k in keys or ():
+            self.expect(k)
+
+    def expect(self, key: Any) -> None:
+        """A page that will want a distill (a backfilled one ranks last)."""
+        self._rank.setdefault(key, len(self._rank))
+        self._waiting.add(key)
+
+    def drop(self, key: Any) -> None:
+        """This page will not be distilled (its fetch failed, or it is done)."""
+        self._waiting.discard(key)
+
+    def left(self) -> float:
+        """Seconds the distills still have (the report's reserve kept back)."""
+        return self.deadline - time.monotonic() - self.reserve_s
+
+    def _plan(self, budget_s: float, width: int) -> Any:
+        kwargs: Dict[str, Any] = {"concurrency": width}
+        if self.max_chars is not None:
+            kwargs["max_chars"] = self.max_chars
+        return self.llm_client.plan_distill(budget_s, **kwargs)
+
+    def report(self, turn: DistillTurn, ok: bool, *, timed_out: bool = False,
+               burned_s: float = 0.0, prompt_chars: int = 0,
+               max_tokens: int = 0) -> None:
+        """How the call of ``turn`` ended (§4UZ review r1/r2). Only a failure
+        whose time limit fired (``timed_out`` — `is_distill_timeout`) counts,
+        never another error however late: the tracker gets a pessimistic reading
+        (a timeout carries no ``timings``) and the next page is planned at
+        half the size — halved again by every further timeout in a row, down
+        to the planner's smallest plan. Only when THAT has timed out
+        `WAVE_MAX_TIMEOUTS` times in a row, each with real slack in its limit
+        (`GIVE_UP_SLACK`), does the wave stop asking: the
+        pages still waiting keep their raw text at once instead of each
+        burning a share of the phase. A success ends the row; the size stays
+        reduced for the rest of this wave, and the next wave starts from what
+        the tracker has learned by then."""
+        if ok:
+            # the row of minimum-size timeouts ends. The SIZE stays where the
+            # timeouts of this wave put it: an answer's `timings` are the
+            # node's own figures, the very ones that were too fast, so growing
+            # back on one answer timed out every other page (measured: 4 of 8
+            # at 2x). The next wave starts at full size from what the tracker
+            # holds by then.
+            self._timeouts = 0
+            self._row = 0
+            return
+        if not timed_out:
+            return                           # refused, reset, malformed: not the clock
+        # ``burned_s`` is the caller's wall time around the call. It includes
+        # any wait at the node's own gate (not separable from out here), which
+        # only makes the reading below more pessimistic.
+        self._shrink *= AFTER_TIMEOUT_SHRINK
+        learned = False
+        try:
+            k = float(getattr(turn.plan, "density", 0) or CHARS_PER_TOKEN)
+            learned = self.llm_client.note_distill_timeout(
+                float(prompt_chars) / k, max_tokens, burned_s, concurrency=turn.width) is True
+        except Exception:  # noqa: BLE001 — a client without it just learns nothing
+            pass
+        try:
+            predicted = float(getattr(turn.plan, "predicted_s", 0.0) or 0.0)
+            slack = turn.minimum and predicted > 0 and (
+                float(turn.budget_s) >= GIVE_UP_SLACK * predicted * self._slowed)
+            if learned and predicted > 0 and float(burned_s) > 0:
+                # what `observe_timeout` just did to the rates the next plan's
+                # `predicted_s` is computed from
+                self._slowed *= min(1.0, predicted / float(burned_s))
+        except (TypeError, ValueError):
+            slack = False
+        if slack:
+            self._timeouts += 1
+        self._row += 1
+        if self._timeouts >= WAVE_MAX_TIMEOUTS or self._row >= WAVE_MAX_ANY_TIMEOUTS:
+            self.gave_up = True
+        try:
+            pretty_log(
+                "Distill Plan",
+                f"{self.label}: a distill ran into its {turn.budget_s:.0f}s limit — "
+                + (GAVE_UP_NOTE if self.gave_up else "the next page is planned smaller"),
+                level="WARNING", icon=Icons.WARN)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _size(self, key: Any) -> DistillTurn:
+        width = distill_width()
+        if self.gave_up:
+            return DistillTurn(None, 0.0, width, note=GAVE_UP_NOTE)
+        waiting = max(1, len(self._waiting))
+        avail = self.left()
+        budget = min(self.ceiling_s, avail * min(width, waiting) / waiting)
+        # One at a time never queues behind this wave at the node's own gate;
+        # a wider queue can, and its plans keep the allowance for that wait.
+        allow = self.slot_allowance_s if width > 1 else 0.0
+        if not self._announced:
+            self._announced = True
+            try:
+                pretty_log(
+                    "Distill Plan",
+                    f"{self.label}: {waiting} page(s) to distill, "
+                    f"{max(0.0, avail):.0f}s left, {max(0.0, budget):.0f}s per page "
+                    f"(ceiling {self.ceiling_s:.0f}s), width {width}",
+                    icon=Icons.NODE_WORKER)
+            except Exception:  # noqa: BLE001 — telemetry must never break a call
+                pass
+        if avail <= 0:
+            # never plan on a spent clock: the page keeps its raw text
+            return DistillTurn(None, 0.0, width, note=NO_TIME_NOTE)
+        # ⚠ PLAN FOR A FRACTION OF THE BUDGET (review r1). The budget stays the
+        # call's hard limit; the plan is sized for `BUDGET_UTILISATION` of it,
+        # so a node somewhat slower than its own figures still finishes — at
+        # 100% a node 1.4x slower timed out on 7 pages of 8. After a timeout
+        # the next plan is half that again (`report`).
+        sized = BUDGET_UTILISATION * self._shrink
+        try:
+            plan = self._plan((budget - allow) * sized, width)
+        except Exception as exc:  # noqa: BLE001 — the caller degrades to raw text
+            return DistillTurn(None, max(0.0, budget), width, exc)
+        minimum = False
+        try:
+            least = float(getattr(plan, "min_budget_s", 0.0) or 0.0)
+            if not plan.feasible and least > 0:
+                # The smallest plan, when the share (or what a timeout left of
+                # it) cannot buy a larger one. Its hard limit is the page's
+                # share — or, when the share is below it, what funds the
+                # smallest plan with headroom (minimum / utilisation; in a
+                # short phase that is all the limit there is: ~13 s, no slack).
+                # ⚠ That floor is taken at the rates the wave STARTED with
+                # (`_slowed` undoes what its own timeouts taught): letting each
+                # timeout raise the next limit (13 -> 19 -> 26 s, review r2)
+                # spent a short phase on three calls to a node that was only
+                # busy for a moment.
+                base = (least - SAFETY_MARGIN_S) * self._slowed + SAFETY_MARGIN_S
+                floor = (base + 0.05) / BUDGET_UTILISATION + allow
+                if floor <= min(self.ceiling_s, avail):
+                    budget = max(budget, floor)
+                    plan = self._plan(least + 0.05, width)
+                    minimum = bool(plan.feasible)
+            elif plan.feasible:
+                minimum = (int(plan.char_limit) <= MIN_CHARS and int(plan.max_tokens) <= MIN_TOKENS)
+        except Exception:  # noqa: BLE001 — keep the first plan
+            pass
+        return DistillTurn(plan, max(0.0, budget), width, minimum=minimum)
+
+    @contextlib.asynccontextmanager
+    async def turn(self, key: Any):
+        """``async with wave.turn(url) as turn:`` — waits for this page's turn
+        (best rank first), then sizes it. The page stops counting as waiting
+        when the block ends."""
+        self.expect(key)
+        mine = False
+        try:
+            if self.gave_up:                      # nothing to wait for
+                yield DistillTurn(None, 0.0, distill_width(), note=GAVE_UP_NOTE)
+                return
+            mine = await self.queue.acquire(self._rank[key], timeout=self.left())
+            if mine:
+                yield self._size(key)
+            else:
+                yield DistillTurn(None, 0.0, distill_width(), note=NO_TIME_NOTE)
+        finally:
+            if mine:
+                self.queue.release()
+            self.drop(key)

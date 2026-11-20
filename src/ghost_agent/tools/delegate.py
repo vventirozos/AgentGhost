@@ -242,6 +242,11 @@ def _land_sandbox_row(reg, sup, sbx_jobs, job, sid, entry) -> None:
     state = entry.get("state")
     if state == sbx_jobs.STATE_RUNNING:
         return
+    try:                                   # §4UY N6 r2: a detached job's files, recorded where it lands
+        from ..utils.provenance import note_detached_job_files
+        note_detached_job_files(sid, str(entry.get("command") or ""), f"detached sandbox job {sid}")
+    except Exception:  # noqa: BLE001 — bookkeeping never costs the landing
+        pass
     try:
         tail = sup.log_tail(sid, lines=_SANDBOX_RESULT_LINES)
     except Exception:  # noqa: BLE001
@@ -250,17 +255,20 @@ def _land_sandbox_row(reg, sup, sbx_jobs, job, sid, entry) -> None:
     try:
         # the stage-status marker line is ours, never the job's output —
         # stripped from a successful tail too (§4LP follow-up)
-        from .execute import _take_pipestatus
-        tail, _ = _take_pipestatus(tail)
+        from .execute import _take_status, status_failures_of_job
+        tail, _, _ = _take_status(tail)
+        # §4UY C9: the failures the job's ERR trap recorded in its status file
+        _fails = status_failures_of_job(entry.get("command"),
+                                        getattr(getattr(sup, "sandbox", None), "host_workspace", None))
     except Exception:  # noqa: BLE001
-        pass
-    if isinstance(code, int) and code != 0:
+        _fails = []
+    if isinstance(code, int):
         # §4LO: the same exit-code reading as a foreground run — a detached
         # `find / … 2>/dev/null` that printed results, or a `| head` that
         # closed the pipe early, is not "exited 1, failed"
         try:
             from .execute import _normalise_exit
-            code = _normalise_exit(str(entry.get("command") or ""), code, tail)
+            code = _normalise_exit(str(entry.get("command") or ""), code, tail, _fails)
         except Exception:  # noqa: BLE001
             pass
     log_hint = ""

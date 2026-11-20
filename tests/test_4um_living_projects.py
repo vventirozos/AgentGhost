@@ -100,15 +100,16 @@ def test_a_finished_plan_leaves_the_project_open_and_ready_and_fires_once(store)
 async def test_only_the_owner_closes_a_project(ctx, store):
     pid, _ = _built(store)
     ctx.current_project_id = pid
+    from ghost_agent.tools.projects import tool_manage_projects_for_model   # §4UY P1: the one gate, at the model entry
     tok = request_id_context.set("sched-autopilot-1")
     try:
-        out = await tool_manage_projects(ctx, action="update", project_id=pid, status="DONE")
+        out = await tool_manage_projects_for_model(ctx, action="update", project_id=pid, status="DONE")
     finally:
         request_id_context.reset(tok)
     assert store.get_project(pid)["status"] == "ACTIVE", str(out)
     tok = request_id_context.set("req-owner-close")
     try:
-        await tool_manage_projects(ctx, action="update", project_id=pid, status="DONE")
+        await tool_manage_projects_for_model(ctx, action="update", project_id=pid, status="DONE")
     finally:
         request_id_context.reset(tok)
     assert store.get_project(pid)["status"] == "DONE" and store.project_state(pid) == "done"
@@ -364,7 +365,9 @@ def test_the_briefing_shows_ready_changes_files_and_live(ctx, store):
     assert "RECENT CHANGES" in b and "add tetris" in b and "js/apps/tetris.js" in b
     assert "LIVE AT: Live at https://lab.example/" in b
     files = next(ln for ln in b.splitlines() if ln.startswith("FILES (on disk now)"))
-    assert "index.html" in files and "js/apps/tetris.js" in files and "node_modules" not in files
+    # §4UY P12: a deliverable (index.html) is listed once — under DELIVERABLES, not again under FILES
+    assert "index.html" in b and "index.html" not in files
+    assert "js/apps/tetris.js" in files and "node_modules" not in files
 
 
 def test_the_briefing_of_a_closed_project_says_a_change_reopens_it(store):
@@ -446,7 +449,7 @@ def test_a_legacy_auto_closed_project_briefs_as_open_not_done(store):
     store.update_project(pid, status="DONE")
     store.log_event(pid, None, "project_auto_rollup", {"new_status": "DONE"})
     b = _briefing(store, pid)["project"]
-    assert (b["status"], b["state"]) == ("ACTIVE", "ready")
+    assert (b["status"], b["state"]) == ("READY", "ready")        # §4UY P19: was ("ACTIVE", "ready") — one word
     store.log_event(pid, None, "project_closed", {"by": "owner"})
     b = _briefing(store, pid)["project"]
     assert (b["status"], b["state"]) == ("DONE", "done")
@@ -461,5 +464,5 @@ async def test_get_and_the_project_prompt_show_a_legacy_auto_close_as_open(store
     store.log_event(pid, None, "project_auto_rollup", {"new_status": "DONE"})
     out = json.loads(str(await tool_manage_projects(action="get", project_id=pid, context=ctx)))
     body = out.get("result", out) if isinstance(out, dict) else out
-    assert (body.get("status"), body.get("state")) == ("ACTIVE", "ready"), body
+    assert (body.get("status"), body.get("state")) == ("READY", "ready"), body     # §4UY P19 (was ACTIVE)
     assert "· DONE" not in build_project_briefing(store, pid)

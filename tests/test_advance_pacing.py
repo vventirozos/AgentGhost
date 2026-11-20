@@ -293,7 +293,7 @@ async def test_tool_autoadvance_all_completes_research_project(context, stub_sub
     await tool_manage_projects(context, action="create", title="Lit Review")
     pid = context.current_project_id
     await tool_manage_projects(context, action="task_decompose",
-                               subtasks=["research topic A", "research topic B"])
+                               subtasks=["research topic A", "research topic B"], go_ahead=True)  # §4UY P4
     out = json.loads(await tool_manage_projects(
         context, action="autoadvance", count="all"))
     # both research tasks advance (stub search output → marked DONE) and the
@@ -310,7 +310,7 @@ async def test_tool_autoadvance_count_one_default(context, stub_subtools):
     await tool_manage_projects(context, action="create", title="P")
     pid = context.current_project_id
     await tool_manage_projects(context, action="task_decompose",
-                               subtasks=["research a", "research b", "research c"])
+                               subtasks=["research a", "research b", "research c"], go_ahead=True)  # §4UY P4
     out = json.loads(await tool_manage_projects(context, action="autoadvance"))
     assert out["requested"] == 1
     assert out["count"] == 1

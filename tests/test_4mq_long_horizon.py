@@ -208,8 +208,12 @@ async def test_an_owner_batch_stops_before_a_step_that_would_cross_the_deadline(
 
 async def test_the_model_cannot_raise_a_budget_through_metadata(ctx, store):
     pid = store.create_project("Job")
-    res = await tool_manage_projects_for_model(ctx, action="update", project_id=pid,
-                                               metadata={"steps_cap": 999, "note": "x"})
+    tok = request_id_context.set("req-owner")         # §4UY P1: even the owner's `update` cannot set a budget key
+    try:
+        res = await tool_manage_projects_for_model(ctx, action="update", project_id=pid,
+                                                   metadata={"steps_cap": 999, "note": "x"})
+    finally:
+        request_id_context.reset(tok)
     assert "action=budget" in res
     assert int(_meta(store, pid).get("steps_cap") or PA.DEFAULT_STEPS_CAP) == PA.DEFAULT_STEPS_CAP
 
@@ -220,7 +224,7 @@ async def test_only_the_owners_turn_sets_a_budget(ctx, store):
     try:
         res = await tool_manage_projects_for_model(ctx, action="budget", project_id=pid,
                                                    metadata={"unattended_per_day": 200})
-        assert "only the owner" in res
+        assert getattr(res, "reason_code", "") == "who_may_act"       # §4UY P1: the one gate's refusal
         request_id_context.set("req-owner")
         res = json.loads(await tool_manage_projects_for_model(
             ctx, action="budget", project_id=pid,

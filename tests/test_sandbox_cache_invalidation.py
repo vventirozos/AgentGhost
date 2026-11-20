@@ -22,7 +22,7 @@ import pytest
 #: shown a stale workspace listing.
 MUTATING_OPS = [
     "write", "edit", "replace", "download", "delete", "move", "rename",
-    "unzip", "git_clone", "copy",
+    "unzip", "git_clone", "copy", "restore",
 ]
 READ_ONLY_OPS = ["read", "list_files", "find"]
 
@@ -39,9 +39,11 @@ def _mutation_expr():
     assert len(exprs) == 1, f"expected one definition, found {len(exprs)}"
     code = compile(ast.Expression(exprs[0]), "<extracted>", "eval")
 
+    import ghost_agent.core.agent as _agent_mod
+
     def _run(tool, op=None):
-        return bool(eval(code, {}, {"_cname": tool,
-                                    "t_args": {"operation": op}}))
+        return bool(eval(code, dict(vars(_agent_mod)), {"_cname": tool,
+                                                         "t_args": {"operation": op}}))
     return _run
 
 
@@ -81,3 +83,28 @@ def test_all_three_caches_are_invalidated_together():
         assert needle in body, (
             f"a mutating op no longer clears {needle!r} — the other caches "
             "keep serving a stale listing")
+
+
+def test_the_three_readers_share_one_mutating_op_list():
+    """§4UY r2 m1: `restore` reached none of the three lists. They now read ONE set (`tools.fs_ops`)."""
+    import ghost_agent.core.agent as A
+    from ghost_agent.distill import outcome_heuristics as OH
+    from ghost_agent.tools.fs_ops import FS_MUTATING_OPS
+    assert A._FS_MUTATING_OPS is FS_MUTATING_OPS and OH._FS_MUTATING_OPS is FS_MUTATING_OPS
+    assert set(MUTATING_OPS) <= FS_MUTATING_OPS and "restore" in FS_MUTATING_OPS
+    import ast
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(A.GhostAgent._dispatch_and_process_tool_batch)))
+    shared = [n for n in ast.walk(tree) if isinstance(n, ast.Compare) and isinstance(n.ops[0], ast.In)
+              and isinstance(n.comparators[0], ast.Name) and n.comparators[0].id == "_FS_MUTATING_OPS"]
+    assert len(shared) >= 2                                       # cache invalidation + is_mutating
+    private = [n for n in ast.walk(tree) if isinstance(n, (ast.List, ast.Set, ast.Tuple))
+               and {"write", "replace", "delete"} <= {e.value for e in n.elts if isinstance(e, ast.Constant)}]
+    assert not private                                            # no private copy left
+
+
+def test_every_written_op_name_is_on_the_list():
+    """Every operation the dispatcher treats as a project write is a mutating op for the caches too."""
+    from ghost_agent.tools.file_system import _PROJECT_WRITE_OPS
+    from ghost_agent.tools.fs_ops import FS_MUTATING_OPS
+    assert _PROJECT_WRITE_OPS <= FS_MUTATING_OPS

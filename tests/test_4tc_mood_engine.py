@@ -1569,3 +1569,13 @@ def _two_hour_half_life(monkeypatch):
     tests/test_4us_mood_visible.py."""
     from ghost_agent.selfhood import mood as _M
     monkeypatch.setattr(_M, "HALF_LIFE_S", 7200.0)
+
+
+@pytest.fixture(autouse=True)
+def _the_bound_of_three_these_tests_were_written_for(monkeypatch):
+    """§4UW: these tests place the pair by round numbers against the bounds they were written for (0.8 reads
+    3; the owner's "3" starts at 0.90); they test the mechanics around a bound, not where it lies. The live
+    bound of 3 (0.90) and the owner's anchor (0.96) are pinned in tests/test_4uw_mood_fixes.py."""
+    from ghost_agent.selfhood import mood as _M
+    monkeypatch.setattr(_M, "INTENSITY_THRESHOLDS", (0.20, 0.45, 0.75))
+    monkeypatch.setattr(_M, "ANCHOR_MAGNITUDE", {1: 0.32, 2: 0.60, 3: 0.90})

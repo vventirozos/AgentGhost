@@ -328,7 +328,9 @@ async def test_the_registry_fact_check_gives_its_research_the_claim_and_a_deadli
 def test_the_deep_research_schema_offers_the_question():
     from ghost_agent.tools import registry as R
     d = next(d for d in R.TOOL_DEFINITIONS if d["function"]["name"] == "deep_research")["function"]
-    assert "question" in d["parameters"]["properties"] and d["parameters"]["required"] == ["query"]
+    # §4UY N10: `urls` reads named pages, so a query is no longer required
+    assert "question" in d["parameters"]["properties"] and d["parameters"]["required"] == []
+    assert "urls" in d["parameters"]["properties"]
 
 
 # ── m7 / m9: the sources and their reserves ─────────────────────────────────
@@ -373,7 +375,8 @@ async def test_a_script_only_page_is_a_failed_fetch_and_backfilled(monkeypatch):
         _Client())
     urls = [u for u, _ in fetched]
     assert "https://s8.example/p" in urls                            # the reserve took the slot
-    assert "page too thin to be the document" in text
+    # §4UY N5: the one wall classifier (`content_check.classify_page`) names a JS-only shell a wall page
+    assert "page too thin to be the document" in text or "bot-check page" in text
 
 
 # ── m11: an extract cut at the output limit says so ─────────────────────────

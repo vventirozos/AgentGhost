@@ -12,8 +12,6 @@ for onions, and since §4RX the clearnet host memo (two strikes, counted
 only when a page loaded between them, so a Tor outage bans nothing).
 """
 
-import re
-
 _DETERMINISTIC_ERROR_ROUTES: tuple = (
     ("ERR_HTTP2_PROTOCOL_ERROR",
      "This site rejected the headless client at the protocol layer — "
@@ -42,47 +40,26 @@ def _deterministic_error_route(error_text: str) -> str:
 # ── §4HH (2026-09-16, req 7ee072f2) — the blocked page that read as OK ──
 # ft.com answered a 403 "Security Verification" page (554 chars) and
 # kelacyber.com a 403 "Just a moment…" challenge (0 chars); both came back
-# `STATUS: OK`, the model's reasoning then read "FT (15 Sep 2026): … tied to
-# pec.interno.it" as if it had read the FT, and the report listed FT and
-# KELA among its sources. Everything it knew of the FT story came from a
-# secondary site's summary. Corpus: 75 of 584 browser OK results were
-# challenge or 4xx pages. The document's own response status is decisive;
-# a challenge TITLE counts only with a near-empty body, so a real article
-# that happens to be titled "Access Denied" is not misfiled.
-_CHALLENGE_TITLE_RE = re.compile(
-    r"^\s*(?:just a moment|security verification|attention required|"
-    r"access (?:to this page has been )?denied|verify you are human|"
-    r"are you a human|checking your browser|please enable cookies|"
-    r"403 forbidden|401 authorization required|429 too many requests|"
-    r"one moment, please|bot verification|"
-    # §4UN-fetch r1: a bare BRAND word is a wall only as the WHOLE title — "Cloudflare outage takes down X"
-    # and "CAPTCHA farms are booming" are news stories
-    r"(?:cloudflare|ddos-guard|captcha|incapsula)\s*[.!]?\s*$|"
-    # §4HV (2026-09-16, req d121dcc6): Hetzner's "Heray" gate — HTTP 200,
-    # TITLE "Security Check", 211 chars, URL rewritten to /_ray/pow, body
-    # "Checking that you are not a robot … Verifying…". Passed as a normal
-    # page five times in one turn; the model re-navigated and the
-    # no-progress breaker forced the conclusion. Word-bounded so a real
-    # "Security Checklist …" article never matches.
-    r"security check\b|checking that you are not a robot|robot check\b|"
-    r"human verification|"
-    # §4UN-fetch: Anubis' proof-of-work gate, Google/YouTube's EU consent wall (Tor exits are often EU),
-    # Imperva/Incapsula, and the "one more step" / "please wait" interstitials
-    r"making sure you(?:'|\u2019)?re not a bot|before you continue(?: to (?:google|youtube)[\w ]*)?\s*$|"
-    r"request unsuccessful|one more step\b|please wait while we verify|"
-    r"pardon our interruption)",
-    re.IGNORECASE)
-_CHALLENGE_URL_RE = re.compile(r"__cf_chl|/cdn-cgi/challenge|/_ray/pow\b", re.IGNORECASE)
-_BLOCKED_STATUSES = frozenset({401, 403, 407, 429, 451, 503})
-_CHALLENGE_MAX_CHARS = 2000
+# `STATUS: OK` and the report listed them among its sources. The document's
+# own response status is decisive; the wall itself is judged by THE page
+# classifier (§4UY N5: `utils.content_check.classify_page` — the browser had
+# its own title-only rule and booked the 51-char "Please wait while your
+# request is being verified..." page OK while the search readers called it a
+# bot check). The page's text, when the runner shipped it, is read too.
+from ..utils.content_check import (  # noqa: E402 — one classifier (§4UY N5)
+    CHALLENGE_TITLE_RE as _CHALLENGE_TITLE_RE, REFUSAL_STATUSES as _BLOCKED_STATUSES, WALL_REFUSAL,
+    classify_page)
 
 
 def blocked_page_reason(parsed: dict) -> str:
     """Why this fetch must not be read as the page — "" when it may.
 
     ``parsed`` is the runner's result for a url-loading op (navigate,
-    extract_text, screenshot): ``status`` (document HTTP status, when the
-    runner captured it), ``title``, ``url``, ``length``.
+    extract_text, screenshot) or an interact goto: ``status`` (document HTTP
+    status, when the runner captured it), ``title``, ``url``, ``text`` (the
+    page text or its preview) and its full size under ``length`` /
+    ``dom_text_chars`` / ``nav_text_chars``. Unknown size: the title alone
+    decides nothing (§4LN).
     """
     if not isinstance(parsed, dict):
         return ""
@@ -92,26 +69,25 @@ def blocked_page_reason(parsed: dict) -> str:
     except (TypeError, ValueError):
         status = None
     title = str(parsed.get("title") or "")
-    url = str(parsed.get("url") or "")
-    # §4LN: the page's text size under whichever name the op ships it — a
-    # screenshot carries `dom_text_chars`, never `length`, and an absent
-    # length read as 0 made every screenshot of a page titled "Cloudflare…"
-    # a challenge (and two of them banned the host for 6 h). Unknown size:
-    # the title alone decides nothing.
     _raw_len = next((parsed.get(k) for k in ("length", "dom_text_chars", "nav_text_chars")
                      if parsed.get(k) is not None), None)
     try:
         length = int(_raw_len) if _raw_len is not None else None
     except (TypeError, ValueError):
         length = None
+    text = parsed.get("text")
+    text = text if isinstance(text, str) else None
+    kind, detail = classify_page(status, title, text, str(parsed.get("url") or ""), length)
     if status in _BLOCKED_STATUSES:
-        kind = "bot challenge" if (_CHALLENGE_TITLE_RE.match(title) or _CHALLENGE_URL_RE.search(url)) else "access refused"
-        return f"HTTP {status} — {kind}"
+        # a refusal status decides; a wall title/url under it names it a challenge even when the size is unknown
+        _wall = (kind and kind != WALL_REFUSAL) or bool(_CHALLENGE_TITLE_RE.match(title))
+        return f"HTTP {status} — {'bot challenge' if _wall else 'access refused'}"
     if status is not None and status >= 400:
         return f"HTTP {status}"
-    if _CHALLENGE_URL_RE.search(url) or (
-            _CHALLENGE_TITLE_RE.match(title) and length is not None and length < _CHALLENGE_MAX_CHARS):
-        return f"bot challenge / interstitial ({title.strip()[:40] or 'challenge url'})"
+    if kind == "bot challenge":
+        return f"bot challenge / interstitial ({title.strip()[:40] or detail})"
+    if kind:
+        return f"{kind} ({detail})"
     return ""
 
 

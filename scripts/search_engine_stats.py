@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""§4UN-onion / §4UN-read: per-engine search outcomes and web_search page reads, from the dated agent log.
+"""§4UN-onion / §4UN-read / §4VA: per-engine search outcomes and web_search page reads, from the dated agent log.
 
 Reads the durable log (``$GHOST_HOME/system/ghost-agent.log``, default ``~/Data/AI/Data/system/ghost-agent.log``,
 plus its ``.1`` rotation when present). Its lines are day-stamped::
@@ -8,7 +8,9 @@ plus its ``.1`` rotation when present). Its lines are day-stamped::
     2026-11-13 10:00:06 - GhostStream - INFO - [abc +7.0s] search page read — read python.org in 900 ms — …
 
 Every search wave's line ends with `` | engines: <engine>=<outcome> …`` (win, empty, blocked, timeout,
-conn-error, off-topic, low-relevance, error, abandoned — "late" in older logs — unfinished); every page web_search opened logs one
+conn-error, off-topic, low-relevance, error, unfinished; ``wikipedia=added`` when the supplement's rows joined
+the batch — §4VA; older logs also carry ``abandoned`` / ``late`` and the hedge labels ``yandex-h`` / ``yahoo-h``);
+every page web_search opened logs one
 ``search page read — <outcome> …`` line (read, failed, timeout, thin, off-topic).
 
     python scripts/search_engine_stats.py --days 14
@@ -66,8 +68,8 @@ def tally(paths: Iterable[str], since: Optional[dt.date] = None) -> Dict:
 
 
 def render(stats: Dict) -> str:
-    kinds = ["win", "empty", "blocked", "timeout", "conn-error", "abandoned", "late", "unfinished", "off-topic",
-             "low-relevance", "error"]
+    kinds = ["win", "added", "empty", "blocked", "timeout", "conn-error", "unfinished", "off-topic",
+             "low-relevance", "error", "abandoned", "late"]
     out = [f"waves: {stats['waves']}", "",
            f"{'engine':<20}" + "".join(f"{k:>14}" for k in kinds) + f"{'win %':>8}"]
     for name in sorted(stats["engines"], key=lambda n: -stats["engines"][n].get("win", 0)):

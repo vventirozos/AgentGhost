@@ -349,8 +349,7 @@ def is_unresolved_tool_result(result) -> bool:
 #: "VISION ANALYSIS RESULT:\nTraceback (most recent call last)".
 #: file_system operations that change a file (an edit between two browser
 #: tests is progress — §4LN).
-_FS_MUTATING_OPS = frozenset({"write", "replace", "edit", "append", "patch", "delete",
-                              "move", "rename", "copy", "mkdir", "download", "batch"})
+from ..tools.fs_ops import FS_MUTATING_OPS as _FS_MUTATING_OPS  # noqa: E402 — §4UY r2 m1: the ONE list
 
 #: tools whose result is CONTENT that can mention "exception" / "error:" —
 #: judged by the shared failure classifier, never the head-substring scan

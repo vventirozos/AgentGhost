@@ -378,25 +378,39 @@ PYTEST_FAIL = "FAILED tests/test_a.py::test_c - assert 1 == 2\n1 failed, 2 passe
 TRACE = "Traceback (most recent call last):\n  File \"x.py\", line 1, in <module>\nModuleNotFoundError: No module named 'foo'"
 
 
-@pytest.mark.parametrize("command,out,want", [
-    ("python3 -m pytest tests/ -q || true", PYTEST_FAIL, 1),
-    ("python3 -m pytest tests/ -q; echo done", PYTEST_FAIL, 1),
-    ("python3 x.py; ls", TRACE, 1),
-    ("python3 x.py\nls", TRACE, 1),
-    ("cd x && python3 y.py", TRACE, 0),                      # && is not a launderer
-    ("python3 x.py && echo ok", TRACE, 0),                   # …even with a runner first: a caught error under 0
-    ("python3 x.py", TRACE, 0),                              # a caught error under 0 is the same-error arm's
-    ("python3 -c 'print(1); print(2)'", TRACE, 0),           # the `;` is quoted
-    ("python3 x.py; ls", "all good", 0),
+# §4UY C9/C10: the list rule reads the REAL exit codes the shell's ERR trap recorded (`failures`), never the
+# output's signatures. `X || true` is the model's own "ignore this status": the shell's 0 stands (and the run
+# ledger does not credit such a run, §4UY C3).
+@pytest.mark.parametrize("command,out,failures,want", [
+    ("python3 -m pytest tests/ -q || true", PYTEST_FAIL, [], 0),
+    ("python3 -m pytest tests/ -q; echo done", PYTEST_FAIL, [(1, "python3 -m pytest tests/ -q")], 1),
+    ("python3 x.py; ls", TRACE, [(1, "python3 x.py")], 1),
+    ("python3 x.py\nls", TRACE, [(1, "python3 x.py")], 1),
+    ("cd x && python3 y.py", TRACE, [], 0),                  # a caught error under 0 is the same-error arm's
+    ("python3 x.py && echo ok", TRACE, [], 0),
+    ("python3 x.py; ls", PYTEST_FAIL, [], 0),                # the printed words are no status (C10)
+    ("python3 -c 'print(1); print(2)'", TRACE, [], 0),
+    ("python3 x.py; ls", "all good", [], 0),
 ])
-def test_list_laundering_is_undone(command, out, want):
-    assert _normalise_exit(command, 0, out) == want
+def test_list_laundering_is_undone(command, out, failures, want):
+    assert _normalise_exit(command, 0, out, failures) == want
 
 
 async def test_laundered_failure_reads_as_a_failure_with_the_note(tmp_path):
-    res = await tool_execute(command="python3 -m pytest tests/ -q || true",
-                             sandbox_dir=tmp_path, sandbox_manager=_mgr((PYTEST_FAIL, 0)))
-    assert "EXIT CODE: 1" in res and "LAST command of the list" in res
+    # §4UY r1: the failure comes from the run's status file (the ERR trap), not from a stdout marker
+    def _run(cmd, *a, **kw):
+        import re as _re
+        m = _re.search(r"__g_sf='?/workspace/\.ghost_status/([0-9a-f]{32})", cmd)
+        if m:
+            (tmp_path / ".ghost_status").mkdir(exist_ok=True)
+            (tmp_path / ".ghost_status" / m.group(1)).write_text("1:1:python3 -m pytest tests/ -q\n")
+        return PYTEST_FAIL + "\ndone\n", 0
+    mgr = MagicMock()
+    mgr.host_workspace = tmp_path
+    mgr.execute = MagicMock(side_effect=_run)
+    res = await tool_execute(command="python3 -m pytest tests/ -q; echo done", sandbox_dir=tmp_path,
+                             sandbox_manager=mgr)
+    assert "EXIT CODE: 1" in res and "earlier in it exited 1" in res and "__GHOST_FAILED" not in res
     assert classify_tool_failure(str(res))[0] != FailureClass.RETRYABLE
     assert exec_exit_code(str(res)) == 1
 

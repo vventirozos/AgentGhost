@@ -125,26 +125,33 @@ class _RecordingJournal:
 
 async def test_journal_append_safe_writes_through():
     j = _RecordingJournal()
-    await GhostAgent._journal_append_safe(_fake_agent(j), "post_mortem", {"x": 1})
+    task = await GhostAgent._journal_append_safe(_fake_agent(j), "post_mortem", {"x": 1})
+    await task                                   # §4UY image-5: the write is a background task
     assert j.entries == [("post_mortem", {"x": 1})]
 
 
-async def test_journal_append_safe_drops_on_timeout_without_raising():
+async def test_journal_append_safe_returns_at_once_and_a_slow_entry_still_lands():
+    """§4UY image-5: this pin used to assert the entry was DROPPED on timeout —
+    it never was (a thread cannot be cancelled); the caller now does not wait at
+    all, and the slow entry lands."""
     j = _RecordingJournal(delay=0.5)
-    await GhostAgent._journal_append_safe(
+    t0 = time.monotonic()
+    task = await GhostAgent._journal_append_safe(
         _fake_agent(j), "smart_memory", {"x": 1}, timeout=0.05
     )
-    # returned promptly and did not raise; the entry was dropped
-    assert j.entries == []
+    assert time.monotonic() - t0 < 0.3, "the caller waited for the write"
+    await task
+    assert j.entries == [("smart_memory", {"x": 1})]
 
 
 async def test_journal_append_safe_swallows_journal_errors():
     j = _RecordingJournal(raises=OSError("disk full"))
-    await GhostAgent._journal_append_safe(_fake_agent(j), "smart_memory", {"x": 1})
+    task = await GhostAgent._journal_append_safe(_fake_agent(j), "smart_memory", {"x": 1})
+    await task                                   # logged, never raised
 
 
 async def test_journal_append_safe_no_journal_is_noop():
-    await GhostAgent._journal_append_safe(_fake_agent(None), "smart_memory", {})
+    assert await GhostAgent._journal_append_safe(_fake_agent(None), "smart_memory", {}) is None
 
 
 def test_turn_loop_uses_safe_journal_helper():

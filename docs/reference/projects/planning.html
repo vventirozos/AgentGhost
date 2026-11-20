@@ -84,7 +84,9 @@
       <tr><td><code>_check_parent_completion(parent_id)</code></td><td>ALL/ANY/BEST aggregation propagated upward (line 299).</td></tr>
       <tr><td><code>_check_parent_failure(parent_id)</code></td><td>Spawns alternatives, propagates BLOCKED/FAILED (line 364).</td></tr>
       <tr><td><code>get_active_node()</code></td><td>Next leaf in IN_PROGRESS or READY (line 462).</td></tr>
-      <tr><td><code>render()</code></td><td>ASCII tree with emoji status icons (line 487).</td></tr>
+      <tr><td><code>roots()</code></td><td>&sect;4VB: every top-level task in plan order — a node with no parent, or whose parent is not in the tree. <code>root_id</code> is only the first root ever seen; a project routinely has several sibling top-level tasks (the owner's live projects: 8 and 9), and walks anchored at <code>root_id</code> showed one of them (<code>manage_projects get</code> listed 1 of 3 tasks and the model said "1 of 1"). <code>render</code>, <code>to_json</code>, <code>get_active_node</code> and the retrospective's empty check all start here; nothing outside the setters reads <code>root_id</code> (an AST test). Limit: tasks in a <code>parent_id</code> cycle have no root and are not shown. A plan hydrated from the store behaves as before; a cycle built through <code>load_from_json</code> (no production caller) now renders "No Plan." where the first root used to anchor it.</td></tr>
+      <tr><td><code>render()</code></td><td>ASCII tree with emoji status icons, every root in plan order with its children under it.</td></tr>
+      <tr><td><code>to_json()</code></td><td>The tree as nested dicts: the root's node for a one-root plan; <code>{"roots": [&hellip;]}</code> when there are several (&sect;4VB); <code>load_from_json</code> reads both shapes back.</td></tr>
       <tr><td><code>load_from_json(json_data)</code></td><td>Stateful merge (no clear) so concurrent edits survive; coerces malformed planner fields (2026-07-20, see below).</td></tr>
     </tbody>
   </table></div>

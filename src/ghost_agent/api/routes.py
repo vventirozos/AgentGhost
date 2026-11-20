@@ -1589,7 +1589,11 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 request_id = str(uuid.uuid4())[:8]      # the agent's own format (handle_chat)
             _tap = ReplyTap(request_id, model, int(time.time()))
             # §4UT: steps only for a client that shows them (the web console's proxy, the CLI)
-            _tap.progress_wanted = (request.headers.get("X-Ghost-Progress") or "").strip() == "1"
+            # §4UY S10: `1` = steps and their sentences (a Nova call each), `steps` = the steps only (the web
+            # page with steps turned off keeps its one "steps hidden · show" line and costs no Nova call)
+            _prog = (request.headers.get("X-Ghost-Progress") or "").strip().lower()
+            _tap.progress_wanted = _prog in ("1", "steps")
+            _tap.progress_sentences = _prog == "1"
 
         async def stream_generator():
             # Track whether any real content chunk has shipped to the

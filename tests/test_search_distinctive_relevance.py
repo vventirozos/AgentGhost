@@ -106,20 +106,18 @@ def test_no_distinctive_token_falls_back_to_the_batch_rule():
     assert S._results_are_off_topic(q, [{"title": "Taurine supplements slow aging", "body": "research on supplements and aging", "href": ""}]) is False
 
 
-def test_the_wave_reranks_its_winner():
-    """AST: `_race_search_wave` assigns `valid = rank_on_topic(query, valid)`
-    on the winning path, after the off-topic check and before returning."""
-    tree = ast.parse(inspect.getsource(S._race_search_wave))
-    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef))
-    assigns = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
-               and isinstance(n.value, ast.Call) and getattr(n.value.func, "id", "") == "rank_on_topic"]
-    assert len(assigns) == 1 and getattr(assigns[0].targets[0], "id", "") == "valid"
-    # it sits in the same body as `return valid`, before it
-    for n in ast.walk(fn):
-        body = getattr(n, "body", None)
-        if isinstance(body, list) and assigns[0] in body:
-            rest = body[body.index(assigns[0]) + 1:]
-            assert any(isinstance(s, ast.Return) and getattr(s.value, "id", "") == "valid" for s in rest)
-            break
-    else:
-        raise AssertionError("re-rank site not in a statement body")
+def test_the_wave_reranks_its_winner(monkeypatch):
+    """The winning batch comes back with the rows that carry a distinctive token first. (§4VA: was an
+    AST pin on `valid = rank_on_topic(…)` followed by `return valid`; the wave now returns a `WaveBatch`,
+    so the behaviour is pinned instead of the statement.)"""
+    import asyncio
+    import sys
+    from unittest.mock import MagicMock
+    other = {"title": "Release notes of another database", "body": "release notes, version 18", "href": "https://other.example/notes"}
+    wanted = {"title": "PostgreSQL 18 release notes", "body": "PostgreSQL 18 release notes", "href": "https://db.example/pg18"}
+    mod = MagicMock()
+    mod.DDGS.return_value.__enter__.return_value.text.side_effect = lambda q, **kw: [dict(other), dict(wanted)]
+    monkeypatch.setitem(sys.modules, "ddgs", mod)
+    rows = asyncio.run(S._race_search_wave("postgresql 18 release notes", None, 0))
+    assert [r["href"] for r in rows] == [wanted["href"], other["href"]]
+    assert S.rank_on_topic("postgresql 18 release notes", [other, wanted]) == [wanted, other]

@@ -1562,11 +1562,11 @@ class TestProducerParserParity:
     # +2 (§4KW fresh review): delete/rename of a symlink as itself — both
     # emit the parsed `Deleted '…'.` / `Renamed/Moved '…' to '…'.` shapes
     # §4NU: + the append site and the write site's more_parts variant
-    EXPECTED_SITES = 19        # §4UU-5: + the template's per-file write line; §4SH: + the empty last part's receipt; §4PE: the two download SUCCESS sites became one receipt helper
+    EXPECTED_SITES = 20        # §4UY C21: + the versions `restore` receipt; §4UU-5: + the template's per-file write line; §4SH: + the empty last part's receipt; §4PE: the two download SUCCESS sites became one receipt helper
     # 2026-09-21 (§4JP): the write site's message gained `{rewrite_note}` —
     # a hint, not a path; the renderer's heuristic counts it as a slot. The
     # ledger's captures were re-checked (the parity assertions below pass).
-    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 5, 5, 5, 6]   # §4UU-5: template write line (1);   # §4UN-fetch: download receipt 4→5 (the redirect note, after the receipt's period — a hint, not a path);   # §4SH r1: Finished 5 (+ the honest check phrase, after the path); §4SH: Finished (4: the path, then three check notes after the `;` terminator)   # §4QA: both write receipts carry the stray-prefix NOTE (a hint after the path, not a path)   # §4PE: one download receipt with 4 slots replaced two 2-slot sites   # §4KW: + link delete (1), link rename (2); §4NU: append (4), more_parts write (4); §4OC: edit success names its old_string (2 — the ledger regex accepts the trailing «…» and still takes the path first)
+    EXPECTED_SLOT_COUNTS = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 4, 5, 5, 5, 6]   # §4UY C21: restore (2: the path, then the store's own sentence after ` — `, which names the same file);   # §4UY C21: the delete receipt carries the kept-version note after its period (a hint, not a path) 1→2;   # §4UU-5: template write line (1);   # §4UN-fetch: download receipt 4→5 (the redirect note, after the receipt's period — a hint, not a path);   # §4SH r1: Finished 5 (+ the honest check phrase, after the path); §4SH: Finished (4: the path, then three check notes after the `;` terminator)   # §4QA: both write receipts carry the stray-prefix NOTE (a hint after the path, not a path)   # §4PE: one download receipt with 4 slots replaced two 2-slot sites   # §4KW: + link delete (1), link rename (2); §4NU: append (4), more_parts write (4); §4OC: edit success names its old_string (2 — the ledger regex accepts the trailing «…» and still takes the path first)
 
     def _rendered_messages(self):
         """Every `SUCCESS:` message tools/file_system.py can emit, rendered.
@@ -1778,6 +1778,7 @@ class TestProducerParserParity:
         "Flexible match found and replaced in",
         "Fuzzy match (",
         "Renamed/Moved",
+        "Restored",                       # §4UY C21 file_system restore (a whole-file write)
         "Streaming replace applied to",
         "Wrote",
         "auto-promoted operation=",

@@ -365,16 +365,20 @@ async def test_a_nul_path_write_is_booked_as_a_refusal_through_the_dispatcher(tm
     assert o.status in (OutcomeStatus.REJECTED, OutcomeStatus.FAILED) and not list(tmp_path.iterdir())
 
 
-async def test_a_held_payload_survives_a_refused_write(tmp_path):
-    """F8: the hold was consumed by the write the unread-rewrite gate then refused."""
+async def test_a_held_payload_over_an_unread_file_is_written_and_the_old_text_kept(tmp_path):
+    """F8 was: the hold was consumed by the write the unread-rewrite gate then refused. §4UY C6/C21: that
+    gate is now a note — the held payload is written, and the unread old text is kept as a version."""
+    from ghost_agent.tools.file_versions import list_versions, version_path
     (tmp_path / "doc.md").write_text("old text that this request has not read\n")
     tok = request_id_context.set("req-hold-1")
     try:
         FS._hold_rejected_content(tmp_path, "doc.md", "THE WHOLE NEW DOCUMENT")
         out = await FS.tool_file_system(operation="write", path="doc.md", content="<<HELD>>", sandbox_dir=tmp_path)
-        assert getattr(out, "status", None) is OutcomeStatus.REJECTED and "KEPT" in str(out)
-        assert FS._redeem_held_content(tmp_path, "doc.md") == "THE WHOLE NEW DOCUMENT"
-        assert (tmp_path / "doc.md").read_text().startswith("old text")
+        assert str(out).startswith("SUCCESS") and "had not read whole" in str(out)
+        assert (tmp_path / "doc.md").read_text() == "THE WHOLE NEW DOCUMENT"
+        vs = list_versions(tmp_path / "doc.md", tmp_path)
+        assert vs and version_path(vs[-1], tmp_path).read_text().startswith("old text")
+        assert FS._redeem_held_content(tmp_path, "doc.md") is None            # redeemed once
     finally:
         request_id_context.reset(tok)
 

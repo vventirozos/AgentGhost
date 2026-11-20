@@ -62,7 +62,7 @@ def test_fifth_review_ordinary_commands_pass(cmd):
 
 
 @pytest.mark.parametrize("cmd,bulk", [
-    ("cd src && rm -rf ../build", False), ("cd src; cd ..; rm -rf *", False), ("rm -rf *", False),
+    ("cd src && rm -rf ../build", False), ("cd src; cd ..; rm -rf *", True), ("rm -rf *", True),   # §4UY C6: the project-top wipe is refused
     ("cd .. && rm -rf *", True), ("rm -rf ..", True),
 ])
 def test_the_directory_is_tracked_inside_a_project(cmd, bulk):

@@ -908,6 +908,8 @@ LAB_NO_LAB_HELD_PREFIX = "code build got no lab (task back to its owner hold)"
 #: §4UL round 7: a task turn whose model server failed (task reopened) — a batch stops on it (`model_server_failed`),
 #: never spends its count re-picking the same task while the server is down
 MODEL_SERVER_FAILED_PREFIX = "the model server failed during the task's turn"
+#: §4UY C18: a production task whose turn could not be built or run (no fallback builder any more)
+TASK_TURN_UNAVAILABLE_PREFIX = "the task turn could not run (task back to the queue)"
 
 
 def _experiment_gate_build(store, project_id, nxt, cres):
@@ -1380,8 +1382,11 @@ async def _advance_once_body(
         Defaults to :func:`classify_task` (synchronous, wrapped).
       coding_executor: async callable ``(context, description, *,
         tool_runner, ledger) -> CodingResult`` that BUILDS a coding leaf for
-        real (writes files, verifies). When supplied it handles every coding
-        task — the strong path. See :mod:`core.coding_executor`.
+        real (writes files, verifies). §4UY C18: the PRODUCTION executor
+        (``coding_executor.build_coding_task``, marked by
+        ``project_turns.mark_real_executor``) is never called — its task runs
+        as an agent turn or goes back to the queue; only a caller-supplied
+        (unmarked) executor is called here.
       code_generator: async callable ``(description) -> str`` — the weaker
         fallback used only when ``coding_executor`` is absent or crashes: it
         returns a single executable command run via ``execute``. Without
@@ -1656,7 +1661,12 @@ async def _advance_once_body(
 
     # §4UL (decision 1A): a build or research task runs as ONE full agent turn
     # (core/project_turns.py) — every tool, the briefing, the task_update close
-    # gates; the build executor below is the fallback when that turn cannot be built
+    # gates. §4UY C18: with the production executor wired there is NO fallback
+    # builder any more (the spec executor was removed): a CODING task whose turn
+    # cannot be built or run goes back to the queue, as a crashed build does
+    # (§4AT-C: never a weaker closer). Only a caller-supplied (test) executor
+    # reaches the build path below. (A research task still falls through to
+    # the research path — out of C18's scope.)
     if classification in ("coding", "research"):
         from .project_turns import run_task_turn_for_advance, wants_task_turn
         if wants_task_turn(context, coding_executor):
@@ -1666,7 +1676,16 @@ async def _advance_once_body(
                 started_at=_tick_started_at)
             if _tt is not None:
                 return _tt
-            logger.warning("task turn unavailable for %s — the build executor runs it", nxt.id)
+        if classification == "coding" and getattr(coding_executor, "_ghost_real_executor", False) is True:
+            logger.warning("task turn unavailable for %s — the task goes back to the queue", nxt.id)
+            try:
+                store.release_claim(nxt.id, failure_reason="the task turn could not run")
+            except Exception:  # noqa: BLE001
+                logger.debug("unrun task not released", exc_info=True)
+            return AdvanceResult(True, nxt.id, "blocked",
+                                 f"{TASK_TURN_UNAVAILABLE_PREFIX}: '{nxt.id}' reopened — nothing ran; a task runs "
+                                 f"only as an agent turn (needs the model, the project store and task turns on)",
+                                 worked=False)
 
     # STRONG coding path: when a coding_executor is wired, BUILD the leaf for
     # real (write files + verify) and finalize from its structured result —
@@ -2779,16 +2798,31 @@ def _paused_since(store, project_id, t0: float) -> bool:
         return False
 
 
+def _task_turn_unclosed_prefix() -> str:
+    from .project_turns import TASK_TURN_UNCLOSED_PREFIX
+    return TASK_TURN_UNCLOSED_PREFIX
+
+
 def _batch_would_cross_deadline(next_step_s: float) -> bool:
     """True when this request's client deadline would arrive inside its
     report reserve before another step of ``next_step_s`` could finish.
     No deadline known (a background run) → False."""
     try:
-        from ..utils.logging import request_id_context, request_remaining_s, request_deadline_s
+        from ..utils.logging import (request_id_context, request_remaining_s, request_deadline_s,
+                                     request_recent_progress)
         rid = request_id_context.get() or ""
         remaining = request_remaining_s(rid)
         if remaining is None:
             return False
+        if request_recent_progress(rid):
+            # §4UY P3: a request that is making progress earns its extensions as the step runs — the time it
+            # can still have is the turn's own reader's (`_request_left_s`: the ceiling less what it spent), not
+            # the deadline as it stands now (a211f0db: 1 of 4 tasks, stopped "deadline" with hours of ceiling)
+            from .coding_executor import _request_left_s
+            left = _request_left_s()
+            if left is None:
+                return False
+            remaining = max(float(remaining), float(left))
         from .agent import effective_report_floor
         return float(next_step_s) > float(remaining) - effective_report_floor(request_deadline_s(rid), rid)   # §4RA r2: sized
     except Exception:  # noqa: BLE001
@@ -3002,11 +3036,18 @@ async def advance_many(
                              "summary": res.summary})
             stop_reason = "lab_gave_up"           # review r4 #1: it waits for the owner — never "starts again by itself"
             break
-        if cls == "blocked" and res.task_id and res.summary.startswith("coding executor crashed"):
+        if cls == "blocked" and res.task_id and (res.summary.startswith("coding executor crashed")
+                                                 or res.summary.startswith(TASK_TURN_UNAVAILABLE_PREFIX)):
             advanced.append({"task_id": res.task_id, "classification": res.classification,
                              "status": (store.get_task(res.task_id) or {}).get("status"),
                              "summary": res.summary})
             stop_reason = "step_crashed"          # §4MR: was reported as a budget stop
+            break
+        if cls == "blocked" and res.task_id and res.summary.startswith(_task_turn_unclosed_prefix()):
+            advanced.append({"task_id": res.task_id, "classification": res.classification,
+                             "status": (store.get_task(res.task_id) or {}).get("status"),
+                             "summary": res.summary})
+            stop_reason = "task_unclosed"         # §4UY P15: reopened, not FAILED — never re-picked in the batch
             break
         if cls == "blocked" and res.task_id and res.summary.startswith(MODEL_SERVER_FAILED_PREFIX):
             advanced.append({"task_id": res.task_id, "classification": res.classification,

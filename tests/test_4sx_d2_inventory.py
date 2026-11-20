@@ -330,7 +330,8 @@ async def test_only_the_owner_retires_an_owner_project(env, fake, scope, act, or
     scope(env.ctx, origin=origin)
     srv = _ws_server(env, pid)
     _labs(env, fake, pid, [{"lab_id": LAB_D, "lifetime": "disposable"}])
-    r = _j(await P.tool_manage_projects(env.ctx, action=act, project_id=pid))
+    # §4UY P1: the one who-may-act gate sits at the model's entry (the only production caller)
+    r = _j(await P.tool_manage_projects_for_model(env.ctx, action=act, project_id=pid))
     assert "nothing was changed" in json.dumps(r), r
     assert fake.calls == [] and _reg(env.ctx).get(srv)["state"] == "running"
     assert str(env.store.get_project(pid)["status"]).upper() != "ARCHIVED"
@@ -507,7 +508,8 @@ async def test_a_probe_update_to_archived_changes_no_field(env, fake, scope):
     """r3 m6 (tool path)."""
     pid = _pid(env)
     scope(env.ctx, origin="probe")
-    r = _j(await P.tool_manage_projects(env.ctx, action="update", project_id=pid, status="ARCHIVED", goal="hijacked"))
+    r = _j(await P.tool_manage_projects_for_model(env.ctx, action="update", project_id=pid, status="ARCHIVED",
+                                                  goal="hijacked"))                  # §4UY P1: the model's entry
     assert "nothing was changed" in json.dumps(r) and env.store.get_project(pid)["goal"] == "g"
 
 

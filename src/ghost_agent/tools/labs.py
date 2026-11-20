@@ -164,6 +164,22 @@ ORDER_CLASSES = {"read": READ_ACTIONS, "lineage": LINEAGE_ACTIONS, "files": FILE
                  "lab": frozenset({"create", "exec", "member", "extend", "cancel"})}
 
 
+#: §4UY P5 (req eb25d165): WHAT each action does to a KEPT lab's live site — ONE table over every action, read by
+#: the ONE gate (`_question_wall`). A new action that is in neither set fails at import.
+#:   publish — changes what the live site SERVES: its files (`put`, `deploy`), its version (`switch`,
+#:             `rollback`), its data (`restore`), or makes the lab the live site / changes the kept app (`keep`);
+#:   other   — reads, disposable-lab work, and operations that change no served content (`app` start/stop,
+#:             `backup`, `rehearse`, `exec`, `member`, `destroy` … — each keeps its own walls).
+PUBLISH_ACTIONS = frozenset({"put", "deploy", "switch", "rollback", "restore", "keep"})
+NOT_PUBLISH_ACTIONS = frozenset({"templates", "create", "list", "status", "exec", "get", "member", "logs", "http",
+                                 "extend", "destroy", "spec", "cancel", "screenshot", "rehearse", "backup",
+                                 "backups", "app"})
+if (PUBLISH_ACTIONS | NOT_PUBLISH_ACTIONS) != set(ACTIONS) or (PUBLISH_ACTIONS & NOT_PUBLISH_ACTIONS):
+    raise RuntimeError("lab: every action must be in exactly one of PUBLISH_ACTIONS / NOT_PUBLISH_ACTIONS")
+#: … and of the publish actions, the one that also serves disposable labs: walled only when its lab is KEPT
+_PUBLISH_IF_KEPT = frozenset({"put"})
+
+
 def is_read_call(args: Any) -> bool:
     """True for a `lab` call that only reads (by its action)."""
     if isinstance(args, str):
@@ -816,6 +832,9 @@ async def tool_lab(context, action: str = "", lab_id: str = "", template: str = 
         return ToolOutcome(f"LAB ERROR (not_allowed): {refusal}.", status=OutcomeStatus.REJECTED,
                            reason_code="lab_not_allowed", world_changed=False)
     lab_id = str(lab_id or "").strip()
+    _qwall = await _question_wall(context, action, origin, lab_id)       # §4UY P5: before any argument error
+    if _qwall is not None:
+        return _qwall
     if action not in ("templates", "create", "list") and not _LAB_ID_RE.match(lab_id):
         # req 6043a546: name the project's own live lab, and for a deploy say EVERY missing piece at once (the
         # model spent two calls finding lab_id, then params.folder)
@@ -1990,6 +2009,60 @@ async def _kept_action(context, action: str, origin: str, owner: str, a) -> Tool
 #: §4UM: kept labs seen by `_note_project_push` — {lab_id: (owner, app url, app member, app workdir)}; a kept lab
 #: stays kept and its owner never changes, so one look per lab per process
 _KEPT_LAB_SEEN: Dict[str, Tuple[str, str, str, str]] = {}
+
+
+def _asked_only_a_question(context) -> bool:
+    """§4UY P5: is this the OWNER's own interactive turn, and did they only ASK in it? Not a probe, a scheduled or
+    background run, a sub-agent or a project task's turn (those keep their own walls, unchanged). The predicate
+    is `provenance.question_only_request`: structure only — every sentence of the request's message(s) ends
+    with a question mark."""
+    try:
+        from .projects import _owner_turn_now
+        if not _owner_turn_now():
+            return False
+        from ..utils.logging import request_id_context
+        from ..utils.provenance import question_only_request
+        return question_only_request(str(request_id_context.get() or ""))
+    except Exception:  # noqa: BLE001 — unknown is not "a question": the rule does not apply
+        return False
+
+
+async def _question_wall(context, action: str, origin: str, lab_id: str) -> Optional[ToolOutcome]:
+    """§4UY P5 (req eb25d165): THE question wall of the `lab` tool — None when the call may run, else the refusal
+    (a `WHO_MAY_ACT_REASONS` code). §4UK: no confirmation — a refusal and a steer; the user's instruction (their
+    next message, or one sent while this request runs) is what deploys.
+
+        the request                              | a publish action (`PUBLISH_ACTIONS`)
+        the owner's turn, an instruction in it   | runs (as before)
+        the owner's turn, only questions         | deploy / switch / rollback / restore / keep: REFUSED, nothing sent
+                                                 | put: refused when its lab is KEPT; a disposable lab: runs;
+                                                 |   the host cannot say (no usable answer): refused, and says so
+        any other origin or kind of turn         | this wall does not apply (its own walls do)"""
+    if action not in PUBLISH_ACTIONS or origin != "owner" or not _asked_only_a_question(context):
+        return None
+    unsure = False
+    if action in _PUBLISH_IF_KEPT:
+        if not _LAB_ID_RE.match(lab_id):
+            return None                          # no lab named: the argument error follows, nothing is sent
+        if lab_id not in _KEPT_LAB_SEEN:
+            try:
+                st, det = await _call(context, "GET", f"/v1/labs/{lab_id}", origin=origin, timeout=10)
+            except Exception:  # noqa: BLE001 — the host did not answer: unsure
+                st, det = 0, None
+            if st == 404 or (st == 200 and isinstance(det, dict) and str(det.get("lifetime") or "") != "kept"):
+                return None                      # no such lab (the action says so) / a disposable machine
+            unsure = not (st == 200 and isinstance(det, dict))
+    pretty_log("Lab Question Wall", f"`lab {action}`{f' {lab_id}' if lab_id else ''} refused — the user only "
+               "asked a question in this request", icon=Icons.SHIELD, level="WARNING")
+    what = (f"`lab {action}` could not be checked against the labs host, and it would change a live "
+            "site if its lab is kept" if unsure else f"`lab {action}` changes the live site")
+    return ToolOutcome(f"LAB ERROR (not_allowed): NOT done: the user asked a QUESTION in this request, they did not "
+                       f"ask for a change to the live site — {what}, so nothing was sent. Answer the question from "
+                       "what you can read (files, `lab status` / `http` / `logs`). If something should go live, "
+                       "say in the reply what you would deploy (which files, to which lab); edits already made in "
+                       "the workspace are NOT live — say that too. The user deploys by asking for it: an "
+                       "instruction from them runs this at once.",
+                       status=OutcomeStatus.REJECTED, reason_code="question_not_instruction", world_changed=False)
 
 
 def _in_app_workdir(path: str, workdir: str) -> bool:

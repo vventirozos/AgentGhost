@@ -39,11 +39,6 @@ def _actx(store, **kw):
 
 # ------------------------------------------------------------------ the leaf's tools
 
-def test_the_leaf_has_lab_and_the_prompt_says_how():
-    from ghost_agent.core import coding_loop as CL
-    assert CL.LEAF_ALLOWED_TOOLS == ("file_system", "execute", "lab", "run")
-    p = CL._leaf_prompt("build x", "", {}, None, False, "")
-    assert "`lab` gives a disposable one" in p and "destroy it when you are done" in p
 
 
 # ------------------------------------------------------------------ lab_waits
@@ -727,25 +722,6 @@ async def test_a_leafs_create_is_tagged_and_idles_out_and_its_untracked_lab_is_d
         RS.reset(tok)
 
 
-async def test_a_failed_agentic_build_carries_the_lab_wait_its_leaves_hit(tmp_path, monkeypatch):
-    """battery C2: the build's failure names the wait one of ITS leaves got."""
-    from ghost_agent.core import coding_loop as CL
-
-    async def fake_turn(context, *, leaf_id, prompt, is_background, **kw):
-        W.note_outcome(str(leaf_id).rsplit("-a", 1)[0], "lab_lab_limit", False, action="create", needed_mb=2048)
-        return "SUMMARY: could not get a lab"
-    monkeypatch.setattr(CL, "run_leaf_turn", fake_turn)
-
-    class Store:
-        def get_project(self, pid):
-            return {"id": pid, "workspace_dir": str(tmp_path), "metadata": {}}
-    ctx = SimpleNamespace(current_project_id="p1", project_store=Store(), llm_client=object(),
-                          args=SimpleNamespace(model="m"))
-
-    async def runner(name, args):
-        return "EXIT CODE: 1"
-    res = await CL.build_coding_task_agentic(ctx, "build x", tool_runner=runner, max_attempts=1)
-    assert res.ok is False and res.lab_wait == "lab_capacity" and res.lab_needed_mb == 2048
 
 
 async def test_a_build_that_got_its_lab_starts_the_wait_count_over(store):

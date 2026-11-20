@@ -102,20 +102,3 @@ def test_run_leaf_turn_routes_calls_through_the_background_lane(monkeypatch):
     assert "is_background" not in seen
 
 
-def test_no_files_inside_the_workspace_is_a_failed_attempt_even_with_a_verify(monkeypatch, tmp_path):
-    """World where it fails: a leaf whose files landed outside the project
-    (empty diff) passes on the verify command alone — the theatrical DONE."""
-    class Store:
-        def get_project(self, pid):
-            return {"id": pid, "workspace_dir": str(tmp_path), "metadata": {}}
-    ctx = SimpleNamespace(current_project_id="p1", project_store=Store(),
-                          llm_client=object(), args=SimpleNamespace(model="m"))
-
-    async def fake_turn(context, *, leaf_id, prompt, is_background, **kw):
-        return "VERIFY: python -m pytest -q\nSUMMARY: wrote files (elsewhere)"
-    monkeypatch.setattr(cl, "run_leaf_turn", fake_turn)
-
-    async def runner(name, args):
-        return "3 passed\nEXIT CODE: 0"
-    res = asyncio.run(cl.build_coding_task_agentic(ctx, "x", tool_runner=runner, max_attempts=1))
-    assert res.ok is False and "no files inside the project workspace" in res.detail

@@ -66,14 +66,19 @@ def test_a_step_says_what_ran_in_words():
     assert P.summary({"web_search": 1}) == "Searched the web"
     assert P.summary({"file_system.edit": 1, "browser": 3, "execute": 1}) == \
         "Edited a file, used the browser 3 times and ran a command"
-    assert P.summary({"some_new_tool": 2}) == "Used some new tool 2 times"
+    assert P.summary({"some_new_tool": 2}, known={"some_new_tool"}) == "Used some new tool 2 times"   # a skill
+    assert P.summary({"some_new_tool": 2}) == "Used 2 tools"          # round 2: a name nobody registered
     assert P.summary({}) == "" and P.summary({"execute": 0}) == ""
 
 
 def test_file_operations_are_told_apart():
+    """§4UY S2: every tool's action argument (``action``, else ``operation``) is part of the key — a project
+    `list` is not "Updated the project"."""
     assert P.tool_key("file_system", {"operation": "read"}) == "file_system.read"
     assert P.tool_key("file_system", {}) == "file_system"
-    assert P.tool_key("execute", {"operation": "read"}) == "execute"
+    assert P.tool_key("execute", {"command": "ls"}) == "execute"
+    assert P.tool_key("manage_projects", {"action": "List"}) == "manage_projects.list"
+    assert P.summary({"execute.read": 1}) == "Ran a command"          # an action the table lacks: the tool
 
 
 # ── the sentence: one clean English line or nothing ─────────────────────────
@@ -83,7 +88,10 @@ def test_file_operations_are_told_apart():
     "I added the script tag to index.html",
 ])
 def test_a_clean_line_is_shown(line):
-    assert P.clean_line(line).startswith(line.rstrip("."))
+    # §4UY S8: a negative ("no CSS changes") must be in a tool result the narrator was shown
+    # round 2: a file name in the line must be one the calls were given (else it reads as a host)
+    assert P.clean_line(line, "", "diff: no CSS changes are needed.",
+                        "{'path': 'site/index.html'}").startswith(line.rstrip("."))
 
 
 @pytest.mark.parametrize("line", [
@@ -116,7 +124,7 @@ def test_the_intent_is_the_end_of_the_thinking():
 # ── the narrator ────────────────────────────────────────────────────────────
 
 async def test_a_batch_sends_its_step_at_once_and_its_sentence_after():
-    tap, nova = ReplyTap("r1", "m", 1), _Nova("I read the styles and found no rules for the app.")
+    tap, nova = ReplyTap("r1", "m", 1), _Nova("I read the styles and found the rules for the app.")
     n = P.ProgressNarrator(tap, nova, "add the portfolio app")
     n.after_batch([_row("execute", {"command": "ls"}), _row("file_system", {"operation": "read", "path": "a.css"})],
                   reasoning="I should read the CSS.")
@@ -124,7 +132,7 @@ async def test_a_batch_sends_its_step_at_once_and_its_sentence_after():
     assert first == [{"seq": 1, "tools": {"execute": 1, "file_system.read": 1},
                       "summary": "Ran a command and read a file", "at": first[0]["at"]}]
     await _settle()
-    assert _progress(_frames(tap)) == [{"seq": 1, "text": "I read the styles and found no rules for the app."}]
+    assert _progress(_frames(tap)) == [{"seq": 1, "text": "I read the styles and found the rules for the app."}]
     assert n.steps[0]["text"].startswith("I read the styles")
     payload, kw = nova.calls[0]
     assert kw["use_worker"] and kw["off_main_only"] and kw["is_background"]       # never the main slot
@@ -144,35 +152,46 @@ async def test_steps_that_finish_while_nova_writes_collapse_into_the_newest():
     assert [p["seq"] for p in texts] == [1, 3] and len(nova.calls) == 2           # step 2 was never asked
 
 
-async def test_nothing_after_the_answer_starts():
-    tap, nova = ReplyTap("r1", "m", 1), _Nova("I did the work.", delay=0.05)
+async def test_no_new_step_or_call_after_the_answer_starts():
+    """§4UY S16 (replaces "nothing after the answer starts", which pinned the defect): no new step and no new
+    Nova call after `close` — but the sentence already being written lands on its step and in the record."""
+    tap, nova = ReplyTap("r1", "m", 1), _Nova("I did the work.", "I did more.", delay=0.05)
     n = P.ProgressNarrator(tap, nova, "x")
     n.after_batch([_row("execute", {})])
+    await asyncio.sleep(0.01)                           # Nova is writing step 1's line
     n.close()
     n.after_batch([_row("execute", {})])
     await asyncio.sleep(0.2)
-    assert [p.get("seq") for p in _progress(_frames(tap))] == [1]                  # the step only, no sentence
+    got = _progress(_frames(tap))
+    assert [p.get("seq") for p in got if "summary" in p] == [1]                    # no step after the answer
+    assert [p for p in got if "text" in p] == [{"seq": 1, "text": "I did the work."}]
+    assert len(nova.calls) == 1 and n.steps[0]["text"] == "I did the work."
 
 
-async def test_a_sentence_is_dropped_once_reply_text_is_on_screen():
+async def test_a_sentence_still_lands_once_reply_text_is_on_screen():
+    """§4UY S16 (replaces the pin of the defect): a turn that answers within a second kept its last step
+    without a sentence — the line now lands (the web attaches it to the folded list; the CLI has stopped)."""
     tap, nova = ReplyTap("r1", "m", 1, hold_chars=0), _Nova("I did the work.", delay=0.05)
     n = P.ProgressNarrator(tap, nova, "x")
     n.after_batch([_row("execute", {})])
     tap.begin_generation()
     _feed_stream(tap, ANSWER)
     assert tap.sent                                     # the answer is on screen before Nova answers
+    n.close()
     await asyncio.sleep(0.2)
-    assert not [p for p in _progress(_frames(tap)) if "text" in p]
+    assert [p for p in _progress(_frames(tap)) if "text" in p] == [{"seq": 1, "text": "I did the work."}]
 
 
-@pytest.mark.parametrize("answer", [TimeoutError("busy"), "I'll check the CSS next.", "Ελέγξα."])
-async def test_a_failed_or_bad_line_leaves_the_step_with_its_summary(answer):
+@pytest.mark.parametrize("answer,why", [(RuntimeError("down"), "unavailable"), ("I'll check the CSS next.", "rejected"),
+                                        ("Ελέγξα.", "rejected")])
+async def test_a_failed_or_bad_line_leaves_the_step_with_its_summary(answer, why):
     tap = ReplyTap("r1", "m", 1)
     n = P.ProgressNarrator(tap, _Nova(answer), "x")
     n.after_batch([_row("web_search", {"query": "q"})])
     await _settle()
     got = _progress(_frames(tap))
-    assert [g.get("summary") for g in got] == ["Searched the web"] and "text" not in n.steps[0]
+    assert [g.get("summary") for g in got if "summary" in g] == ["Searched the web"] and "text" not in n.steps[0]
+    assert got[-1] == {"seq": 1, "none": why} and n.steps[0]["why"] == why        # §4UY S15: and why
 
 
 async def test_an_empty_batch_is_no_step():
@@ -220,11 +239,17 @@ def test_a_client_that_does_not_ask_for_steps_costs_no_nova_call():
 
 
 @pytest.mark.parametrize("worker", [None, "http://127.0.0.1:8088", "http://127.0.0.1:8088/v1/"])
-def test_no_narrator_without_a_worker_off_the_main_box(worker):
-    """r1: with no off-main worker an `off_main_only` call waits for, then takes, the main slot."""
-    tok = reply_tap_context.set(_wanted_tap())
+def test_no_nova_call_without_a_worker_off_the_main_box(worker):
+    """r1: with no off-main worker an `off_main_only` call waits for, then takes, the main slot. §4UY: the
+    steps still show (they cost no model call) — only the sentences are off, and each step says so."""
+    tap = _wanted_tap()
+    tok = reply_tap_context.set(tap)
     try:
-        assert P.ProgressNarrator.for_request(_ctx(worker), "x", "abc") is None
+        n = P.ProgressNarrator.for_request(_ctx(worker), "x", "abc")
+        assert n is not None and n.llm is None
+        n.after_batch([_row("execute", {})])
+        assert _progress(_frames(tap))[-1]["none"] == "off" and n._task is None
+        n.close()
     finally:
         reply_tap_context.reset(tok)
 
@@ -249,15 +274,18 @@ async def test_a_refused_call_is_no_step():
     assert [p["tools"] for p in _progress(_frames(tap))] == [{"execute": 1}]
 
 
-async def test_close_cancels_a_call_in_flight():
+async def test_a_call_in_flight_at_close_is_bounded_by_the_narrator_deadline(monkeypatch):
+    """§4UY S16: `close` no longer cancels the line being written — the narrator's own deadline bounds it."""
+    monkeypatch.setattr(P, "NARRATE_TIMEOUT_S", 0.1)
     tap, nova = ReplyTap("r1", "m", 1), _Nova("I did it.", delay=2.0)
     n = P.ProgressNarrator(tap, nova, "x")
     n.after_batch([_row("execute", {})])
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.02)
     task = n._task
     n.close()
-    await asyncio.sleep(0.05)
-    assert task is not None and task.cancelled()
+    await asyncio.sleep(0.3)
+    assert task is not None and task.done() and not task.cancelled()
+    assert _progress(_frames(tap))[-1] == {"seq": 1, "none": "slow"}
 
 
 def test_the_intent_the_request_and_a_cut_argument_are_redacted():
@@ -421,15 +449,16 @@ def test_the_cli_asks_for_steps_only_when_it_shows_them(monkeypatch):
     assert sent[0].get("X-Ghost-Progress") == "1" and "X-Ghost-Progress" not in sent[1]
 
 
-def test_ctrl_c_drops_a_held_step():
+def test_ctrl_c_prints_a_held_step_then_nothing_more():
+    """§4UY S12 (replaces "Ctrl-C drops a held step"): what was done prints above the stop line — as the web
+    keeps its list after Stop (S1) — and nothing prints after it."""
     from tests.test_4kp_think_split_and_clients import _cli
     printed = []
     sp = _cli()._StepPrinter(printed.append)
     sp.on({"seq": 1, "summary": "Ran a command"})
-    sp.discard()
     sp.stop()
     sp.on({"seq": 2, "summary": "Read a file"})
-    assert printed == [] and sp.printed == 0
+    assert len(printed) == 1 and sp.printed == 1
 
 
 def test_a_step_without_its_sentence_prints_after_the_wait(monkeypatch):
@@ -642,10 +671,12 @@ def test_the_hide_control_sits_in_the_header_row(web):
     assert pg.evaluate("document.querySelector('.progress-off').parentElement.className") == "progress-bar"
 
 
-def test_a_held_cli_step_does_not_print_under_an_error(monkeypatch):
+def test_a_held_cli_step_prints_above_an_error(monkeypatch):
+    """§4UY S12: the held step used to be dropped when an error followed (the weak `not in out or` pin let
+    it); it prints, above the error line."""
     frames = [_pf({"seq": 1, "summary": "Ran a command"}), b'data: {"error": {"message": "boom"}}', b"data: [DONE]"]
     _reply, out, _ = _cli_run(monkeypatch, frames)
-    assert "boom" in out and ("Ran a command" not in out or out.index("Ran a command") < out.index("boom"))
+    assert "boom" in out and "Ran a command" in out and out.index("Ran a command") < out.index("boom")
 
 
 @pytest.mark.parametrize("main,nodes,want", [

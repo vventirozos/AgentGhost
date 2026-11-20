@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 
 import pytest
 
-from ghost_agent.core.coding_executor import build_coding_task
+from ghost_agent.core.coding_executor import CodingResult
 from ghost_agent.core.project_advancer import (
     advance_once, classify_verify_result, _verify_fail_closed_runner,
 )
@@ -80,9 +80,8 @@ def _spec_json(verify: str) -> str:
 
 
 def _coding_context(store, verify_output: str):
-    """Context + runner for an end-to-end coding tick through the REAL
-    build_coding_task: the fake LLM emits a one-file spec with a shell
-    verify, the fake runner answers the verify with ``verify_output``."""
+    """Context + runner for an end-to-end coding tick: the fake runner answers
+    the build step's verify with ``verify_output``."""
     ctx = SimpleNamespace(
         project_store=store,
         llm_client=_FakeLLM(_spec_json("grep -q marker notes.txt")),
@@ -150,8 +149,20 @@ async def _run_coding_tick(store, verify_output):
     tid = store.add_task(pid, "Build the notes file")
     ctx, runner, calls = _coding_context(store, verify_output)
     res = await advance_once(ctx, pid, tool_runner=runner,
-                             coding_executor=build_coding_task)
+                             coding_executor=_verifying_builder)
     return pid, tid, res, calls
+
+
+async def _verifying_builder(_ctx, _desc, *, tool_runner, **_kw):
+    """A caller-supplied build step (§4UY C18: the spec executor these pins
+    first drove is gone): it writes one file and runs a shell verify through
+    the runner the ADVANCER hands it — the fail-closed wrapper is the advancer's,
+    so an inconclusive verify must come back as an ERROR here."""
+    await tool_runner("file_system", {"operation": "write", "path": "notes.txt", "content": "hello world\n"})
+    out = str(await tool_runner("execute", {"command": "grep -q marker notes.txt"}) or "")
+    if out.startswith("ERROR"):
+        return CodingResult(False, f"verify failed: {out[:300]}", files=["notes.txt"])
+    return CodingResult(True, "wrote notes", files=["notes.txt"], verified=True)
 
 
 async def test_grep_no_match_verify_does_not_mark_done(store):

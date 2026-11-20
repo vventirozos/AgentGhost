@@ -335,9 +335,14 @@ async def test_a_reasoning_channel_or_thinking_off_sends_no_hint():
 
 
 def test_speech_sentences_speak_the_cleaned_text(app_js):
-    fn = extract_js_function(app_js, "_speechSentences")
+    fn = extract_js_function(app_js, "_stripSourcesList") + extract_js_function(app_js, "_speechSentences")  # §4UY N7
     got = eval_js(fn, "_speechSentences(" + json.dumps("**Bold** first. Second, `code`! Third? ...") + ")")
     assert got == ["Bold first.", "Second, code!", "Third?"]
+    # §4UY N7: the appended source list is never spoken (both heads)
+    for head in ("Sources:", "Search results used (pages not opened):"):
+        text = "Elena won the award on Friday.\n\n" + head + "\n- https://news.example/a\n- https://b.example/x"
+        got = eval_js(fn, "_speechSentences(" + json.dumps(text) + ")")
+        assert got == ["Elena won the award on Friday."], got
 
 
 def test_the_ui_holds_speech_on_the_hint_and_speaks_the_display_at_the_end(app_js):
@@ -640,6 +645,7 @@ async def test_the_route_stores_an_astral_prefix_in_browser_units():
 
 def test_a_held_reply_speaks_the_prefix_remainder_then_the_generation(app_js):
     fn = (extract_js_function(app_js, "_stripOrphanThinkClose") + extract_js_function(app_js, "_stripInternalTags")
+          + extract_js_function(app_js, "_stripSourcesList")      # §4UY N7: speech drops the sources list
           + extract_js_function(app_js, "_speechSentences") + extract_js_function(app_js, "_heldSpeech"))
     prefix = "Earlier text. And a tail"
     acc = prefix + "Let me look it up.\n</think>\n\nThe answer is four."

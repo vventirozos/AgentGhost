@@ -235,6 +235,9 @@ def _drain_stream_bounded(stream, cap, demux=False):
     return bytes(head) + marker + bytes(tail), total
 
 
+#: §4UY review: the counter read is on every networked `execute`; a slow daemon must not hold the run
+NET_COUNTERS_DEADLINE_S = 3.0
+
 class SandboxDaemonTimeout(Exception):
     """A container exec exceeded its CLIENT-SIDE deadline — the docker daemon
     is likely wedged. Raised instead of blocking forever so the caller
@@ -1509,6 +1512,24 @@ class DockerSandbox:
         failed): a caller under `--mandatory-tor` must refuse to run
         network-capable work. Reads state only; never blocks."""
         return self._egress_state in ("enforced", "blocked")
+
+    def net_connections(self):
+        """§4UY N6: ``(connections, socks_counted)`` the sandbox has sent out
+        so far — read from the Tor-only rules' own counters (every outbound
+        connection passes them, whatever program opened it). None when they
+        cannot be read: no Tor rules in this container, no container, an exec
+        that failed. A read, never a decision; never raises."""
+        try:
+            if self._egress_state not in ("enforced", "blocked") or self.container is None:
+                return None
+            from . import tor_egress as _te
+            code, out = self._exec_run(_te.counters_cmd(), deadline_s=NET_COUNTERS_DEADLINE_S,   # §4UY review
+                                       privileged=True)
+            if code != 0:
+                return None
+            return _te.parse_net_counters(out)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _block_egress_hard(self, why: str) -> None:
         """Fail closed BY CONSTRUCTION when the Tor-only rules could not be

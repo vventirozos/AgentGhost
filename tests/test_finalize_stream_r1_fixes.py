@@ -10,7 +10,7 @@ import json
 import pytest
 
 from ghost_agent.core.agent import (
-    GhostAgent, _scrub_task_status_runs, _truncate_prompt_bleed)
+    GhostAgent, _truncate_prompt_bleed)
 from ghost_agent.core import stream_guards as SG
 from ghost_agent.utils.constraints import (
     enforce_start_with, parse_start_with_phrase)
@@ -21,7 +21,7 @@ from tests.test_finalize_stream_pins import (
     StreamScript, run_chat)
 
 
-# ── A-F3: prompt-bleed strong/weak + task-status runs ────────────────────────
+# ── A-F3: prompt-bleed strong/weak ────────────────────────
 
 class TestPromptBleedTruncation:
     def test_lone_readme_tools_heading_is_kept(self):
@@ -46,31 +46,8 @@ class TestPromptBleedTruncation:
         assert _truncate_prompt_bleed(text) == "head\n"
 
 
-class TestTaskStatusRunScrub:
-    def test_isolated_status_lines_are_kept(self):
-        text = ("Current state:\n- Draft the intro (DONE)\n"
-                "- Ship the report (PENDING)\nMore prose.")
-        assert _scrub_task_status_runs(text) == text
-
-    def test_regurgitated_tree_run_is_stripped(self):
-        # R2 M-4: a stripped run must be BOTH >=3 lines AND task-shaped
-        # (task_NN id / emoji / bracket lead) — the real regurgitation shape.
-        tree = "\n".join(f"[task_{i}] deploy step (IN_PROGRESS)"
-                         for i in range(4))
-        text = f"head\n{tree}\ntail"
-        assert _scrub_task_status_runs(text) == "head\ntail"
-
-    def test_plain_status_answer_run_is_kept(self):
-        # R2 M-4: a legitimate 4-item "where do the workstreams stand" answer
-        # (no task ids/markers) was being deleted wholesale.
-        text = ("Current standing:\n- Ship the report (DONE)\n"
-                "- Fix the parser (IN_PROGRESS)\n- Update docs (PENDING)\n"
-                "- Deploy to nova (BLOCKED)\nMore prose.")
-        assert _scrub_task_status_runs(text) == text
-
-    def test_two_line_run_is_kept(self):
-        text = "a (DONE)\nb (FAILED)\nrest"
-        assert _scrub_task_status_runs(text) == text
+# §4VC: the task-status run scrubber was removed; tests/test_4vc_task_lines_reach_the_owner.py pins
+# that task lines reach the owner.
 
 
 # ── A-F5: start-with phrase parsing ──────────────────────────────────────────

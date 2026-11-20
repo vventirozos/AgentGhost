@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, AsyncMock
 # per run (2026-10-27: round5_4gj, then safety_4gj_r4). Pinned here, before
 # any test module is imported, to the real cache.
 os.environ.setdefault("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+# §4VA r1: from the first import of the session, search._direct_fetch dials nothing (see no_search_page_reads)
+os.environ["GHOST_SEARCH_NO_NETWORK"] = "1"
 import huggingface_hub.constants  # noqa: E402,F401  (freezes the cache path now)
 
 # ⚠ COLLECTION-TIME live-path isolation. Must run at MODULE level, before
@@ -535,10 +537,16 @@ def no_search_page_reads(monkeypatch):
     engine rows must not dial out, so the reads are off unless a test turns
     them on (tests/test_4un_web_read.py does, with a fake fetcher)."""
     monkeypatch.setenv("GHOST_SEARCH_READ_PAGES", "0")
-    # §4UN-onion: the DuckDuckGo onion races as an extra engine; tests written
-    # against the clearnet engine list keep it (tests/test_4un_ddg_onion.py
-    # turns it on)
-    monkeypatch.setenv("GHOST_SEARCH_DDG_ONION", "0")
+    # §4VA: the Brave onion and Wikipedia are fetched by search.py itself (not
+    # through ddgs, which the suites mock) — over the real transport. They are
+    # switched off here (the operator's own switch) and the transport refuses
+    # outright, so no test can dial out; tests/test_4va_search_engines.py
+    # turns them on with a scripted transport.
+    monkeypatch.setenv("GHOST_SEARCH_ENGINES_OFF", "brave_onion,wikipedia")
+    # r1: the refusal lives INSIDE `search._direct_fetch`, keyed on this variable — so it holds for
+    # both import paths the suites use and for a module first imported in the middle of a test
+    # (a patch of the function object depended on what had been imported when the fixture ran)
+    monkeypatch.setenv("GHOST_SEARCH_NO_NETWORK", "1")
     yield
 
 

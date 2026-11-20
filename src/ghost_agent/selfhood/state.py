@@ -271,6 +271,15 @@ class SelfStateThread:
         #: §4TX review r3: moved only when the owner REPLACES the pair (a set mood, a "neutral" that
         #: cleared one) — the reaction ledger's amounts belong to one pair (in memory, like the ledger)
         self.pair_epoch = 0
+        #: §4UW-b (review r3 of §4UW: 👍 on a reply, a set mood, its undo, then 👎 on the same reply left −0.05
+        #: where the changed thumb alone gives −0.30, and the 👍 could no longer be taken back): an undo puts
+        #: back the pair the set replaced, so the ledger's amounts for THAT pair count again — the undo goes
+        #: back to the epoch the set left (``_epoch_before_set``), and a new epoch is always a new number
+        #: (``_epoch_seq``), so one that was left is never handed out a second time. The tone shares do NOT come
+        #: back with an undo (they stay out), so the ledger's tone books go by ``tone_epoch``, which only moves on
+        self._epoch_seq = 0
+        self._epoch_before_set: Optional[int] = None
+        self.tone_epoch = 0
         #: §4UD (F12): "" when state.json was read (or there was none); else why it could not be
         #: ("unreadable: …") — the state then started empty, and a copy of the file is kept beside it
         self.load_problem: str = ""
@@ -653,6 +662,11 @@ class SelfStateThread:
                    "p": round(m.p if rp == 0.0 else M.clamp(m.p + rp), 3),
                    "e": round(m.e if re_ == 0.0 else M.clamp(m.e + re_), 3),
                    "at": m.set_at, "cause": m.cause, "kind": kind}
+            if rp or re_:
+                # §4UW (review 11-18: a row read "neutral" at p = 0.22 — a deviation of 0.16, under the bound a
+                # level is kept down to, shown on a resting point of 0.06): the numbers are rest + deviation,
+                # and the label is read off the deviation alone — the row says which part is the rest
+                rec["rest"] = [round(rp, 3), round(re_, 3)]
             if note:
                 rec["note"] = note
             with open_append(self.mood_history_path) as f:
@@ -663,7 +677,8 @@ class SelfStateThread:
             logger.warning("mood history append failed: %s", e)
 
     def _append_event_locked(self, *, kind: str, cause: str, dp: float, de: float, held: str = "",
-                             after: str = "", now: Optional[datetime.datetime] = None) -> None:
+                             after: str = "", now: Optional[datetime.datetime] = None,
+                             moved: Optional[Tuple[float, float]] = None) -> None:
         """§4TX: one row of ``mood.events.jsonl`` — every event, applied or
         held (``held`` says why it was not applied). Never the words of a
         message: the cause is the event's own sentence. Best-effort."""
@@ -678,6 +693,10 @@ class SelfStateThread:
                 rec["held"] = held
             if after:
                 rec["after"] = after
+            if moved is not None and (abs(moved[0] - float(dp)) >= 5e-5 or abs(moved[1] - float(de)) >= 5e-5):
+                # §4UW: what the pair really moved by, when that is not the event's own size (a tone fitted to
+                # its cap, the ±1 limit, a reaction that replaced another) — ``dp``/``de`` stay the size
+                rec["moved"] = [round(float(moved[0]), 4), round(float(moved[1]), 4)]
             with open_append(self.mood_events_path) as f:
                 f.write(json.dumps(rec, ensure_ascii=False))
                 f.write("\n")
@@ -1023,7 +1042,7 @@ class SelfStateThread:
             )
             self._store_locked(new)
             self._append_event_locked(kind=kind, cause=cause, dp=ask_p, de=ask_e, after=self._describe(new),
-                                      now=now)
+                                      now=now, moved=(p - base.p, e - base.e))
             if changed:
                 self._append_history_locked(new, str(kind or ""), prev=before.describe())
             r9 = lambda *vs: tuple(round(v, 9) for v in vs)   # noqa: E731 — float dust is not a move
@@ -1138,7 +1157,8 @@ class SelfStateThread:
                 prev=self._replaced(base, at),
             )
             self._store_locked(new)
-            self.pair_epoch += 1
+            self._epoch_before_set = self.pair_epoch
+            self._new_epoch_locked()
             self._append_event_locked(kind=M.KIND_OWNER, cause=OWNER_CAUSE, dp=p - base.p, de=e - base.e,
                                       after=self._describe(new), now=now)
             if changed:
@@ -1165,6 +1185,13 @@ class SelfStateThread:
             prev.update(label=base.label, intensity=base.intensity, owner=True, held_until=base.held_until)
         return prev
 
+    def _new_epoch_locked(self) -> None:
+        """The owner REPLACED the pair: the ledger's amounts so far belong to another pair. A number never
+        used before, for the pair's book and the tones' alike."""
+        self._epoch_seq += 1
+        self.pair_epoch = self._epoch_seq
+        self.tone_epoch += 1
+
     def undo_owner_mood(self, *, now: Optional[datetime.datetime] = None) -> Optional[Tuple[MoodView, MoodView]]:
         """§4UD (G2): put back what the owner's LAST set mood replaced — the
         pair as it was then (without any message tone), worn off by the time
@@ -1173,8 +1200,10 @@ class SelfStateThread:
         is still on comes back as it was, held to the same end. One step:
         there is nothing to undo after it ("neutral" is not undone — it
         clears what could be). None when nothing is on file to put back. It
-        is the owner's word: the ledger's amounts are void, events about
-        earlier messages are held, and the tone shares stay out."""
+        is the owner's word: events about earlier messages are held, and the
+        tone shares stay out. §4UW-b: the ledger's amounts for the pair that
+        is put back count again (a thumb given before the set can be changed
+        or taken back as if the set had never been); its tone books do not."""
         with self._lock:
             base = self._settle_locked(now)
             prev = dict(base.prev or {})
@@ -1203,7 +1232,12 @@ class SelfStateThread:
                        **self._kept_manner(base, now),
                        held_until=(then.held_until if owners else ""), owner_at=at)
             self._store_locked(new)
-            self.pair_epoch += 1
+            if self._epoch_before_set is not None:
+                # the pair the set replaced is back: what the ledger holds for it counts again (not its tones)
+                self.pair_epoch, self._epoch_before_set = self._epoch_before_set, None
+                self.tone_epoch += 1
+            else:
+                self._new_epoch_locked()         # a set from before this process started: its ledger is gone
             self._append_event_locked(kind=M.KIND_OWNER, cause=UNDO_CAUSE, dp=p - base.p, de=e - base.e,
                                       after=self._describe(new), now=now)
             if (new.label, n) != (base.label, base.intensity):
@@ -1252,6 +1286,10 @@ class SelfStateThread:
                 if stored is not None and stored.prev:
                     stored.prev = {}             # "neutral" always clears what an undo could put back (below)
                     self._flush()
+                # §4UW-b (review): … and it is the owner's word on the pair whether or not anything was left of
+                # it — the ledger starts afresh here too (a pair at exactly 0 took this way out and kept its
+                # ledger, while the same history with a message tone in it took the other and lost it)
+                self._new_epoch_locked()
                 return before, before            # nothing on file to reset
             new = Mood(
                 p=0.0, e=0.0, updated_at=at, label=M.NEUTRAL, intensity=0, novelty=False,
@@ -1267,7 +1305,7 @@ class SelfStateThread:
                 **(self._kept_manner(base, now) if keep_manner else {}),
             )
             self._store_locked(new)
-            self.pair_epoch += 1
+            self._new_epoch_locked()             # (nothing is left to undo: ``prev`` is cleared above)
             if visible:
                 self._append_event_locked(kind=M.KIND_OWNER, cause=OWNER_CAUSE + ": neutral",
                                           dp=-base.p, de=-base.e, after=M.NEUTRAL, now=now)

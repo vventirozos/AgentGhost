@@ -5,7 +5,7 @@
 //  by substring tokens, keyboard-first (arrows + Enter, Escape closes).
 // ═══════════════════════════════════════════════════════════════
 
-import { progressMode, setProgressMode } from './progress.js?v=1.2';
+import { progressMode, setProgressMode } from './progress.js?v=1.3';
 
 export function initPalette(ctx) {
     const { Core, el, toast, toggleRail, toggleDensity, sessions, notifications } = ctx;

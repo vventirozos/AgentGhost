@@ -257,7 +257,11 @@ async def test_update_status_archived_runs_the_archive_action(tmp_path):
     pid = store.create_project("Old App")
     ctx = SimpleNamespace(project_store=store, scratchpad=None, graph_memory=None, workspace_model=None,
                           current_project_id=pid, last_user_content="", sandbox_manager=None)
-    out = str(await tool_manage_projects_for_model(ctx, action="update", project_id=pid, status="ARCHIVED"))
+    tok = request_id_context.set("req-owner-elena")   # §4UY P1: `update` is the owner's (who-may-act gate)
+    try:
+        out = str(await tool_manage_projects_for_model(ctx, action="update", project_id=pid, status="ARCHIVED"))
+    finally:
+        request_id_context.reset(tok)
     assert '"archived": true' in out and store.get_project(pid)["status"].upper() == "ARCHIVED"
 
 
@@ -409,7 +413,12 @@ async def test_an_archived_update_keeps_its_other_fields(tmp_path):
     pid = store.create_project("Old App")
     ctx = SimpleNamespace(project_store=store, scratchpad=None, graph_memory=None, workspace_model=None,
                           current_project_id=pid, last_user_content="", sandbox_manager=None)
-    await tool_manage_projects_for_model(ctx, action="update", project_id=pid, status="ARCHIVED", title="Renamed App")
+    tok = request_id_context.set("req-owner-elena")   # §4UY P1: `update` is the owner's (who-may-act gate)
+    try:
+        await tool_manage_projects_for_model(ctx, action="update", project_id=pid, status="ARCHIVED",
+                                             title="Renamed App")
+    finally:
+        request_id_context.reset(tok)
     p = store.get_project(pid)
     assert p["title"] == "Renamed App" and p["status"].upper() == "ARCHIVED"
 

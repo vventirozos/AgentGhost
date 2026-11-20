@@ -427,7 +427,9 @@ def test_r1_a_page_quoting_a_wall_phrase_deep_in_its_text_is_read():
 @pytest.mark.parametrize("title,text", [
     ("Cloudflare", "Please wait"), ("Attention Required! | Cloudflare", "Sorry, you have been blocked"),
     ("Captcha", "Type the characters"), ("Just a moment...", "x" * 300),
-    ("Shop", "Verify you are human by completing the action below. " + "x" * 900),
+    # §4UY review: a wall phrase counts only on a SHORT page (under 800 chars) — at 955 chars this pinned the
+    # rule that also blocked a how-to opening "Error 1020: Access Denied is shown when…"
+    ("Shop", "Verify you are human by completing the action below. " + "x" * 600),
 ])
 def test_r1_real_walls_are_still_walls(title, text):
     assert CC.challenge_reason(200, title, text, "https://shop.example/") != ""

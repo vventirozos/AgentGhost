@@ -342,12 +342,17 @@ class SelfModel:
             return None
         return after
 
-    def note_owner_turn(self, signals: "M.TurnSignals", *, now=None) -> Optional[MoodView]:
+    def note_owner_turn(self, signals: "M.TurnSignals", *, now=None, shade_heard: str = "") -> Optional[MoodView]:
         """The end of an OWNER's turn: what happened in it moves the mood
         (``mood.turn_events``), as one move. The caller decides that the turn
         was the owner's — this method does not know who asked. A plain chat
         turn changes nothing. Returns the mood after, or None when nothing
-        moved."""
+        moved.
+
+        §4UW: ``shade_heard`` — the shade this turn's own reply already
+        carried (the pride of a task it finished, ``may_shade_now``): the
+        turn's shade is still set and logged, and when it is that same one it
+        is marked heard, so the next reply does not carry it again."""
         try:
             ev = M.merge_events(M.turn_events(signals))
         except Exception as e:
@@ -370,8 +375,8 @@ class SelfModel:
         after = self._apply(booked, now=now, leaned=True)
         if ev is not None:
             from . import shade as _shade
-            self._set_shade(_shade.for_turn(signals, moved_dp=ev.dp, own_trouble_age_s=own_age),
-                            ev.cause, after, now)
+            _name = _shade.for_turn(signals, moved_dp=ev.dp, own_trouble_age_s=own_age)
+            self._set_shade(_name, ev.cause, after, now, heard=bool(_name) and _name == str(shade_heard or ""))
             # §4UG (review r1): the agent's own trouble, for relief, is a bad turn that MOVED the mood —
             # one the owner's set mood held is not something to be relieved about later, and a held
             # good turn does not end it
@@ -391,13 +396,26 @@ class SelfModel:
         except Exception:  # noqa: BLE001
             return False
 
-    def _set_shade(self, name: str, cause: str, after: Optional[MoodView], now) -> None:
+    def may_shade_now(self, *, now=None) -> bool:
+        """§4UW: may a reply being written right now carry a shade for something its own turn just did (a
+        project task finished mid-turn)? Not while the owner's set mood holds — the turn's event will move
+        nothing then, and an event that moves nothing sets no shade (``_set_shade``). Never raises."""
+        try:
+            # (a self-model that is switched off has no state)
+            return bool(self.state is not None and not self.state.hold_reason(now=now))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _set_shade(self, name: str, cause: str, after: Optional[MoodView], now, *, heard: bool = False) -> None:
         """§4UG: set the mood's shade — only for an event that MOVED the mood (one the owner's set mood
-        held sets none). Never raises."""
+        held sets none). §4UW: ``heard`` — the reply of the turn that set it already carried it: it is set
+        (the face and the day record have it) and taken at once. Never raises."""
         try:
             if not name or after is None or not self.enabled or not self._moved(after):
                 return
             self.shade.set(name, cause, now=self._now_of(now))
+            if heard:
+                self.shade.take(now=self._now_of(now))
         except Exception as e:  # noqa: BLE001
             logger.debug("mood shade skipped: %s: %s", type(e).__name__, e)
 
@@ -457,6 +475,15 @@ class SelfModel:
         old stamp too, and a thumb changed after "be terse" counted the old thumb twice."""
         try:
             return int(getattr(self.state, "pair_epoch", 0) or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _tone_word(self) -> int:
+        """§4UW-b: which pair the ledger's TONE books belong to (``SelfStateThread.tone_epoch``): it moves with
+        every word of the owner on the pair, an undo included — the tone shares stay out of what an undo puts
+        back, so a tone booked before it holds nothing any more."""
+        try:
+            return int(getattr(self.state, "tone_epoch", 0) or 0)
         except Exception:  # noqa: BLE001
             return 0
 
@@ -657,6 +684,7 @@ class SelfModel:
             with self._ledger_lock:
                 target = self._target(request_id, reply_id)
                 word = self._owner_word()
+                tword = self._tone_word()        # §4UW-b: the tone books' epoch (an undo does not bring tones back)
                 if not target:
                     if retract:
                         logger.info("mood: a thumb taken back names no reply — nothing to take back")
@@ -682,7 +710,7 @@ class SelfModel:
                     while len(self._taken_back) > self.LEDGER_REPLIES:
                         self._taken_back.popitem(last=False)
                 elif is_tone:
-                    tone = (ev.dp, ev.de, at, word)
+                    tone = (ev.dp, ev.de, at, tword)
                 else:
                     slot = "thumb" if ev.kind in (M.KIND_THUMB_UP, M.KIND_THUMB_DOWN) else ev.kind
                     if slot == "thumb":
@@ -711,8 +739,8 @@ class SelfModel:
                 if tone is not None:
                     # the tone's part of the verdict NOW (rebuilt on every reaction — a thumb changed back, or
                     # taken back, brings it back), fitted to the room the other replies' tones leave
-                    full = self._marginal(standing, self._booked_now(tone, at, word))
-                    booked = self._booked_now(self._private_booked.get(target), at, word)
+                    full = self._marginal(standing, self._booked_now(tone, at, tword))
+                    booked = self._booked_now(self._private_booked.get(target), at, tword)
                     want = self._fit(full, booked, now)
                     self._tones[target] = tone
                     if is_tone:
@@ -743,7 +771,7 @@ class SelfModel:
                     got = after.toned
                     self._private_booked[target] = (self._booked_after(want[0], booked[0], got[0], got[2]),
                                                     self._booked_after(want[1], booked[1], got[1], got[3]),
-                                                    at, word)
+                                                    at, tword)
                 ap, ae = after.moved
                 if ap == 0.0 and ae == 0.0:
                     # the pair is at ±1 (a tone with no room under its cap was held above, before the write)
@@ -753,11 +781,15 @@ class SelfModel:
             logger.debug("mood reaction skipped: %s: %s", type(e).__name__, e)
             return None, 0.0, ""
 
-    def owner_arrived(self, *, now=None, request_id: str = "", conversation: str = "") -> None:
+    def owner_arrived(self, *, now=None, request_id: str = "", conversation: str = "",
+                      complaint: bool = False) -> None:
         """An owner's request has arrived. Writes down what time did to the
         mood, closes a boredom the journal holds ("the quiet ended"), and
         stamps the owner's presence in the state file. The caller decides
-        that the request is the OWNER's. Never raises."""
+        that the request is the OWNER's. Never raises.
+
+        §4UW: ``complaint`` — the message opens like a correction: the owner
+        is back, and not pleased; the lift of a return is not given."""
         if not self.enabled or self.state is None:
             return
         if request_id:
@@ -785,7 +817,8 @@ class SelfModel:
         except Exception as e:
             logger.debug("mood owner-arrival skipped: %s: %s", type(e).__name__, e)
         # §4US (operator 11-16): the owner back after a long quiet lifts the mood a little (leaned by warmth)
-        self._apply(M.return_event(quiet), now=now)
+        if not complaint:
+            self._apply(M.return_event(quiet), now=now)
 
     def owner_turn_ended(self, *, now=None, request_id: str = "", conversation: str = "") -> None:
         """An owner's turn has ended: the next quiet is measured from here

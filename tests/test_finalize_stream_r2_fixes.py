@@ -17,7 +17,7 @@ import pytest
 
 from ghost_agent.core.agent import (
     GhostAgent, _inline_think_open, _emit_safe_end,
-    _scrub_task_status_runs, _truncate_prompt_bleed)
+    _truncate_prompt_bleed)
 from unittest.mock import AsyncMock, MagicMock
 
 from tests.test_finalize_stream_pins import (

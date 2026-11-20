@@ -13,7 +13,6 @@ composition is "the helper refuses links" plus "this site calls the helper".
 """
 import ast
 import inspect
-from pathlib import Path
 
 import pytest
 
@@ -32,23 +31,6 @@ def _sandbox_with_a_link(tmp_path):
     return ws, victim
 
 
-def test_the_workspace_snapshot_never_hashes_through_a_planted_link(tmp_path):
-    """`snapshot_workspace` decides whether a coding leaf CHANGED the
-    workspace (§4FH made an empty diff a failed attempt). Pre-fix it walked
-    with a bare `os.walk`, which lists a linked FILE, and hashed it — so the
-    verdict could be driven by a host file the model pointed at."""
-    from ghost_agent.core.coding_loop import snapshot_workspace
-    ws, victim = _sandbox_with_a_link(tmp_path)
-    snap = snapshot_workspace(ws)
-    assert "sub/real.py" in snap
-    assert "sub/link.py" not in snap, snap          # pre-fix: present
-    assert not any(k.startswith("dirlink") for k in snap), snap
-    assert victim.read_text() == SECRET
-
-    # and the snapshot still reports a real edit (the two worlds must differ
-    # only on the link, not on everything)
-    (ws / "sub" / "real.py").write_text("print('changed')\n")
-    assert snapshot_workspace(ws)["sub/real.py"] != snap["sub/real.py"]
 
 
 @pytest.mark.parametrize("module_name,func_name,needle", [
@@ -85,36 +67,3 @@ def test_the_cleanup_reference_scan_reads_nofollow():
     assert any(c.endswith("read_text_nofollow") for c in calls), calls[:20]
 
 
-def test_the_snapshot_read_refuses_a_link_that_appeared_after_the_listing(tmp_path, monkeypatch):
-    """Defence in depth, and the reason the read goes through a descriptor
-    rather than the path: `walk_nofollow` lists regular files only, so a
-    by-path read looks identical — until the entry is SWAPPED between the
-    listing and the read, which is the window the model gets with a detached
-    job. The swap is injected here (a racing thread is not deterministic);
-    the world this fails in is a snapshot that reads `Path(dirpath) / fn`.
-    """
-    from ghost_agent.core import coding_loop as cl
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    (ws / "real.py").write_text("mine\n")
-    victim = tmp_path / "outside.txt"
-    victim.write_text(SECRET)
-
-    # `snapshot_workspace` imports the helpers inside the function, so the
-    # patch goes on the SOURCE module both it and the test read from.
-    from ghost_agent.tools import file_system as fs_mod
-    real_walk = fs_mod.walk_nofollow
-
-    def _walk_then_swap(base):
-        for dirpath, filenames, dir_fd in real_walk(base):
-            # the listing saw a regular file; by the time the caller reads,
-            # the name points elsewhere
-            swapped = Path(dirpath) / "swapped.py"
-            swapped.symlink_to(victim)
-            yield dirpath, list(filenames) + ["swapped.py"], dir_fd
-    monkeypatch.setattr(fs_mod, "walk_nofollow", _walk_then_swap)
-
-    snap = cl.snapshot_workspace(ws)
-    assert "real.py" in snap
-    assert "swapped.py" not in snap, snap        # a by-path read would hash the victim
-    assert victim.read_text() == SECRET

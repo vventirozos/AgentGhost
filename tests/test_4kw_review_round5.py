@@ -132,7 +132,8 @@ def test_bulk_removal_fourth_review_false_positives_pass(cmd):
 
 def test_bulk_removal_tracks_the_directory_from_a_project():
     wd = f"/workspace/projects/{DEV}"
-    assert _bulk_destructive("rm -rf *", _REL, wd) is False
+    assert _bulk_destructive("rm -rf *", _REL, wd) is True          # §4UY C6: the project's top, wiped
+    assert _bulk_destructive("cd src && rm -rf *", _REL, wd) is False
     assert _bulk_destructive("cd .. && rm -rf *", _REL, wd) is True
     assert _bulk_destructive("rm -rf ..", _REL, wd) is True
 

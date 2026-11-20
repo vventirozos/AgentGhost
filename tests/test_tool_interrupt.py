@@ -1040,42 +1040,6 @@ def test_a_not_run_write_is_not_a_written_file_in_task_state():
     assert TSt.untested_pages([page]) == []
 
 
-# ── review r6 pin ───────────────────────────────────────────────────────────
-
-async def test_stopped_runs_never_feed_the_futility_breaker(monkeypatch, tmp_path):
-    """Seven batches of write a.py + execute, each stopped during the write:
-    execute never ran, so no run is counted and no futility alert fires."""
-    monkeypatch.setenv("GHOST_QUEUED_MESSAGES", "1")
-    agent, ctx, _ = _loop_agent(monkeypatch, tmp_path)
-    reg, rid, ran = get_turn_registry(agent), "web-ti-fut", []
-
-    async def _fs(**kw):
-        reg.interrupt_tools(rid)
-        await asyncio.sleep(0.05)
-        return "wrote a.py"
-
-    async def _exec(**kw):
-        ran.append(1)
-        return "EXIT CODE: 0\nsame"
-    agent.available_tools = {"file_system": _fs, "execute": _exec}
-
-    def batch(n):
-        return _resp("", [_tc(f"w{n}", "file_system", {"operation": "write", "path": "a.py", "content": str(n)}),
-                          _tc(f"e{n}", "execute", {"command": "python a.py"})])
-    payloads = []
-    replies = iter([batch(n) for n in range(1, 8)] + [_resp("Done."), _resp("x"), _resp("x")])
-
-    async def _complete(*a, **k):
-        payloads.append(a[0] if a and isinstance(a[0], dict) else k)
-        return next(replies)
-    ctx.llm_client.chat_completion = AsyncMock(side_effect=_complete)
-    body = {"session_id": "s1", "messages": [{"role": "user", "content": "write a.py and run it until it works"}]}
-    await agent.handle_chat(body, FakeBgTasks(), request_id=rid, requester_role="owner")
-    assert ran == []
-    assert all(r.get("runs", 0) == 0 for r in (getattr(ctx, "_script_iter", None) or {}).values())
-    assert not any("futility breaker" in str(p.get("messages")) for p in payloads)
-
-
 # ── review r7 pins: per-request state ───────────────────────────────────────
 
 async def test_a_stopped_read_does_not_mark_the_request_as_having_read_outside_content(monkeypatch, tmp_path):

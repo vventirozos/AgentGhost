@@ -36,15 +36,12 @@ class TestFinalContentScrubs:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("junk", [
         "--- EXECUTION RESULT ---\nexit 0\n------------------------\n",          # L17745
-        "🟢 [task_1] do the thing\n",                                             # L17746
-        "task_3\n[task_4]\n",                                                     # L17748
         "FOCUS TASK: build it\nPLAN: step\nTHOUGHT: hmm\n",                       # L17749
-        "\n".join(f"[task_{i}] deploy step (IN_PROGRESS)" for i in range(4)) + "\n",   # L17747 status run
     ])
     async def test_internal_artifacts_never_reach_the_reply(self, junk):
         a = make_fin_agent()
         out = await _out(a, final_ai_content="Real answer.\n" + junk + "More real text.")
-        for token in ("EXECUTION RESULT", "🟢", "[task_", "task_3", "FOCUS TASK", "PLAN:", "THOUGHT:", "IN_PROGRESS"):
+        for token in ("EXECUTION RESULT", "FOCUS TASK", "PLAN:", "THOUGHT:"):  # §4VC: task lines are content
             assert token not in out, (junk, out)
         assert "Real answer." in out and "More real text." in out
 

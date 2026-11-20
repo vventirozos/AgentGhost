@@ -141,7 +141,7 @@ def test_unverified_repair_is_gated_on_the_flag():
 
 # ── per-request resets ────────────────────────────────────────────────
 
-@pytest.mark.parametrize("attr", ["_futility_steer_done", "_futility_report_done", FLAG])
+@pytest.mark.parametrize("attr", [FLAG])          # §4UY C5: the futility flags are gone with the steer
 def test_request_start_resets(attr):
     tree = _tree(GhostAgent.handle_chat)
     hits = [s for s in ast.walk(tree) if _is_assign_to(s, attr, False)
@@ -169,8 +169,6 @@ def _make_agent(tools):
     agent.disabled_tools = set()
     agent.context.current_project_id = None
     agent.context._script_iter = {}
-    agent.context._futility_steer_done = False
-    agent.context._futility_report_done = False
     agent.context._breaker_forced_final = False
     return agent
 
@@ -206,30 +204,6 @@ def _run(cid, path):
 
 
 @pytest.mark.asyncio
-async def test_futility_steer_tells_the_model_to_look_the_api_up():
-    async def fs(**kw):
-        return "SUCCESS: wrote"
-
-    async def ex(**kw):
-        return "EXIT CODE: 0\nGrid: cannot build grid without 'type'"
-
-    agent = _make_agent({"file_system": fs, "execute": ex})
-    for calls in ([_write("a", "probe.py")], [_run("b", "probe.py")],
-                  [_write("c", "probe.py")], [_run("d", "probe.py")]):
-        await agent._dispatch_and_process_tool_batch(_ts(calls))
-    ts = _ts([_write("e", "probe.py")])
-    await agent._dispatch_and_process_tool_batch(ts)
-    steers = [m for m in ts.messages if m.get("role") == "user"
-              and "SYSTEM ALERT (futility breaker)" in str(m.get("content"))]
-    (steer,) = steers
-    c = steer["content"]
-    assert "STOP guessing" in c and "look it up" in c
-    assert "`search`" in c                      # the tool by its registered name
-    assert "help()" in c
-    assert "compute the result another way" in c
-
-
-@pytest.mark.asyncio
 async def test_a_long_rewrite_rerun_cycle_is_never_forced_to_report():
     """§4UI behavioural twin: 6 writes + 4 runs steer once and force nothing."""
     async def fs(**kw):
@@ -248,5 +222,4 @@ async def test_a_long_rewrite_rerun_cycle_is_never_forced_to_report():
         ts = _ts(calls)
         await agent._dispatch_and_process_tool_batch(ts)
         assert not ts.force_final_response
-    assert not getattr(agent.context, "_futility_report_done", False)
 

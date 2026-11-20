@@ -1874,3 +1874,70 @@ class TestProjectCallsCarryTheSession:
         monkeypatch.setattr(g, "notice", lambda *a, **k: None, raising=False)
         g.cmd_project("use", ["p1"])
         assert ("list", "sess-xyz") in calls and ("switch", "p1", "sess-xyz") in calls
+
+
+# ── 2026-11-19: key codes are never a message (requests 81809b78, 6cdbd1a0) ──────────────────────────────────
+_KEY_CODES = ["\x1b[5;2~", "\x1b[6;2~", "\x1b[5;5~", "\x1b[6;5~", "\x1b[5;6~"]      # Shift/Ctrl(+Shift)+PageUp/Down
+
+
+@pytest.mark.parametrize("code", _KEY_CODES)
+def test_an_unbound_key_never_lands_in_the_line(code):
+    """prompt_toolkit self-inserts the raw bytes of a key it knows but binds nothing to; the prompt drops them."""
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    with create_pipe_input() as inp:
+        inp.send_text("he" + code * 4 + "llo" + code + "\r")
+        plain = PromptSession(input=inp, output=DummyOutput()).prompt("> ")
+    assert "\x1b" in plain                                   # the library still does it: this pin is not vacuous
+    with create_pipe_input() as inp:
+        inp.send_text("he" + code * 4 + "llo" + code + "\r")
+        s = PromptSession(input=inp, output=DummyOutput())
+        cli.keep_key_codes_out(s)
+        assert s.prompt("> ") == "hello"
+
+
+def test_a_line_of_nothing_but_key_codes_is_empty():
+    assert cli.typed_text("\x1b[5;2~" * 4 + "\x1b[6;2~" * 6) == ""
+    assert cli.typed_text("\x1b[5;2~hi\x1b[6;2~ there\x07\x00") == "hi there"
+
+
+@pytest.mark.parametrize("text", ["plain text", "Τι έχει το κατάστημα;", "tab\there", "two\nlines", "50% [ok] ~done~",
+                                  "a[5;2~b", "emoji 🙂 ok", ""])
+def test_ordinary_typed_text_is_untouched(text):
+    assert cli.typed_text(text) == text
+
+
+def test_typed_text_is_linear_on_a_long_paste():
+    import time as _t
+    blob = ("\x1b[" * 50000) + ("\x1b]" * 50000) + "x" * 200000
+    t = _t.monotonic()
+    cli.typed_text(blob)
+    assert _t.monotonic() - t < 10
+
+
+@pytest.mark.parametrize("line", ["[2;2~", "[13;2u", "[5;2~[6;2~", " [1;9H "])
+def test_what_is_left_of_an_unrecognised_key_is_not_a_message(line):
+    """Review 11-19: the editor swallows the ESC of a code it does not know and types the rest."""
+    assert cli.typed_text(line) == ""
+
+
+@pytest.mark.parametrize("text", ["a[2;2~b", "see [1] and [2]", "[x] done", "arr[0]", "[A]"[:2] + "bc"])
+def test_brackets_in_real_text_stay(text):
+    assert cli.typed_text(text) == text
+
+
+def test_a_stray_escape_in_a_paste_does_not_eat_the_lines_after_it():
+    assert cli.typed_text("a \x1b]0;t\nline2\nline3").endswith("\nline2\nline3")
+    assert cli.typed_text("x\x1b\x1b[5~y") == "xy"
+
+
+def test_the_history_search_text_is_cleaned_too():
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    with create_pipe_input() as inp:
+        s = PromptSession(input=inp, output=DummyOutput())
+        cli.keep_key_codes_out(s)
+        s.search_buffer.text = "ol\x1b[5;2~"
+        assert s.search_buffer.text == "ol"

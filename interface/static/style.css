@@ -3130,7 +3130,15 @@ body.restoring .message { animation: none !important; }
     animation: slideInLeft 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .progress-dot { flex: none; color: var(--accent-color); font-size: 0.7em; line-height: 2.1; }
-.progress-steps.is-working .progress-step:last-child .progress-dot { animation: typingBounce 1.1s infinite ease-in-out; }
+/* §4UY S3: only the step that is running now (or "Thinking…" between steps) pulses — never a finished one */
+.progress-steps.is-working .progress-step.is-running .progress-dot { animation: typingBounce 1.1s infinite ease-in-out; }
+.progress-step.is-failed .progress-dot { color: var(--error-color); }
+.progress-step.is-thinking .progress-body { opacity: 0.75; }
+/* §4UY S17: the screen-reader announcement of each new step (visually hidden) */
+.progress-live {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
 .progress-body { display: flex; flex-direction: column; min-width: 0; }
 .progress-text { color: var(--text-color); opacity: 0.88; overflow-wrap: anywhere; }
 .progress-step.is-summary .progress-text { color: inherit; opacity: 1; }
@@ -3152,7 +3160,7 @@ body.restoring .message { animation: none !important; }
 .progress-bar .progress-off { flex: none; opacity: 0.55; }
 .progress-steps:not(:hover):not(:focus-within) .progress-bar .progress-off { opacity: 0.3; }
 @media (prefers-reduced-motion: reduce) {
-    .progress-step, .progress-steps.is-working .progress-step:last-child .progress-dot { animation: none; }
+    .progress-step, .progress-steps.is-working .progress-step.is-running .progress-dot { animation: none; }
 }
 .progress-steps.is-hidden { margin-bottom: 2px; }
 .progress-show {

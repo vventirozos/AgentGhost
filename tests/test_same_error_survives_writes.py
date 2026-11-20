@@ -92,8 +92,6 @@ def _make_agent(tools):
     agent.disabled_tools = set()
     agent.context.current_project_id = None
     agent.context._script_iter = {}
-    agent.context._futility_steer_done = False
-    agent.context._futility_report_done = False
     agent.context._breaker_forced_final = False
     return agent
 
@@ -126,30 +124,6 @@ def _write(cid, path):
 def _run(cid, path):
     return {"id": cid, "type": "function", "function": {"name": "execute", "arguments": json.dumps(
         {"command": f"cd /workspace && python3 {path} 2>&1 | grep -E 'OK|ERR'"})}}
-
-
-@pytest.mark.asyncio
-async def test_futility_steer_fires_across_numbered_probe_files():
-    async def fs(**kw):
-        return "SUCCESS: wrote"
-
-    async def ex(**kw):
-        return "EXIT CODE: 0\nERR dict: RuntimeError: SpecError: [pl]"
-
-    agent = _make_agent({"file_system": fs, "execute": ex})
-    seq = [[_write("w6", "probe6.py")], [_run("r6", "probe6.py")],
-           [_write("w7", "probe7.py")], [_run("r7", "probe7.py")],
-           [_write("w8", "probe8.py")]]
-    fired = []
-    for i, calls in enumerate(seq):
-        ts = _ts(calls)
-        await agent._dispatch_and_process_tool_batch(ts)
-        if any("SYSTEM ALERT (futility breaker)" in str(m.get("content")) for m in ts.messages
-               if m.get("role") == "user"):
-            fired.append(i)
-    assert fired == [4]
-    _si = {k: {f: v[f] for f in ("writes", "runs")} for k, v in agent.context._script_iter.items()}
-    assert _si == {"probe.py": {"writes": 3, "runs": 2}}       # §4OE-2: the record also carries progress/last_out
 
 
 # ── G3: two turns are reserved ────────────────────────────────────────

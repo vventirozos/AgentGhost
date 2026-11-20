@@ -584,9 +584,13 @@ class TestConcurrencyScaling:
         assert alone.rates(URL)[0] == pytest.approx(busy.rates(URL)[0], rel=0.30)
         assert alone.rates(URL)[1] == pytest.approx(busy.rates(URL)[1], rel=0.30)
 
-    def test_round_tripping_a_loaded_sample_is_stable(self):
+    def test_round_tripping_a_loaded_sample_is_stable(self, monkeypatch):
         # Observe at N, plan at N -> you get back what you measured. Without
         # that, every wave would shrink the next one without bound.
+        # §4UZ: in the regime where N-way is what is planned (the distill
+        # queue at width 3); at the default width of 1 a 3-way reading never
+        # sets a plan rate on its own.
+        monkeypatch.setenv("GHOST_DISTILL_WIDTH", "3")
         nt = NodeThroughput()
         for _ in range(6):
             nt.observe(URL, _timings(12000, 54545, 600, 50000), concurrency=3)

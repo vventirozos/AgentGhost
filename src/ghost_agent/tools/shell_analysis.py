@@ -25,25 +25,66 @@ _MAX_QUOTED = 4096
 _INTERPRETERS = {"python", "python3", "node", "nodejs", "perl", "ruby", "php", "deno", "bun"}
 
 
-def _strip_heredocs(cmd: str):
-    """(command without heredoc bodies, [(reader head, body), …])."""
+#: a heredoc operator and its delimiter (`<<EOF`, `<<-'END-SCRIPT'`, `<<"x.y"`, `<<\EOF`). Review r4: never a
+#: here-string `<<<`, an unquoted delimiter starts with a letter or `_` (`1<<3` is a shift), and a `<<` inside
+#: `((…))` / `$((…))` or inside quotes on its line is not an operator (`heredoc_op`)
+_HEREDOC_OP_RE = re.compile(r"(?<!<)<<(?!<)-?[ \t]*(?:(['\"])([\w.-]+)\1|\\?([A-Za-z_][\w.-]*))")
+#: a header line that pipes the heredoc into a shell / interpreter: the body is that program's code
+_HEADER_FED_RE = re.compile(r"\|\s*(?:sudo\s+)?(?:/\S*/)?((?:ba|z|da|k)?sh|python[0-9.]*|perl|ruby|node|php)\b")
+
+
+def heredoc_op(line: str):
+    """The first heredoc operator on `line` that bash would read as one, or None."""
+    for m in _HEREDOC_OP_RE.finditer(line):
+        pre = line[:m.start()]
+        if pre.count("((") > pre.count("))"):
+            continue                                    # arithmetic: `$((1<<n))`, `((x <<= 2))`
+        if pre.count("'") % 2 or (pre.count('"') - pre.count('\\"')) % 2:
+            continue                                    # inside a quoted string
+        return m
+    return None
+
+
+def heredocs(cmd: str) -> list:
+    """THE heredoc reader — one pass over the lines: [(header line, reader head, body, index of the line after
+    the terminator), …]. A body runs to the first line that is its delimiter (leading tabs / spaces
+    stripped). The reader head is the header's program, or the shell / interpreter it pipes into
+    (`cat <<EOF | bash`)."""
     lines = str(cmd or "").split("\n")
-    out, bodies, i = [], [], 0
+    found, i = [], 0
     while i < len(lines):
         line = lines[i]
-        out.append(line)
-        m = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][\w-]*)\1", line)
+        m = heredoc_op(line)
         i += 1
         if not m:
             continue
-        delim, body = m.group(2), []
+        delim, body = m.group(2) or m.group(3), []
         while i < len(lines) and lines[i].strip() != delim:
             body.append(lines[i])
             i += 1
         i += 1                                          # the delimiter line
-        head = (line[:m.start()].strip().split() or [""])[0].lower().rsplit("/", 1)[-1]
-        bodies.append((head, "\n".join(body)))
-    return "\n".join(out), bodies
+        fed = _HEADER_FED_RE.search(line[m.end():])
+        head = fed.group(1).lower() if fed else \
+            (line[:m.start()].strip().split() or [""])[0].lower().rsplit("/", 1)[-1]
+        found.append((line, head, "\n".join(body), i))
+    return found
+
+
+def _strip_heredocs(cmd: str):
+    """(command without heredoc bodies, [(reader head, body), …]) — over `heredocs`."""
+    lines = str(cmd or "").split("\n")
+    docs = heredocs(cmd)
+    if not docs:
+        return "\n".join(lines), []
+    out, i, k = [], 0, 0
+    while i < len(lines):
+        out.append(lines[i])
+        if k < len(docs) and heredoc_op(lines[i]):                  # the k-th header `heredocs` read
+            i = docs[k][3]
+            k += 1
+            continue
+        i += 1
+    return "\n".join(out), [(h, b) for _l, h, b, _n in docs]
 
 
 def _shrink_quotes(cmd: str) -> str:
@@ -312,8 +353,11 @@ def _bulk_target(arg: str, released_ids) -> bool:
     if a == ".." or a.startswith(("../", "/workspace/..")):
         return True
     m = re.match(r"^(?:/workspace/)?projects/(.+)$", a)
-    if m and any(ch in m.group(1) for ch in _GLOB_CHARS):
+    if m and any(ch in m.group(1) for ch in _GLOB_CHARS) and "/" not in m.group(1):
         return True                                   # a glob over the project ids
+    # §4UY C6: a whole project's folder (or everything in it) — `manage_projects delete` owns that
+    if re.fullmatch(r"(?:/workspace/)?projects/[0-9a-f]{12}(?:/\*|/\.)?", a):
+        return True
     # a glob at the workspace root that matches the projects folder (`proj*`)
     base = a[len("/workspace/"):] if a.startswith("/workspace/") else a
     if "/" not in base and any(ch in base for ch in _GLOB_CHARS) and fnmatch.fnmatch("projects", base):
@@ -324,6 +368,53 @@ def _bulk_target(arg: str, released_ids) -> bool:
 _RM_HEADS = {"rm", "rmdir", "unlink", "shred", "truncate", "srm"}
 _FIND_FILTERS = ("-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-wholename", "-iwholename")
 _FIND_ACTIONS = ("-delete", "-exec", "-execdir", "-ok", "-okdir")
+#: §4UY r1: predicates that select SOME files (`find . -empty -delete`, `-mtime +7`, `-newer x`): a find that
+#: carries one positively is cleanup, not a wipe. `-type f` alone is not one (it still takes every file).
+#: §4UY r2 M2: ownership / permission / link-count tests are NOT narrowers — in the sandbox everything is
+#: root's, readable and writable, so `find <project> -user root -delete` takes every file.
+_FIND_NARROWERS = frozenset({"-empty", "-newer", "-anewer", "-cnewer", "-newermt", "-newerct", "-newerat",
+                             "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-size", "-inum",
+                             "-samefile", "-used"})
+
+
+def _regex_takes_all(pat: str) -> bool:
+    """§4UY r4: a `-regex` that matches every path (`.*`, `./.*`) does not narrow a wipe. Probed on a few
+    typical paths; a pattern Python cannot read narrows (judged by its intent, as before)."""
+    try:
+        rx = re.compile(pat.strip("'\""))
+    except re.error:
+        return False
+    return all(rx.fullmatch(p) for p in ("./a", "./a.py", "./src/b.txt", "./.env", "./Makefile"))
+
+
+def _find_removes_trees(expr: list) -> bool:
+    """§4UY r2 M2: the find removes whole FOLDERS — `-exec rm -r… {}` (a matched folder goes with everything in
+    it), or `-delete` with `-maxdepth 1` / on directories. Then no narrower makes it cleanup: an old folder
+    or a matched project is still the whole folder. `-empty` stays a narrower (an empty folder holds nothing)."""
+    for k, e in enumerate(expr):
+        if e in ("-exec", "-execdir", "-ok", "-okdir") and k + 1 < len(expr) \
+                and expr[k + 1].lower().rsplit("/", 1)[-1] in _RM_HEADS:
+            tail = []
+            for a in expr[k + 2:]:
+                if a in (";", "\\;", "+"):
+                    break
+                tail.append(a)
+            if _is_recursive([a for a in tail if a.startswith("-")]):
+                return True
+    if "-delete" in expr:
+        if any(e == "-maxdepth" and k + 1 < len(expr) and expr[k + 1] == "1" for k, e in enumerate(expr)):
+            return True
+        if any(e == "-type" and k + 1 < len(expr) and "d" in expr[k + 1].split(",")
+               and not (k and expr[k - 1] in ("-not", "!")) for k, e in enumerate(expr)):
+            return True
+    return False
+
+
+def _git_clean_wipes(args) -> bool:
+    """§4UY r1: `git clean` with both -d (folders) and -x (ignored files too) removes everything git does not
+    track — at a project's top that is the project's untracked work, builds and `.env` at once."""
+    flags = "".join(a.lstrip("-") for a in args if a.startswith("-") and not a.startswith("--"))
+    return ("d" in flags) and ("x" in flags or "X" in flags)
 
 
 def _is_recursive(opts) -> bool:
@@ -335,6 +426,148 @@ def _find_removes(expr: list) -> bool:
         e in ("-exec", "-execdir", "-ok", "-okdir") and k + 1 < len(expr)
         and expr[k + 1].lower().rsplit("/", 1)[-1] in _RM_HEADS | {"mv"}
         for k, e in enumerate(expr))
+
+
+#: find primaries that take no argument (every other `-x` takes one; `-exec …` runs to `;` / `+`)
+_FIND_NOARG = frozenset({"-delete", "-print", "-print0", "-ls", "-prune", "-quit", "-true", "-false", "-empty",
+                         "-readable", "-writable", "-executable", "-nouser", "-nogroup", "-depth", "-xdev",
+                         "-mount", "-follow", "-noleaf", "-daystart", "-ignore_readdir_race",
+                         "-noignore_readdir_race", "-nowarn", "-warn"})
+
+
+def _find_expr_matcher(expr: list):
+    """§4UY r3: find's expression as a three-valued test ``f(name, printed) -> True | False | None`` over its
+    name / path / regex tests, with find's own grammar (`!`/`-not`, implicit and `-a`, `-o`, `( )`, `,`).
+    Every other test — and every action — is UNKNOWN (None), so ``f(...) is not False`` is a SUPERSET of
+    what find selects: `\\( -name '*.tmp' -o -name '*.bak' \\)` keeps the union, never everything."""
+    import fnmatch
+    toks = [{"\\(": "(", "\\)": ")", "\\!": "!", "\\;": ";"}.get(t, t) for t in expr]
+    n = len(toks)
+
+    def unknown(*_x):
+        return None
+
+    def _and(a, b):
+        return lambda *x: (lambda u, v: False if (u is False or v is False) else
+                           (None if (u is None or v is None) else True))(a(*x), b(*x))
+
+    def _or(a, b):
+        return lambda *x: (lambda u, v: True if (u is True or v is True) else
+                           (None if (u is None or v is None) else False))(a(*x), b(*x))
+
+    def _not(a):
+        return lambda *x: (lambda u: None if u is None else not u)(a(*x))
+
+    _rt = next((toks[k + 1] for k in range(n - 1) if toks[k] == "-regextype"), "emacs")
+
+    def _test(e, pat):
+        pat = pat.strip("'\"")
+        # §4UY r4: only what Python reads EXACTLY as find does narrows. find's default regex dialect is emacs
+        # (`\(`, `\|`, `\{` mean the opposite of Python's), a backslash escape or a `[^…]` class differs
+        # from fnmatch — those tests are UNKNOWN (everything is kept)
+        if e in ("-regex", "-iregex"):
+            if _rt not in ("posix-extended", "egrep") or "\\" in pat or "[[:" in pat:
+                return unknown
+        elif "\\" in pat or "[^" in pat:
+            return unknown
+
+        def t(name, printed):
+            if e == "-name":
+                return fnmatch.fnmatchcase(name, pat)
+            if e == "-iname":
+                return fnmatch.fnmatchcase(name.lower(), pat.lower())
+            if e in ("-path", "-wholename"):
+                return fnmatch.fnmatchcase(printed, pat)
+            if e in ("-ipath", "-iwholename"):
+                return fnmatch.fnmatchcase(printed.lower(), pat.lower())
+            try:
+                return re.fullmatch(pat, printed, re.I if e == "-iregex" else 0) is not None
+            except re.error:
+                return None
+        return t
+
+    def p_list(i):
+        v, i = p_or(i)
+        while i < n and toks[i] == ",":
+            w, i = p_or(i + 1)
+            v = _or(v, w)
+        return v, i
+
+    def p_or(i):
+        v, i = p_and(i)
+        while i < n and toks[i] in ("-o", "-or"):
+            w, i = p_and(i + 1)
+            v = _or(v, w)
+        return v, i
+
+    def p_and(i):
+        v, i = p_not(i)
+        while i < n and toks[i] not in ("-o", "-or", ")", ","):
+            if toks[i] in ("-a", "-and"):
+                i += 1
+            w, i = p_not(i)
+            v = _and(v, w)
+        return v, i
+
+    def p_not(i):
+        if i >= n:
+            return unknown, i
+        t = toks[i]
+        if t in ("!", "-not"):
+            v, i = p_not(i + 1)
+            return _not(v), i
+        if t == "(":
+            v, i = p_list(i + 1)
+            return v, (i + 1 if i < n and toks[i] == ")" else i)
+        if t in _FIND_FILTERS and i + 1 < n:
+            return _test(t, toks[i + 1]), i + 2
+        if t in ("-true",):
+            return (lambda *_x: True), i + 1
+        if t in ("-false",):
+            return (lambda *_x: False), i + 1
+        if t in _FIND_ACTIONS and t != "-delete":
+            j = i + 1
+            while j < n and toks[j] not in (";", "+"):
+                j += 1
+            return unknown, j + 1
+        if t in _FIND_NOARG or not t.startswith("-"):
+            return unknown, i + 1
+        return unknown, (i + 3 if t == "-fprintf" else i + 2)
+
+    try:
+        f, i = p_list(0)
+        return f if i >= n else (lambda *_x: None)
+    except Exception:  # noqa: BLE001 — unreadable: everything may go
+        return lambda *_x: None
+
+
+def _find_kept_match(args: list, *, removes: bool = False):
+    """§4UY r2 m4 / r3: what a NARROWED removing `find` (`find src -name '*.py' -delete`, or one piped to
+    `xargs rm` — ``removes=True``) may remove, for the version store: [(start, match)] where
+    ``match(rel, is_dir)`` is a SUPERSET of find's selection (`_find_expr_matcher`: the name / path / regex
+    tests under find's grammar, everything else unknown). None when the find removes nothing."""
+    import os
+    expr_at = next((i for i, a in enumerate(args) if a.startswith("-") or a in ("(", "!", "\\(", "\\!")),
+                   len(args))
+    expr = args[expr_at:]
+    if not removes and not _find_removes(expr):
+        return None
+    starts = args[:expr_at] or ["."]
+    test = _find_expr_matcher(expr)
+
+    def _for(start: str):
+        def match(rel: str, is_dir: bool) -> bool:
+            if not rel:
+                return test(start.rstrip("/").rsplit("/", 1)[-1] or start, start) is not False
+            rel = rel.replace(os.sep, "/")
+            name = rel.rsplit("/", 1)[-1]
+            # §4UY r4: how find PRINTS the path `-path` sees — GNU appends to a start ending in `/` as is
+            # (`src//` → `src//a.py`), BSD adds one more; any of them matching keeps the file (a superset)
+            printed = {start + rel if start.endswith("/") else start + "/" + rel,
+                       start.rstrip("/") + "/" + rel, start + "/" + rel}
+            return any(test(name, p) is not False for p in printed)
+        return match
+    return [(s, _for(s)) for s in starts]
 
 
 def _destructive_targets(head: str, args: list, via_xargs: bool):
@@ -377,9 +610,14 @@ def _destructive_targets(head: str, args: list, via_xargs: bool):
         # -name x`, `! -name x` and `-delete -name x` counted as narrowing)
         act = next((k for k, e in enumerate(expr) if e in _FIND_ACTIONS), len(expr))
         narrowing = [expr[k + 1] for k, e in enumerate(expr[:act]) if k + 1 < act and e in _FIND_FILTERS
-                     and not (k and expr[k - 1] in ("-not", "!"))]
+                     and not (k and expr[k - 1] in ("-not", "!"))
+                     and not (e in ("-regex", "-iregex") and _regex_takes_all(expr[k + 1]))]
         if narrowing and any(p.strip("'\"") not in ("*", "*.*", ".*", "") for p in narrowing):
             return []
+        if any(e in _FIND_NARROWERS and not (k and expr[k - 1] in ("-not", "!"))
+               and (e == "-empty" or not _find_removes_trees(expr))
+               for k, e in enumerate(expr[:act])):
+            return []                                # §4UY r1: `-empty`, `-mtime +7`, `-newer x` select some
         # `-maxdepth 1` sweeps the start folder's contents: judged as the
         # folder itself, the same verdict (fifth review: the old `<entry>`
         # marker made `find projects -maxdepth 1 -exec rm -rf {} +` pass)
@@ -511,8 +749,20 @@ def _bulk_destructive(command: str, released_ids, workdir: str = "") -> bool:
             if local:
                 if cwd.kind in ("root", "unknown") and (n in (".", "*", "./*") or fnmatch.fnmatch("projects", n)):
                     return True
+                # §4UY C6: everything in a project's OWN folder (`rm -rf *`, `find . -delete` at its top) wipes
+                # the project at once; one level down (`cd build && rm -rf *`) is ordinary cleanup
+                if (cwd.kind == "project" and cwd.depth == 0 and n in (".", "*", "./*")
+                        and (head in _RM_HEADS or head == "find"
+                             or (head == "git" and _git_clean_wipes(args)))):
+                    return True
                 continue
             if relative and n.startswith("..") and cwd.resolves_inside_project(n):
+                # §4UY C6: `cd src && rm -rf ../*` is the project-top wipe from one level down
+                _parts = [x for x in n.split("/") if x not in ("", ".")]
+                _ups = len(_parts) - len([x for x in _parts if x != ".."])
+                if (cwd.kind == "project" and _ups == cwd.depth and _parts[_ups:] == ["*"]
+                        and (head in _RM_HEADS or head == "find")):
+                    return True
                 continue                                 # `cd src && rm -rf ../build` stays in the project
             if cwd.kind in ("root", "bulk", "unknown") or not relative or n.startswith(".."):
                 if _bulk_target(t, rel):

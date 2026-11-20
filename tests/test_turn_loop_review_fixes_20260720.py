@@ -94,8 +94,11 @@ async def test_work_log_helper_noop_without_project():
 def test_is_mutating_covers_unzip_git_clone_and_image_gen():
     src = inspect.getsource(agent_mod.GhostAgent._dispatch_and_process_tool_batch)
     seg = src[src.index("is_mutating ="):src.index("is_mutating =") + 600]
-    for needle in ('"unzip"', '"git_clone"', '"image_generation"'):
-        assert needle in seg, f"is_mutating missing {needle}"
+    assert '"image_generation"' in seg, "is_mutating missing image_generation"
+    # §4UY r2 m1: the file_system ops are the ONE shared list now (tools/fs_ops.py)
+    assert "_FS_MUTATING_OPS" in seg
+    for op in ("unzip", "git_clone"):
+        assert op in agent_mod._FS_MUTATING_OPS, f"is_mutating missing {op!r}"
 
 
 def test_batch_collapse_allowlist_is_reads_only():

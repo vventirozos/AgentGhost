@@ -124,7 +124,9 @@ def test_failed_tool_calls_in_the_turn_make_it_irritable(tmp_path, owner):
     v = _mood(agent)
     assert (v.label, v.intensity) == ("irritable", 1)
     assert (v.p, v.e) == (pytest.approx(-0.36), pytest.approx(0.24))
-    assert v.cause == "3 tool calls failed (of 4) in this turn" and v.source == "auto"
+    # §4UW: the turn's own record files it FAILED (the same failed calls) — said, and not counted a second time
+    assert v.cause == "3 tool calls failed (of 4) and the request as a whole failed in this turn"
+    assert v.source == "auto"
     assert [(r["label"], r["kind"]) for r in _rows(agent)] == [("irritable", "turn")]
 
 
@@ -256,13 +258,14 @@ def _calls_named(tree, name):
 
 
 def test_every_guard_the_brief_names_reports_itself():
-    """The sites, read off the tree: an edit-churn steer, a futility steer, a
+    """The sites, read off the tree: an edit-churn steer, a
     killed thinking loop — and every breaker close, through
-    `stamp_loop_breaker` (§4UI removed the edit-churn stop and futility report)."""
+    `stamp_loop_breaker` (§4UI removed the edit-churn stop and futility report;
+    §4UY C5 removed the futility steer)."""
     tree = ast.parse((ROOT / "src" / "ghost_agent" / "core" / "agent.py").read_text(encoding="utf-8"))
     kinds = sorted(c.args[2].value for c in _calls_named(tree, "note_guard_event")
                    if len(c.args) == 3 and isinstance(c.args[2], ast.Constant))
-    assert kinds == ["edit_churn", "futility", "thinking_loop"]
+    assert kinds == ["edit_churn", "thinking_loop"]                     # §4UY C5 deleted the futility steer
     stamp = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "stamp_loop_breaker")
     assert len(_calls_named(stamp, "note_guard_event")) == 1
     assert len(_calls_named(tree, "stamp_loop_breaker")) >= 5
@@ -523,17 +526,18 @@ def test_the_owner_on_a_public_surface_still_moves_it(tmp_path, owner):
     assert (_mood(agent).label, _mood(agent).intensity) == ("irritable", 2)
 
 
-def test_a_turn_cut_from_outside_moves_nothing(tmp_path, owner):
+def test_the_cut_of_a_turn_from_outside_moves_nothing(tmp_path, owner):
     """(Ported from §4IC: an abort from outside is not a verdict on my work.)
-    A Stop, a disconnect, a restart mid-request: recorded, and the mood stays."""
+    A Stop, a disconnect, a restart mid-request: recorded, and the cut itself moves nothing — a turn that
+    was going fine when it was cut earns no reward and no blame. §4UW: what had ALREADY gone wrong in it
+    counts (tests/test_4uw_mood_fixes.py)."""
     agent = _traj_agent(tmp_path)
-    A.note_guard_event(agent.context, OWNER_RID, "futility")
     GhostAgent._record_aborted_turn(agent, req_id=OWNER_RID, reason="cancelled: client disconnected",
-                                    messages=_turn(BAD_TURN), user_request=ASK, model="m")
+                                    messages=_turn([("execute", OK)] * 5), user_request=ASK, model="m")
     assert agent.context.trajectory_collector.append.call_count == 1       # the turn IS recorded
     assert _mood(agent).neutral and _untouched(agent)
-    _record(agent, _turn(BAD_TURN))                                        # the same turn, finished: it moves
-    assert _mood(agent).label == "irritable"
+    _record(agent, _turn([("execute", OK)] * 5))                           # the same turn, finished: it moves
+    assert _mood(agent).p > 0
 
 
 def test_a_guard_that_cannot_be_asked_moves_nothing(tmp_path, owner, monkeypatch):
@@ -872,7 +876,7 @@ def test_an_owners_turn_that_was_cut_still_says_the_owner_was_here(tmp_path, own
     agent, st = _quiet_agent(tmp_path, 13.0)
     before = _stamp(st)
     GhostAgent._record_aborted_turn(agent, req_id=OWNER_RID, reason="cancelled: client disconnected",
-                                    messages=_turn(BAD_TURN), user_request=ASK, model="m")
+                                    messages=_turn([("execute", OK)] * 3), user_request=ASK, model="m")
     assert _stamp(st) > before and st.state.mood is None
 
 

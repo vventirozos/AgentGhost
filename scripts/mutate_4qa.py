@@ -34,7 +34,7 @@ def _tests():
 
 MUT = [
     ("CONTROL no-op (must SURVIVE)", TD, "def task_topic(description) -> str:", "# ctl\ndef task_topic(description) -> str:"),
-    ('CONTROL known-bad (must DIE): no gate at task close', 'src/ghost_agent/core/task_close.py', '        "deliverable": lambda: gate_deliverable(ws, judged_desc),', '        "deliverable": lambda: None,'),
+    ('CONTROL known-bad (must DIE): no gate at task close', 'src/ghost_agent/core/task_close.py', '        "deliverable": _deliverable,', '        "deliverable": lambda: None,'),
     # #1 self-analysis self-stall
     ('M1 self-analysis background again', 'src/ghost_agent/core/project_advancer.py', 'is_background=_idle_invocation(context), task_label="project-self-analysis",', 'is_background=True, task_label="project-self-analysis",'),
     # #5 routing / topic / slug

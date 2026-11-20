@@ -1301,6 +1301,11 @@ async def _logs(context, row, origin, lines) -> ToolOutcome:
             return _out("RUN ERROR: the sandbox is not running.", OutcomeStatus.FAILED, changed=False,
                         code="sandbox_unavailable")
         text = await asyncio.to_thread(jobs.log_tail, row["backend_ref"], n)
+        try:
+            from .execute import _take_status
+            text = _take_status(str(text or ""))[0]      # §4UY C9: our marker lines are never the job's log
+        except Exception:  # noqa: BLE001
+            pass
         return _out(f"[run {row['name']} logs]\n{_cap(str(text))}", OutcomeStatus.OK, changed=False)
     state, note, detail = await _probe(context, row, origin)
     if detail.get("refused"):
@@ -1548,10 +1553,14 @@ async def _collect(context, reg, row, origin) -> ToolOutcome:
         # review (§4NS): the SAME exit reading as the wake and the old `jobs collect` — the stage-status marker is
         # ours, and a `| head` / `find … 2>/dev/null` that exited 1/141 with output is not a failure
         try:
-            from .execute import _normalise_exit, _take_pipestatus
-            tail, _ = _take_pipestatus(str(tail or ""))
-            if isinstance(code, int) and code != 0:
-                code = _normalise_exit(row["command"] or "", code, tail)
+            from .execute import _normalise_exit, _take_status, status_failures_of_job
+            tail, _, _ = _take_status(str(tail or ""))
+            # §4UY C9: the failures the job's ERR trap recorded in its status file
+            _entry = jobs.get(row["backend_ref"]) if jobs is not None else None
+            _fails = await asyncio.to_thread(status_failures_of_job, (_entry or {}).get("command"),
+                                             getattr(getattr(jobs, "sandbox", None), "host_workspace", None))
+            if isinstance(code, int):
+                code = _normalise_exit(row["command"] or "", code, tail, _fails)
         except Exception:  # noqa: BLE001
             logger.debug("collect: exit not normalised", exc_info=True)
         if jobs is not None and _delivers(jobs, row["backend_ref"]):

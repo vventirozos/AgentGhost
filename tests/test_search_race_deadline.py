@@ -27,15 +27,15 @@ def _mock_ddgs_module(text_side_effect):
 
 
 def test_the_deadline_is_the_slowest_raced_engine_plus_grace():
+    # §4VA: the timeouts are the engine table's rows
+    table = {"a": S.EngineSpec("a", "ddgs", 1, 7, "aaaa"), "b": S.EngineSpec("b", "ddgs", 1, 3, "bbbb")}
     with patch.object(S, "_RACE_ENGINES", ("a", "b")), \
-         patch.object(S, "_DDGS_ENGINE_TIMEOUT", {"a": 7}), \
-         patch.object(S, "_DDGS_FAST_ENGINE_TIMEOUT", 3), \
+         patch.object(S, "ENGINE_TABLE", table), \
          patch.object(S, "_RACE_WAVE_GRACE", 1), \
          patch.object(S, "_DDGS_TOR_TIMEOUT", 99):
         assert S._race_wave_deadline() == 8          # 7 + 1, not 99 + 1
     with patch.object(S, "_RACE_ENGINES", ("b",)), \
-         patch.object(S, "_DDGS_ENGINE_TIMEOUT", {"a": 7}), \
-         patch.object(S, "_DDGS_FAST_ENGINE_TIMEOUT", 3), \
+         patch.object(S, "ENGINE_TABLE", table), \
          patch.object(S, "_RACE_WAVE_GRACE", 1):
         assert S._race_wave_deadline() == 4          # the fast tier bounds it
 
@@ -43,13 +43,17 @@ def test_the_deadline_is_the_slowest_raced_engine_plus_grace():
 def test_the_live_deadline_is_the_fast_tier_now():
     """FAILS IF: a slow-tier engine is raced again without re-measuring, or
     the deadline goes back to the slow-tier constant."""
-    assert S._race_wave_deadline() == S._DDGS_FAST_ENGINE_TIMEOUT + S._RACE_WAVE_GRACE
+    # §4VA: the slowest RACED engine is the Brave onion (16 s: its page and its wrapped links,
+    # measured 11-19) — still under the old slow tier, and still derived from the table
+    assert S._race_wave_deadline() == S._engine_timeout("brave_onion") + S._RACE_WAVE_GRACE == 20
     assert S._race_wave_deadline() < S._DDGS_TOR_TIMEOUT + S._RACE_WAVE_GRACE
 
 
 def test_no_raced_engine_carries_the_slow_budget():
     for e in S._RACE_ENGINES:
-        assert S._engine_timeout(e) == S._DDGS_FAST_ENGINE_TIMEOUT, e
+        assert S._engine_timeout(e) < S._DDGS_TOR_TIMEOUT, e
+        if S._engine_spec(e).kind == "ddgs":
+            assert S._engine_timeout(e) == S._DDGS_FAST_ENGINE_TIMEOUT, e
 
 
 @pytest.mark.asyncio
@@ -62,14 +66,16 @@ async def test_a_wave_of_fast_failures_ends_when_its_last_engine_does():
 
     mod, inst = _mock_ddgs_module(fail_fast)
     with patch.dict("sys.modules", {"ddgs": mod}), \
-         patch("src.ghost_agent.tools.search._DDGS_FAST_ENGINE_TIMEOUT", 5), \
+         patch("src.ghost_agent.tools.search._engine_timeout", lambda e: 5), \
          patch("src.ghost_agent.tools.search._RACE_WAVE_GRACE", 5), \
          patch("src.ghost_agent.tools.search.pretty_log"):
         t0 = time.monotonic()
         results = await S._race_search_wave("q", None, 0)
         elapsed = time.monotonic() - t0
     assert results == []
-    assert inst.text.call_count == len(S._RACE_ENGINES)
+    # §4VA: one ddgs call per circuit of every ddgs engine (the direct engines are off in the suite)
+    assert inst.text.call_count == sum(S._engine_spec(e).circuits for e in S._RACE_ENGINES
+                                       if S._engine_spec(e).kind == "ddgs")
     assert elapsed < 2.0, elapsed
 
 

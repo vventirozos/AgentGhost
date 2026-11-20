@@ -258,14 +258,22 @@ async def test_one_failing_recheck_does_not_stop_the_others_and_is_reported():
     urls, blocks = _blocks(3)
     texts = {urls[0]: ("big " * 300 + "s0", 200, 5.0), urls[1]: ("mid s1", 200, 5.0), urls[2]: ("s2", 200, 5.0)}
     c = _Scripted(lambda t: RuntimeError("busy") if t.endswith("mid s1") else "- a real fact")
-    r = await S.recheck_all_none(blocks, urls, texts, "q", c, "m", deadline=time.monotonic() + 300, slot_wait=1.0)
+    r = await S.recheck_all_none(blocks, urls, texts, "q", c, "m", deadline=time.monotonic() + 70, slot_wait=1.0)
     assert r.anomaly and r.fixed == 2 and r.unchecked == 1
     assert "1 source(s) could not be re-checked" in S.recheck_note(r)
     assert all(kw["timeout"] <= 65.0 for _, kw in c.sent)                  # capped per call, not the whole phase
 
 
-async def test_rechecks_run_in_parallel():
+# §4UZ r2: the rechecks wait for the worker's queue up to their deadline, so the real-clock deadlines in this
+# block are 35-70 s (were 120-300 s): each still exceeds what its pages need (25 s; 65 s where the per-call
+# cap is the point), and a queue that stops passing turns fails these tests in about a minute, not five.
+@pytest.mark.parametrize("width", [1, 3])
+async def test_rechecks_go_through_the_distill_queue(monkeypatch, width):
+    """§4UZ (was `test_rechecks_run_in_parallel`, fanout=3 → 3 at once): the worker does not scale
+    with parallel requests, so the rechecks take the same queue as the first extractions — one at a
+    time by default, GHOST_DISTILL_WIDTH at a time when the operator widens it."""
     import asyncio, time
+    monkeypatch.setenv("GHOST_DISTILL_WIDTH", str(width))
     urls, blocks = _blocks(4)
     texts = {u: (u, 200, 1.0) for u in urls}
     live = {"now": 0, "max": 0}
@@ -277,8 +285,8 @@ async def test_rechecks_run_in_parallel():
             live["now"] -= 1
             return await super().chat_completion(payload, **kw)
     r = await S.recheck_all_none(blocks, urls, texts, "q", _Slow(lambda t: "- fact"), "m",
-                                 deadline=time.monotonic() + 300, slot_wait=1.0, fanout=3)
-    assert r.fixed == 4 and live["max"] == 3
+                                 deadline=time.monotonic() + 35, slot_wait=1.0)
+    assert r.fixed == 4 and live["max"] == width
 
 
 async def test_a_page_whose_plan_does_not_fit_is_left_unchecked():
@@ -286,7 +294,7 @@ async def test_a_page_whose_plan_does_not_fit_is_left_unchecked():
     urls, blocks = _blocks(3)
     texts = {urls[0]: ("big " * 300, 200, 5.0), urls[1]: ("a", 200, 500.0), urls[2]: ("b", 200, 500.0)}
     c = _Scripted(lambda t: "- fact")
-    r = await S.recheck_all_none(blocks, urls, texts, "q", c, "m", deadline=time.monotonic() + 120, slot_wait=10.0)
+    r = await S.recheck_all_none(blocks, urls, texts, "q", c, "m", deadline=time.monotonic() + 35, slot_wait=10.0)
     assert r.fixed == 1 and r.unchecked == 2 and len(c.sent) == 1
 
 
@@ -296,7 +304,7 @@ async def test_a_none_recheck_never_replaces_a_block():
     texts = {u: (u + " x" * i, 200, 1.0) for i, u in enumerate(urls)}
     seq = iter(["- fact", "", "No relevant information found."])
     r = await S.recheck_all_none(blocks, urls, texts, "q", _Scripted(lambda t: next(seq)), "m",
-                                 deadline=time.monotonic() + 300, slot_wait=1.0, fanout=1)
+                                 deadline=time.monotonic() + 35, slot_wait=1.0, fanout=1)
     assert r.fixed == 1 and r.unchecked == 0
     assert sum("No relevant information found." in b for b in r.contents) == 2
 
@@ -307,7 +315,7 @@ async def test_a_url_read_twice_is_rechecked_once():
     urls, blocks = urls + [urls[0]], blocks + [blocks[0]]
     texts = {urls[0]: ("big " * 50, 200, 1.0), urls[1]: ("small", 200, 1.0)}
     c = _Scripted(lambda t: "- fact")
-    await S.recheck_all_none(blocks, urls, texts, "q", c, "m", deadline=time.monotonic() + 300, slot_wait=1.0)
+    await S.recheck_all_none(blocks, urls, texts, "q", c, "m", deadline=time.monotonic() + 35, slot_wait=1.0)
     assert len(c.sent) == 2
 
 
@@ -370,7 +378,7 @@ async def test_a_malformed_plan_estimate_never_escapes():
     urls, blocks = _blocks(2)
     texts = {urls[0]: ("big " * 40, 200, "not-a-number"), urls[1]: ("s", 200, None)}
     r = await S.recheck_all_none(blocks, urls, texts, "q", _Scripted(lambda t: "- fact"), "m",
-                                 deadline=time.monotonic() + 300, slot_wait=1.0)
+                                 deadline=time.monotonic() + 35, slot_wait=1.0)
     assert r.fixed == 2
 
 
@@ -379,7 +387,7 @@ async def test_the_largest_page_that_fits_is_rechecked_first():
     urls, blocks = _blocks(2)
     texts = {urls[0]: ("big " * 300, 200, 1000.0), urls[1]: ("small", 200, 5.0)}
     c = _Scripted(lambda t: "- fact")
-    r = await S.recheck_all_none(blocks, urls, texts, "q", c, "m", deadline=time.monotonic() + 120, slot_wait=1.0)
+    r = await S.recheck_all_none(blocks, urls, texts, "q", c, "m", deadline=time.monotonic() + 35, slot_wait=1.0)
     assert r.anomaly and c.sent[0][0].endswith("small") and r.unchecked == 1
 
 

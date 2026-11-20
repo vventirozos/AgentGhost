@@ -105,57 +105,8 @@ def _spec_llm(captured):
     return MagicMock(chat_completion=AsyncMock(side_effect=_cc))
 
 
-class TestSpecPromptConstraints:
-    async def _gen(self, constraints):
-        from ghost_agent.core.coding_executor import _generate_build_spec
-        captured = []
-        llm = _spec_llm(captured)
-        spec, was_empty = await _generate_build_spec(
-            llm, "m", "Build the chess game task", "",
-            constraints=constraints)
-        user_msg = captured[0]["messages"][1]["content"]
-        return spec, user_msg
-
-    async def test_constraints_rendered_into_prompt(self):
-        _, user = await self._gen(["don't use html / js etc"])
-        assert "EXPLICIT USER CONSTRAINTS (PROJECT-WIDE)" in user
-        assert "don't use html / js etc" in user
-
-    async def test_participant_constraint_appends_steer(self):
-        _, user = await self._gen(
-            ["with YOU - Ghost plays directly, not a generated chess AI"])
-        assert "PARTICIPANT-MODE ARCHITECTURE" in user
-        assert "/api/game/move" in user
-
-    async def test_non_participant_constraint_no_steer(self):
-        _, user = await self._gen(["don't use html / js etc"])
-        assert "PARTICIPANT-MODE ARCHITECTURE" not in user
-
-    async def test_no_constraints_prompt_unchanged(self):
-        _, user = await self._gen(None)
-        assert "EXPLICIT USER CONSTRAINTS" not in user
-        assert "PARTICIPANT-MODE ARCHITECTURE" not in user
 
 
-class TestBuildCodingTaskForwarding:
-    async def test_constraints_kwarg_reaches_spec_generation(self):
-        from ghost_agent.core import coding_executor as ce
-        cons = ["with YOU - Ghost plays directly"]
-        seen = {}
-
-        async def _fake_spec(llm, model, description, ledger, **kw):
-            seen.update(kw)
-            # Empty spec ends the attempt loop quickly.
-            return {}, False
-
-        ctx = MagicMock()
-        ctx.llm_client = MagicMock()
-        ctx.args.model = "m"
-        with patch.object(ce, "_generate_build_spec", side_effect=_fake_spec):
-            await ce.build_coding_task(
-                ctx, "task", tool_runner=AsyncMock(return_value="ok"),
-                constraints=cons, max_attempts=1)
-        assert seen.get("constraints") == cons
 
 
 # --------------------------------------------------------------------------

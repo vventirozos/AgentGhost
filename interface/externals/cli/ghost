@@ -287,6 +287,49 @@ SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 RATE_HISTORY = 50
 
 
+# --- typed text → message -----------------------------------------------------
+# prompt_toolkit knows Shift/Ctrl+PageUp/PageDown as keys but binds nothing to
+# them, and an unbound key is "self-inserted": its raw bytes (`\x1b[5;2~`) land
+# in the line. On 2026-11-18 two messages of nothing but such codes were sent
+# (requests 81809b78, 6cdbd1a0). A key code is never something the owner typed:
+# `typed_text` takes escape sequences and control characters out of a line
+# (newline and tab stay), and `keep_key_codes_out` does it in the prompt's
+# buffer as they arrive, so they are never shown either.
+_KEY_CODE_RE = re.compile(r"\x1b+(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]{0,256}(?:\x07|\x1b\\)?|O[ -~])?")
+#: What is left of a key code the line editor did NOT recognise: it swallows the ESC and types the rest
+#: (`[2;2~`, `[13;2u`). A line made of nothing but such leftovers is a key press, not a message.
+_KEY_RESIDUE_RE = re.compile(r"(?:\s*\[[0-9;?<>]*[~A-Za-z])+\s*")
+_TYPED_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def typed_text(text) -> str:
+    """A typed line without key codes: escape sequences and control characters removed, newline and tab kept."""
+    if not isinstance(text, str):
+        return ""
+    if "\x1b" in text:
+        text = _KEY_CODE_RE.sub("", text)
+    text = _TYPED_CTRL_RE.sub("", text)
+    return "" if _KEY_RESIDUE_RE.fullmatch(text) else text
+
+
+def keep_key_codes_out(session) -> None:
+    """Clean the prompt's buffer whenever a key code lands in it (see `typed_text`)."""
+    for name in ("default_buffer", "search_buffer"):            # the line, and the Ctrl-R search text
+        buf = getattr(session, name, None)
+        if buf is None or not hasattr(buf, "on_text_changed"):  # a stand-in prompt: the line is cleaned at submit
+            continue
+
+        def _clean(_buf, buf=buf) -> None:
+            text = buf.text
+            clean = _TYPED_CTRL_RE.sub("", _KEY_CODE_RE.sub("", text)) if "\x1b" in text else _TYPED_CTRL_RE.sub("", text)
+            if clean != text:
+                head = text[:buf.cursor_position]
+                at = len(_TYPED_CTRL_RE.sub("", _KEY_CODE_RE.sub("", head)))
+                buf.set_document(buf.document.__class__(clean, min(at, len(clean))), bypass_readonly=True)
+
+        buf.on_text_changed += _clean
+
+
 # --- untrusted text → terminal ---------------------------------------------
 # rich strips only BEL/BS/VT/FF/CR (rich.control.STRIP_CONTROL_CODES = [7, 8,
 # 11, 12, 13]). ESC is NOT in that set, so every CSI and ST-terminated OSC in
@@ -458,16 +501,20 @@ class _StepPrinter:
         ● I read the portfolio app's styles and concluded no CSS changes are needed.
           ⎿  Read a file
 
-    A step frame (``ghost.progress`` with ``summary``) comes first; its sentence (``text``, same ``seq``)
-    about a second later. The step is held until its sentence, the next step or the answer arrives — or
-    ``WAIT_S`` passes — so the sentence prints above its summary. A step that gets no sentence prints its
-    summary alone. Nothing prints after ``stop`` (the answer has started). Thread-safe."""
+    A step is printed when it is DONE (a frame with ``summary``); a started one (``running``) and what a task
+    turn inside it does (``detail``) go to the spinner line instead (``on_running``; §4UY S3). A done step is
+    held for its sentence (``text``, same ``seq``) or the agent's word that none comes (``none``), or ``WAIT_S``
+    — so the sentence prints above its summary. Steps print in order: a later step does not push an earlier
+    one out before its sentence (§4UY S11), and a sentence for a later step means none comes for the earlier
+    ones (the agent narrates in order). ``stop`` prints what is held (the answer starts, an error or a Ctrl-C
+    follows — §4UY S12: the last step is not lost under the error line), then nothing more. Thread-safe."""
 
     WAIT_S = 5.0
 
-    def __init__(self, emit):
+    def __init__(self, emit, on_running=None):
         self._emit = emit
-        self._pending: dict | None = None
+        self._on_running = on_running
+        self._held: list = []                  # done steps, in order, waiting for their sentence
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
         self._stopped = False
@@ -480,35 +527,73 @@ class _StepPrinter:
             if self._stopped:
                 return
             seq = progress.get("seq")
+            if progress.get("gone") is True:
+                self._held = [h for h in self._held if h.get("seq") != seq]
+                self._running_locked("")
+                return
             if progress.get("summary"):
-                self._flush_locked()
-                self._pending = dict(progress)
-                self._timer = threading.Timer(self.WAIT_S, self._on_timer)
-                self._timer.daemon = True
-                self._timer.start()
-            elif progress.get("text") and self._pending is not None and self._pending.get("seq") == seq:
-                self._pending["text"] = str(progress["text"])
-                self._flush_locked()
+                self._running_locked("")
+                step = dict(progress)
+                step["_due"] = time.monotonic() + self.WAIT_S
+                step["_final"] = bool(progress.get("none"))
+                self._held = [h for h in self._held if h.get("seq") != seq] + [step]
+            elif progress.get("running") is True:
+                self._running_locked(str(progress.get("label") or ""))
+                return
+            elif progress.get("detail"):
+                self._running_locked(str(progress.get("detail") or ""))
+                return
+            elif progress.get("text") or progress.get("none"):
+                hit = False
+                for h in self._held:
+                    if h.get("seq") == seq:
+                        if progress.get("text"):
+                            h["text"] = str(progress["text"])
+                        h["_final"] = hit = True
+                if hit:                         # the narrator works in order: the earlier ones get none
+                    for h in self._held:
+                        if isinstance(h.get("seq"), int) and isinstance(seq, int) and h["seq"] < seq:
+                            h["_final"] = True
+            else:
+                return
+            self._release_locked()
+
+    def _running_locked(self, label: str) -> None:
+        if self._on_running is not None:
+            try:
+                self._on_running(_safe(label))
+            except Exception:          # noqa: BLE001 — a spinner label is optional
+                pass
 
     def _on_timer(self) -> None:
         with self._lock:
+            self._timer = None
             if not self._stopped:
-                self._flush_locked()
+                self._release_locked()
 
-    def _flush_locked(self) -> None:
+    def _release_locked(self, everything: bool = False) -> None:
+        now = time.monotonic()
+        while self._held and (everything or self._held[0]["_final"] or self._held[0]["_due"] <= now):
+            self._print_locked(self._held.pop(0))
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
-        step, self._pending = self._pending, None
-        if not step:
-            return
+        if self._held and not everything:
+            self._timer = threading.Timer(max(0.0, self._held[0]["_due"] - now), self._on_timer)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _print_locked(self, step: dict) -> None:
         summary = _safe(str(step.get("summary") or ""))
+        if step.get("cut") is True and summary:
+            summary += " — stopped before it finished"
         sentence = _safe(str(step.get("text") or ""))
         from rich.table import Table
         line = Table.grid(padding=0)              # a wrapped sentence stays under its first word
         line.add_column(width=GUTTER + 2, no_wrap=True)
         line.add_column(ratio=1)
-        bullet = Text(" " * GUTTER + "● ", style=PALETTE["ghost"])
+        failed = bool(step.get("failed"))
+        bullet = Text(" " * GUTTER + ("✕ " if failed else "● "), style=PALETTE["err" if failed else "ghost"])
         if sentence:
             line.add_row(bullet, Text(sentence))
             if summary:
@@ -521,23 +606,15 @@ class _StepPrinter:
         except Exception:          # noqa: BLE001 — a step line is optional
             pass
 
-    def discard(self) -> None:
-        """Ctrl-C: drop what is held, print nothing more."""
-        with self._lock:
-            if self._timer is not None:
-                self._timer.cancel()
-                self._timer = None
-            self._pending = None
-            self._stopped = True
-
     def stop(self, gap: bool = False) -> None:
-        """The answer starts (or the turn ended): print what is held, then nothing more.
-        ``gap`` (the answer starts): a blank line after the steps, so the reply stands
-        apart from them — once, and only when a step was printed."""
+        """The answer starts, or the turn ended (an error, a Ctrl-C): print what is held, then nothing more.
+        ``gap`` (the answer starts): a blank line after the steps, so the reply stands apart from them —
+        once, and only when a step was printed."""
         with self._lock:
             if self._stopped:
                 return
-            self._flush_locked()
+            self._release_locked(everything=True)
+            self._running_locked("")
             self._stopped = True
             if gap and self.printed:
                 try:
@@ -948,6 +1025,7 @@ class _BusyView:
         self.done = threading.Event()
         self.detached = False          # stopped from the prompt: worker muted
         self.waiting = False           # spinner up (no token yet)
+        self.spin_label = ""           # §4UY S3: the step that is running, on the spinner line
         self.tail = ""
         self.printer: _StreamPrinter | None = None
         self.resp: Any = None
@@ -1066,7 +1144,7 @@ class _BusyView:
         elif self.waiting:
             i = int(time.monotonic() / 0.08) % len(SPINNER_FRAMES)
             frags.extend([(f"fg:{PALETTE['ghost']}", SPINNER_FRAMES[i]),
-                          (f"fg:{PALETTE['faint']}", " thinking…\n")])
+                          (f"fg:{PALETTE['faint']}", " " + (self.spin_label or "thinking…") + "\n")])
         if frags:
             frags.append(("", "\n"))
         frags.append(("class:p", PROMPT_GLYPH))
@@ -1588,7 +1666,18 @@ class GhostCLI:
                 with busy.lock:
                     if not busy.detached:
                         console.print(line)
-        steps = _StepPrinter(_emit_step) if self.show_progress else None   # §4UT
+        def _spin_label(label: str) -> None:
+            """§4UY S3: a step that has started (or what a task turn inside it does) on the spinner line."""
+            text = label or "thinking…"
+            if busy is None:
+                try:
+                    status_spin.update(Text(text, style="faint"))
+                except Exception:      # noqa: BLE001 — a spinner label is optional
+                    pass
+            else:
+                busy.spin_label = label
+                busy.invalidate()
+        steps = _StepPrinter(_emit_step, _spin_label) if self.show_progress else None   # §4UT
 
         def _release_trim(clean: bool) -> None:
             """§4TE: settle a held reply. The whole of it arrived: keep what
@@ -1632,8 +1721,8 @@ class GhostCLI:
                 waiting = False
             _release_trim(False)       # before the notice the caller prints
             printer.settle()
-            if steps is not None:      # §4UT r2: a held step never prints under an error line (the
-                steps.discard()        # normal end stops — prints — it before this runs)
+            if steps is not None:      # §4UY S12: a held step prints ABOVE the error/stop line (it was
+                steps.stop()           # dropped); the normal end stops — prints — it before this runs
 
         try:
             with self.api.chat_stream(self.history, self.session_id,
@@ -1696,7 +1785,7 @@ class GhostCLI:
                         saw_retract = True
                         if steps is not None:   # §4UT: text taken back mid-work — the steps go on below it
                             steps.stop()
-                            steps = _StepPrinter(_emit_step)
+                            steps = _StepPrinter(_emit_step, _spin_label)
                         _release_trim(False)
                         _tail_chars = _trim_tail_chars(obj.get("ghost"))
                         if held is not None:
@@ -1727,9 +1816,7 @@ class GhostCLI:
                         waiting = False
                     printer.feed(chunk)
         except KeyboardInterrupt:
-            if steps is not None:      # §4UT r1: a held step is not printed after the abort
-                steps.discard()
-            _settle()
+            _settle()                  # §4UY S12: what was done prints above "cancelled" (as the web keeps it)
             self._turn_interrupted = "cancelled"
             self._abort_turn(request_id)
         except requests.exceptions.ConnectionError:
@@ -1960,14 +2047,16 @@ class GhostCLI:
                               "type to add to this request · /interrupt stops "
                               "a tool · Ctrl-C stops the turn")],
             )
+            keep_key_codes_out(self._busy_session)
             # Every chunk invalidates, and each redraw renders the open block
             # (a table with no blank line IS the whole reply): cap it at rich
             # Live's 12/s, the clock _LazyMarkdown was measured against.
             self._busy_session.app.min_redraw_interval = 1 / 12
         view.app = self._busy_session.app
         view.app.ghost_busy_owner = view    # see _BusyView.exit_if_done
-        return self._busy_session.prompt(view.message, default=draft,
-                                         pre_run=view.exit_if_done)
+        res = self._busy_session.prompt(view.message, default=draft,
+                                        pre_run=view.exit_if_done)
+        return typed_text(res) if isinstance(res, str) else res    # never a message of key codes
 
     def _hold(self, text: str, why: str = "") -> None:
         # A stop/hold word typed this turn (``_typed`` includes this line)
@@ -2738,8 +2827,8 @@ class GhostCLI:
             # The reason is the part the distiller and verifier can train
             # on — a bare thumb only resolves outcome=unknown.
             try:
-                note = console.input(
-                    Text("  why? (enter to skip) ", style="mute")).strip()
+                note = typed_text(console.input(
+                    Text("  why? (enter to skip) ", style="mute"))).strip()
             except EOFError:              # Ctrl-D = end of input = skip it
                 console.print()
                 note = ""
@@ -3305,6 +3394,7 @@ class GhostCLI:
             complete_while_typing=False,
             bottom_toolbar=self.status_toolbar,
         )
+        keep_key_codes_out(self.prompt_session)
         self._start_status_refresh()
         self.banner()
         while True:
@@ -3334,7 +3424,7 @@ class GhostCLI:
                 continue
             if line is None:                        # Ctrl-D
                 break
-            line = line.strip()
+            line = typed_text(line).strip()   # never a message of key codes
             if not line:
                 continue
             try:

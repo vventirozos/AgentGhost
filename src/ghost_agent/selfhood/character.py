@@ -15,8 +15,10 @@ model's own replies. It is held here as data instead:
 * the SENTENCE is a pure function of the dials (``sentence``) — no model call, the same bytes until a dial
   moves, and it survives a change of model because the model never wrote it;
 * a dial MOVES one step at a time: by the owner's word (``set_dial``), or by the daily rule (``daily``),
-  which counts, over the day records (``days.py``), the days on which the owner asked for a manner that
-  pulls a dial one way. A pin holds a dial; a veto takes the last automatic move back;
+  which reads, over the day records (``days.py``), how far the days since the dial last moved sit from the
+  agent's own usual — warmth from how the owner talked to it, humour from how its own work went, directness
+  from how its answers were judged (§4UH, §4UP; the first rule, which counted the days the owner asked for a
+  manner, is gone). A pin holds a dial; a veto takes the last automatic move back;
 * every change is a row in an append-only LOG with what was counted — the character's history, and what
   "how have you changed" is answered from (``story``).
 

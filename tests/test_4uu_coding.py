@@ -31,6 +31,12 @@ def _w(path):
             "content": f"SUCCESS: Wrote 10 chars to '{path}'. Script-side path (from sandbox cwd): '{path}'."}
 
 
+def _wp(path, content):
+    """A whole-file write whose text the ledger can read (a page's `<script src>`)."""
+    return {"name": "file_system", "arguments": {"operation": "write", "path": path, "content": content},
+            "content": f"SUCCESS: Wrote 10 chars to '{path}'. Script-side path (from sandbox cwd): '{path}'."}
+
+
 def _x(cmd, code=0):
     return {"name": "execute", "arguments": {"command": cmd}, "content": f"EXIT CODE: {code}\n--- STDOUT ---\nok"}
 
@@ -479,7 +485,9 @@ def test_scaffold_confirmation_feeds_the_write_ledgers(tmp_path):
     msg = str(run(tool_file_system(operation="write", sandbox_dir=tmp_path, path="app", template="web-app")))
     row = {"name": "file_system", "arguments": {"operation": "write", "path": "app", "template": "web-app"},
            "content": msg}
-    assert set(C.code_evidence([row])) >= {"index.html", "app.js", "main.js"}
+    # §4UY C3: the ledger keys by PATH (app/js/app.js), not by basename
+    assert {k.rsplit("/", 1)[-1] for k in C.code_evidence([row])} >= {"index.html", "app.js", "main.js"}
+    assert all(k.startswith("app/") for k in C.code_evidence([row]))
 
 
 def test_scaffold_runner_passes_headless(tmp_path):
@@ -537,7 +545,9 @@ def test_shell_keywords_and_tests_are_not_runs(cmd):
 
 @pytest.mark.parametrize("cmd", ["if true; then node app.js; fi", "(cd x && node app.js)", "{ node app.js; }"])
 def test_a_run_inside_shell_grouping_still_counts(cmd):
-    assert C.unbacked_code_writes([_w("app.js"), _x(cmd)]) == ([], [])
+    # §4UY C3: `cd x && node app.js` runs x/app.js — the ledger keys by path
+    path = "x/app.js" if "cd x" in cmd else "app.js"
+    assert C.unbacked_code_writes([_w(path), _x(cmd)]) == ([], [])
 
 
 @pytest.mark.parametrize("cmd,progs", [("for f in a; do sudo rm $f; done", ["for", "sudo"]),
@@ -1008,7 +1018,8 @@ def _b(args, ok=True):
     ({"operation": "navigate", "url": "file:///workspace/other/index.html"}, ["app/js/app.js"]),
 ])
 def test_a_clean_page_load_runs_the_scripts_it_serves(load, never):
-    rows = [_w("app/index.html"), _w("app/js/app.js"), _b(load)]
+    # §4UY C20: the page's own `<script src>` decides what the load ran
+    rows = [_wp("app/index.html", '<script src="js/app.js"></script>'), _w("app/js/app.js"), _b(load)]
     assert [p for p in C.unbacked_code_writes(rows)[0] if p.endswith(".js")] == never
 
 
@@ -1020,7 +1031,8 @@ def test_a_failed_page_load_credits_no_script():
 def test_a_playwright_script_that_loads_the_page_runs_its_scripts():
     pw = ("python3 - <<'EOF'\nfrom playwright.sync_api import sync_playwright\nwith sync_playwright() as p:\n"
           "  pg = p.chromium.launch().new_page(); pg.goto('file:///workspace/app/index.html')\nEOF")
-    assert C.unbacked_code_writes([_w("app/index.html"), _w("app/js/app.js"), _x(pw)]) == ([], [])
+    assert C.unbacked_code_writes([_wp("app/index.html", '<script src="js/app.js"></script>'), _w("app/js/app.js"),
+                                   _x(pw)]) == ([], [])
 
 
 @pytest.mark.parametrize("rows", [
@@ -1145,7 +1157,8 @@ def test_a_page_load_that_threw_credits_no_script():
 
 
 def test_a_localhost_page_credits_front_end_scripts_only():
-    rows = [_w("scripts/migrate.js"), _w("web/js/app.js"), _b({"operation": "navigate", "url": "http://localhost:3000/"})]
+    rows = [_w("scripts/migrate.js"), _wp("web/index.html", '<script src="/js/app.js"></script>'), _w("web/js/app.js"),
+            _b({"operation": "navigate", "url": "http://localhost:3000/"})]
     assert C.unbacked_code_writes(rows)[0] == ["scripts/migrate.js"]
 
 

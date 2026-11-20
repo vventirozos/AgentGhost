@@ -4,7 +4,6 @@ Pins are behavioural: they drive the advancer, the leaf loop, the routes'
 helpers and the store, and assert what lands."""
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import time
@@ -15,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ghost_agent.core import project_advancer as PA
-from ghost_agent.core import coding_loop as CL
 from ghost_agent.core.coding_executor import CodingResult
 from ghost_agent.core.planning import ProjectPlan, TaskStatus
 from ghost_agent.memory.projects import ProjectStore
@@ -73,14 +71,6 @@ async def test_a_verified_unattended_build_closes_and_the_owners_closes_regardle
     assert store2.get_task(tid2)["status"] == "DONE"
 
 
-@pytest.mark.parametrize("reply,want", [
-    ("VERIFY: python -m pytest -q tests/test_x.py\nSUMMARY: built", "python -m pytest -q tests/test_x.py"),
-    ("VERIFY: pytest -q\nSUMMARY: ok\n\nVERIFY: <one shell command that exits 0 iff …>\nSUMMARY: <one line>", "pytest -q"),
-    ("VERIFY: true\nSUMMARY: done", ""), ("VERIFY: none\nSUMMARY: x", ""), ("VERIFY: `pytest -q`", "pytest -q"),
-])
-def test_the_verify_line_is_the_last_real_command(reply, want):
-    """R2-1: a re-quoted contract after the real line read as `verify=''`; `true` passed."""
-    assert CL.parse_leaf_reply(reply)[0] == want
 
 
 async def test_a_postcondition_demotion_is_a_failed_step_not_a_completed_one(tmp_path):
@@ -111,23 +101,8 @@ async def test_a_postcondition_demotion_is_a_failed_step_not_a_completed_one(tmp
     assert store2.get_task(tid2)["status"] == "FAILED"
 
 
-def test_a_timed_out_attempts_files_are_carried(tmp_path):
-    """R2-2: files from a cut attempt vanished — the next `before` absorbed them."""
-    ws = tmp_path / "ws"; ws.mkdir()
-    before = CL.snapshot_workspace(ws)
-    (ws / "core.py").write_text("x")
-    assert CL._carry_after_abort(ws, before, []) == ["core.py"]
-    assert CL._carry_after_abort(None, before, ["a"]) == ["a"]
 
 
-def test_dotfile_deliverables_and_big_files_are_seen(tmp_path):
-    """R2-6."""
-    ws = tmp_path / "ws"; (ws / ".github" / "workflows").mkdir(parents=True); (ws / ".git").mkdir()
-    (ws / ".github" / "workflows" / "ci.yml").write_text("on: push"); (ws / ".env").write_text("A=1")
-    (ws / ".git" / "HEAD").write_text("ref"); (ws / "big.bin").write_bytes(b"0" * 5_000_002)
-    snap = CL.snapshot_workspace(ws)
-    assert ".github/workflows/ci.yml" in snap and ".env" in snap and ".git/HEAD" not in snap
-    assert "big.bin" in snap and not CL.snapshot_incomplete(snap)     # r3: a big file is seen, not a transient fault
 
 
 async def test_research_on_low_relevance_results_is_held(tmp_path, monkeypatch):
@@ -265,24 +240,6 @@ async def test_a_failed_unattended_build_reaches_the_activity_ledger(tmp_path, m
     assert rec and "FAILED" in rec[0][0][1] and rec[0][1].get("kind") == "autoadvance_failed"
 
 
-async def test_a_deferred_leaf_is_not_a_failed_task(tmp_path, monkeypatch):
-    """R2-3: the owner coming back mid-leaf made the task FAILED and paused autopilot."""
-    from ghost_agent.core.llm import BackgroundDeferred
-    from ghost_agent.core import coding_executor as CE
-    store = _store(tmp_path); pid, tid = _coding_project(store)
-
-    async def exe(ctx, desc, **kw):
-        raise BackgroundDeferred("deferred for the owner's request")
-    res = await PA.advance_once(_ctx(store), pid, tool_runner=AsyncMock(return_value=""), coding_executor=exe,
-                                owner_requested=False)
-    assert store.get_task(tid)["status"] != "FAILED"
-
-    async def _spec_raises(*a, **k):
-        raise BackgroundDeferred("x")
-    monkeypatch.setattr(CE, "_generate_build_spec", _spec_raises)
-    with pytest.raises(BackgroundDeferred):
-        await CE.build_coding_task(SimpleNamespace(llm_client=MagicMock(), args=SimpleNamespace(model="m")), "build x",
-                                   tool_runner=AsyncMock(return_value=""), ledger="", existing_files={})
 
 
 # ── A. the HTTP surface ────────────────────────────────────────────────────
@@ -393,22 +350,6 @@ async def test_a_leaf_turn_writes_no_interactive_work_log_row(monkeypatch):
 
 # ── round 3: defects the diff reader found inside the first cut ────────────
 
-async def test_a_deferred_leaf_is_detected_before_the_no_files_discard(tmp_path, monkeypatch):
-    """r3 MAJOR: the abort lands on the FIRST call (nothing written), and the
-    no-files discard retried the leaf while the owner was active."""
-    from ghost_agent.core.llm import BackgroundDeferred
-    ws = tmp_path / "ws"; ws.mkdir()
-    calls = []
-
-    async def _leaf(context, *, leaf_id, prompt, is_background, project_id):
-        calls.append(leaf_id); return "[ATTEMPT_ABORTED_UPSTREAM] the owner's request took the slot"
-    monkeypatch.setattr(CL, "run_leaf_turn", _leaf)
-    ctx = SimpleNamespace(project_store=SimpleNamespace(get_project=lambda pid: {"workspace_dir": str(ws)}),
-                          llm_client=None, args=SimpleNamespace(native_tools=True))
-    with pytest.raises(BackgroundDeferred):
-        await CL.build_coding_task_agentic(ctx, "Implement hello.py", tool_runner=AsyncMock(return_value=""),
-                                           project_id="aaaaaaaaaaaa", is_background=True, max_attempts=2)
-    assert len(calls) == 1                                                  # not retried while the owner is active
 
 
 async def test_a_deferral_is_reopened_and_not_scored(tmp_path, monkeypatch):
@@ -427,24 +368,8 @@ async def test_a_deferral_is_reopened_and_not_scored(tmp_path, monkeypatch):
     assert meta.get("autopilot") and not meta.get("autopilot_paused") and int(meta.get("no_progress_streak") or 0) == 0
 
 
-async def test_a_skipped_kill_shaped_verify_is_not_verified():
-    """r3 MAJOR: `_run_verify` returns None without running a kill-shaped command."""
-    from ghost_agent.core import coding_executor as CE
-    runner = AsyncMock(return_value="--- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\nok")
-    reason, ran = await CE._run_verify_ex(runner, {"verify": "pkill -f app.py && python app.py"}, ["app.py"])
-    assert reason is None and ran is False and runner.await_count == 0
-    reason2, ran2 = await CE._run_verify_ex(runner, {"verify": "python -m pytest -q"}, ["app.py"])
-    assert reason2 is None and ran2 is True and runner.await_count == 1
-    assert (await CE._run_verify_ex(runner, {"verify": ""}, [])) == (None, False)
 
 
-@pytest.mark.parametrize("reply,want", [
-    ("VERIFY: python solve.py < tests/sample.in\nSUMMARY: ok", "python solve.py < tests/sample.in"),
-    ("VERIFY: test $(wc -l < out.txt) -gt 0\nSUMMARY: ok", "test $(wc -l < out.txt) -gt 0"),
-    ("VERIFY: <one shell command that exits 0 iff this task's work is correct>\nSUMMARY: <one line>", ""),
-])
-def test_a_real_verify_with_redirection_is_kept_and_only_the_placeholder_dropped(reply, want):
-    assert CL.parse_leaf_reply(reply)[0] == want
 
 
 def test_research_is_judged_by_the_tools_own_head_not_a_snippet():
@@ -479,31 +404,10 @@ async def test_the_routes_probe_identity_reaches_the_prefix_readers(tmp_path, mo
     assert is_probe_request_id(seen["rid"])
 
 
-def test_only_deliverable_dotfiles_are_snapshotted(tmp_path):
-    """r3 MAJOR: the first cut dragged .ruff_cache/.next/.idea into deliverables."""
-    ws = tmp_path / "ws"
-    for d in (".ruff_cache", ".next", ".idea", ".github/workflows", ".git"):
-        (ws / d).mkdir(parents=True)
-    (ws / ".ruff_cache" / "CACHEDIR.TAG").write_text("x"); (ws / ".next" / "build.js").write_text("x")
-    (ws / ".idea" / "ws.xml").write_text("x"); (ws / ".github" / "workflows" / "ci.yml").write_text("x")
-    (ws / ".git" / "HEAD").write_text("x"); (ws / ".env").write_text("A=1"); (ws / ".env.local").write_text("S=1")
-    (ws / ".gitignore").write_text("*.pyc"); (ws / "app.py").write_text("x")
-    snap = CL.snapshot_workspace(ws)
-    assert set(snap) == {".github/workflows/ci.yml", ".env", ".gitignore", "app.py"}
 
 
-def test_a_big_file_is_seen_without_a_permanent_incomplete_reading(tmp_path):
-    ws = tmp_path / "ws"; ws.mkdir(); (ws / "data.bin").write_bytes(b"0" * 5_000_002)
-    before = CL.snapshot_workspace(ws)
-    assert "data.bin" in before and not CL.snapshot_incomplete(before)
-    (ws / "data.bin").write_bytes(b"1" * 5_000_003)
-    assert CL.diff_snapshots(before, CL.snapshot_workspace(ws)) == ["data.bin"]
 
 
-def test_a_deferred_attempts_files_are_carried_into_the_next_invocation(tmp_path):
-    CL._CARRY_ACROSS.clear()
-    CL._remember_carry("aaaaaaaaaaaa", "Implement x", ["core.py"])
-    assert CL._CARRY_ACROSS.pop(CL._carry_key("aaaaaaaaaaaa", "Implement x")) == ["core.py"]
 
 
 def test_the_digest_pages_past_five_hundred_events(tmp_path):
@@ -550,25 +454,6 @@ def test_a_probes_own_probe_created_stamp_is_dropped_an_owners_refused():
         _guarded_metadata({"probe_created": True}, "owner")
 
 
-async def test_a_timed_out_attempts_files_reach_the_result_through_the_loop(tmp_path, monkeypatch):
-    """Battery M4: the helper was pinned; the timeout branch of the loop was not."""
-    ws = tmp_path / "ws"; ws.mkdir()
-    n = {"i": 0}
-
-    async def _leaf(context, *, leaf_id, prompt, is_background, project_id):
-        n["i"] += 1
-        if n["i"] == 1:
-            (ws / "core.py").write_text("print(1)\n")
-            raise asyncio.TimeoutError()
-        (ws / "index.html").write_text("<p>x</p>")
-        return "VERIFY: python -c 'print(1)'\nSUMMARY: built"
-    monkeypatch.setattr(CL, "run_leaf_turn", _leaf)
-    runner = AsyncMock(return_value="--- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\n1")
-    ctx = SimpleNamespace(project_store=SimpleNamespace(get_project=lambda pid: {"workspace_dir": str(ws)}),
-                          llm_client=None, args=SimpleNamespace(native_tools=True))
-    res = await CL.build_coding_task_agentic(ctx, "Implement core.py", tool_runner=runner,
-                                             project_id="aaaaaaaaaaaa", is_background=False, max_attempts=2)
-    assert res.ok and "core.py" in res.files and "index.html" in res.files, (res.files, res.detail)
 
 
 async def test_every_projects_route_request_carries_its_origin():

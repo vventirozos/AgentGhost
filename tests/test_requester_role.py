@@ -1357,7 +1357,7 @@ async def test_the_journal_writer_refuses_a_members_turn():
     finally:
         requester_role_context.reset(t)
     j.append.assert_not_called()
-    await agent._journal_append_safe("smart_memory", {"x": 1})
+    await (await agent._journal_append_safe("smart_memory", {"x": 1}))   # §4UY image-5: a background write
     j.append.assert_called_once()
 
 

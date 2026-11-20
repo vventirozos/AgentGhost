@@ -1570,6 +1570,12 @@ def _effort_header(value) -> dict:
     return {"X-Ghost-Effort": v} if v in _EFFORT_LEVELS else {}
 
 
+def _progress_header(value) -> dict:
+    """§4UT/§4UY S10: the upstream header for the page's step mode — "off" = the steps only (the page keeps
+    its "steps hidden · show" line; no Nova sentence is asked for), anything else = steps and sentences."""
+    return {"X-Ghost-Progress": "steps" if str(value or "").strip().lower() == "off" else "1"}
+
+
 @app.post("/api/chat", dependencies=[Depends(verify_interface_key)])
 async def chat_proxy(request: Request):
     """Proxies chat requests to the Ghost Agent."""
@@ -1590,6 +1596,9 @@ async def chat_proxy(request: Request):
         # auto) rides the body from the page and goes upstream as a header —
         # the agent's chat schema has no such field
         _effort = _effort_header(body.pop("reasoning_effort", None))
+        # §4UY S10: the page's step mode rides the body too — "off" asks for the steps without their
+        # sentences (no Nova call per step); the agent's chat schema has no such field
+        _progress = _progress_header(body.pop("progress", None))
 
         if is_streaming:
             task_id = str(uuid.uuid4())
@@ -1637,7 +1646,7 @@ async def chat_proxy(request: Request):
                     # until the end, so it really does hang up at CHAT_TIMEOUT_S.
                     _up_headers = {"X-Ghost-Key": GHOST_API_KEY,
                                    "X-Ghost-Client-Timeout": "inf",
-                                   "X-Ghost-Progress": "1",      # §4UT: the page shows the agent's steps
+                                   **_progress,                  # §4UT: the page shows the agent's steps
                                    **_effort}
                     if t.get("request_id"):
                         _up_headers["X-Request-ID"] = t["request_id"]

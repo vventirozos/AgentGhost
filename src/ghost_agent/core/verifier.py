@@ -2291,6 +2291,36 @@ Respond ONLY with a JSON object:
   "issues": ["specific contradictions, if any"]
 }}"""
 
+# §4UY image-3: the check of a GENERATED picture the image tool already looked
+# at reads that look instead of taking a second one (a second look ran on the
+# main single-slot server and displaced the owner's conversation). Text only:
+# it runs off the main slot.
+_VERIFY_LOOK_PROMPT = """You check what an agent told the user about a picture it generated. A vision model LOOKED at the picture and wrote what it shows (below); you do not see the picture — that look is your only evidence about it.
+
+USER REQUEST:
+{symptom}
+
+WHAT THE PICTURE SHOWS (the vision model's look, one sentence):
+{look}
+
+AGENT'S RESPONSE (its claim about the result):
+{claim}
+
+Judge ONLY the response's statements about the picture against the look:
+- Every statement about the picture agrees with the look, OR the response honestly says what is missing or different from the request → CONFIRMED.
+- A statement about the picture is CONTRADICTED by the look (it claims a thing is there that the look shows differently, a different subject, count, setting or style; or it claims the request was met where the look shows it was not) → REFUTED.
+- The response states details the look neither confirms nor contradicts, and nothing is contradicted → UNCERTAIN.
+
+A one-sentence look omits details: a detail it does not mention is NOT a contradiction. Be conservative: only REFUTE a clear contradiction.
+
+Respond ONLY with a JSON object:
+{{
+  "verdict": "CONFIRMED" | "REFUTED" | "UNCERTAIN",
+  "confidence": 0.0-1.0,
+  "reasoning": "one sentence: what the look says vs. what the response claims",
+  "issues": ["specific contradictions, if any"]
+}}"""
+
 # §4MG: a picture rendered from photos of named subjects is judged AGAINST
 # those photos. Live 2026-10-07 the visual check CONFIRMED two strangers at
 # 100% ("two men in suits kissing") and later named one of them "Erdoğan" —
@@ -5112,6 +5142,60 @@ class Verifier:
                 logger.warning("Visual verifier call failed: %s", exc)
             return {}
 
+    async def _tool_look_at(self, image_path) -> str:
+        """§4UY image-3: the image tool's own look at exactly the bytes of
+        ``image_path`` (`image_gen.render_look_for`, by sha256), or ""."""
+        try:
+            p = Path(str(image_path or ""))
+            if not image_path or not p.is_file() or p.stat().st_size > _MAX_VISUAL_BYTES:
+                return ""
+            data = await asyncio.to_thread(p.read_bytes)
+            from ..tools.image_gen import render_look_for
+            return render_look_for(data)
+        except Exception as exc:  # noqa: BLE001 — no look = the pixel check, as before
+            logger.debug("visual verify: tool look unreadable for %s: %s", image_path, exc)
+            return ""
+
+    async def _verify_against_look(self, *, symptom: str, claim: str, look: str) -> Optional[VerifyResult]:
+        """§4UY image-3: the claim judged against the image tool's look at the
+        same picture — a TEXT call, only off the main slot (the critic pool,
+        `off_main_only`; the deferred lane and its busy mark as the pixel
+        check's critic leg). No pool, a failure or an unusable answer = skipped
+        (None, never a penalty) — never a second look, never the main slot."""
+        prompt = _VERIFY_LOOK_PROMPT.format(symptom=(symptom or "")[:1000], look=str(look)[:600],
+                                            claim=(claim or "")[:1500])
+        clients = getattr(self.llm_client, "critic_clients", None)
+        if not self.llm_client or not isinstance(clients, (list, tuple)) or not clients:
+            logger.info("Visual verifier: the picture's own look exists but no off-main pool can read it — "
+                        "check skipped (no second look on the main slot)")
+            return None
+        _deferred = deferred_verdict_context.get()
+        if isinstance(_deferred, dict) and _deferred.get("nova_busy"):
+            return None
+        payload = {"messages": [{"role": "user", "content": prompt + "\n\n/no_think"}],
+                   "temperature": 0.1, "max_tokens": _CRITIC_MAX_TOKENS, "stream": False,
+                   "chat_template_kwargs": {"enable_thinking": False}}
+        try:
+            _kw = dict(_bounded_fallback_kwargs(self.llm_client))
+            _kw.pop("timeout", None)
+            _kw.setdefault("task_label", "verify-visual-look")
+            _lane = _critic_lane() if _deferred else contextlib.nullcontext()
+            async with _lane:
+                if isinstance(_deferred, dict) and _deferred.get("nova_busy"):
+                    raise LaneBusy("this verdict already found Nova busy")
+                result = await self.llm_client.chat_completion(
+                    payload, use_critic=True, off_main_only=True, timeout=_VISUAL_CRITIC_TIMEOUT_S,
+                    slot_wait=(_DEFERRED_SLOT_WAIT_S if _deferred else _VERIFY_SLOT_WAIT_S), **_kw)
+            text = ((result or {}).get("choices", [{}])[0].get("message", {}).get("content", ""))
+        except Exception as exc:  # noqa: BLE001 — a cancel is BaseException and unwinds
+            if _deferred and getattr(exc, "saturated", False) and isinstance(_deferred, dict):
+                _deferred["nova_busy"] = True
+            logger.info("Visual verifier: reading the picture's own look failed (%s) — check skipped, "
+                        "no second look", exc.__class__.__name__)
+            return None
+        logger.info("Visual verifier: judged against the picture's own look (no second look)")
+        return self._build_verify_result(self._parse_json(text))
+
     @_logged_verify("visual")
     async def verify_visual(self, *, symptom: str, claim: str,
                             after_image: str,
@@ -5139,6 +5223,13 @@ class Verifier:
             # there is no claim to hold against the pixels (the §4QJ unseen-
             # image cap still applies to the text verdict). Skipped, not judged.
             return None
+        if not before_image and not likeness_subjects:
+            # §4UY image-3: the image tool already looked at THESE bytes — its
+            # look is the evidence; no second look (a before/after or likeness
+            # check compares two pictures, which one sentence cannot)
+            seen = await self._tool_look_at(after_image)
+            if seen:
+                return await self._verify_against_look(symptom=symptom, claim=claim, look=seen)
         if likeness_subjects and before_image:
             # §4MG: before_image is the subjects' reference photo
             prompt = _VERIFY_LIKENESS_PROMPT.format(

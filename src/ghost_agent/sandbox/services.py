@@ -79,6 +79,9 @@ REMOTE_UNSERVE_SCRIPT = os.environ.get(
     "/Users/vasilis/Data/AI/bin/unserve-remote.sh")
 
 MAX_SERVICES = 5
+#: §4UY C13: at the cap, on the OWNER's own turn, a conversation's (project-less) server IDLE this long (no start,
+#: status/logs by name, or line in its log) is stopped to make room
+STALE_SERVER_S = 24 * 3600
 # ⚠ `--` IS ILLEGAL IN A BARE NAME. `_file_stem` maps `project:service` to
 # `project--service`, so a bare name containing `--` collides with a scoped
 # key: `acme:api` and `acme--api` both validate and both derive the stem
@@ -1280,9 +1283,13 @@ class ServiceSupervisor:
         them, so a restart does not forget a moved port."""
         with self._lock:
             _REPLACE_TLS.done = None
+            self._stale_note = ""
             try:
                 out = self._start_impl(name, command, port=port, workdir=workdir,
                                        project_id=project_id, _asked=_asked)
+                if self._stale_note:            # §4UY C13: say which stale server made room
+                    from ..tools.outcome import with_text as _with_text
+                    out = _with_text(out, self._stale_note + "\n" + str(out))
             except Exception as e:  # noqa: BLE001
                 done = _replace_record()
                 if not done:
@@ -1427,6 +1434,14 @@ class ServiceSupervisor:
             _max = self._max_services()
             alive = sum(1 for k2, e2 in reg.items()
                         if k2 != key and self._entry_alive_or_unknown(e2))
+            if alive >= _max:
+                # §4UY C13: workspace servers never expired, so the cap (5, across every conversation) filled
+                # with stale ones nobody used. At the cap, the OLDEST conversation server (no project: a
+                # project's server is that project's app) that has run past STALE_SERVER_S is stopped to make
+                # room — never a live-but-unknown one (an infra fault), never a project's.
+                _reclaimed = self._reclaim_stale(reg, key)
+                if _reclaimed:
+                    alive -= 1
             if alive >= _max:
                 # ft live 11-18 (w6_rest): the slots were other conversations' services, which this turn's
                 # `status` does not list — "stop one first (action='status')" was a dead end. Name them and
@@ -2068,6 +2083,79 @@ class ServiceSupervisor:
             return False
         return True
 
+    def _last_use(self, key, entry) -> float:
+        """When a service was last used: its start, a status/logs by name (`used_at`), or the last line its
+        log got (a server logs the requests it serves) — whichever is newest."""
+        times = []
+        for f in ("started_at", "used_at"):
+            try:
+                times.append(float(entry.get(f) or 0))
+            except (TypeError, ValueError):
+                pass
+        try:
+            st = os.lstat(self.host_dir / f"{_file_stem(key)}.log")
+            import stat as _stat
+            if _stat.S_ISREG(st.st_mode):
+                times.append(st.st_mtime)
+        except OSError:
+            pass
+        return max(times or [0.0])
+
+    def _touch(self, key) -> None:
+        """Record a use of a service (status / logs by name) — the idle clock `_reclaim_stale` reads."""
+        try:
+            with self._lock:
+                reg = self._load()
+                if key in reg:
+                    reg[key]["used_at"] = time.time()
+                    self._save(reg)
+        except Exception:  # noqa: BLE001 — bookkeeping only
+            logger.debug("services: use not recorded", exc_info=True)
+
+    def _reclaim_stale(self, reg, keep_key) -> str:
+        """§4UY C13: stop the longest-IDLE project-less service idle past STALE_SERVER_S (its row removed);
+        returns its name, or "" when none qualifies. Only on the owner's own turn — a probe, an unattended
+        run, a leaf or a member never stops anyone's server (review r1). Called with the lock held, `reg`
+        loaded."""
+        try:
+            from ..core.request_scope import ORIGIN_OWNER, current_scope
+            _scope = current_scope()
+            if _scope is None or _scope.origin != ORIGIN_OWNER:
+                return ""
+        except Exception:  # noqa: BLE001 — unknown requester: reclaim nothing
+            return ""
+        now = time.time()
+        stale = []
+        for k2, e2 in reg.items():
+            if k2 == keep_key or e2.get("project_id"):
+                continue
+            age = now - self._last_use(k2, e2)
+            if age > STALE_SERVER_S and self._entry_alive(e2) is True:
+                stale.append((age, k2))
+        if not stale:
+            return ""
+        _age, k2 = max(stale)
+        entry = reg.pop(k2)
+        self._last_kill_survived = False
+        self._kill_service(entry, others=reg.values())
+        if getattr(self, "_last_kill_survived", False):
+            reg[k2] = entry
+            return ""
+        self._save(reg)
+        name = str(entry.get("name") or k2)
+        logger.info("services: reclaimed stale server %s (idle %.0f h) at the cap", name, _age / 3600)
+        shown = name
+        try:                                   # a member never sees others' service names (review r1, the cap)
+            from ..utils.logging import requester_is_member as _member
+            if _member():
+                shown = "…"
+        except Exception:  # noqa: BLE001
+            shown = "…"
+        self._stale_note = (f"[the service cap was full: '{shown}', a conversation's server unused for "
+                            f"{int(_age // 3600)} h, was STOPPED to make room (restart it by name if it is "
+                            f"still wanted)]")
+        return name
+
     def _kill_service(self, entry, others=()) -> bool:
         """Kill one service's process tree and reclaim its port. Returns True
         if anything was actually alive/reclaimed. Also drops its pidfile.
@@ -2449,6 +2537,7 @@ class ServiceSupervisor:
             if _err:
                 return _err
             entries = {key: reg.get(key)}
+            self._touch(key)                       # §4UY C13: a look by name is a use
         else:
             entries = reg
         if not entries:
@@ -2545,6 +2634,7 @@ class ServiceSupervisor:
         key, _err = self._resolve_or_error(_reg, name, project_id)
         if key is not None:
             stem = _file_stem(key)
+            self._touch(key)                       # §4UY C13: a look by name is a use
         elif _err and "ambiguous" in _err:
             return _err
         elif (self.host_dir / f"{_file_stem(str(name))}.log").exists():

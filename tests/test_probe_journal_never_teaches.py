@@ -50,7 +50,7 @@ def _agent():
 async def test_a_probe_turn_appends_nothing(kind):
     a, journal = _agent()
     with _rid("probe-4hz001"), patch("ghost_agent.core.agent.pretty_log"):
-        await a._journal_append_safe(kind, {"user": "x", "tools": [], "ai": "y", "model": "m"})
+        assert await a._journal_append_safe(kind, {"user": "x", "tools": [], "ai": "y", "model": "m"}) is None
     journal.append.assert_not_called()
 
 
@@ -58,7 +58,8 @@ async def test_a_probe_turn_appends_nothing(kind):
 async def test_a_user_turn_still_appends(kind):
     a, journal = _agent()
     with _rid("ab12cd34"), patch("ghost_agent.core.agent.pretty_log"):
-        await a._journal_append_safe(kind, {"text": "arc", "model": "m"})
+        task = await a._journal_append_safe(kind, {"text": "arc", "model": "m"})
+        await task                               # §4UY image-5: a background write
     journal.append.assert_called_once()
     assert journal.append.call_args[0][0] == kind
 
@@ -68,7 +69,8 @@ async def test_no_request_id_is_not_a_probe():
     gate withholds only what is KNOWN to be a probe."""
     a, journal = _agent()
     with patch("ghost_agent.core.agent.pretty_log"):
-        await a._journal_append_safe("post_mortem", {})
+        task = await a._journal_append_safe("post_mortem", {})
+        await task
     journal.append.assert_called_once()
 
 

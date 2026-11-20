@@ -116,7 +116,8 @@ async def test_a_probe_delete_is_a_wall(tmp_path, store, probe_rid):
 
 @pytest.mark.asyncio
 async def test_probe_autopilot_budget_and_close_are_walls(tmp_path, store, probe_rid):
-    from ghost_agent.tools.projects import tool_manage_projects
+    # §4UY P1: the walls are ONE gate at the model's entry (`_who_may_act`)
+    from ghost_agent.tools.projects import tool_manage_projects_for_model as tool_manage_projects
     ctx = _ctx(tmp_path, store)
     pid = store.create_project("Owner Project 2", goal="g")
     for kw in ({"action": "autopilot", "project_id": pid, "enabled": True},
@@ -254,10 +255,10 @@ async def test_an_argument_refusal_gets_the_reissue_advice_at_three(agent):
 
 @pytest.mark.asyncio
 async def test_a_probe_archive_of_an_owner_project_is_a_wall(tmp_path, store):
-    """r1 M1: archive goes through `_teardown_refusal` only — the obvious next
-    try after a refused delete got the argument advice."""
+    """r1 M1: archive — the obvious next try after a refused delete got the
+    argument advice. (§4UY P1: one gate at the model's entry.)"""
     from ghost_agent.core import request_scope as RS
-    from ghost_agent.tools.projects import tool_manage_projects
+    from ghost_agent.tools.projects import tool_manage_projects_for_model as tool_manage_projects
     ctx = _ctx(tmp_path, store)
     pid = store.create_project("Owner Project 3", goal="g")
     tok = RS.install(RS.RequestScope(origin=RS.ORIGIN_PROBE, context=ctx))

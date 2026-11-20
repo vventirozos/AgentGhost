@@ -66,7 +66,7 @@
   <h2 id="no-confirmations">No confirmations <span class="tag">2026-11-12 &sect;4UK</span></h2>
   <p class="note">Operator: "i want all confirmations, everywhere to be removed. i don't wanna be asked for anything. that's why everything is sandboxed" (clarifying questions stay). This supersedes the preview/confirm_token, human-gate and gate-word sections further down.</p>
   <ul>
-    <li><code>manage_projects</code> release / unrelease / delete run in the call; <code>confirm_token</code> is accepted and ignored. <code>_lifecycle_confirmation</code> only refuses a non-user turn (background, scheduled, probe — a probe may still act on its own probe-created project) and a request that read outside content.</li>
+    <li><code>manage_projects</code> release / unrelease / delete run in the call; <code>confirm_token</code> is accepted and ignored. <em>§4UY: the one who-may-act gate (<a href="projects_tool.html#4uy">projects_tool</a>) refuses a non-user turn and a request that read outside content, for every owner action; <code>_lifecycle_confirmation</code> is gone.</em></li>
     <li><code>project_safety.HUMAN_GATES_ENABLED = False</code>: a <code>HUMAN_GATE:</code> postcondition never parks a task; <code>is_human_gate_text</code> keeps it out of text grading.</li>
     <li>Gate words ("approve", "publish", "send", "confirm") no longer hold or park a task; the classifier answers only coding / research.</li>
     <li>A constraint override (<code>override={"constraints": "&lt;why&gt;"}</code>) goes through in the owner's own turn and is recorded (<code>constraint_override</code> event + ledger line); an unattended turn still cannot go over a constraint.</li>
@@ -114,8 +114,9 @@
   (not ACTIVE, or an unattended run's daily allowance is used, <a href="#4ul">&sect;4UL</a>) · <strong>failed</strong> (a task FAILED, when
   <code>stop_on_fail</code>) · <strong>hard_cap</strong>
   (<code>ADVANCE_ALL_HARD_CAP=40</code>, a backstop for an uncapped project).</p>
-  <p><strong>Coding executor (2026-06-20).</strong> A tick's coding path is the
-  real <a href="../coding/coding_executor.html"><code>build_coding_task</code></a>:
+  <p class="note"><strong>&sect;4UY C18 (2026-11-18):</strong> the spec executor described below was REMOVED. With the production executor a coding task runs only as a task turn (<a href="project_turns.html">project_turns</a>); a turn that cannot run releases the task and returns <code>blocked</code> / <code>TASK_TURN_UNAVAILABLE_PREFIX</code> (batch stop <code>step_crashed</code>). <code>_finalize_coding</code> still consumes a caller-supplied (unmarked) executor's <code>CodingResult</code>. The paragraph below is history.</p>
+  <p><strong>Coding executor (2026-06-20).</strong> A tick's coding path was the
+  <a href="../coding/coding_executor.html"><code>build_coding_task</code></a> spec executor:
   spec&nbsp;→&nbsp;write files&nbsp;→&nbsp;verify, finalized by
   <code>_finalize_coding</code> (success registers the produced files as
   deliverables + appends a ledger note + marks DONE; a failed build marks
@@ -317,7 +318,7 @@
   <li><strong>The HTTP surface knows who calls.</strong> <code>X-Ghost-Origin: probe</code> (or a <code>probe-</code> request id) makes an advance non-owner and a created project a fixture, and the probe mark travels as the request-id prefix so every reader agrees; <code>autopilot</code> and the budget keys are refused as metadata (400); a failed build answers <code>ok: false</code>.</li>
   <li><strong>The digest misses nothing.</strong> It scans every event since its watermark (<code>list_events(since_id=…)</code>, paged with <code>before_id</code>), not the newest 50.</li>
   <li><strong>A leaf's turn</strong> writes no interactive work_log row beside the advancer's own. Every projects route request carries the caller's origin (a router dependency), and the smoke gate removes its own script.</li>
-  <li><strong>Pins:</strong> <code>tests/test_4pg_autopilot_review.py</code> (27); battery <code>scripts/mutate_4pg.py</code> — 37/37 mutants killed, controls behaved (two-tier harness: run 4 killed 34 with three no-compiles from anchors cut mid-comment and one survivor, the timed-out attempt's carry, whose pin had covered only the helper — re-pinned through the loop and all four killed on rerun). Suite 24,486 passed. Deployed 2026-10-15, pid 92612. Live probe (HTTP, probe identity): a probe's project is a fixture, autopilot metadata refused (400), a real leaf build held for a check, research closed with a brief, every event <code>origin: probe</code>, nothing at the sandbox root; two residuals from the first probe (route events written as <code>system</code>; the smoke-gate script left behind) fixed before the second.</li>
+  <li><strong>Pins:</strong> <code>tests/test_4pg_autopilot_review.py</code> (27); battery <code>scripts/mutate_4pg.py</code> (retired §4UY: its targets were deleted) — 37/37 mutants killed, controls behaved (two-tier harness: run 4 killed 34 with three no-compiles from anchors cut mid-comment and one survivor, the timed-out attempt's carry, whose pin had covered only the helper — re-pinned through the loop and all four killed on rerun). Suite 24,486 passed. Deployed 2026-10-15, pid 92612. Live probe (HTTP, probe identity): a probe's project is a fixture, autopilot metadata refused (400), a real leaf build held for a check, research closed with a brief, every event <code>origin: probe</code>, nothing at the sandbox root; two residuals from the first probe (route events written as <code>system</code>; the smoke-gate script left behind) fixed before the second.</li>
 </ul>
 
 <h2 id="4qa-e">Quote check after a close <span class="tag">2026-10-19 &sect;4QA-e</span></h2>

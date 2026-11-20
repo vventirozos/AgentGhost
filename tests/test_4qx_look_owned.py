@@ -146,34 +146,33 @@ async def test_it_never_raises():
 
 async def test_both_reply_paths_and_the_census_append_the_line():
     """A correct helper nobody calls is the §4KB lesson: each path must ADD
-    the result to the text it delivers."""
+    the result to the text it delivers. §4UY image-1: finalize and the census
+    PLACE the line under the picture (`_place_owned_look_lines`); the streamed
+    final sends it under the link as it streams (`LookPlacer`) and appends
+    only what text already shown could not carry (`_owned_look_note`). The
+    behaviour is pinned end to end in tests/test_4uy_image.py."""
     src = ast.parse(inspect.getsource(A))
-    for fn in ("_finalize_and_return", "_stream_final_generation"):
-        node = next(n for n in ast.walk(src) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and n.name == fn)
-        calls = [c for c in ast.walk(node) if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_owned_look_note"]
-        assert calls, fn
+
     def fn(name):
         return next(n for n in ast.walk(src) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
 
     def names_in(node):
         return {x.id for x in ast.walk(node) if isinstance(x, ast.Name)}
 
-    def adds(node, target, added):
-        """`target = <…> + <added>` somewhere under ``node``: the result is ADDED to the text."""
-        return any(isinstance(a, ast.Assign) and any(isinstance(t, ast.Name) and t.id == target for t in a.targets)
-                   and isinstance(a.value, ast.BinOp) and isinstance(a.value.op, ast.Add)
-                   and added in names_in(a.value.right) for a in ast.walk(node))
+    def calls(node, name):
+        return [c for c in ast.walk(node) if isinstance(c, ast.Call) and getattr(c.func, "id", "") == name]
 
-    assert adds(fn("_finalize_and_return"), "final_ai_content", "_ol_note")
+    assert calls(fn("_finalize_and_return"), "_place_owned_look_lines")
     stream = fn("_stream_final_generation")
-    assert adds(stream, "full_content", "_ol_note_s")
+    assert calls(stream, "_owned_look_note") and calls(stream, "LookPlacer")
+    assert any(isinstance(a, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "full_content" for t in a.targets)
+               and isinstance(a.value, ast.BinOp) and "_ol_note_s" in names_in(a.value.right) for a in ast.walk(stream))
     assert any(isinstance(y, ast.Yield) and "_ol_note_s" in names_in(y) for y in ast.walk(stream)), \
         "the streamed client must be SENT the line, not just the record"
     census = [n for n in ast.walk(src) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
               and any(isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "record_turn" for c in ast.walk(n))]
     assert any(isinstance(a, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_shown" for t in a.targets)
-               and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_owned_look_note" for c in ast.walk(a.value))
+               and calls(a.value, "_place_owned_look_lines")
                for f in census for a in ast.walk(f)), "the census row's delivered reply carries the line"
 
 

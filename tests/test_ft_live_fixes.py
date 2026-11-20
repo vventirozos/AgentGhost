@@ -23,24 +23,8 @@ def test_bounded_backgrounded_or_non_server_commands_pass(cmd):
     assert _foreground_server_block(cmd) is None
 
 
-from ghost_agent.tools.execute import _normalise_exit, _status_echo_ends_the_run
-
-
-@pytest.mark.parametrize("cmd,ends", [
-    ('python3 x.py; echo "exit=$?"', True), ('python3 x.py; echo "exit=$?"; ls', True),
-    ('for t in a b; do python3 $t; echo "exit=$?"; done', True), ('a; echo "exit=$?"; b; echo "exit=$?"', True),
-    ('python3 x.py; echo "rc=$?" ; cat out.txt', True), ('if python3 x.py; then :; fi; echo "exit=$?"', True),
-    ('python3 x.py; echo "exit=$?; done"; ls', True), ("python3 x.py; echo exit=$?", True),
-])
-def test_only_a_trailing_status_echo_summarises_the_run(cmd, ends):
-    assert _status_echo_ends_the_run(cmd) is ends
-
-
-def test_a_negative_test_mid_command_is_not_the_runs_failure():
-    """req d6bff7a8: the error path tested on purpose, then more commands — the run did not fail."""
-    cmd = 'python3 inv.py remove zebra 99; echo "exit=$?"; python3 inv.py remove zebra 2; python3 inv.py list; ls'
-    assert _normalise_exit(cmd, 0, "error: only 2 in stock\nexit=1\napples 8\ninv.py\n") == 0
-    assert _normalise_exit('python3 x.py; echo "exit=$?"', 0, "Traceback\nexit=1\n") == 1
+# §4UY C9/C10: the `$?`-echo rule (`_status_echo_ends_the_run`) is gone — the real exit codes decide; the
+# d6bff7a8 negative-test shape is pinned against a real bash in tests/test_execute_self_reported_exit.py.
 
 
 @pytest.mark.parametrize("cmd", ["npm run dev:build", "npm run dev-build", "npm run start:test", "yarn dev:build",
@@ -56,15 +40,6 @@ def test_review_r1_builds_and_checks_are_not_servers(cmd):
                                  "npx vite", "npx serve -l 3000"])
 def test_review_r1_more_servers_and_per_segment_exemptions(cmd):
     assert _foreground_server_block(cmd)
-
-
-@pytest.mark.parametrize("cmd,ends", [
-    ('python3 x.py; echo "a \\" b exit=$?"; python3 neg.py', False), ('x; echo "exit=$?"\n# done', True),
-    ('x; echo "exit=$?"; cd ..', True), ('x; echo "exit=$?"; wait', True),
-    ('x; echo "exit=$?" > s.txt; cat s.txt', True), ('x; echo "exit=$?"; cat other.txt', True),
-])
-def test_review_r1_status_echo_edges(cmd, ends):
-    assert _status_echo_ends_the_run(cmd) is ends
 
 
 from ghost_agent.core import env_limits as _envl
@@ -122,13 +97,16 @@ from ghost_agent.tools.validators import _SHELL_DENY
     ("rm -rf /etc", True), ("rm -rf /", True), ("rm -rf ~/x", True), ("rm -rf /workspace/a /etc", True),
 ])
 def test_rm_rf_of_own_scratch_is_not_a_disk_wipe(cmd, blocked):
-    """ft live w2_backup: /tmp scratch may be removed; absolute /workspace paths stay denied (owner data lives there)."""
-    assert bool(_SHELL_DENY[0].search(cmd)) is blocked
+    """ft live w2_backup: /tmp scratch may be removed; absolute /workspace paths stay denied (owner data lives there).
+    §4UY C8: the rm rule is judged per command (`validators._rm_denied`), no longer `_SHELL_DENY[0]`."""
+    from ghost_agent.tools.validators import _rm_denied
+    assert _rm_denied(cmd) is blocked
 
 
 @pytest.mark.parametrize("cmd", ['rm -rf "/tmp/x"/../../etc', "rm -rf '/tmp/x/'..'/..'", r"rm -rf /tmp/x/.\./.\./etc"])
 def test_review_r2_quoting_cannot_smuggle_dotdot_past_the_tmp_exemption(cmd):
-    assert _SHELL_DENY[0].search(cmd)
+    from ghost_agent.tools.validators import _rm_denied
+    assert _rm_denied(cmd)
 
 
 @pytest.mark.parametrize("cmd,out", [
@@ -166,7 +144,7 @@ def test_live_w4_flaky_loop_run_backs_the_claim():
     r = {"name": "execute", "arguments": {"command": "cd ft_w4_flaky && for i in 1 2 3; do python -m pytest -q "
                                                       "test_tags.py 2>&1 | tail -1; done"},
          "content": "--- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\n1 passed in 0.00s\n"}
-    ev = _cc.code_evidence([w, r])["tags.py"]
+    ev = _cc.code_evidence([w, r])["ft_w4_flaky/tags.py"]          # §4UY C3: keyed by path
     assert ev["run_ok"] is True
     assert _cc.unbacked_claim("Fixed and verified — the test passes.", [w, r])[0] == ""
 
@@ -328,17 +306,23 @@ def test_final_foreground_guard(cmd, blocked):
     assert bool(_foreground_server_block(cmd)) is blocked
 
 
-@pytest.mark.parametrize("cmd,out,adopted", [
-    ('python3 a.py; echo "exit=$?"; rm -f tmp.txt', "exit=1\n", True),
-    ('cd p && python3 a.py; echo "exit=$?"; deactivate', "exit=1\n", True),
-    ('python3 a.py; echo "exit=$?"; cat out.log', "exit=1\n", True), ('python3 a.py; echo "exit=${?}"', "exit=1\n", True),
-    ('python3 inv.py remove z 99; echo "exit=$?"; python3 inv.py list; ls', "exit=1\nok\n", False),
-    ('x; echo "exit=$?"; pytest -q', "exit=1\n", False),
-    ('make; echo "exit=$?"; timeout -s KILL 5 python3 t.py', "exit=1\n", False),
-    ('make; echo "exit=$?"; timeout --foreground 5 python3 t.py', "exit=1\n", False),
+@pytest.mark.parametrize("cmd,failed,adopted", [
+    ('python3 a.py; echo "exit=$?"; rm -f tmp.txt', "python3 a.py", True),
+    ('cd p && python3 a.py; echo "exit=$?"; deactivate', "python3 a.py", True),
+    ('python3 a.py; echo "exit=$?"; cat out.log', "python3 a.py", True),
+    ('python3 a.py; echo "exit=${?}"', "python3 a.py", True),
+    ('python3 inv.py remove z 99; echo "exit=$?"; python3 inv.py list; ls', "python3 inv.py remove z 99", False),
+    ('x; echo "exit=$?"; pytest -q', "x", False),
+    ('make; echo "exit=$?"; timeout -s KILL 5 python3 t.py', "make", False),
+    ('make; echo "exit=$?"; timeout --foreground 5 python3 t.py', "make", False),
 ])
-def test_final_status_echo_is_ended_only_by_a_later_runner(cmd, out, adopted):
-    assert (_normalise_exit(cmd, 0, out) == 1) is adopted
+def test_final_status_echo_is_ended_only_by_a_later_runner(cmd, failed, adopted):
+    """§4UY r3: a command that reads `$?` KEEPS the trap (bash restores `$?` after it). A failure whose status
+    the very next member reads is the model's own probe — never adopted, whatever ran after it (`adopted`
+    records the r0 rule this replaced); a LATER runner's failure still counts."""
+    from ghost_agent.tools.execute import _bash_c, _normalise_exit, _reads_own_status
+    assert not _reads_own_status(cmd) and " ERR" in _bash_c(cmd)
+    assert _normalise_exit(cmd, 0, "", [(1, [1], failed)]) == 0
 
 
 @pytest.mark.parametrize("content,blocked", [
@@ -410,7 +394,9 @@ async def test_battery_foreground_server_refused_by_tool_execute(tmp_path):
 
 def test_battery_status_echo_heredoc_closer_named_like_a_runner():
     cmd = 'python3 a.py; echo "exit=$?"; cat > notes.txt <<PY\nhello\nPY'
-    assert _normalise_exit(cmd, 0, "exit=1\n") == 1
+    from ghost_agent.tools.execute import _normalise_exit
+    # §4UY r3: the next member reads this status (`echo "exit=$?"`): the model's own probe, not adopted
+    assert _normalise_exit(cmd, 0, "exit=1\n", [(1, "python3 a.py")]) == 0
 
 
 @pytest.mark.parametrize("name,old,content,blocked", [

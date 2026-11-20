@@ -18,7 +18,7 @@ try:
     from curl_cffi import requests as curl_requests
 except ImportError:
     curl_requests = None
-from ..utils.logging import Icons, pretty_log, request_elapsed_s, request_id_context, slot_session_context
+from ..utils.logging import Icons, pretty_log, request_elapsed_s, request_id_context
 from ..utils.edit_ledger import record_edit
 from ..utils.helpers import socks_url_with_identity
 # §4UN-fetch: no longer called (each attempt rides its own SOCKS circuit); kept as a patch target for older tests
@@ -3273,9 +3273,7 @@ async def _replace_text_impl(filename: str, old_text: str, new_text: str,
                 # arm — a DECLARED rejection over a half-written file, and
                 # the `failed(world_changed=True)` arm written for it was
                 # unreachable.
-                _unread = unread_rewrite_refusal(path, filename)                 # §4OE-2: same gate as `write`
-                if _unread:
-                    return ToolOutcome.rejected("REJECTED: " + _unread, reason_code="unread_rewrite")
+                _kept_note = await asyncio.to_thread(keep_before_replace, path, filename, sandbox_dir)  # §4UY C6
                 _wrote = True
                 # O_NOFOLLOW on the RESOLVED path: the promote is a whole-file
                 # overwrite, and this was the one write in the module that
@@ -3298,7 +3296,7 @@ async def _replace_text_impl(filename: str, old_text: str, new_text: str,
                     f"module and 'replace_with' was missing. The file has been "
                     f"overwritten. Next time, use operation='write' directly "
                     f"when you intend to rewrite the whole file."
-                    + _syn
+                    + _syn + _kept_note
                 )
                 if _syn:
                     return ToolOutcome.partial(
@@ -4915,11 +4913,14 @@ async def _syntax_feedback(path: Path, filename: str, *, in_progress: bool = Fal
         if _pat in _err_low:
             recipe = f"\nRECIPE: {_rec}"
             break
+    # §4UY C16: the browser sentence is for a file a browser loads; a broken .py / .sh fails when it is run
+    _web = str(filename).lower().rsplit("?", 1)[0].endswith((".js", ".mjs", ".cjs", ".html", ".htm"))
+    _why = ("a browser loads a broken script silently and every downstream symptom (dead buttons, blank page) "
+            "traces back here" if _web else
+            "every run or import of it fails on this line before any of your code runs")
     return (
         f"\n⚠ SYNTAX CHECK FAILED: '{filename}' was written but does NOT "
-        f"parse. Fix this BEFORE any other step — a browser loads a broken "
-        f"script silently and every downstream symptom (dead buttons, blank "
-        f"page) traces back here:\n{err}{recipe}"
+        f"parse. Fix this BEFORE any other step — {_why}:\n{err}{recipe}"
     )
 
 
@@ -5486,9 +5487,7 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path, more_p
                     f"cannot be written as text. '{filename}' is unchanged.")
 
         _stray_note = _stray_root_prefix_note(sandbox_dir, path)
-        _unread = unread_rewrite_refusal(path, filename, more_parts=bool(more_parts))   # §4OE-2
-        if _unread:
-            return ToolOutcome.rejected("REJECTED: " + _unread, reason_code="unread_rewrite")
+        _stray_note += await asyncio.to_thread(keep_before_replace, path, filename, sandbox_dir)   # §4UY C6/C21
         # §4NY: a NEW throwaway test/debug script is noted for the end-of-turn
         # cleanup (kept when the reply or the user names it, or tests were asked for)
         from .turn_scratch import is_scratch_test_name, note_created
@@ -6210,13 +6209,33 @@ def unread_rewrite_refusal(path: Path, filename: str, **_ignored) -> str:
             f"(operation='read'), " + tail)
 
 
-#: §4TJ: (conversation, real path) -> (the refused request, the tree's fingerprint,
-#: when): a LATER request of that conversation may delete it within the hour — the
-#: refusal told the model to ask the user in between. The answer itself is not read
-#: (as with `forget`'s confirm: a later turn, never the same one).
-_DELETE_ASKED: "dict[tuple, tuple]" = {}
-_DELETE_ASK_TTL_S = 3600.0
-#: a tree with this many unread files is not walked to the end, and never deleted here
+def keep_before_replace(path: Path, filename: str, sandbox_dir, *, delete: bool = False) -> str:
+    """§4UY C6/C21 — THE rule for a `file_system` overwrite or delete of an existing file (execute keeps the
+    same versions: `execute._keep_versions_before_run`): nothing is refused; the previous version is kept
+    (`file_versions.keep_previous`) and, when this request had not seen the content it replaces
+    (`unread_rewrite_refusal` / `_delete_loses` — kept as the READER of that fact), the result says so and
+    where the old version is. Returns the note ("" when there is nothing to say)."""
+    try:
+        if not isinstance(path, Path) or not os.path.lexists(path):
+            return ""
+        import itertools
+        files = (itertools.islice(path.rglob("*"), _DELETE_WALK_MAX) if path.is_dir() and not path.is_symlink()
+                 else [path])
+        unseen = (any(_delete_loses(p) for p in files if p.is_file() and not p.is_symlink())
+                  if delete else bool(unread_rewrite_refusal(path, filename)))
+        from .file_versions import keep_previous, versions_note
+        # §4UY r1: the store is OUTSIDE the sandbox (GHOST_HOME); ids are relative to the workspace root
+        kept, skipped = keep_previous([path], _outer_root(sandbox_dir))
+    except Exception:  # noqa: BLE001 — a version is never a reason to fail the write
+        return ""
+    if not unseen:
+        return ("\n" + versions_note([], skipped)) if skipped else ""
+    what = "deleted" if delete else "replaced"
+    return (f"\nNOTE: '{filename}' held content this request had not read whole and it was {what}. "
+            + versions_note(kept, skipped))
+
+
+#: a tree with this many files is not walked further for the "had not read" note (§4UY: the delete is not refused)
 _DELETE_WALK_MAX = 5000
 #: the system's own scratch files: made by `execute(filename=…)`, no read receipt,
 #: often in work with no tracked request (§4PG: the smoke gate removes its script)
@@ -6240,67 +6259,6 @@ def _delete_loses(path: Path) -> bool:
         return True
     elapsed = request_elapsed_s(str(request_id_context.get() or ""))
     return elapsed is None or getattr(st, "st_birthtime", st.st_mtime) < time.time() - elapsed
-
-
-def unread_delete_refusal(path: Path, filename: str) -> str:
-    """"" when deleting `path` is allowed, else the refusal text. Req c6751cb9:
-    refused a write over an unread 28 KB file, the model deleted the file to
-    save the read and wrote a new one. A directory is judged by its files.
-    The fingerprint covers every file, not the unread ones: receipts are per
-    request, so a file read in the refused request is unread in the next."""
-    import hashlib
-    lost, cut = [], False
-    sig = hashlib.sha1()
-
-    def _see(p: Path) -> None:
-        sig.update(f"{p}\0{_file_stamp(p)}\n".encode("utf-8", "surrogateescape"))
-        if _delete_loses(p):
-            lost.append(p)
-
-    if path.is_dir():
-        for root, dirs, names in os.walk(path):
-            dirs.sort()
-            for name in sorted(names):
-                p = Path(root) / name
-                if not p.is_symlink() and p.is_file():
-                    _see(p)
-                if len(lost) >= _DELETE_WALK_MAX:
-                    cut = True
-                    break
-            if cut:
-                break
-    else:
-        _see(path)
-    key = (str(slot_session_context.get() or ""), str(path.resolve()))
-    if not lost:
-        _DELETE_ASKED.pop(key, None)
-        return ""
-    rid = str(request_id_context.get() or "")
-    now = time.monotonic()
-    asked = _DELETE_ASKED.get(key)
-    if (asked and asked[0] != rid and asked[1] == sig.digest() and not cut
-            and now - asked[2] <= _DELETE_ASK_TTL_S):
-        _DELETE_ASKED.pop(key, None)
-        return ""
-    if key[0]:
-        if len(_DELETE_ASKED) >= _IN_PROGRESS_MAX and key not in _DELETE_ASKED:
-            for old in list(_DELETE_ASKED)[: _IN_PROGRESS_MAX // 4]:
-                _DELETE_ASKED.pop(old, None)
-        _DELETE_ASKED[key] = (rid, sig.digest(), now)
-    if cut:
-        return (f"'{filename}' holds at least {len(lost)} files this request has not read — too many "
-                f"to delete from here. Leave it and tell the user. Nothing was deleted.")
-    ask = ("ask the user whether to delete it, and delete it in a later turn if they agree"
-           if key[0] else "leave it and say so in your report")
-    if path.is_dir():
-        names = ", ".join(p.relative_to(path).as_posix() for p in lost[:3])
-        return (f"'{filename}' holds {len(lost)} file(s) this request has not read "
-                f"({names}{', …' if len(lost) > 3 else ''}) — deleting would lose content you have not seen. "
-                f"Read those files whole first (operation='read' on each), then delete the folder. If they "
-                f"cannot be read (binary, too big), {ask}. Nothing was deleted.")
-    return (f"'{filename}' ({lost[0].stat().st_size:,} bytes) is a file this request has not read — "
-            f"deleting would lose content you have not seen. Read it whole first (operation='read', or "
-            f"read_chunked pages when that is only a sample), then delete it. If it cannot be read (binary, too big), {ask}. Nothing was deleted.")
 
 
 def _mark_written(path: Path) -> None:
@@ -6909,6 +6867,17 @@ def _name_from_response(filename, headers, sandbox_dir=None) -> str:
         raw = (m.group(1) or m.group(2) or "").strip()
         cand = download_target_name(None, "https://x/" + urllib.parse.quote(urllib.parse.unquote(raw)))
         if cand and cand != "download.bin" and _known_extension(cand):
+            from ..utils.content_check import server_name_may_stand
+            if not server_name_may_stand(cand):
+                # §4UY N8: a code / config / text name (`conftest.py`, `sitecustomize.py`, `pytest.ini`,
+                # `package.json`) is one a toolchain loads BY NAME in the project folder — the server gives
+                # the TYPE only; the stem stays the URL's
+                _suf = Path(cand).suffix.lower()
+                _base = (name[:-len(".bin")] if name.endswith("download.bin") else name) or "download"
+                _bsuf = Path(_base).suffix.lower()
+                if _bsuf in _SCRIPT_SUFFIXES:
+                    _base = _base[:-len(_bsuf)]
+                return _base + _suf
             parent = str(Path(name).parent) if name and "/" in name else ""
             return f"{parent}/{cand}" if parent and parent != "." else cand
     try:
@@ -6923,6 +6892,20 @@ def _name_from_response(filename, headers, sandbox_dir=None) -> str:
             base = base[:-len(_suf)]
         return base + ext
     return name
+
+
+def _landing_note(name_from_url: bool, filename) -> str:
+    """§4UY N8 r3: the receipt says which name the file did NOT get, and why."""
+    from ..utils.content_check import LANDING_SUFFIX, toolchain_loads
+    name = str(filename or "")
+    if not name_from_url or not name.endswith(LANDING_SUFFIX):
+        return ""
+    orig = Path(name[:-len(LANDING_SUFFIX)]).name
+    if not toolchain_loads(orig):
+        return ""
+    return (f"\n[Saved as '{Path(name).name}', not '{orig}': a downloaded file never lands under a name a "
+            f"toolchain loads (code, a build/test/package file, a dotfile). Rename it yourself if you mean "
+            f"to use it as '{orig}'.]")
 
 
 def _free_server_name(sandbox_dir, name: str) -> str:
@@ -6976,6 +6959,9 @@ def _download_receipt(url, filename, target_path: Path, total: int, ctype, head:
         _mark_written(target_path)
     except Exception:  # noqa: BLE001
         pass
+    # §4UY N6: the file came from outside — a later read or run of it (this request or a later one) is marked
+    from ..utils.provenance import note_outside_file
+    note_outside_file(target_path, source=f"download {str(url)[:160]}")
     # §4UN-fetch (final review): the type and the final URL are server-chosen text inside a receipt the
     # verifier's file ledger parses — a ")" in the type plus a "'" in the URL let the ledger capture a fake path
     ct = re.sub(r"[^a-z0-9/.+-]", "", str(ctype or "").split(";")[0].strip().lower())[:80] or "unknown type"
@@ -7032,6 +7018,11 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
     if _is_dark(str(url)):
         return ("Error: a dark-web (.onion) file never goes to the workspace — use "
                 "file_system(operation='download', url=<the .onion URL>), which stores it in the quarantine.")
+    # §4UY N8 r3: a path-less download's FINAL name is `content_check.landing_name` of every name source
+    from ..utils.content_check import landing_name as _landing_name
+    _url_name = filename
+    if name_from_url and filename:
+        filename = _landing_name(filename)
     # --- SSRF guard (shared) ---
     # Block file:// and internal/metadata hosts BEFORE any fetch, so the
     # LLM can't make the host read local files or reach 169.254.169.254 /
@@ -7070,16 +7061,21 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
     if proxy_url and proxy_url.startswith("socks5://"): 
         proxy_url = proxy_url.replace("socks5://", "socks5h://")
 
-    # §4OE-2: a download over an EXISTING file this request has not read is a
-    # whole-file replacement — refused BEFORE any network cost (review 3:
-    # inside the hop loop it would have refused after a Tor rotation)
-    if filename:
+    # §4UY C6/C21: a download over an EXISTING file is a whole-file replacement — its previous version is
+    # kept (one rule with write/execute; the §4OE-2 refusal is gone), noted on the receipt. Seam review: kept
+    # on the FINAL target, just before the bytes land — a server's Content-Disposition name can differ from
+    # the URL's; once per path (a retried attempt must not keep its own partial bytes as a version)
+    _kept_note, _kept_paths = "", set()
+
+    async def _keep_final(tp, fn):
+        nonlocal _kept_note
+        if str(tp) in _kept_paths:
+            return
+        _kept_paths.add(str(tp))
         try:
-            _unread = unread_rewrite_refusal(_get_safe_path(sandbox_dir, filename), filename)
-        except Exception:  # noqa: BLE001 — the per-hop safe-path check below answers escapes
-            _unread = ""
-        if _unread:
-            return ToolOutcome.rejected("REJECTED: " + _unread, reason_code="unread_rewrite")
+            _kept_note = await asyncio.to_thread(keep_before_replace, tp, fn, sandbox_dir)
+        except Exception:  # noqa: BLE001 — keeping a version never blocks the download
+            _kept_note = ""
     headers = {"User-Agent": "Mozilla/5.0"}
     last_error = None
     _last_kind = ""          # §4UN-fetch: "status" | "timeout" | "stall" | "cut" | "other" — what the message says
@@ -7155,7 +7151,7 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                         return f"Error: File is too large ({_clen/1000000:.1f}MB). Download limit is 50MB."
 
                     if name_from_url:
-                        _renamed = _name_from_response(filename, resp.headers, sandbox_dir)
+                        _renamed = _landing_name(_name_from_response(_url_name, resp.headers, sandbox_dir))
                         if _renamed and _renamed != filename:
                             _renamed = _free_server_name(sandbox_dir, _renamed)   # r1: never over an unread file
                         if _renamed and _renamed != filename:
@@ -7168,6 +7164,7 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                     if _nr:
                         await _aclose_curl(resp)
                         return _nr
+                    await _keep_final(target_path, filename)            # the landed name, before the bytes
                     try:
                         _total, _overflow, _head = await _save_download_stream(
                             target_path, _guarded_chunks(resp.aiter_content(), url, _clen, _got, _clock))
@@ -7179,8 +7176,10 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                     if _overflow:
                         return ("Error: download exceeded the 50MB cap (server omitted or exceeded "
                                 "Content-Length). Nothing was saved.")
-                    return _download_receipt(url, filename, target_path, _total, resp.headers.get("Content-Type"),
-                                             _head, final_url=_final_url)
+                    return append_note(_download_receipt(url, filename, target_path, _total,
+                                                         resp.headers.get("Content-Type"), _head,
+                                                         final_url=_final_url),
+                                       _kept_note + _landing_note(name_from_url, filename))
             else:
                 # follow_redirects=False + manual hop loop so each Location is
                 # SSRF-validated before the fetch (see _download_redirect_target).
@@ -7214,13 +7213,16 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                             _nr = _nonregular_refusal(target_path, filename)    # §4PE (F3)
                             if _nr:
                                 return _nr
+                            await _keep_final(target_path, filename)
                             _total, _overflow, _head = await _save_download_stream(
                                 target_path, _guarded_chunks(resp.aiter_bytes(), url, _clen, _got, _clock))
                             if _overflow:
                                 return ("Error: download exceeded the 50MB cap (server omitted or exceeded "
                                         "Content-Length). Nothing was saved.")
-                            return _download_receipt(url, filename, target_path, _total,
-                                                     resp.headers.get("Content-Type"), _head, final_url=cur_url)
+                            return append_note(_download_receipt(url, filename, target_path, _total,
+                                                                 resp.headers.get("Content-Type"), _head,
+                                                                 final_url=cur_url),
+                                               _kept_note + _landing_note(name_from_url, filename))
                     else:
                         return "Error: too many redirects (possible redirect loop)."
                     # reached only via the refusal `break` → the outer attempt loop (a fresh circuit)
@@ -7621,6 +7623,7 @@ async def tool_copy_file(src_name: str, dest_name: str, sandbox_dir: Path):
             # copy2 carries BSD flags on macOS: a copy OUT of a released
             # workspace would be immutable too (§4KW fourth review)
             _clear_immutable(dest_path)
+        _carry_outside(src_path, dest_path)              # §4UY N6 r4: a copy of outside content is outside
         if _skipped:
             # A half-landed write is `ToolOutcome.partial`, never a bare
             # string that merely starts with "PARTIAL:" — the package-wide
@@ -7641,6 +7644,15 @@ async def tool_copy_file(src_name: str, dest_name: str, sandbox_dir: Path):
         return str(ve)
     except Exception as e:
         return f"Error: {e}"
+
+
+def _carry_outside(src, dst) -> None:
+    """§4UY N6 r4: the outside-file ledger row(s) of ``src`` follow a move/copy to ``dst``. Never raises."""
+    try:
+        from ..utils.provenance import carry_outside_rows
+        carry_outside_rows(src, dst)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def tool_rename_file(old_name: str, new_name: str, sandbox_dir: Path):
@@ -7688,6 +7700,7 @@ async def tool_rename_file(old_name: str, new_name: str, sandbox_dir: Path):
         _old_rp = str(old_path.resolve())
         await asyncio.to_thread(shutil.move, str(old_path), str(new_path))
         _move_parts(_old_rp, new_path)             # §4OI r1 m5: the parts state follows the file
+        _carry_outside(old_path, new_path)         # §4UY N6 r4: …and so does its outside-file row
         return f"SUCCESS: Renamed/Moved '{old_name}' to '{new_name}'."
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
@@ -7742,18 +7755,46 @@ async def tool_delete_file(filename: str, sandbox_dir: Path):
         _ref = _protected_dir_refusal(sandbox_dir, path, filename)
         if _ref is not None:
             return _ref
-        _unread = await asyncio.to_thread(unread_delete_refusal, path, filename)      # §4TJ
-        if _unread:
-            from .outcome import ToolOutcome
-            return ToolOutcome.rejected("REJECTED: " + _unread, world_changed=False, reason_code="unread_delete")
+        # §4UY C6/C21: no refusal (its "ask the user" was a confirmation, §4UK) — the previous version is kept
+        _kept_note = await asyncio.to_thread(keep_before_replace, path, filename, sandbox_dir, delete=True)
         if path.is_dir():
             await asyncio.to_thread(shutil.rmtree, path)
         else:
             await asyncio.to_thread(path.unlink)
         _forget_parts_under(path)                  # §4OI r1 m5: a deleted parts file is not "unfinished"
-        return f"SUCCESS: Deleted '{filename}'."
+        return f"SUCCESS: Deleted '{filename}'.{_kept_note}"
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
+
+
+async def tool_file_versions(operation: str, filename: str, sandbox_dir: Path, version: str = ""):
+    """§4UY C6/C21 r1: the versions a tool kept before overwriting or deleting ``filename`` (`versions`), and
+    putting one back (`restore`, the newest unless ``version`` names a stamp). The store is outside the
+    sandbox, so this is the model's only way to it."""
+    from .file_versions import list_versions, restore_version
+    if not filename:
+        return ToolOutcome.rejected("SYSTEM INSTRUCTION: 'path' is MANDATORY for versions/restore (the file "
+                                    "whose earlier version you want).", reason_code="missing_path")
+    try:
+        path = _get_safe_path(sandbox_dir, filename, allow_root=False)
+    except ValueError as ve:
+        return ToolOutcome.rejected(str(ve), reason_code="unsafe_path")
+    root = _outer_root(sandbox_dir)
+    if operation == "versions":
+        vs = await asyncio.to_thread(list_versions, path, root)
+        if not vs:
+            return ToolOutcome.ok(f"No kept versions of '{filename}'. (Only what a tool overwrote or deleted "
+                                  "is kept — not a file a program wrote itself — for 14 days.)",
+                                  world_changed=False)
+        return ToolOutcome.ok(f"Kept versions of '{filename}' (oldest first; restore one with "
+                              f"file_system(operation='restore', path='{filename}', version='<stamp>')):\n"
+                              + "\n".join(f"  {v.rsplit('@', 1)[1]}" for v in vs), world_changed=False)
+    ok, msg = await asyncio.to_thread(restore_version, path, root, version)
+    if not ok:
+        return ToolOutcome.rejected(f"Error: {msg}. Nothing was changed.", reason_code="restore_failed")
+    _mark_written(path)
+    # one fixed shape the run ledger parses (agent._FS_PRODUCE_RES; tests/test_grounded_file_verify parity)
+    return ToolOutcome.ok(f"SUCCESS: Restored '{filename}' — {msg}.", world_changed=True)
 
 async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int = 1, chunk_size: int = 32000, max_context: int = 8192) -> str:
     """
@@ -7933,7 +7974,7 @@ _READ_ONLY_OPS = frozenset({
     "read", "read_file", "read_chunked", "read_document", "inspect",
     "outline", "symbols",
     "search", "find", "list", "list_files", "ls", "dir", "tree", "list_dir",
-    "list_directory",
+    "list_directory", "versions",
 })
 
 
@@ -8094,6 +8135,7 @@ _EMPTY_OK_NAMES = frozenset({"__init__.py", ".gitkeep", ".keep", ".nojekyll", "p
 #: "batch" and left out edit/search/copy…). Pinned equal to the enum in tests.
 ADVERTISED_OPS = ("read", "read_chunked", "outline", "symbols", "inspect", "search", "find", "list_files",
                   "write", "edit", "replace", "download", "copy", "rename", "move", "delete",
+                  "versions", "restore",
                   "quarantine_list", "quarantine_inspect", "quarantine_delete")
 #: §4NL: the quarantine operations — they never touch the workspace
 QUARANTINE_OPS = frozenset({"quarantine_list", "quarantine_inspect", "quarantine_delete"})
@@ -8104,7 +8146,7 @@ ACCEPTED_OPS = ADVERTISED_OPS + ("list", "ls", "dir", "tree", "list_dir", "list_
 #: §4UL: operations that put work into a file (the projects hook below); §4UM review M4: delete too, and a
 #: move/rename changes its SOURCE (removed) as well as its destination
 _PROJECT_WRITE_OPS = frozenset({"write", "append", "append_file", "write_append", "edit", "replace",
-                                "move", "rename", "copy", "delete", "download"})
+                                "move", "rename", "copy", "delete", "download", "restore"})
 _PROJECT_MOVE_OPS = frozenset({"move", "rename"})
 
 
@@ -8116,6 +8158,9 @@ def _download_target(path, kwargs) -> str:
     if t and re.match(r"https?://", str(t), re.I):           # the URL in the path (the impl heals it the same way)
         url, t = url or str(t), None
     try:
+        if not t and url:                    # §4UY N8 r3: path-less — the download's own final-name rule
+            from ..utils.content_check import landing_name
+            return landing_name(download_target_name(None, url))
         return download_target_name(t, url) if (t or url) else ""
     except Exception:  # noqa: BLE001
         return ""
@@ -8275,7 +8320,11 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
             _ok = (_st in ("ok", "partial") if _st is not None
                    else not str(res or "").lstrip().lower().startswith(("error", "system instruction")))
             if _ok and _op == "download":
-                _dt = _download_target(path, kwargs)
+                # seam review: the LANDED name (a server's Content-Disposition can rename it) — the receipt's
+                # (the status word is matched as `\w+:` — `_ok` already says it succeeded; a literal success
+                # prefix here would read as a new emitter to tests/test_grounded_file_verify's parity walker)
+                _landed = re.match(r"\w+: Downloaded '.+?' to '(.+?)'(?: \([^)]*\))?\.", str(res or "").lstrip())
+                _dt = _landed.group(1) if _landed else _download_target(path, kwargs)
                 _full = Path(_dt) if Path(_dt).is_absolute() else Path(sandbox_dir) / _dt
                 _note = note_project_write_hook(sandbox_dir, _dt) if _full.is_file() else ""
                 if _note:
@@ -8296,7 +8345,34 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
     except Exception:  # noqa: BLE001
         import logging as _logging
         _logging.getLogger("GhostAgent").debug("project write hook skipped", exc_info=True)
+    _note_agent_wrote(_op0, sandbox_dir, path, res, kwargs)                  # §4UY review (N6 ledger)
     return res
+
+
+#: §4UY review: the operations that REPLACE a file's whole text with the agent's own — after one, the
+#: file is no longer outside content (`provenance.note_agent_write`). An append, edit or replace keeps the
+#: bytes that came from outside, a copy/move carries them: those keep the ledger row.
+_AGENT_WHOLE_WRITE_OPS = frozenset({"write"})
+
+
+def _note_agent_wrote(op, sandbox_dir, path, res, kwargs) -> None:
+    try:
+        if op not in _AGENT_WHOLE_WRITE_OPS or kwargs.get("template") or \
+                str(kwargs.get("append")).strip().lower() in ("true", "1", "yes"):
+            return                                       # an append keeps the outside bytes
+        _st = getattr(getattr(res, "status", None), "value", None)
+        if (_st not in ("ok", "partial")) if _st is not None else \
+                str(res or "").lstrip().lower().startswith(("error", "system instruction")):
+            return
+        target = path or kwargs.get("filename") or kwargs.get("file")
+        if not target:
+            return
+        from ..utils.provenance import note_agent_write, _scope_roots
+        roots = [str(sandbox_dir)] if sandbox_dir else []
+        roots += [r for r in _scope_roots() if r not in roots]
+        note_agent_write(target, roots)
+    except Exception:  # noqa: BLE001 — bookkeeping never breaks a write
+        pass
 
 
 async def _tool_file_system_impl(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, read_budget: "ReadBudget | None" = None, **kwargs):
@@ -9033,7 +9109,11 @@ async def _tool_file_system_impl(operation: str = None, sandbox_dir: Path = None
         
     if operation == "delete":
         return await tool_delete_file(target_path, sandbox_dir)
-    
+
+    if operation in ("versions", "restore"):
+        return await tool_file_versions(operation, target_path, sandbox_dir,
+                                        version=str(kwargs.get("version") or ""))
+
     return ToolOutcome.rejected(
         f"Unknown operation: {operation}. Valid operations are: {', '.join(ADVERTISED_OPS)} "
         f"(to change part of a file use 'edit').",

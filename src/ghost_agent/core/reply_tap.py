@@ -109,7 +109,10 @@ class ReplyTap:
         self._qf_len = 0
         self._qf_seen = ""
         self._trims: List[str] = []   # §4TE: the reply through finalize's reported trims
-        self.progress_wanted = False  # §4UT: the client shows steps (`X-Ghost-Progress: 1`)
+        self.progress_wanted = False  # §4UT: the client shows steps (`X-Ghost-Progress: 1` or `steps`)
+        self.progress_sentences = True  # §4UY S10: and their Nova sentences (`1`; `steps` = no Nova call)
+        self._look_rows: List[Any] = []  # §4UY image-1: the owned look lines of this request's pictures
+        self._looks = None               # the generation's LookPlacer
 
     def set_lead(self, text: str) -> None:
         """§4MU: the finalize prepends a staged block (a deferred correction
@@ -144,6 +147,22 @@ class ReplyTap:
         self._gen_raw, self._gen_sent, self._scanned = "", 0, 0
         self._qf, self._qf_len, self._qf_seen = None, 0, ""
         self._open, self._latched = True, False
+        self._looks = None
+        if self._look_rows:
+            try:
+                from .agent import LookPlacer
+                self._looks = LookPlacer(self._look_rows)
+            except Exception:  # noqa: BLE001 — the line then comes with the rest
+                self._looks = None
+
+    def set_looks(self, rows) -> None:
+        """§4UY image-1: the look lines the SYSTEM shows under this request's
+        pictures (`agent._owned_look_rows` of the tool results so far), for the
+        generations that follow. A line goes out under its picture as soon as
+        the picture's markdown block has ended — by `agent.owned_look_insertions`,
+        the rule the finalized reply is placed by, so the reply extends what was
+        shown (live 76e8b1d0: the line came 54 s later, at the reply's end)."""
+        self._look_rows = list(rows or [])
 
     def tool_call_seen(self) -> None:
         self._latch("a tool call followed")
@@ -180,9 +199,12 @@ class ReplyTap:
         lt = text.rfind("<", max(0, len(text) - 32))
         if lt >= 0 and ">" not in text[lt:] and "\n" not in text[lt:]:
             safe_end = lt                       # may be the start of a marker
+        if self._looks is not None:             # §4UY image-1: a picture's block end is not known yet
+            safe_end = self._looks.hold(text, self._gen_sent, safe_end)
         if safe_end <= self._gen_sent:
             return
-        piece = text[self._gen_sent:safe_end]
+        piece = (self._looks.take(text, self._gen_sent, safe_end) if self._looks is not None
+                 else text[self._gen_sent:safe_end])
         if not self._gen_sent:
             piece = piece.lstrip()
             if not piece:
@@ -264,6 +286,14 @@ class ReplyTap:
         if not self._trims:
             return None
         views = [self._client_view(t).replace("\r", "").strip() for t in self._trims]
+        if self._look_rows:
+            # §4UY image-1 (review m1): the screen and the final carry the look lines the
+            # placement rule put in — a trim view is compared as the stream would send it
+            try:
+                from .agent import place_owned_looks
+                views = [place_owned_looks(v, self._look_rows, final=False) for v in views]
+            except Exception:  # noqa: BLE001 — no views: a plain retract, as before
+                return None
         after = views[-1]
         final = final_text.lstrip()
         if not after or shown.strip() not in views[:-1] or not final.startswith(after):

@@ -215,7 +215,8 @@ RETURN_PATHS = [
     "streaming_source_swapped",
     "read_changed_underneath",
     "not_a_regular_file",
-    "unread_rewrite",            # §4OE-2: the auto-promote over an existing file this request has not read
+    # §4UY C6/C21: "unread_rewrite" is gone — the auto-promote over an unread file now WRITES (a note + the
+    # previous version kept), so it is the "auto_promote_write" family
 ]
 
 
@@ -244,10 +245,6 @@ async def test_every_return_path_records_exactly_one_row(label, home, sandbox):
 
 async def _drive(label, sandbox):
     (sandbox / "t.txt").write_text("alpha\nbeta\ngamma\n")
-    if label == "unread_rewrite":
-        (sandbox / "unread.py").write_text("x = 1\n")
-        module = "import os\n\ndef f():\n    return os.sep\n\nif __name__ == '__main__':\n    f()\n"
-        return await tool_replace_text("unread.py", module, None, sandbox)
     if label == "empty_old_text":
         return await tool_replace_text("t.txt", "", "x", sandbox)
     if label == "identical_args_corruption":
@@ -439,9 +436,9 @@ def test_the_return_path_table_is_not_a_sample():
     returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
     # 37 = 36 ledger paths + the `return` inside the nested `_inode_check`
     # helper (§4KC r3), which `ast.walk` also visits.
-    assert len(returns) == 41, (
+    assert len(returns) == 40, (                 # §4UY C6: the unread-rewrite refusal's return is gone
         f"`_replace_text_impl` now has {len(returns)} return statements, not "
-        f"41. A new return is a new ledger path: give it a RETURN_PATHS label "
+        f"40. A new return is a new ledger path: give it a RETURN_PATHS label "
         f"and a `_drive` case, then update this number.")
 
 

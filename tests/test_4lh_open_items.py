@@ -141,9 +141,9 @@ def test_long_or_only_pre_tool_text_is_kept():
     assert drop_pre_tool_segments("Checking.", ["Checking."]) == "Checking."   # never empties
 
 
-# ── the search hedge ─────────────────────────────────────────────────────────
+# ── fresh circuits (§4LH's hedge after 6 s → §4VA: three circuits from the start) ──────────
 class _FakeDDGS:
-    """Engines on the first circuits hang empty; a hedge circuit answers."""
+    """Engines on their first circuit hang empty; yandex's SECOND circuit answers."""
     def __init__(self, **kw):
         self.proxy = str(kw.get("proxy") or "")
 
@@ -154,24 +154,27 @@ class _FakeDDGS:
         return False
 
     def text(self, q, **kw):
-        if "yandh" in self.proxy:
+        if "yandc1" in self.proxy:
             return [{"title": "Python 3.13", "body": "release", "href": "https://python.org/x"}]
         time.sleep(1.2)
         return []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("hedge_s,wins", [("0.3", True), ("0", False)])
-async def test_a_wave_nobody_wins_hedges_on_fresh_circuits(monkeypatch, hedge_s, wins):
-    """Fails where a wave with no early winner waited the full deadline (13%
-    of first waves, median 12 s) before wave 2."""
-    from ghost_agent.tools.search import _race_search_wave
+@pytest.mark.parametrize("circuits,wins", [(3, True), (1, False)])
+async def test_a_fresh_circuit_of_the_engine_that_works_wins_the_wave(monkeypatch, circuits, wins):
+    """Fails where a wave whose first circuits hang waited the full deadline (13%
+    of first waves, median 12 s) before wave 2. §4VA: the fresh circuits race from
+    the start (the engine table's ``circuits``), not as a hedge after 6 s."""
+    import dataclasses
+    import ghost_agent.tools.search as S
     mod = MagicMock()
     mod.DDGS = _FakeDDGS
-    monkeypatch.setenv("GHOST_SEARCH_HEDGE_S", hedge_s)
+    monkeypatch.setitem(S.ENGINE_TABLE, "yandex", dataclasses.replace(S.ENGINE_TABLE["yandex"], circuits=circuits))
+    monkeypatch.setattr(S, "_race_wave_deadline", lambda: 2.0)
     t0 = time.monotonic()
     with patch.dict("sys.modules", {"ddgs": mod}):
-        res = await _race_search_wave("python release", "socks5h://127.0.0.1:9050", 0)
+        res = await S._race_search_wave("python release", "socks5h://127.0.0.1:9050", 0)
     took = time.monotonic() - t0
     assert bool(res) is wins
     if wins:
@@ -416,9 +419,10 @@ def test_the_removed_links_line_is_not_judged_as_the_models_words():
 
 
 @pytest.mark.asyncio
-async def test_a_hedge_ends_with_the_first_engines(monkeypatch):
-    """Fails where a hedge engine kept its full timeout from 6 s, so a wave
-    nobody won ran 16 s instead of 12."""
+async def test_a_wave_nobody_wins_ends_with_its_engines(monkeypatch):
+    """Fails where an attempt is started late with its full timeout (the §4LH
+    hedge kept 12 s from 6 s, so a wave nobody won ran 16 s instead of 12).
+    §4VA: no attempt starts late — every circuit races from the start."""
     import ghost_agent.tools.search as S
 
     class Hang:
@@ -437,7 +441,6 @@ async def test_a_hedge_ends_with_the_first_engines(monkeypatch):
     mod = MagicMock()
     mod.DDGS = Hang
     monkeypatch.setattr(S, "_engine_timeout", lambda e: 2.0)
-    monkeypatch.setenv("GHOST_SEARCH_HEDGE_S", "0.6")
     t0 = time.monotonic()
     with patch.dict("sys.modules", {"ddgs": mod}):
         assert await S._race_search_wave("q words", "socks5h://127.0.0.1:9050", 0) == []

@@ -422,7 +422,12 @@ async def test_an_unknown_title_never_falls_through_to_the_current_project(conte
     pid = store.create_project("Shipped")
     store.update_project(pid, status="RELEASED")
     context.current_project_id = pid
-    res = await tool_manage_projects_for_model(context, action="unrelease", title="No Such App")
+    from ghost_agent.utils.logging import request_id_context
+    tok = request_id_context.set("req-owner-elena")   # §4UY P1: unrelease is the owner's (the one gate)
+    try:
+        res = await tool_manage_projects_for_model(context, action="unrelease", title="No Such App")
+    finally:
+        request_id_context.reset(tok)
     assert "not found" in res and store.get_project(pid)["status"] == "RELEASED"
 
 
@@ -469,6 +474,7 @@ async def test_no_preview_for_an_action_that_would_refuse(context, store):
 
 async def test_the_owner_turns_autopilot_on_and_off_and_a_probe_cannot(context, store):
     from ghost_agent.utils.logging import request_id_context
+    from ghost_agent.tools.projects import tool_manage_projects_for_model as tool_manage_projects  # §4UY P1: the gate
     pid = store.create_project("App")
     tok = request_id_context.set("req-owner")
     try:
@@ -519,16 +525,26 @@ async def test_autopilot_by_title_names_that_project_not_the_current(context, st
 
 async def test_autopilot_through_metadata_is_refused_not_silently_dropped(context, store):
     from ghost_agent.tools.projects import tool_manage_projects_for_model
+    from ghost_agent.utils.logging import request_id_context
     pid = store.create_project("App", metadata={"autopilot": True})
-    res = await tool_manage_projects_for_model(context, action="update", project_id=pid,
-                                               metadata={"autopilot": False})
+    tok = request_id_context.set("req-owner-elena")   # §4UY P1: `update` is the owner's (the one gate)
+    try:
+        res = await tool_manage_projects_for_model(context, action="update", project_id=pid,
+                                                   metadata={"autopilot": False})
+    finally:
+        request_id_context.reset(tok)
     assert "action=autopilot" in res and (store.get_project(pid)["metadata"] or {}).get("autopilot")
 
 
 async def test_a_vanished_current_project_gets_no_preview(context, store):
     from ghost_agent.tools.projects import tool_manage_projects_for_model
+    from ghost_agent.utils.logging import request_id_context
     context.current_project_id = "0123456789ab"
-    res = await tool_manage_projects_for_model(context, action="delete")
+    tok = request_id_context.set("req-owner-elena")   # §4UY P1: `delete` is the owner's (the one gate)
+    try:
+        res = await tool_manage_projects_for_model(context, action="delete")
+    finally:
+        request_id_context.reset(tok)
     assert "no longer exists" in res
 
 

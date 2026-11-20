@@ -6,9 +6,8 @@ cleanup, and a prompt that states one working directory."""
 import asyncio
 
 from ghost_agent.core import agent as ag
-from ghost_agent.core.agent import (futility_keys_in_command, is_suite_command, futility_tier, note_run_outcome,
-                                    build_is_converging, turn_budget_extension_fits, TURN_BUDGET_EXTENSION,
-                                    FUTILITY_REPORT_WRITES, FUTILITY_REPORT_RUNS)
+from ghost_agent.core.agent import (futility_keys_in_command, is_suite_command, note_run_outcome,
+                                    build_is_converging, turn_budget_extension_fits, TURN_BUDGET_EXTENSION)
 from ghost_agent.core import task_state as TS
 from ghost_agent.tools import file_system as FS
 from ghost_agent.tools.file_system import tool_file_system
@@ -49,15 +48,14 @@ def test_two_green_suite_runs_are_not_a_stall_but_a_green_countless_rerun_is():
     feature → 23 passed forced a blocker report on a converging build (§4OF
     defect 1b). The breaker's founding case — exit-0 runs whose output stayed
     wrong (xrick) — must still report."""
-    rec = {"writes": FUTILITY_REPORT_WRITES, "runs": FUTILITY_REPORT_RUNS}
+    rec = {"writes": 6, "runs": 4}
     note_run_outcome(rec, ok=True, output="===== 23 passed in 0.4s =====")
     note_run_outcome(rec, ok=True, output="===== 23 passed in 0.4s =====")
     assert rec["progress"] is False and rec["ok"] is True and rec["counted"] is True
-    assert futility_tier({"app.py": rec}, True, False)[0] == ""
     note_run_outcome(rec, ok=False, output="===== 2 failed, 21 passed in 0.4s =====")
     note_run_outcome(rec, ok=False, output="===== 2 failed, 21 passed in 0.4s =====")
     assert rec["progress"] is False                                          # failing and stalled (§4UI: the steer reads it; no report tier)
-    x = {"writes": FUTILITY_REPORT_WRITES, "runs": FUTILITY_REPORT_RUNS}
+    x = {"writes": 6, "runs": 4}
     note_run_outcome(x, ok=True, output="counts: 12 sprites (expected 300)")
     note_run_outcome(x, ok=True, output="counts: 12 sprites (expected 300)")
     assert x["counted"] is False and x["progress"] is False
@@ -156,10 +154,11 @@ def test_overlapping_ranged_reads_do_not_double_count(tmp_path):
     fs(tmp_path, operation="read", path="o.py", start_line=100, end_line=200)
     want = sum(map(len, lines[:200])) / sum(map(len, lines))    # §4TJ: coverage is by size
     assert abs(FS.read_coverage(tmp_path / "o.py") - want) < 0.001
-    assert getattr(fs(tmp_path, operation="write", path="o.py", content="x = 1\n"), "reason_code", None) == "unread_rewrite"
+    assert FS.unread_rewrite_refusal(tmp_path / "o.py", "o.py") != ""        # §4UY C6: the reader of the note
     fs(tmp_path, operation="read", path="o.py", start_line=200, end_line=260)
     assert FS.read_coverage(tmp_path / "o.py") >= 0.8
-    assert str(fs(tmp_path, operation="write", path="o.py", content="x = 1\n")).startswith("SUCCESS")
+    r = fs(tmp_path, operation="write", path="o.py", content="x = 1\n")
+    assert str(r).startswith("SUCCESS") and "had not read whole" not in str(r)
 
 
 def test_a_replace_or_direct_append_by_this_request_keeps_its_own_file_current(tmp_path):
@@ -198,13 +197,12 @@ def test_the_steer_tier_leaves_a_converging_loop_alone_and_convergence_needs_an_
     note_run_outcome(rec, ok=False, output="5 failed, 2 passed in 0.3s"); rec["runs"] += 1
     assert rec["improved"] is False and not build_is_converging({"app.py": rec})
     note_run_outcome(rec, ok=False, output="2 failed, 5 passed in 0.3s"); rec["runs"] += 1
-    assert rec["improved"] is True and futility_tier({"app.py": rec}, False, False)[0] == ""
+    assert rec["improved"] is True
     assert build_is_converging({"app.py": rec})
     note_run_outcome(rec, ok=False, output="2 failed, 5 passed in 0.3s"); rec["runs"] += 1
-    assert rec["improved"] is False and futility_tier({"app.py": rec}, False, False)[0] == "steer"
+    assert rec["improved"] is False
     x = {"writes": 3, "runs": 2}
     note_run_outcome(x, ok=True, output="rows=12 (expected 300)"); note_run_outcome(x, ok=True, output="rows=12 (expected 300)")
-    assert futility_tier({"gen.py": x}, False, False)[0] == "steer"            # the founding case still steers
 
 
 def test_network_failures_inside_program_output_stay_transient():
@@ -248,7 +246,8 @@ def test_receipts_are_forgotten_per_request(tmp_path):
         assert FS.read_coverage(tmp_path / "a.py") == 1.0
         assert FS.forget_request_receipts("req-4og-a") >= 1
         assert FS.read_coverage(tmp_path / "a.py") == 0.0
-        assert getattr(fs(tmp_path, operation="write", path="a.py", content="a = 2\n"), "reason_code", None) == "unread_rewrite"
+        r = fs(tmp_path, operation="write", path="a.py", content="a = 2\n")   # §4UY C6: noted, not refused
+        assert str(r).startswith("SUCCESS") and "had not read whole" in str(r)
     finally:
         request_id_context.reset(tok)
 

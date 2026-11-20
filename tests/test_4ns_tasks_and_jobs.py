@@ -1,6 +1,5 @@
 """§4NS (2026-10-12): review of scheduled tasks, watches and background jobs
 (4 fresh lenses). Every test names the world it fails in."""
-import asyncio
 import json
 import time
 
@@ -249,21 +248,6 @@ async def test_the_wake_prompt_defuses_output_and_reads_the_exit_like_collect(mo
     assert "EXIT CODE: 1" not in p
 
 
-def test_a_leaf_that_ran_out_of_turns_is_not_done(monkeypatch, tmp_path):
-    """D-M3: 25 of 33 budget-exhausted leaves were accepted as DONE."""
-    from tests.test_4fg_coding_loop import _ctx, _runner_ok
-    import ghost_agent.core.coding_loop as cl
-
-    async def fake_turn(context, *, leaf_id, prompt, is_background, **kw):
-        (tmp_path / "half.py").write_text("def f():\n    return 1\n")
-        return "[TURN BUDGET EXHAUSTED] I used all 40 turns … NOT a finished result"
-    monkeypatch.setattr(cl, "run_leaf_turn", fake_turn)
-
-    async def no_smoke(tool_runner, written):
-        return None
-    monkeypatch.setattr("ghost_agent.core.build_gates.smoke_gate", no_smoke)
-    res = asyncio.run(cl.build_coding_task_agentic(_ctx(tmp_path), "add f", tool_runner=_runner_ok([])))
-    assert res.ok is False
 
 
 @pytest.mark.asyncio
@@ -409,22 +393,3 @@ def test_a_short_watch_from_before_the_floor_is_raised_not_deleted(monkeypatch):
     assert saved["watch_x"]["cron_expression"] == "interval:60"
 
 
-def test_a_finishing_attempt_gates_the_files_a_rejected_attempt_wrote(monkeypatch, tmp_path):
-    from tests.test_4fg_coding_loop import _ctx, _runner_ok
-    import ghost_agent.core.coding_loop as cl
-    n = {"i": 0}
-
-    async def fake_turn(context, *, leaf_id, prompt, is_background, **kw):
-        n["i"] += 1
-        if n["i"] == 1:
-            (tmp_path / "a.py").write_text("A = 1\n")
-            return "[TURN BUDGET EXHAUSTED] I used all 14 turns … NOT a finished result"
-        (tmp_path / "b.py").write_text("B = 2\n")
-        return "done\nSUMMARY: finished"
-    monkeypatch.setattr(cl, "run_leaf_turn", fake_turn)
-
-    async def no_smoke(tool_runner, written):
-        return None
-    monkeypatch.setattr("ghost_agent.core.build_gates.smoke_gate", no_smoke)
-    res = asyncio.run(cl.build_coding_task_agentic(_ctx(tmp_path), "two files", tool_runner=_runner_ok([])))
-    assert res.ok is True and sorted(res.files) == ["a.py", "b.py"]

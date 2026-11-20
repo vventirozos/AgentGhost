@@ -406,6 +406,10 @@ def spawn_task(coro):
 # collected mid-flight and the work silently never lands. Every spawn_bg task
 # is held here until it finishes; the lifespan shutdown drains this set.
 _BG_TASKS: set = set()
+#: §4UY image-5 (review r2 #4): the SERVICE tasks among them — loops and
+#: watchers that write no record (keepalives, warmups, watches, the narrator).
+#: The shutdown drain cancels these first and waits only for the writers.
+_BG_SERVICE: set = set()
 
 
 def _without_tool_stop(coro):
@@ -425,7 +429,7 @@ def _without_tool_stop(coro):
     return _run()
 
 
-def spawn_bg(coro, *, name: str = "bg"):
+def spawn_bg(coro, *, name: str = "bg", service: bool = False):
     """The one fire-and-forget primitive. Composes the three guarantees the
     four ad-hoc conventions each had only some of:
 
@@ -459,9 +463,16 @@ def spawn_bg(coro, *, name: str = "bg"):
         # we get None, so there is nothing to register.
         return None
     _BG_TASKS.add(task)
+    if service:
+        _BG_SERVICE.add(task)
+    try:
+        task.set_name(name)      # the shutdown drain names what it leaves unwritten
+    except Exception:  # noqa: BLE001 — a test double without set_name
+        pass
 
     def _done(t: "asyncio.Task"):
         _BG_TASKS.discard(t)
+        _BG_SERVICE.discard(t)
         if t.cancelled():
             return
         exc = t.exception()
@@ -476,15 +487,30 @@ def spawn_bg(coro, *, name: str = "bg"):
 async def drain_background_tasks(timeout: float = 5.0):
     """Await outstanding spawn_bg tasks at shutdown (best-effort, bounded).
     Called from the lifespan finally-block so in-flight memory writes get a
-    chance to land before the process exits."""
-    pending = [t for t in list(_BG_TASKS) if not t.done()]
+    chance to land before the process exits. Service tasks (``spawn_bg(...,
+    service=True)``: loops and watchers that write nothing) are cancelled
+    first — a keepalive would otherwise hold the whole window and be named as
+    an unwritten entry (§4UY image-5, review r2 #4)."""
+    for t in [t for t in list(_BG_SERVICE) if not t.done()]:
+        t.cancel()
+    pending = [t for t in list(_BG_TASKS) if not t.done() and t not in _BG_SERVICE]
     if not pending:
         return
     try:
-        await asyncio.wait_for(
-            asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
-    except (asyncio.TimeoutError, Exception):
-        pass
+        # `asyncio.wait`: each task is awaited on its own, none is cancelled — one
+        # hung write does not hide which others landed (§4UY image-5, review m2)
+        _done, left = await asyncio.wait(pending, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return
+    if left:
+        try:
+            names = sorted(t.get_name() for t in left)
+            pretty_log("Shutdown Drain",
+                       f"{len(left)} background task(s) still running after {timeout:g}s — "
+                       f"not written before exit: {', '.join(names)}",
+                       level="WARNING", icon=Icons.WARN)
+        except Exception:  # noqa: BLE001
+            pass
 
 # Serializes stdout writes so concurrent requests can never interleave a line.
 # Without this, two requests streaming `print(token, end="")` will splice into
@@ -790,6 +816,32 @@ def note_report_floor(req_id: str, floor_s: float) -> None:
 MAX_COUNTED_REWRITES = 5
 
 
+#: §4UY P3: request -> the request it runs inside (a project task's turn inside the batch's request). Coding
+#: progress in the inner turn is progress of the outer one too: credited to the inner id only, the outer
+#: request never earned an extension while a long task turn wrote code, and its batch stopped at "deadline"
+_PROGRESS_PARENTS: dict = {}
+_PROGRESS_PARENTS_MAX = 256
+
+
+def set_progress_parent(child: str, parent: str) -> None:
+    """§4UY P3: ``child`` runs inside ``parent`` — its coding progress counts for ``parent`` as well."""
+    child, parent = str(child or ""), str(parent or "")
+    if not child or not parent or child == parent or parent == "SYSTEM":
+        return
+    with _REQ_STATE_LOCK:
+        _PROGRESS_PARENTS[child] = parent
+        while len(_PROGRESS_PARENTS) > _PROGRESS_PARENTS_MAX:
+            _PROGRESS_PARENTS.pop(next(iter(_PROGRESS_PARENTS)))
+
+
+def request_recent_progress(req_id: str) -> bool:
+    """§4UY P3: the request made coding progress inside its progress window (it is earning extensions)."""
+    with _REQ_STATE_LOCK:
+        s = _REQ_STATE.get(req_id)
+        pt = (s or {}).get("progress_t")
+        return bool(s is not None and pt is not None and time.monotonic() - float(pt) <= _progress_window_s(s))
+
+
 def note_code_progress(req_id: str, what: str = "", key: str = "",
                        rewrite_of: str = "") -> bool:
     """§4RA: this request just made coding progress (the turn loop decides
@@ -801,6 +853,11 @@ def note_code_progress(req_id: str, what: str = "", key: str = "",
     whether it counted."""
     with _REQ_STATE_LOCK:
         s = _REQ_STATE.get(req_id)
+        # §4UY P3: an inner turn that is not tracked itself counts on the request it runs inside
+        _up, _hops = _PROGRESS_PARENTS.get(req_id), 0
+        while s is None and _up and _hops < 4:
+            s, req_id = _REQ_STATE.get(_up), _up
+            _up, _hops = _PROGRESS_PARENTS.get(_up), _hops + 1
         if s is None:
             return False
         seen = s.setdefault("progress_keys", set())
@@ -815,6 +872,14 @@ def note_code_progress(req_id: str, what: str = "", key: str = "",
             seen.add(key)
         s["progress_t"] = time.monotonic()
         s["progress_what"] = str(what or "")
+        # §4UY P3: and every request it runs inside (≤4 hops)
+        cur, hops = _PROGRESS_PARENTS.get(req_id), 0
+        while cur and hops < 4:
+            ps = _REQ_STATE.get(cur)
+            if ps is not None:
+                ps["progress_t"] = s["progress_t"]
+                ps["progress_what"] = s["progress_what"]
+            cur, hops = _PROGRESS_PARENTS.get(cur), hops + 1
         return True
 
 

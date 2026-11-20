@@ -333,7 +333,11 @@ async def test_a_workspace_job_runs_through_bash_with_pipefail(tmp_path, scope, 
     c = _lab_ctx(tmp_path)
     scope(c)
     await R.tool_run(c, action="start", name="t", command="cd app && FOO=1 pytest", where="workspace", lifetime="job")
-    assert fj.started and fj.started[0].startswith("bash -c ") and "set -o pipefail; cd app && FOO=1 pytest" in fj.started[0]
+    # §4UY C9/C10: the status traps sit between pipefail and the command (`execute._STATUS_TRAPS`)
+    import shlex
+    assert fj.started and fj.started[0].startswith("bash -c ")
+    inner = shlex.split(fj.started[0])[2]
+    assert inner.startswith("set -o pipefail; ") and inner.endswith("cd app && FOO=1 pytest")
 
 
 @pytest.mark.parametrize("cmd,code", [("rm -rf / --no-preserve-root", "run_shell_blocked"),
@@ -518,10 +522,6 @@ def test_leaf_end_bounds_run_stops_and_lab_destroys_separately():
     assert {"LEAF_RUN_STOP_BOUND_S", "LEAF_LAB_DESTROY_BOUND_S"} <= bounds
 
 
-def test_each_attempt_drops_an_earlier_attempts_lab_note():
-    from ghost_agent.core import coding_loop as CL
-    drop, snap = _call_lines(CL.__file__, "_drop_seen"), _call_lines(CL.__file__, "snapshot_workspace")
-    assert drop and snap and min(drop) < max(snap)
 
 
 def test_a_no_lab_answer_on_an_owner_hold_has_its_own_state():

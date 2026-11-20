@@ -19,9 +19,8 @@ import inspect
 import pytest
 
 from ghost_agent.core import agent as ag
-from ghost_agent.core.agent import (EDIT_CHURN_REPORT_AFTER_STEERS, FUTILITY_REPORT_RUNS,
-                                    FUTILITY_REPORT_WRITES, _EDIT_CHURN_MAX_STEERS,
-                                    _EDIT_CHURN_STEER_AFTER, edit_churn_decision, futility_tier)
+from ghost_agent.core.agent import (EDIT_CHURN_REPORT_AFTER_STEERS, _EDIT_CHURN_MAX_STEERS,
+                                    _EDIT_CHURN_STEER_AFTER, edit_churn_decision)
 
 
 # --- edit churn ---------------------------------------------------------------
@@ -55,28 +54,7 @@ def test_report_tier_sits_after_the_steers():
     assert EDIT_CHURN_REPORT_AFTER_STEERS == _EDIT_CHURN_MAX_STEERS >= 1
 
 
-# --- futility -----------------------------------------------------------------
-
-def test_futility_steers_once_and_never_reports():
-    si = {"probe.py": {"writes": 3, "runs": 2}}
-    assert futility_tier(si, False, False)[0] == "steer"
-    si["probe.py"] = {"writes": FUTILITY_REPORT_WRITES * 3, "runs": FUTILITY_REPORT_RUNS * 3}
-    assert futility_tier(si, True, False)[0] == ""
-    assert futility_tier(si, True, True)[0] == ""
-
-
-def test_report_tier_never_precedes_the_steer():
-    si = {"probe.py": {"writes": 12, "runs": 9}}
-    assert futility_tier(si, False, False)[0] == "steer"
-
-
-def test_futility_thresholds_are_above_the_steer():
-    assert FUTILITY_REPORT_WRITES > 3 and FUTILITY_REPORT_RUNS > 2
-
-
-def test_futility_tier_is_pure_on_garbage():
-    assert futility_tier(None, False, False) == ("", None, None)
-    assert futility_tier({"x.py": {}}, True, False) == ("", None, None)
+# --- futility: the whole breaker is gone (§4UY C5); tests/test_futility_breaker_trio.py pins that no steer fires.
 
 
 # --- the sites ---------------------------------------------------------------
@@ -97,7 +75,7 @@ def _alert_kinds(node):
 def test_sites_route_through_the_decisions_and_force_no_report():
     fn = _dispatch()
     calls = {getattr(c.func, "id", ""): c for c in ast.walk(fn) if isinstance(c, ast.Call)}
-    assert "edit_churn_decision" in calls and "futility_tier" in calls
+    assert "edit_churn_decision" in calls and "futility_tier" not in calls
     kinds = _alert_kinds(fn)
     assert "edit churn" not in kinds and "futility" not in kinds
 

@@ -37,7 +37,6 @@ def _make_agent(tools):
     agent.disabled_tools = set()
     agent.context.current_project_id = None
     agent.context._script_iter = {}
-    agent.context._futility_steer_done = False
     return agent
 
 
@@ -83,10 +82,13 @@ def _steers(ts):
             and "SYSTEM ALERT (futility breaker)" in str(m.get("content"))]
 
 
-# ── futility breaker ─────────────────────────────────────────────────
+# ── futility breaker: REMOVED (§4UY C5) ──────────────────────────────
+# An old-model compensation: its one live firing since 11-12 was false (an owner build booked every write part
+# as a rewrite and `node --check` as a rerun, and was told to shrink a web app to "one record/sprite/tile").
+# The pin: the founding cycle (3 writes + 2 runs of one script, exit 0) and far past it draw NO steer.
 
 @pytest.mark.asyncio
-async def test_futility_breaker_fires_on_third_write_second_run():
+async def test_the_write_run_cycle_draws_no_futility_steer():
     async def fs(**kw):
         return "SUCCESS: wrote"
 
@@ -94,61 +96,15 @@ async def test_futility_breaker_fires_on_third_write_second_run():
         return "EXIT CODE: 0\nran fine"
 
     agent = _make_agent({"file_system": fs, "execute": ex})
-    seq = [
-        [_write_call("w1", "extract_data.py")],
-        [_run_call("r1", "extract_data.py")],
-        [_write_call("w2", "extract_data.py")],
-        [_run_call("r2", "extract_data.py")],
-        [_write_call("w3", "extract_data.py")],   # 3 writes + 2 runs → trip
-    ]
-    fired_at = []
-    for i, calls in enumerate(seq):
-        ts = _ts(calls)
-        await agent._dispatch_and_process_tool_batch(ts)
-        if _steers(ts):
-            fired_at.append(i)
-    assert fired_at == [4]
-    assert agent.context._futility_steer_done is True
-
-
-@pytest.mark.asyncio
-async def test_futility_steer_content_and_once_per_request():
-    async def fs(**kw):
-        return "SUCCESS: wrote"
-
-    async def ex(**kw):
-        return "EXIT CODE: 0"
-
-    agent = _make_agent({"file_system": fs, "execute": ex})
-    for calls in ([_write_call("a", "s.py")], [_run_call("b", "s.py")],
-                  [_write_call("c", "s.py")], [_run_call("d", "s.py")]):
-        await agent._dispatch_and_process_tool_batch(_ts(calls))
-    ts = _ts([_write_call("e", "s.py")])
-    await agent._dispatch_and_process_tool_batch(ts)
-    (steer,) = _steers(ts)
-    content = steer["content"]
-    assert "RECORD" in content and "ledger" in content
-    assert "SHRINK" in content and "smallest unit" in content
-    assert "switch class" in content
-    # 4th write → no second steer
-    ts2 = _ts([_write_call("f", "s.py")])
-    await agent._dispatch_and_process_tool_batch(ts2)
-    assert _steers(ts2) == []
-
-
-@pytest.mark.asyncio
-async def test_futility_breaker_ignores_non_code_files():
-    async def fs(**kw):
-        return "SUCCESS: wrote"
-
-    async def ex(**kw):
-        return "EXIT CODE: 0"
-
-    agent = _make_agent({"file_system": fs, "execute": ex})
-    for cid in ("1", "2", "3", "4", "5"):
-        ts = _ts([_write_call(cid, "index.html")])
-        await agent._dispatch_and_process_tool_batch(ts)
-        assert _steers(ts) == []
+    for i in range(6):
+        for calls in ([_write_call(f"w{i}", "extract_data.py")], [_run_call(f"r{i}", "extract_data.py")]):
+            ts = _ts(calls)
+            await agent._dispatch_and_process_tool_batch(ts)
+            assert _steers(ts) == []
+            assert not any("futility" in str(m.get("content")).lower() for m in ts.messages if m.get("role") == "user")
+    # the counters the §4RA earn / §4RB stuck reading use are still kept
+    assert agent.context._script_iter["extract_data.py"]["writes"] == 6
+    assert agent.context._script_iter["extract_data.py"]["runs"] == 6
 
 
 # ── syntax-gate recipes ──────────────────────────────────────────────

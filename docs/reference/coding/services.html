@@ -370,6 +370,16 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
     the effective service cap is the published-range size (<code>_max_services()</code> —
     <code>MAX_SERVICES</code> is the floor); widening <code>GHOST_SANDBOX_SERVICE_PORTS</code>
     requires a container recreate, which kills running services.</li>
+    <li><strong>§4UY C13: stale servers make room.</strong> Workspace servers never expired, so the
+    cap (5, shared by every conversation) filled with ones nobody used. At the cap, on the
+    <em>owner's own turn</em> only, <code>_reclaim_stale</code> stops the longest-IDLE server that
+    belongs to no project and has been idle longer than <code>STALE_SERVER_S</code> (24&nbsp;h). Idle is
+    measured from the last use (<code>_last_use</code>): its start, a <code>status</code>/<code>logs</code>
+    by name (<code>used_at</code>, <code>_touch</code>), or the last line its log got — a server logs the
+    requests it serves. A probe, an unattended run, a leaf or a member never stops anyone's server
+    (review r1). It never stops a project's server (that is the project's app) and never one whose
+    liveness is unknown. The start result says which server was STOPPED and how long it was unused.
+    When every server is in use or belongs to a project, the cap still refuses as before.</li>
   </ul>
   <p><strong>Service tokens (same day, follow-up):</strong> the 2026-07-13 auth rollout silently
   orphaned sandbox-hosted apps that integrate with the agent — the RELEASED chess coach could no

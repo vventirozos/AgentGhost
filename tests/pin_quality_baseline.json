@@ -17,7 +17,6 @@
     "test_4ec_parser_dialects.py": 1,
     "test_4ec_read_budget_enumeration.py": 1,
     "test_4fd_provenance.py": 2,
-    "test_4fg_coding_loop.py": 2,
     "test_4fm_prefix_rewarm.py": 1,
     "test_4fn_judge_fixes.py": 7,
     "test_4fx_tool_head_diet_retired.py": 1,
@@ -35,7 +34,7 @@
     "test_agent_metacog_per_tool.py": 5,
     "test_agent_stream_bg_fixes.py": 5,
     "test_audio_ingest.py": 8,
-    "test_audit_4at_round3_fixes.py": 7,
+    "test_audit_4at_round3_fixes.py": 4,
     "test_audit_bug_fixes.py": 2,
     "test_audit_fixes.py": 13,
     "test_audit_lower_confidence_fixes.py": 6,
@@ -57,7 +56,6 @@
     "test_clockwork_client_ui.py": 17,
     "test_clockwork_facestate.py": 2,
     "test_clockwork_turnstatus.py": 2,
-    "test_coding_executor.py": 1,
     "test_component_guard.py": 1,
     "test_context_governor.py": 10,
     "test_context_manager.py": 2,
@@ -214,5 +212,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 839
+  "total_textual": 833
 }

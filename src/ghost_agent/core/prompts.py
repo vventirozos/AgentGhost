@@ -141,14 +141,19 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             f"*** All planned work on this project is done (id={project_id}, state READY) — it stays OPEN: a "
             "living app/site. When the user asks for a change, make it straight in its files (the system logs "
             "each change, and each deploy, in the change log and PROJECT_CHANGES.md — no task needed for it); add "
-            "tasks only for multi-step work. Never call it complete or closed: only the user closes it "
-            "(manage_projects action=update status=DONE when they ask). ***")
+            "tasks only for multi-step work. A QUESTION about it ('is it up to date?', 'does X work?') is answered "
+            "by looking: say what you found and what you would change — its files and its live site change only "
+            "when the user asks for the change. Never call it complete or closed: only the user closes it "
+            "(manage_projects action=update status=DONE when they ask). Do not create a new project for it. ***")
     # Hard directive at the top. Small Qwen models routinely re-call
     # `manage_projects action=create` AND re-interpret the user's
     # original "start a new project" message every few turns — they
     # don't fully trust the conversation-state signal, so we repeat
     # it as loudly as possible on every turn the project is active.
-    if not _finished:
+    # §4UY P12: a READY project (nothing open) gets its one banner above — not the "ALREADY ACTIVE" line nor the
+    # PACING block (both are about a plan in flight; 2.7–2.9k-token briefings on a project with nothing open)
+    _in_flight = not _finished and _state != "ready"
+    if _in_flight:
         # §4UI r1 M2: "the rest of that message is still to do" only in the
         # request that created it — on a later request the old message is
         # fulfilled history (re-reading it started builds with no go-ahead)
@@ -211,7 +216,7 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                           + (f" — {d['desc']}" if d.get("desc") else ""))
         return "\n".join(rl)
 
-    if not _finished:
+    if _in_flight:
         lines.append(
             # §4UI (2026-11-12): THE pacing rule — the tool description and
             # every manage_projects result defer to it instead of restating
@@ -224,9 +229,17 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             # wording is plan-only; unsure = plan-only.
             "*** PACING (the one rule; tool results defer to it): "
             "GO-AHEAD — decide it ONCE, from the user's message, before you "
-            "create, decompose or replan the plan, and keep that decision when "
-            "the call returns (its result is not a new reason to start); only "
-            "a NEW message from the user changes it. If it "
+            "create, decompose or replan the plan, pass it on that call "
+            "(go_ahead=true only when the message also asked for the work; "
+            "false or omitted = plan only and autoadvance is refused — but an "
+            "omitted one keeps a go already given or a batch that already ran, "
+            "and splitting one task with it omitted changes nothing; "
+            "autoadvance takes go_ahead too), and keep that decision when "
+            "the call returns (its result is not a new reason to start). A "
+            "plan-only decision is lifted only by go_ahead=true AFTER a "
+            "NEW message from the user; that message re-opens the decision "
+            "without making it ('don't start yet' stays plan only; 'ok go' → "
+            "pass go_ahead=true on your next call). If it "
             "asked ONLY for a project or a plan, show the task list and stop "
             "there (no 'shall I start?' — they will say 'proceed', 'next task' "
             "or 'continue' when they want the work). A message that makes "
@@ -263,8 +276,9 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         )
     lines.append(
         # §4UM live probe: an open (ready) project never shows the legacy auto-close's raw DONE
-        f"TITLE: {proj['title']}  ({proj['kind']} · {'ACTIVE' if _state == 'ready' else proj['status']}"
-        + (f" · {_state}" if _state in ("ready", "working") else "") + ")"
+        # §4UY P19: one word per state — READY (open, planned work done), never "ACTIVE · ready"
+        f"TITLE: {proj['title']}  ({proj['kind']} · {'READY, open' if _state == 'ready' else proj['status']}"
+        + (" · working" if _state == "working" else "") + ")"
     )
     goal = (proj.get("goal") or "").strip()
     if goal:
@@ -643,6 +657,7 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         deliverables = store.list_deliverables(project_id)
     except Exception:
         deliverables = []
+    shown_files: list = []
     if deliverables:
         shown_files = deliverables[:max_deliverables]
         more_files = len(deliverables) - len(shown_files)
@@ -707,8 +722,12 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         _layout = folder_layout(store, project_id, 40)
     except Exception:
         _layout = []
+    # §4UY P12: the deliverables listed above are not listed again
+    _shown = set(shown_files)
+    _layout = [f for f in _layout if f not in _shown]
     if _layout:
-        lines.append(f"FILES (on disk now): {', '.join(_layout)}")
+        lines.append(f"FILES (on disk now){' besides the deliverables above' if _shown else ''}: "
+                     f"{', '.join(_layout)}")
 
     # RETROSPECTIVE — only for projects in a terminal state, where the
     # structured what-worked/what-failed record (assembled from

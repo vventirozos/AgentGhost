@@ -62,7 +62,14 @@ HALF_LIFE_S = 4 * 3600.0
 
 #: ``max(|P|, |E|)`` at or above these → intensity 1, 2, 3; below the first
 #: there is no mood. The automatic mood has no cap: it can reach 3.
-INTENSITY_THRESHOLDS = (0.20, 0.45, 0.75)
+#: §4UW (review 11-18: on 11-16 four finished tasks, two thumbs and two thanks added up to P = 0.95, and 11 of the
+#: 35 owner replies after the §4US deploy heard "calm, 3 of 3"): the bound of 3 is 0.90, was 0.75 — a good
+#: afternoon reads 2, and 3 is for when nearly everything went one way. Replayed over the same events: 4 of 35
+#: replies hear 3 (11), nobody hears less mood than before (the first two bounds are as they were). A first cut
+#: eased every push past 0.45 by the room left instead; three review rounds each found the reaction ledger
+#: wrong in a new way against it (what comes back out of an eased pair is not what went in), so the pair stays
+#: a plain sum and the bound moved
+INTENSITY_THRESHOLDS = (0.20, 0.45, 0.90)
 #: an intensity already held is given up only below its threshold MINUS this
 INTENSITY_MARGIN = 0.04
 #: §4UD (review r2): a magnitude this close under a threshold is ON it. The events are round numbers (a
@@ -357,6 +364,8 @@ LONG_TURN_S = 900.0
 LONG_TURN_CALLS = 25
 #: §4TX: a project task finished in the owner's turn (manage_projects marked it DONE) — once per turn
 EV_TASK_DONE = (+0.15, +0.10)
+#: §4UW: the last part of the cause of a turn that was cut from outside (it moves nothing by itself)
+CUT_SHORT_CAUSE = "the turn was cut short"
 #: the owner's reactions
 #: thumbs move the pleasantness only (review r2: with an energy component,
 #: toggling up / down on one turn pumped the energy by +0.05 per "up")
@@ -420,7 +429,9 @@ class TurnSignals:
     pressure: bool = False     # the turn ended under the context-pressure lockdown
     owner_set: bool = False    # the owner SET the mood or the manner in this turn
     excused: int = 0           # §4TX: failed calls NOT counted (transient, a guard's refusal, a failing test run)
-    tasks_done: int = 0        # §4TX: project tasks marked DONE in this turn
+    tasks_done: int = 0        # §4TX: project tasks marked DONE in this turn (§4UW: an autoadvance batch's too)
+    tasks_failed: int = 0      # §4UW: project tasks an autoadvance batch of this turn left FAILED
+    failed: bool = False       # §4UW: the turn's own record says the request failed (``Outcome.FAILED``)
 
 
 def _n(count: int, one: str, many: str) -> str:
@@ -442,7 +453,17 @@ def turn_events(sig: TurnSignals) -> List[Event]:
     §4TX: failures weigh by the share of the turn's calls that failed (only
     the ones that count — ``excused`` are not in ``failures``); a clean
     reward grows with the calls and survives a long turn; a long turn costs
-    energy only; a finished project task is its own event."""
+    energy only; a finished project task is its own event.
+
+    §4UW (review 11-18: seven failed or cut owner turns in a week moved
+    nothing — one with 9 failed calls of 26 — and one earned a reward): a
+    project task an autoadvance batch left FAILED is one unit of trouble
+    each; a turn whose own record says the request FAILED weighs at least
+    one whole unit (not one more — the label is mostly made of the same
+    failed calls) and earns no reward. A turn that was CUT from outside (``completed``
+    False: the stop button, a dropped connection, a shutdown) is neither
+    blamed nor credited for being cut — what had already gone wrong in it
+    and the tasks it had finished are counted, and nothing else."""
     out: List[Event] = []
     if bool(sig.owner_set):
         return out
@@ -454,6 +475,8 @@ def turn_events(sig: TurnSignals) -> List[Event]:
     guards = max(0, int(sig.guards or 0))
     sources = max(0, int(sig.sources or 0))
     done = max(0, int(sig.tasks_done or 0))
+    lost = max(0, int(getattr(sig, "tasks_failed", 0) or 0))
+    turn_failed = bool(getattr(sig, "failed", False)) and bool(sig.completed)
     try:
         dur = max(0.0, float(sig.duration_s or 0.0))
     except (TypeError, ValueError):
@@ -461,18 +484,33 @@ def turn_events(sig: TurnSignals) -> List[Event]:
     pressure = 1 if bool(sig.pressure) else 0
     share = (failures / calls) if calls else (1.0 if failures else 0.0)
     weight = min(1.0, max(TROUBLE_SHARE_FLOOR, 2.0 * share)) if failures else 0.0
-    units = min(float(TROUBLE_CAP), min(failures, TROUBLE_CAP) * weight + guards + pressure)
+    units = min(float(TROUBLE_CAP), min(failures, TROUBLE_CAP) * weight + guards + pressure + lost)
+    if turn_failed:
+        # at least one whole unit, not one more: the record's label is mostly made of the same failed calls
+        units = max(units, 1.0)
     if units > 0:
         parts = []
         if failures:
             parts.append(_n(failures, "tool call", "tool calls") + " failed"
                          + (f" (of {calls})" if calls > failures else ""))
+        if lost:
+            parts.append(_n(lost, "project task", "project tasks") + " failed")
         if guards:
             parts.append("a loop guard stepped in " + ("once" if guards == 1 else f"{guards} times"))
         if pressure:
             parts.append("the context ran out of room (context pressure)")
+        if turn_failed:
+            parts.append("the request as a whole failed")
         out.append(Event(round(EV_TROUBLE[0] * units, 4), round(EV_TROUBLE[1] * units, 4),
                          " and ".join(parts) + " in this turn", KIND_TURN))
+    if not bool(sig.completed):
+        # §4UW: cut from outside — the trouble it already had and the tasks it had finished, nothing more
+        if done:
+            out.append(Event(EV_TASK_DONE[0], EV_TASK_DONE[1],
+                             "finished " + _n(done, "project task", "project tasks"), KIND_TURN))
+        if out:
+            out.append(Event(0.0, 0.0, CUT_SHORT_CAUSE, KIND_TURN))
+        return out
     if sources >= RESEARCH_MIN_SOURCES:
         out.append(Event(EV_RESEARCH[0], EV_RESEARCH[1],
                          f"read {sources} sources in a research turn", KIND_TURN, novelty=True))
@@ -480,7 +518,8 @@ def turn_events(sig: TurnSignals) -> List[Event]:
         out.append(Event(EV_TASK_DONE[0], EV_TASK_DONE[1],
                          "finished " + _n(done, "project task", "project tasks"), KIND_TURN))
     long_turn = dur >= LONG_TURN_S or all_calls >= LONG_TURN_CALLS
-    clean = guards == 0 and not pressure and bool(sig.completed) and share <= CLEAN_TURN_MAX_SHARE
+    clean = (guards == 0 and not pressure and bool(sig.completed) and share <= CLEAN_TURN_MAX_SHARE
+             and not lost and not turn_failed)
     reward = _clean_reward(calls, share) if clean else 0.0
     # a long turn with nothing done — or mostly excused calls — is a slog, not good long work
     long_clean = clean and calls > 0 and calls >= max(0, int(getattr(sig, "excused", 0) or 0))
@@ -552,6 +591,17 @@ def sentiment_backing(label, emotions) -> Optional[bool]:
     return False
 
 
+def sounds_displeased(emotions) -> bool:
+    """§4UW: does the emotion reading of a message say the owner is displeased WITH SOMETHING — an emotion of
+    ``SENTIMENT_COLD`` (annoyance, anger, disapproval, disappointment, disgust; not sadness or fear: the owner's
+    own bad news is no correction) at ``SENTIMENT_EMOTION_MIN`` or more? False without a reading. This only lets
+    a message in front of the correction judge; it decides nothing. Pure."""
+    if not isinstance(emotions, dict):
+        return False
+    return any(k in SENTIMENT_COLD and isinstance(v, (int, float)) and not isinstance(v, bool)
+               and v >= SENTIMENT_EMOTION_MIN for k, v in emotions.items())
+
+
 def sentiment_gate(label, emotions=None) -> float:
     """§4UP: the score a tone needs: ``SENTIMENT_MIN_SCORE_BACKED`` for an unhappy tone an unhappy emotion
     backs, ``SENTIMENT_MIN_SCORE`` otherwise. Pure."""
@@ -593,7 +643,17 @@ PRAISE_WORDS = frozenset({"thanks", "thx", "ty", "cheers", "great", "perfect", "
                           # Greek, compared without accents (``_fold``): ευχαριστώ, μπράβο, τέλεια / τέλειο,
                           # ωραία / ωραίο, άψογο / άψογα, εξαιρετικό / εξαιρετικά, υπέροχο / υπέροχα
                           "ευχαριστω", "σ'ευχαριστω", "μπραβο", "τελεια", "τελειο", "ωραια", "ωραιο",
-                          "αψογο", "αψογα", "εξαιρετικο", "εξαιρετικα", "υπεροχο", "υπεροχα"})
+                          "αψογο", "αψογα", "εξαιρετικο", "εξαιρετικα", "υπεροχο", "υπεροχα",
+                          # §4VB: the feminine forms, the ones a "δουλειά" takes
+                          "αψογη", "εξαιρετικη", "υπεροχη"})
+#: §4VB: a noun that may FOLLOW a praise word and is then part of the praise — "nice job", "excellent
+#: work", "awesome stuff", "τέλεια δουλειά". Only DIRECTLY after a praise word that describes the work (not
+#: one of `PRAISE_THANKS`), with nothing but spaces between (review r1: "thanks, work tonight", "nice, job
+#: again" read as praise); anywhere else ("job done?", "work") it is any other word. 11-20: only listed
+#: pairs matched, so "nice job", "excellent job", "awesome work", "brilliant work today" were not thanks.
+PRAISE_NOUNS = frozenset({"job", "work", "stuff", "δουλεια"})
+#: the praise words that thank rather than describe — no work noun follows them ("thanks job" is not English)
+PRAISE_THANKS = frozenset({"thanks", "thx", "ty", "cheers", "bravo", "ευχαριστω", "σ'ευχαριστω", "μπραβο"})
 #: two-word thanks / praise
 PRAISE_PAIRS = frozenset({("thank", "you"), ("thank", "u"), ("many", "thanks"), ("well", "done"),
                           ("good", "job"), ("great", "job"), ("nice", "work"), ("great", "work"),
@@ -607,10 +667,13 @@ PRAISE_FILLER = frozenset({"ok", "okay", "ghost", "mate", "that's", "thats", "ve
                            "much", "a", "lot", "really", "πολυ", "σε", "σου", "ρε", "σ",
                            # §4UB: time words and address — "good job today", "thanks again, man"
                            "today", "tonight", "again", "as", "always", "man", "dude", "buddy",
-                           "σημερα", "παλι"})
+                           "σημερα", "παλι", "φιλε"})
 #: §4TX: a message that is nothing but these emoji is thanks too
 PRAISE_EMOJI = frozenset({"👍", "🙏", "👏", "🙌", "❤", "💯", "🔥", "👌", "😊", "🥳", "💪"})
 _PRAISE_TOKEN_RE = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)*")
+#: §4VB r3: what may stand between the two words of a two-word praise — spaces, and the joiners of
+#: "thank-you", "well-done", "thank_you" (and a zero-width space from pasted text). Not punctuation.
+_PRAISE_JOINERS = " \t\r\n\v\f-_\u2010\u2011\u200b"
 #: a message that ENDS with one of these is a question (";" is also what the
 #: Greek question mark normalises to)
 _QUESTION_MARKS = "?;"
@@ -644,18 +707,27 @@ def has_praise(text) -> bool:
     t = unicodedata.normalize("NFKC", text).replace("\u2019", "'").replace("\u2018", "'").lower()
     if _is_question(t):
         return False
-    words = [_fold(w) for w in _PRAISE_TOKEN_RE.findall(t)]
+    toks = list(_PRAISE_TOKEN_RE.finditer(t))
+    words = [_fold(m.group(0)) for m in toks]
     if not words:
         rest = "".join(ch for ch in t if not ch.isspace() and ch not in "\ufe0f\u200d!.")
         return bool(rest) and all(ch in PRAISE_EMOJI or 0x1F3FB <= ord(ch) <= 0x1F3FF for ch in rest)
     if not words or len(words) > PRAISE_MAX_WORDS:
         return False
+    def _adjacent(j: int) -> bool:
+        """§4VB r2: words j and j+1 have nothing but spaces between them — a two-word praise is two ADJACENT
+        words ("nice, work again", "great. job" are not "nice work" / "great job")."""
+        return j + 1 < len(toks) and not t[toks[j].end():toks[j + 1].start()].strip(_PRAISE_JOINERS)
+
     found, i = 0, 0
     while i < len(words):
-        if tuple(words[i:i + 2]) in PRAISE_PAIRS:
+        if tuple(words[i:i + 2]) in PRAISE_PAIRS and _adjacent(i):
             found, i = found + 1, i + 2
         elif words[i] in PRAISE_WORDS:
             found, i = found + 1, i + 1
+            if (i < len(words) and words[i] in PRAISE_NOUNS and words[i - 1] not in PRAISE_THANKS
+                    and _adjacent(i - 1)):
+                i += 1                                  # §4VB: "nice job", "τέλεια δουλειά"
         elif words[i] in PRAISE_FILLER:
             i += 1
         else:
@@ -667,7 +739,7 @@ def has_praise(text) -> bool:
 
 #: ``max(|P|, |E|)`` an owner-set mood starts at, by the intensity asked for
 #: (each clearly inside its band)
-ANCHOR_MAGNITUDE = {1: 0.32, 2: 0.60, 3: 0.90}
+ANCHOR_MAGNITUDE = {1: 0.32, 2: 0.60, 3: 0.96}
 #: the direction of each label's anchor, scaled so its larger number is 1
 ANCHOR_DIRECTION = {
     "cheerful": (1.0, 0.75), "content": (1.0, 0.0), "calm": (1.0, -0.75),

@@ -1881,7 +1881,7 @@ ALLOWED_USES = sorted([
     ("agent.py", ("_slot_wait", "_read"), "._http"),
     ("agent.py", ("_member_head_make",), "._http"),
     ("agent.py", ("_main_window_tokens",), "._http"),
-    ("coding_executor.py", ("_window_tokens",), "._http"),
+    # (§4UY C18: coding_executor._window_tokens went with the spec executor)
 ])
 
 

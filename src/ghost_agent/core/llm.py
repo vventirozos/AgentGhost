@@ -140,6 +140,11 @@ class OffMainNodeUnavailable(Exception):
     #: gate refused; no node was asked). Busy is not down — a caller with
     #: nothing to gain from re-asking the same box can stop here.
     saturated = False
+    #: §4UZ: True when a WORKER node tried for this call ran into the call's
+    #: time limit (an httpx timeout) — the one failure that says "the request
+    #: was too large for the time", which the distill wave learns from. A
+    #: refused permit, a reset connection or a 5xx leave it False.
+    timed_out = False
 
 
 def _disable_thinking(node_payload: Dict[str, Any]) -> None:
@@ -2472,6 +2477,23 @@ class LLMClient:
         except Exception:                                       # noqa: BLE001
             return False
 
+    def note_distill_timeout(self, prompt_tokens: float, max_tokens: float,
+                             burned_s: float, *, concurrency: int = 1) -> bool:
+        """§4UZ: a worker distill ran into its time limit — a timeout carries
+        no ``timings``, so the tracker is told what was asked and how long it
+        did not fit in (`NodeThroughput.observe_timeout`). The pool member
+        that served it is not known here; every worker node is told (the plan
+        is made for the worst of them anyway)."""
+        learned = False
+        try:
+            for n in (getattr(self, "worker_clients", None) or []):
+                learned = self.node_throughput.observe_timeout(
+                    n.get("url") or "", prompt_tokens, max_tokens, burned_s,
+                    concurrency=concurrency) or learned
+        except Exception:                                       # noqa: BLE001
+            return learned
+        return learned
+
     @staticmethod
     def _settle_conc(held: Dict[int, list]) -> None:
         """Charge everyone currently holding for the interval just ended."""
@@ -3045,6 +3067,7 @@ class LLMClient:
         fell_back_from_node = False
         _pool_leg = ""
         _crit_sat = None  # §4MX: see OffMainNodeUnavailable.saturated
+        _worker_timed_out = False  # §4UZ: see OffMainNodeUnavailable.timed_out
         # WHICH pool the caller asked for — independent of whether one is
         # configured. `fell_back_from_node` only becomes True when a
         # CONFIGURED pool fails, so a pool that is simply absent skipped every
@@ -3266,6 +3289,8 @@ class LLMClient:
                         resp.raise_for_status()
                         return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
+                        if isinstance(e, (httpx.TimeoutException, asyncio.TimeoutError)):
+                            _worker_timed_out = True
                         if _charge_node_fault(self, node, e, task_label):
                             self.circuit_breaker.record_failure(node["url"])
                         if _quiet:
@@ -3553,6 +3578,7 @@ class LLMClient:
                     "all off-main nodes failed; main-model fallback is "
                     "disabled for this call")
                 _exc.saturated = _crit_sat is True
+                _exc.timed_out = _worker_timed_out
                 raise _exc
             # A node-sized timeout MUST NOT be applied to the main model
             # (2026-07-11). `timeout` here was sized for a small, fast worker

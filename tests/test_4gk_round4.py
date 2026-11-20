@@ -718,46 +718,6 @@ def test_a_fractional_port_is_refused_like_a_fractional_pid():
     assert rg.valid_port(float("nan")) is None
 
 
-def test_a_snapshot_the_walk_could_not_finish_is_not_an_empty_workspace(tmp_path):
-    """§4GK round 5. Round 4 made the walk RAISE on descriptor exhaustion and
-    guarded the snapshot with `except ValueError` — which does not cover
-    OSError, so the raise went straight through a function the leaf loop
-    documents as best-effort. Widening the guard alone is not enough either:
-    an empty snapshot is indistinguishable from "the workspace has no files",
-    and the leaf loop turns that into "the attempt changed nothing" and
-    DISCARDS the work.
-
-    Fails in any tree where an unreadable tree reads as an empty one."""
-    import resource
-    from ghost_agent.core.coding_loop import (_SNAPSHOT_INCOMPLETE, diff_snapshots,
-                                              snapshot_workspace)
-    for i in range(400):
-        (tmp_path / f"p{i:03d}").mkdir()
-        (tmp_path / f"p{i:03d}" / "i.js").write_text("x")
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (128, hard))
-    try:
-        snap = snapshot_workspace(tmp_path)
-    finally:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
-    assert _SNAPSHOT_INCOMPLETE in snap, "the truncation was silent"
-    # §4GK round 6: the marker is ASKED FOR, never travelled in the path list.
-    # Round 5 returned `[_SNAPSHOT_INCOMPLETE]` from `diff_snapshots`, which
-    # put a non-path into a list every consumer treats as workspace paths: the
-    # "changed nothing" gate saw a truthy list and passed, the constraint gate
-    # ran on an empty file set, and `register_file_artifact` recorded the
-    # sentinel as a durable deliverable that blocks the release rehearsal.
-    from ghost_agent.core.coding_loop import snapshot_incomplete
-    assert snapshot_incomplete(snap) is True
-    assert diff_snapshots(snap, snap) == [], (
-        "the sentinel escaped into a list of workspace paths")
-    for p in diff_snapshots(snap, {"real.txt": "abc"}):
-        assert not p.startswith("__ghost"), p
-    # control: two real snapshots still diff normally and answer False
-    good = snapshot_workspace(tmp_path)
-    assert _SNAPSHOT_INCOMPLETE not in good
-    assert snapshot_incomplete(good) is False
-    assert diff_snapshots(good, good) == []
 
 
 def test_one_oversized_source_file_does_not_kill_the_media_tidy(tmp_path):
@@ -1175,29 +1135,6 @@ def test_a_surviving_port_holder_is_not_overwritten_by_the_pid_verdict(tmp_path)
         ServiceSupervisor.host_dir = _orig
 
 
-def test_an_unreadable_snapshot_retries_instead_of_passing_ungated(tmp_path):
-    """§4GK round 7. Round 6 stopped a failed READING being mistaken for "the
-    attempt changed nothing" — and did it by falling through with an empty
-    written-list, which skips `_run_verify`, `smoke_gate` AND the constraint
-    gate (guarded on `written`). The attempt was returned as a SUCCESS with no
-    files and no gates, and the task was then marked DONE with no artifacts:
-    the task-reaching-DONE-on-evidence-that-no-work-happened class, worse than
-    the discard it replaced.
-
-    Fails in any tree that treats an unknown reading as a pass."""
-    import ast
-    import inspect as _inspect
-    from ghost_agent.core import coding_loop as cl
-    fn = next(n for n in ast.walk(ast.parse(_inspect.getsource(cl)))
-              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-              and n.name == "build_coding_task_agentic")
-    body = ast.unparse(fn)
-    # the unknown branch must not fall through into the success path
-    i = body.index("_cannot_tell")
-    seg = body[i:i + 700]
-    assert "continue" in seg, (
-        "the unknown-snapshot branch falls through to the gates instead of "
-        "retrying — with written == [] every gate is a no-op")
 
 
 def test_descriptor_pressure_is_not_a_fatal_copy_error():

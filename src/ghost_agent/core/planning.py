@@ -690,9 +690,18 @@ class TaskTree:
                     # and the winning result is never rolled up.
                     self._check_parent_completion(parent_id)
 
+    def roots(self) -> List[str]:
+        """§4VB: EVERY top-level task, in plan order (the order the nodes were added / hydrated): a node with
+        no parent, or whose parent is not in the tree (an orphan is reachable from no root, so a walk from
+        the roots would hide it). ``root_id`` is only the FIRST root ever seen — a project routinely has
+        several sibling top-level tasks (8 and 9 in the owner's live projects), and a walk anchored there
+        showed one of them: ``manage_projects get`` listed 1 of 3 tasks and the model reported "1 of 1".
+        Every walk over the whole tree starts here (pinned: ``tests/test_4vb_task_tree.py``)."""
+        return [nid for nid, n in self.nodes.items() if not n.parent_id or n.parent_id not in self.nodes]
+
     def get_active_node(self) -> Optional[TaskNode]:
-        if not self.root_id: return None
-        
+        if not self.nodes: return None
+
         def find_status(node_id: str, target_statuses: List[TaskStatus], visited: set) -> Optional[TaskNode]:
             if node_id in visited: return None
             visited.add(node_id)
@@ -707,18 +716,21 @@ class TaskTree:
                 return node
             return None
 
-        in_prog = find_status(self.root_id, [TaskStatus.IN_PROGRESS], set())
-        if in_prog: return in_prog
-        
-        ready = find_status(self.root_id, [TaskStatus.READY, TaskStatus.PENDING], set()) 
-        if ready: return ready
-        
+        for wanted in ([TaskStatus.IN_PROGRESS], [TaskStatus.READY, TaskStatus.PENDING]):
+            visited: set = set()
+            for rid in self.roots():
+                found = find_status(rid, wanted, visited)
+                if found: return found
+
         return None
 
     def render(self) -> str:
-        if not self.root_id: return "No Plan."
+        roots = self.roots()
+        if not roots: return "No Plan."
         lines = []
-        self._render_node(self.root_id, 0, lines, set())
+        visited: set = set()
+        for rid in roots:
+            self._render_node(rid, 0, lines, visited)
         return "\n".join(lines)
 
     def _render_node(self, node_id: str, depth: int, lines: List[str], visited: set):
@@ -855,6 +867,11 @@ class TaskTree:
                 for child in children_data:
                     traverse(child, node_id, visited)
                     
+        if isinstance(json_data, dict) and "id" not in json_data and isinstance(json_data.get("roots"), list):
+            _seen: set = set()
+            for _root in json_data["roots"]:       # §4VB: `to_json`'s shape for several top-level tasks
+                traverse(_root, None, _seen)
+            return
         traverse(json_data)
 
     def get_failed_tasks(self) -> List[TaskNode]:
@@ -869,7 +886,7 @@ class TaskTree:
         - what failed (FAILED tasks with reasons)
         - tool usage patterns
         """
-        if not self.root_id:
+        if not self.nodes:                    # §4VB: root_id is only the first root (None for an orphans-only tree)
             return {"summary": "No plan executed."}
 
         done_tasks = [n for n in self.nodes.values() if n.status == TaskStatus.DONE]
@@ -922,7 +939,10 @@ class TaskTree:
         return retro
 
     def to_json(self) -> Dict[str, Any]:
-        if not self.root_id: return {}
+        """The tree as nested dicts: the one root's node when the plan has one top-level task; with several,
+        ``{"roots": [<node>, …]}`` in plan order (§4VB — a single root hid every other top-level task)."""
+        roots = self.roots()
+        if not roots: return {}
 
         def serialize(node_id: str, visited: set = None) -> Dict[str, Any]:
             if visited is None:
@@ -951,7 +971,10 @@ class TaskTree:
                 result["depends_on"] = node.depends_on
             return result
 
-        return serialize(self.root_id)
+        if len(roots) == 1:
+            return serialize(roots[0])
+        visited: set = set()
+        return {"roots": [serialize(rid, visited) for rid in roots]}
 
 
 class ProjectPlan:

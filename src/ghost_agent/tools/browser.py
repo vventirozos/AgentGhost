@@ -64,13 +64,14 @@ def _interact_read_failed(parsed) -> bool:
     if not gotos:
         return False
     last = gotos[-1]
-    return (not last.get("ok")) or bool(blocked_page_reason(
-        {"status": last.get("status"), "title": last.get("title"), "url": last.get("url")}))
+    return (not last.get("ok")) or bool(blocked_page_reason(goto_page_view(parsed.get("actions") or [], last)))
+
+
 _BROWSER_RUNNER_FILENAME = ".browser_runner.py"
 from .browser_support import ensure_runner_file as _ensure_runner_file, preview_cap_chars   # §4OE-5, §4OG-5
 from .browser_support import (_note_sandbox_down, _sandbox_down_recently, _sandbox_down_result,   # §4PC
                               _links_block, _last_url_conv_filename, _new_nonce, _parse_runner_output,
-                              text_block)
+                              text_block, goto_page_view)                              # §4UY N5
 
 # Serializes Chromium launches against the shared persistent profile dir.
 # `launch_persistent_context` takes an exclusive SingletonLock on its
@@ -1574,8 +1575,7 @@ async def tool_browser(
                            if r.get("action") == "goto" and r.get("ok")), None)
         if _last_goto is None and isinstance(parsed.get("initial_goto"), dict):
             _last_goto = parsed["initial_goto"]                      # §4PC: the implicit first navigation
-        _ib = (blocked_page_reason({"status": _last_goto.get("status"), "title": _last_goto.get("title"),
-                                    "url": _last_goto.get("url")}) if _last_goto else "")
+        _ib = (blocked_page_reason(goto_page_view(action_results, _last_goto)) if _last_goto else "")
         if _ib:
             _ib_url = _last_goto.get("url") or ""
             header = header.replace(
@@ -1698,6 +1698,18 @@ async def tool_browser(
         return (ToolOutcome.failed if _interact_status == "failed"
                 else ToolOutcome.partial)(
             _txt, world_changed=True,
-            reason_code=f"browser_interact_{_interact_status}")
+            reason_code=("browser_interact_failed" if _interact_status == "failed"
+                         else "browser_interact_partial"))
     # Defensive default — never hit because we validated above.
     return f"{header}\nRAW: {json.dumps(parsed)}"
+
+
+
+# §4UY N6 r3: a browser call moves the sandbox's container-wide counters — an overlapped run records no file
+_tool_browser_impl = tool_browser
+
+
+async def _tool_browser_noting(*args, **kwargs):
+    from ..utils.provenance import sandbox_call
+    return await sandbox_call("browser", lambda: _tool_browser_impl(*args, **kwargs))
+tool_browser = __import__("functools").update_wrapper(_tool_browser_noting, _tool_browser_impl)

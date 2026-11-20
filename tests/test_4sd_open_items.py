@@ -63,112 +63,28 @@ class _SpecStream:
 
 # ── 1. a background spec call yields the slot ─────────────────────────────
 
-async def test_a_background_spec_stream_gives_the_slot_to_the_owner_and_runs_again():
-    # world: the spec stream had no yield — the owner waited behind minutes of planning
-    llm = _SpecStream(owner_at={1})
-    content, reasoning, aborted = await CE._spec_stream(llm, {"messages": []}, True)
-    assert llm.calls == 2 and aborted is None and content == SPEC
 
 
-async def test_a_yielded_spec_call_is_not_a_think_abort():
-    # world: a yield counted as an aborted think phase — the policy turned thinking off
-    llm = _SpecStream(owner_at={1}, think="plan: one file")
-    CE._think_state(llm)["aborts"] = 0
-    spec, _ = await CE._generate_build_spec(llm, "m", "build a.py", "", is_background=True)
-    assert spec.get("files") and CE._think_state(llm)["aborts"] == 0 and llm.calls == 2
 
 
-async def test_the_spec_yield_baseline_is_the_first_chunk():
-    # world: read at the call's start, an owner request already live at admission yielded at once, forever
-    llm = _SpecStream()
-    llm.foreground_requests = 3
-    content, _, aborted = await CE._stream_spec_completion(llm, {}, True)
-    assert aborted is None and content == SPEC and llm.calls == 1
 
 
-async def test_a_waiting_foreground_call_also_makes_the_spec_yield():
-    class _FgWaits(_SpecStream):
-        async def stream_chat_completion(self, payload, is_background=False, **kw):
-            self.calls += 1
-            yield _frame({"content": "{"})
-            if self.calls == 1:
-                self.foreground_tasks = 1
-            else:
-                self.foreground_tasks = 0
-            yield _frame({"content": SPEC[1:]})
-            yield b"data: [DONE]\n\n"
-    llm = _FgWaits()
-    content, _, aborted = await CE._spec_stream(llm, {}, True)
-    assert llm.calls == 2 and content == SPEC
 
 
-async def test_spec_yields_are_bounded():
-    # world: an owner who keeps arriving starves the build — after _MAX_YIELDS it runs on
-    llm = _SpecStream(owner_at=set(range(1, 100)))
-    content, _, aborted = await CE._spec_stream(llm, {}, True)
-    assert llm.calls == CE._MAX_YIELDS + 1 and aborted is None and content == SPEC
 
 
-async def test_a_foreground_spec_stream_never_yields():
-    llm = _SpecStream(owner_at={1})
-    content, _, aborted = await CE._spec_stream(llm, {}, False)
-    assert llm.calls == 1 and aborted is None and content == SPEC
 
 
-async def test_the_background_no_think_spec_call_streams_and_yields():
-    # world: the no-think call was one non-streamed call — it could not yield at all
-    llm = _SpecStream(owner_at={1})
-    content, _ = await CE._spec_nothink_call(llm, "m", "sys", "user", True)
-    assert llm.calls == 2 and content == SPEC
-    assert all("stream" not in p for p in llm.payloads)
-    assert llm.payloads[0]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-async def test_an_empty_answer_under_the_grammar_is_retried_without_it(monkeypatch):
-    # world: streamed, a rejected grammar is an error frame (no raise) — the retry never ran
-    monkeypatch.setattr(CE, "_spec_response_format", lambda: {"type": "json_object"})
-
-    class _GrammarRejected(_SpecStream):
-        async def stream_chat_completion(self, payload, is_background=False, **kw):
-            self.calls += 1
-            self.payloads.append(payload)
-            if "response_format" in payload:
-                yield f"data: {json.dumps({'error': 'grammar'})}\n\n".encode()
-                return
-            yield _frame({"content": SPEC})
-            yield b"data: [DONE]\n\n"
-    llm = _GrammarRejected()
-    content, _ = await CE._spec_nothink_call(llm, "m", "sys", "user", True)
-    assert content == SPEC and llm.calls == 2 and "response_format" not in llm.payloads[1]
 
 
 # ── 2. a foreground build's calls take the side path ──────────────────────
 
-async def test_foreground_executor_streams_ask_for_the_side_path():
-    # world: an owner's build displaced the owner's conversation unsaved (the 28k head re-read)
-    llm = _SpecStream()
-    await CE._stream_spec_completion(llm, {}, False)
-    assert llm.kw[0] == {"side_main": True, "task_label": "coding spec"}
-    await CE._stream_file_text(llm, {}, False)
-    assert llm.kw[1] == {"side_main": True, "task_label": "generated file"}
 
 
-async def test_background_executor_streams_do_not():
-    llm = _SpecStream()
-    await CE._stream_spec_completion(llm, {}, True)
-    await CE._stream_file_text(llm, {}, True)
-    assert llm.kw == [{}, {}]
 
 
-async def test_the_foreground_no_think_call_asks_for_the_side_path():
-    seen = []
-
-    class _NonStream:
-        async def chat_completion(self, payload, is_background=False, **kw):
-            seen.append(kw)
-            return {"choices": [{"message": {"content": SPEC}}]}
-    content, _ = await CE._spec_nothink_call(_NonStream(), "m", "s", "u", False)
-    assert content == SPEC and seen == [{"side_main": True, "task_label": "coding spec"}]
 
 
 class _Client:
@@ -466,34 +382,8 @@ async def test_the_watch_never_stops_before_the_clients_own_timeout(monkeypatch)
     assert await asyncio.wait_for(t, 2) is True
 
 
-async def test_a_finished_spec_is_kept_when_the_owner_arrives_in_its_trailing_frames():
-    # world (review r1): the owner check ran on the usage/[DONE] frames — a whole spec regenerated
-    class _Late(_SpecStream):
-        async def stream_chat_completion(self, payload, is_background=False, **kw):
-            self.calls += 1
-            yield _frame({"content": SPEC})
-            yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
-            self.foreground_requests += 1
-            yield f"data: {json.dumps({'usage': {'completion_tokens': 5}})}\n\n".encode()
-            yield b"data: [DONE]\n\n"
-    llm = _Late()
-    content, _, aborted = await CE._spec_stream(llm, {}, True)
-    assert llm.calls == 1 and content == SPEC and aborted is None
 
 
-@pytest.mark.parametrize("bg", [True, False])
-async def test_a_deferral_is_not_retried_as_a_grammar_failure(monkeypatch, bg):
-    # world (review r1): BackgroundDeferred was caught as a grammar error — parked twice, misleading warning
-    monkeypatch.setattr(CE, "_spec_response_format", lambda: {"type": "json_object"})
-    calls = []
-
-    class _Defers:
-        async def chat_completion(self, payload, is_background=False, **kw):
-            calls.append(payload)
-            raise LLM.BackgroundDeferred("owner busy")
-    with pytest.raises(LLM.BackgroundDeferred):
-        await CE._spec_nothink_call(_Defers(), "m", "s", "u", bg)
-    assert len(calls) == 1
 
 
 async def test_the_reply_names_the_limit_that_fired(monkeypatch):
@@ -508,24 +398,10 @@ async def test_the_reply_names_the_limit_that_fired(monkeypatch):
     assert "(240 min)" in t.reason
 
 
-async def test_a_finish_in_its_own_frame_keeps_the_spec():
-    # world (review r2): the owner check ran before the frame was read — the finish frame itself yielded
-    class _SepFinish(_SpecStream):
-        async def stream_chat_completion(self, payload, is_background=False, **kw):
-            self.calls += 1
-            yield _frame({"content": SPEC})
-            self.foreground_requests += 1
-            yield f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n".encode()
-            yield b"data: [DONE]\n\n"
-    llm = _SepFinish()
-    content, _, aborted = await CE._spec_stream(llm, {}, True)
-    assert llm.calls == 1 and content == SPEC
 
 
 # ── r3: a stopped build writes the files it finished ──────────────────────
 
-from tests.test_4sd_executor_generate import ScriptLLM, FakeRunner, _spec, _ctx, _written, JS  # noqa: E402
-from ghost_agent.core.write_continuation import END_MARKER  # noqa: E402
 
 
 @pytest.fixture
@@ -538,153 +414,22 @@ def _exec_env(monkeypatch):
     monkeypatch.setattr(CE, "_window_tokens", _no_window)
 
 
-async def test_a_build_stopped_mid_file_writes_the_files_it_finished(_exec_env):
-    # world (review r3 MAJOR): the hard stop's CancelledError passed `_write_pending` — a.js lost
-    class _Stopped(ScriptLLM):
-        async def chat_completion(self, payload, is_background=False, **kw):
-            if "WRITE NOW the complete file: b.js" in str(payload["messages"]):
-                raise asyncio.CancelledError()
-            return await super().chat_completion(payload, is_background, **kw)
-    llm = _Stopped([(_spec([{"path": "a.js", "generate": "steps"}, {"path": "b.js", "generate": "b"}]), "stop"),
-                    (JS + END_MARKER, "stop")])
-    runner = FakeRunner()
-    with pytest.raises(asyncio.CancelledError):
-        await CE.build_coding_task(_ctx(llm), "build", tool_runner=runner)
-    assert _written(runner, "a.js") == [JS]
 
 
-async def test_a_build_stopped_in_its_second_spec_call_writes_what_a_refusal_left(_exec_env):
-    spec1 = json.dumps({"files": [{"path": "style.css", "content": "body {\n...\n}\n"},
-                                  {"path": "b.js", "generate": "b"}], "verify": "", "summary": "s", "ledger": ""})
-
-    class _StopsOnSecondSpec(ScriptLLM):
-        specs = 0
-
-        async def chat_completion(self, payload, is_background=False, **kw):
-            if "WRITE NOW" not in str(payload["messages"]):
-                self.specs += 1
-                if self.specs == 2:
-                    raise asyncio.CancelledError()
-            return await super().chat_completion(payload, is_background, **kw)
-    llm = _StopsOnSecondSpec([(spec1, "stop"), ("export const b = 1;\n" + END_MARKER, "stop")])
-    runner = FakeRunner()
-    with pytest.raises(asyncio.CancelledError):
-        await CE.build_coding_task(_ctx(llm), "build", tool_runner=runner, max_attempts=3)
-    assert _written(runner, "b.js") == ["export const b = 1;\n"]
 
 
-async def test_a_flush_that_hangs_does_not_hold_the_stop(_exec_env, monkeypatch):
-    monkeypatch.setattr(CE, "STOP_FLUSH_S", 0.2)
-
-    class _Slow(FakeRunner):
-        async def __call__(self, name, args):
-            if name == "file_system" and args.get("path") == "a.js" and args.get("operation") != "read":
-                await asyncio.sleep(30)
-            return await super().__call__(name, args)
-
-    class _Stopped(ScriptLLM):
-        async def chat_completion(self, payload, is_background=False, **kw):
-            if "WRITE NOW the complete file: b.js" in str(payload["messages"]):
-                raise asyncio.CancelledError()
-            return await super().chat_completion(payload, is_background, **kw)
-    llm = _Stopped([(_spec([{"path": "a.js", "generate": "steps"}, {"path": "b.js", "generate": "b"}]), "stop"),
-                    (JS + END_MARKER, "stop")])
-    t0 = time.monotonic()
-    with pytest.raises(asyncio.CancelledError):
-        await CE.build_coding_task(_ctx(llm), "build", tool_runner=_Slow())
-    assert time.monotonic() - t0 < 5
 
 
-async def test_a_stop_inside_the_batch_writes_the_files_still_pending(_exec_env):
-    # world (review r4): a cancel on a.js's write lost the fully generated b.js
-    class _StopOnA(FakeRunner):
-        async def __call__(self, name, args):
-            if (name == "file_system" and args.get("path") == "a.js" and args.get("operation") != "read"
-                    and not getattr(self, "_stopped", False)):
-                self._stopped = True
-                raise asyncio.CancelledError()
-            return await super().__call__(name, args)
-    llm = ScriptLLM([(_spec([{"path": "a.js", "generate": "steps"}, {"path": "b.js", "generate": "b"}]), "stop"),
-                     (JS + END_MARKER, "stop"), ("export const b = 1;\n" + END_MARKER, "stop")])
-    runner = _StopOnA()
-    with pytest.raises(asyncio.CancelledError):
-        await CE.build_coding_task(_ctx(llm), "build", tool_runner=runner)
-    assert _written(runner, "b.js") == ["export const b = 1;\n"]
 
 
-async def test_a_stopped_background_build_does_not_flush_behind_its_reopen(_exec_env):
-    # world (review r5): the unattended step reopens its leaf without waiting — a late flush
-    # landed inside the next build of the same leaf
-    class _Stopped(ScriptLLM):
-        async def chat_completion(self, payload, is_background=False, **kw):
-            if "WRITE NOW the complete file: b.js" in str(payload["messages"]):
-                raise asyncio.CancelledError()
-            return await super().chat_completion(payload, is_background, **kw)
-    llm = _Stopped([(_spec([{"path": "a.js", "generate": "steps"}, {"path": "b.js", "generate": "b"}]), "stop"),
-                    (JS + END_MARKER, "stop")])
-    runner = FakeRunner()
-    with pytest.raises(asyncio.CancelledError):
-        await CE.build_coding_task(_ctx(llm), "build", tool_runner=runner, is_background=True)
-    assert _written(runner, "a.js") == []
 
 
 # ── r5: a verify the stop killed is a stop, not a failed attempt ──────────
 
-async def test_a_verify_killed_by_the_stop_ends_the_build_as_a_stop(_exec_env):
-    # world (review r5 MAJOR): the killed verify (exit 130) read as a failed attempt; the build
-    # returned FAILED before the cancel landed and the reopen found a FAILED leaf
-    from ghost_agent.utils import tool_stop as TS
-    spec = json.dumps({"files": [{"path": "a.py", "content": "print(1)\n"}], "verify": "python3 a.py",
-                       "summary": "s", "ledger": ""})
-    stop = TS.ToolStop()
-
-    class _KilledVerify(FakeRunner):
-        async def __call__(self, name, args):
-            if name == "execute":
-                stop.request()
-                return "EXIT CODE: 130\nkilled"
-            return await super().__call__(name, args)
-    llm = ScriptLLM([(spec, "stop")] * 3)
-    tok = TS.bind(stop)
-    try:
-        with pytest.raises(asyncio.CancelledError):
-            await CE.build_coding_task(_ctx(llm), "build", tool_runner=_KilledVerify(), max_attempts=1)
-    finally:
-        TS.unbind(tok)
 
 
-async def test_a_build_without_a_stop_still_fails_normally(_exec_env):
-    spec = json.dumps({"files": [{"path": "a.py", "content": "print(1)\n"}], "verify": "python3 a.py",
-                       "summary": "s", "ledger": ""})
-
-    class _Fails(FakeRunner):
-        async def __call__(self, name, args):
-            if name == "execute":
-                return "EXIT CODE: 1\nTraceback: boom"
-            return await super().__call__(name, args)
-    res = await CE.build_coding_task(_ctx(ScriptLLM([(spec, "stop")] * 3)), "build", tool_runner=_Fails(),
-                                     max_attempts=1)
-    assert res.ok is False
 
 
-async def test_a_build_whose_caller_does_not_wait_never_flushes_late(_exec_env):
-    # world (review r5): a scheduled batch's build is foreground AND unattended — it flushed
-    # after the step had reopened its leaf
-    class _Stopped(ScriptLLM):
-        async def chat_completion(self, payload, is_background=False, **kw):
-            if "WRITE NOW the complete file: b.js" in str(payload["messages"]):
-                raise asyncio.CancelledError()
-            return await super().chat_completion(payload, is_background, **kw)
-    llm = _Stopped([(_spec([{"path": "a.js", "generate": "steps"}, {"path": "b.js", "generate": "b"}]), "stop"),
-                    (JS + END_MARKER, "stop")])
-    runner = FakeRunner()
-    tok = CE.caller_waits_context.set(False)
-    try:
-        with pytest.raises(asyncio.CancelledError):
-            await CE.build_coding_task(_ctx(llm), "build", tool_runner=runner)
-    finally:
-        CE.caller_waits_context.reset(tok)
-    assert _written(runner, "a.js") == []
 
 
 def test_the_unattended_step_says_it_does_not_wait():

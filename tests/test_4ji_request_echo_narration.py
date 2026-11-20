@@ -335,8 +335,6 @@ def _breaker_agent():
     agent.disabled_tools = set()
     agent.context.current_project_id = None
     agent.context._script_iter = {}
-    agent.context._futility_steer_done = False
-    agent.context._futility_report_done = False
     agent.context._breaker_forced_final = False
     return agent
 

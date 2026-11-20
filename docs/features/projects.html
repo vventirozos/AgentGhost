@@ -118,6 +118,10 @@
     <li><strong>The briefing shows</strong> the last five changes, where it is live, and the project's files as they are on disk now.</li>
     <li><strong>Old work.</strong> A project the agent closed by itself before (when its plan finished) reads <em>ready</em> again. Changes made before the log existed are added with <code>scripts/backfill_project_change.py</code> (running it twice adds nothing). <a href="../reference/projects/change_log.html">Details</a>.</li>
   </ul>
+  <h3>Who decides (&sect;4UY)</h3>
+  <p>Decisions about a project as a whole are yours: closing, archiving, deleting, renaming, releasing, its budget and autopilot. They run only when you ask, in your own conversation, and never in a request that read web pages. Background runs, scheduled tasks and test probes can work on tasks but cannot make these decisions. A plan made "plan only" is not run in the same request; your next message starts it. A deleted project's folder goes to a trash on the host for 30 days.</p>
+  <p><strong>A question never deploys.</strong> When your message only asks (every sentence ends with a question mark; in Greek, with <code>;</code>; text in quotes, brackets or code is not read), the agent answers by looking and cannot change a live site in that turn: deploy, switch, rollback, restore, keep and a file put into a kept lab are refused, and the reply says what it would deploy. Tell it to ("deploy it", also while the turn is still running) and it does, with no further question. A request worded as a question ("can you deploy it?") counts as a question. <a href="../reference/projects/projects_tool.html#p5">Details</a>.</p>
+
   <h3>The safety check</h3>
   <ul>
     <li><strong>Budgets (§4UL).</strong> Your own runs are never capped. Unattended runs get a daily allowance per project (30 tasks, a few hours); you can change it with <code>action=budget</code> (<code>unattended_per_day</code>, <code>runtime_cap_hours</code>), and you can ask for a check-in every N tasks (<code>checkpoint_every</code>; off by default).</li>

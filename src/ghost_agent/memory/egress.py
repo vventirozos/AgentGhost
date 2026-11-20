@@ -441,9 +441,38 @@ def identifier_values(pm) -> list:
     return out
 
 
-def _forms(value: str) -> list:
-    """Folded forms of one identifier to look for: the value, a name's
-    surname, a date's other spellings."""
+#: §4UY N4: the profile keys whose value is a PERSON'S NAME — the only kind of
+#: value one word of which (the surname) identifies. An address's last word is
+#: its city or country, a street name's last word is "street": treating those
+#: as a surname refused every search naming the owner's city after any outside
+#: read (live 5b9ebfd4, 08d2a444). A first name is not here: "Anna Maria" has
+#: no surname.
+_NAME_KEY = re.compile(
+    r"^(?:name|full_?name)$"
+    r"|^(?:wife|husband|partner|spouse|son|daughter|child|mother|father)_name$"
+    r"|^(?:sons|daughters|children|kids)$", re.IGNORECASE)
+#: …and the keys whose value IS a surname: the value alone identifies
+_SURNAME_KEY = re.compile(r"^(?:last_?name|surname)$", re.IGNORECASE)
+_SURNAME_MIN = 5
+
+
+def field_kind(label: str) -> str:
+    """What a profile identifier IS, from its key (the label's last part):
+    "surname", "name" (a person's full name) or "value" (everything else —
+    an address, a date, a phone, an email, a first name). The one decision
+    `_forms` reads; §4UY N4."""
+    key = str(label or "").rsplit(".", 1)[-1].strip().lower()
+    if _SURNAME_KEY.search(key):
+        return "surname"
+    if _NAME_KEY.search(key):
+        return "name"
+    return "value"
+
+
+def _forms(value: str, label: str) -> list:
+    """Folded forms of one identifier to look for: the value, a person's
+    surname (a NAME field only — `field_kind`), a date's other spellings."""
+    kind = field_kind(label)
     v = fold(value)[0].strip()
     words = re.findall(r"[^\W\d_]+", v)
     # a lone first name ("Maria") identifies nobody — "Maria Callas
@@ -453,8 +482,10 @@ def _forms(value: str) -> list:
     if m:
         y, mo, d = m.groups()
         forms |= {f"{d}/{mo}/{y}", f"{d}.{mo}.{y}", f"{d}-{mo}-{y}", f"{y}{mo}{d}"}
-    if len(words) >= 2 and len(words[-1]) >= 5:
-        forms.add(words[-1])            # the surname alone identifies
+    if kind == "surname" and len(words) == 1 and len(words[0]) >= _SURNAME_MIN:
+        forms.add(words[0])             # a surname field: the value alone identifies
+    if kind == "name" and len(words) >= 2 and len(words[-1]) >= _SURNAME_MIN:
+        forms.add(words[-1])            # a person's name: the surname alone identifies
     return [f for f in forms if f]
 
 
@@ -528,7 +559,7 @@ def content_egress_refusal(tool_name: str, args, context):
                 world_changed=False, reason_code="untrusted_egress")
         hit = None
         for label, value in identifier_values(pm):
-            for f in _forms(value):
+            for f in _forms(value, label):
                 if re.search(rf"(?<!\w){re.escape(f)}(?!\w)", hay) and f not in said:
                     hit = label
                     break

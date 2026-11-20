@@ -104,36 +104,68 @@ def test_the_per_url_distill_budget_derives_from_the_clock(
     halves are pinned here: `_bounded` derives the budget from the outer
     ceiling AND the phase deadline, and `process_url` turns that into a
     clock-based deadline."""
+    # ⚠ UPDATED 2026-11-19 (§4UZ): fetch and distill are separate steps now.
+    # `process_url` is the FETCH stage and no longer opens a `_url_deadline`;
+    # the distill is sized by `DistillWave` when the page's turn at the worker
+    # comes. The property is unchanged and is pinned where it lives now:
+    #   1. the wave is built on the phase deadline (a clock reading),
+    #   2. `DistillWave.left` reads the monotonic clock against that deadline,
+    #   3. `DistillWave._size` computes the budget from `left()` and the
+    #      ceiling — never from a constant,
+    #   4. the distill's `timeout`/`total_budget` are that turn's budget,
+    #   5. and (below, as before) the fetch window is issued from the outer
+    #      ceiling and the phase deadline — now in `_fetch_bounded`.
     tree = ast.parse((_SRC / rel_path).read_text(encoding="utf-8"))
-    fn = _fn_named(tree, "process_url")
-    assert fn is not None, f"{rel_path}: process_url is gone"
+    waves = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "DistillWave"]
+    assert len(waves) == 1, f"{rel_path}: the distills are not taken through one DistillWave"
+    wave_kw = {k.arg: k.value for k in waves[0].keywords}
+    assert isinstance(wave_kw.get("deadline"), ast.Name) and wave_kw["deadline"].id == "_phase_deadline", (
+        f"{rel_path}: the wave is not built on the phase deadline")
+    assert isinstance(wave_kw.get("ceiling_s"), ast.Name) and wave_kw["ceiling_s"].id == "_WEB_SUMMARY_TIMEOUT_S"
+    phase = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "_phase_deadline" for t in n.targets)]
+    assert phase and all("monotonic" in {a.attr for a in ast.walk(d) if isinstance(a, ast.Attribute)}
+                         or "_call_t0" in {a.id for a in ast.walk(d) if isinstance(a, ast.Name)}
+                         for d in phase), f"{rel_path}: the phase deadline is not a clock reading"
 
-    # the deadline must come from the monotonic clock plus the outer ceiling
-    deadlines = [n for n in ast.walk(fn)
-                 if isinstance(n, ast.Assign)
-                 and any(isinstance(t, ast.Name) and t.id == "_url_deadline"
-                         for t in n.targets)]
-    assert deadlines, (
-        f"{rel_path}: no per-URL deadline — the distill budget cannot know "
-        f"how much of the outer window the fetch already spent")
-    names = {n.id for d in deadlines for n in ast.walk(d)
-             if isinstance(n, ast.Name)}
-    attrs = {n.attr for d in deadlines for n in ast.walk(d)
-             if isinstance(n, ast.Attribute)}
-    assert "monotonic" in attrs, (
-        f"{rel_path}: the per-URL deadline is not read from the clock")
-    # The window must be the one HANDED IN, not a constant re-opened here —
-    # a constant would restore the simultaneous-clock defect.
-    assert "budget_s" in names, (
-        f"{rel_path}: the per-URL deadline is not derived from the budget "
-        f"issued after the semaphore was acquired")
-    assert {a.arg for a in fn.args.args} >= {"budget_s"}, (
-        f"{rel_path}: process_url does not accept a budget")
+    nt_tree = ast.parse((_SRC / "core/node_throughput.py").read_text(encoding="utf-8"))
+    wave_cls = next(n for n in ast.walk(nt_tree) if isinstance(n, ast.ClassDef) and n.name == "DistillWave")
+    left, size = _fn_named(wave_cls, "left"), _fn_named(wave_cls, "_size")
+    assert left is not None and size is not None
+    left_attrs = {n.attr for n in ast.walk(left) if isinstance(n, ast.Attribute)}
+    assert {"monotonic", "deadline"} <= left_attrs, "DistillWave.left does not read the clock against the deadline"
+    avail = [n for n in ast.walk(size) if isinstance(n, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "avail" for t in n.targets)]
+    assert avail and all(any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == "left"
+                             for c in ast.walk(a)) for a in avail), "the time available is not read from left()"
+    first_budget = next(n for n in ast.walk(size) if isinstance(n, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "budget" for t in n.targets))
+    assert "avail" in {n.id for n in ast.walk(first_budget) if isinstance(n, ast.Name)}, (
+        "the page's budget is not computed from the time available")
+    assert "ceiling_s" in {n.attr for n in ast.walk(first_budget) if isinstance(n, ast.Attribute)}
+    assert not [n for n in ast.walk(first_budget) if isinstance(n, ast.Constant) and isinstance(n.value, float)
+                and n.value > 1.0], "a constant budget"
 
-    # ...and the ISSUER must clip that budget by both the per-URL ceiling and
-    # the whole-phase deadline, after acquiring the semaphore.
-    issuer = _fn_named(tree, "_bounded")
-    assert issuer is not None, f"{rel_path}: _bounded is gone"
+    sized = _fn_named(tree, "_distill_sized")
+    assert sized is not None, f"{rel_path}: _distill_sized is gone"
+    budget_src = [n for n in ast.walk(sized) if isinstance(n, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "_summary_budget" for t in n.targets)]
+    assert len(budget_src) == 1 and isinstance(budget_src[0].value, ast.Attribute) \
+        and budget_src[0].value.attr == "budget_s", f"{rel_path}: the distill budget is not the turn's"
+    posts = [n for n in ast.walk(sized) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute) and n.func.attr == "chat_completion"]
+    assert posts
+    for call in posts:
+        kw = {k.arg: k.value for k in call.keywords}
+        for name in ("timeout", "total_budget"):
+            assert isinstance(kw.get(name), ast.Name) and kw[name].id == "_summary_budget", (
+                f"{rel_path}: {name} is not the budget derived from the clock")
+
+    # ...and the ISSUER of the fetch window must clip it by both the per-URL
+    # ceiling and the whole-phase deadline, after acquiring the semaphore.
+    issuer = _fn_named(tree, "_fetch_bounded")
+    assert issuer is not None, f"{rel_path}: _fetch_bounded is gone"
     issued = [n for n in ast.walk(issuer)
               if isinstance(n, ast.Assign)
               and any(isinstance(t, ast.Name) and t.id == "budget"
@@ -155,51 +187,6 @@ def test_the_per_url_distill_budget_derives_from_the_clock(
         f"{rel_path}: _bounded no longer acquires the semaphore, so the "
         f"budget is issued before the URL actually starts")
 
-    # ...and the budget handed to the model must derive from that deadline
-    budgets = [n for n in ast.walk(fn)
-               if isinstance(n, ast.Assign)
-               and any(isinstance(t, ast.Name) and t.id == "_summary_budget"
-                       for t in n.targets)]
-    assert budgets, f"{rel_path}: the distill budget is not computed"
-    bnames = {n.id for b in budgets for n in ast.walk(b)
-              if isinstance(n, ast.Name)}
-    assert "_url_deadline" in bnames, (
-        f"{rel_path}: the distill budget ignores the per-URL deadline — it "
-        f"is a constant again, and a slow fetch will lose the URL")
-
-    calls = _call_kwargs(rel_path, "web summary")
-    assert calls
-    for kw in calls:
-        for name in ("timeout", "total_budget"):
-            v = kw[name]
-            assert isinstance(v, ast.Name) and v.id == "_summary_budget", (
-                f"{rel_path}: {name}={ast.unparse(v)} is not the clock-"
-                f"derived budget")
-        # ⚠ SLOT_WAIT IS NO LONGER THE WHOLE BUDGET, DELIBERATELY (2026-08-25).
-        # Passing timeout == slot_wait == total_budget let a call sit in the
-        # per-node permit queue for nearly the entire budget and then POST a
-        # request sized for ALL of it — the plan's arithmetic measured against
-        # time already spent. That is req 08766aa1's "6s for a 27s job"
-        # relocated from the tool's semaphore to `_node_slot`, and it still
-        # ends as a ReadTimeout charged to the node. The permit wait is now a
-        # bounded allowance, and the distill is sized for the budget MINUS it.
-        sw = kw["slot_wait"]
-        assert isinstance(sw, ast.Name) and sw.id == "_QUEUE_ALLOWANCE_S", (
-            f"{rel_path}: slot_wait={ast.unparse(sw)} — queueing must be "
-            f"bounded by an allowance the plan reserved, not by the whole "
-            f"budget")
-
-    # ...and the plan must actually subtract that allowance, or the reserve
-    # is a comment rather than a constraint.
-    plans = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
-             and isinstance(n.func, ast.Attribute)
-             and n.func.attr == "plan_distill"]
-    assert plans, f"{rel_path}: the distill is not sized by a plan"
-    pnames = {n.id for c in plans for n in ast.walk(c)
-              if isinstance(n, ast.Name)}
-    assert {"_summary_budget", "_QUEUE_ALLOWANCE_S"} <= pnames, (
-        f"{rel_path}: plan_distill is not sized against the clock-derived "
-        f"budget minus the queue allowance")
 
 
 def test_the_background_gate_still_refuses_to_dogpile_main():

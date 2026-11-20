@@ -1485,7 +1485,8 @@ def _set_mood(self_model, context, mood, evidence, intensity=None, manner=None, 
 _MOOD_TIMELINE_MAX = 12
 MOOD_HOW_IT_MOVES = ("(It moves by itself: failed tool calls (weighed by how many of the turn's calls "
                      "failed; a transient failure, a guard's refusal or a failing test run does not count) "
-                     "and loop guards in the owner's turns, smooth turns, finished project tasks, research, "
+                     "and loop guards in the owner's turns, a request that failed as a whole, smooth turns, "
+                     "project tasks finished or left failed (a batch's too), research, "
                      "very long turns, the owner's thumbs, corrections, thanks and the tone of the owner's messages, "
                      "the owner coming back after a long quiet "
                      "(reactions to one reply count once); it wears off by half every "

@@ -244,24 +244,6 @@ async def _run_build(monkeypatch, tmp_path, run_outputs):
     return agent, ctx
 
 
-async def test_the_futility_breaker_lets_a_converging_test_fix_loop_run(monkeypatch, tmp_path):
-    """Fails where 6 rewrites + 4 reruns forced a blocker report although
-    every run passed more tests (§4OD)."""
-    falling = [f"=== {n} failed, {12 - n} passed in 0.1s ===" for n in (9, 8, 7, 6, 5, 4, 3)]
-    agent, ctx = await _run_build(monkeypatch, tmp_path, falling)
-    assert not getattr(agent.context, "_futility_report_done", False)
-    assert not getattr(agent.context, "_breaker_forced_final", False)   # the converging loop ran to its own end
-    assert ctx.llm_client.chat_completion.await_count == 2 * len(falling) + 1
-    # the same cycle with NO progress: §4UI — the futility breaker steers once and no
-    # longer forces a report; the progress flag is False (what the steer reads)
-    # production shape: a failing pytest EXITS 1 → the tool result is a declared failure
-    stuck = [ToolOutcome.failed(f"=== 9 failed, 3 passed in 0.{i}s ===") for i in range(1, 8)]
-    agent2, ctx2 = await _run_build(monkeypatch, tmp_path, stuck)
-    assert not getattr(agent2.context, "_futility_report_done", False)
-    rec = (getattr(agent2.context, "_script_iter", None) or {}).get("app.py") or {}
-    assert rec.get("progress") is False and rec.get("fails") == 9
-
-
 # ── §4OE-1b: the report written as a file on the report turn ──────────────── #
 
 _FALLBACK_HEAD = "ran out of this turn's budget"

@@ -10,73 +10,23 @@ import inspect
 import os
 import sys
 
-import pytest
 
 sys.path.insert(0, os.path.abspath(
     os.path.join(os.path.dirname(__file__), "../src")))
 
 from ghost_agent.core import dream as DREAM              # noqa: E402
 from ghost_agent.core import project_advancer as PA      # noqa: E402
-from ghost_agent.core.coding_executor import (           # noqa: E402
-    _replace_failure_kind,
-)
 from ghost_agent.tools import registry as REG            # noqa: E402
 
 
 # ── F: the retry-steering mislabel (req 6e9efd6a's 20-minute grind) ──────
 
-def test_a_syntax_rollback_is_not_reported_as_a_missing_anchor():
-    """THE LIVE DEFECT. Every non-SUCCESS replace was labelled "anchor not
-    found" and fed to the next attempt behind "YOUR PREVIOUS ATTEMPT FAILED:".
-    A syntax-regression rollback therefore sent the model hunting for a better
-    ANCHOR while the defect was its replacement's INDENTATION — 14 attempts,
-    20 minutes, 5 of them rejected by the same guard."""
-    out = ("REJECTED: that replace would introduce a syntax error and was NOT "
-           "applied — 'x.py' is unchanged on disk: unexpected indent (line 238).")
-    kind = _replace_failure_kind(out)
-    assert "syntax" in kind.lower()
-    assert "anchor not found" not in kind.lower()
-    assert "replacement" in kind.lower(), "must point at the REPLACE block"
 
 
-def test_each_distinct_rejection_gets_its_own_label():
-    assert "ambiguous" in _replace_failure_kind(
-        "SYSTEM INSTRUCTION: Multiple instances of this text block found").lower()
-    # ⚠ THE REAL STRING, copied from file_system.py:1671. The first version
-    # of this test invented "None of the blocks matched the file contents",
-    # which appears nowhere in the tree — so it validated the classifier
-    # against a string production never emits, and the genuine multi-block
-    # failure fell through to the neutral branch unnoticed.
-    assert _replace_failure_kind(
-        "SYSTEM INSTRUCTION: None of the SEARCH/REPLACE blocks matched in "
-        "'x.py'.\nCould not find block:\ndef foo()..."
-    ) == "anchor not found"
-    # …and a MISSING FILE is not a missing anchor (file_system.py:1362)
-    assert "file" in _replace_failure_kind("Error: 'utils.py' not found.").lower()
-    assert "anchor" not in _replace_failure_kind("Error: 'utils.py' not found.").lower()
-    assert "marker" in _replace_failure_kind(
-        "REJECTED: replacement contains SEARCH/REPLACE markers (====)").lower()
-    assert "block" in _replace_failure_kind(
-        "SYSTEM BLOCK: released project is immutable; this write was NOT applied.").lower()
 
 
-def test_an_UNRECOGNISED_rejection_stays_neutral():
-    """⚠ The whole defect was a confident wrong guess. An unknown shape must
-    NOT fall back to the most common label — the caller appends the tool's raw
-    text anyway, so saying less is strictly better than saying something
-    false."""
-    kind = _replace_failure_kind("some novel failure nobody has seen")
-    assert "anchor not found" not in kind.lower()
-    assert "syntax" not in kind.lower()
 
 
-def test_the_call_site_actually_uses_the_classifier():
-    """⚠ SEAM. The helper can be perfect while the caller still hardcodes the
-    old string."""
-    src = inspect.getsource(
-        sys.modules["ghost_agent.core.coding_executor"])
-    assert "_replace_failure_kind(out)" in src
-    assert "did not apply (anchor not found)" not in src
 
 
 # ── G: simulation must not author real selfhood ─────────────────────────
@@ -115,85 +65,10 @@ def test_project_advancer_uses_the_SHARED_constraint_normaliser():
 
 # ── F: a dropped edit must not read as "nothing to do" ──────────────────
 
-@pytest.mark.asyncio
-async def test_edits_for_an_UNSNAPSHOTTED_file_return_a_REASON_not_silence():
-    """⚠ THE CRITICAL. `edits` are applied only when `path in snap`, and the
-    prompt snapshot is hard-capped at 12 files. On a larger project an `edits`
-    entry for an unsnapshotted file fell through to the `content` branch,
-    `content` is None, and the function returned (None, None) — "skipped, not
-    a failure": zero tool calls, no reason, nothing in `written`. A sibling
-    entry that DID apply then made the whole spec look successful, so the leaf
-    closed **DONE claiming work that never happened**.
-
-    §4QA-d: the file is now read from disk first (see
-    tests/test_4qa_unsnapshotted_edits.py); a file that cannot be read, or
-    edits that cannot apply, still return a REASON — never silence.
-    """
-    from ghost_agent.core import coding_executor as CE
-
-    calls = []
-
-    async def _runner(tool, args):
-        calls.append((tool, args))
-        return "SUCCESS"            # a read without CONTENTS: unreadable
-
-    written, reason = await CE._apply_file(
-        _runner,
-        {"path": "utils.js", "edits": [{"search": "a", "replace": "b"}]},
-        {"index.html": "<html>"},               # utils.js NOT snapshotted
-        touched=set(), fresh=set())
-    assert written is None
-    assert reason, "a dropped edit returned no reason — silently 'nothing to do'"
-    assert "utils.js" in reason
-    # §4QA-d r21: an unreadable reply is probed (ranged read) and the edits
-    # tried without a copy — none is usable here, so nothing may be written
-    assert {a.get("operation") for _t, a in calls} == {"read"}, "only reads may run"
 
 
-@pytest.mark.asyncio
-async def test_a_rewrite_is_never_judged_against_a_TRUNCATED_snapshot():
-    """⚠ THE SECOND CRITICAL. `_gather_project_files` keeps only a prefix once
-    its 400 KB budget is nearly spent, and that truncation was SILENT — so a
-    300 KB index.html snapshotted as 4 KB made a 20 KB full rewrite look like
-    GROWTH (20000 > 4000×0.85). The non-regression guard waved through an
-    overwrite that destroyed 280 KB of working code. For `.py` the prefix
-    usually fails `ast.parse`, disabling the overwrite guard outright.
-
-    A marked entry now means "unknown baseline" → re-read from disk. If the
-    re-read fails, REFUSE: a refusal costs one retry, a wrong pass costs the
-    file."""
-    from ghost_agent.core import coding_executor as CE
-    from ghost_agent.core.project_advancer import SNAPSHOT_TRUNCATED_MARK
-
-    big = "x" * 300_000
-    truncated_snap = big[:4000] + SNAPSHOT_TRUNCATED_MARK
-    reads = []
-
-    async def _runner(tool, args):
-        if args.get("operation") in ("read", "read_chunked"):
-            reads.append(args.get("path"))
-            return "CONTENTS OF index.html:\n" + big
-        return "SUCCESS"
-
-    written, reason = await CE._apply_file(
-        _runner,
-        {"path": "index.html", "content": "<html>small rewrite</html>"},
-        {"index.html": truncated_snap},
-        touched=set(), fresh=set())
-    assert written is None, "a 20KB rewrite of a 300KB file was allowed"
-    assert reason, "no reason given for refusing the overwrite"
-    assert reads, "the truncated snapshot was trusted instead of re-read"
 
 
-def test_the_truncation_marker_has_exactly_ONE_definition():
-    """Producer and consumer drifting apart is the defect class this file
-    already carries scars for."""
-    from ghost_agent.core.coding_executor import _snap_truncated_mark
-    from ghost_agent.core.project_advancer import SNAPSHOT_TRUNCATED_MARK
-    assert _snap_truncated_mark() == SNAPSHOT_TRUNCATED_MARK
-    src = inspect.getsource(sys.modules["ghost_agent.core.coding_executor"])
-    assert "SNAPSHOT TRUNCATED" not in src, (
-        "the marker literal was copied instead of imported")
 
 
 def test_the_PRODUCER_actually_marks_a_truncated_snapshot_entry():

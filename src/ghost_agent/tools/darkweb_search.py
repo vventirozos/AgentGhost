@@ -24,7 +24,7 @@ What is NEW here:
     and die far more often than clearnet ones, so this is config-driven
     (overridable via the ``GHOST_ONION_ENGINES`` env var, JSON) and we keep
     a WIDE set rather than betting on one engine — breadth + circuit
-    rotation, the same philosophy as `_TOR_BACKENDS`. Each engine carries an
+    rotation, the same philosophy as search.py's `ENGINE_TABLE`. Each engine carries an
     ``index`` tag: endpoints that serve the SAME underlying search index
     (e.g. Ahmia's clearnet mirror and its onion endpoint) share one index so
     cross-engine corroboration ranking counts INDEPENDENT sources, not the
@@ -54,6 +54,7 @@ from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 
 from ..utils.logging import Icons, pretty_log
 from ..core.node_throughput import (
+    DistillWave, is_distill_timeout as _is_distill_timeout,
     CHARS_PER_TOKEN, MIN_CHARS as _MIN_DISTILL_CHARS,
     log_plan as log_distill_plan)
 
@@ -161,6 +162,10 @@ _DEFAULT_ONION_ENGINES: List[Dict[str, str]] = [
         "index": "ahmia",
         "form_token_from": "https://ahmia.fi/",
         "result_selector": "li.result",                 # §4UN-dark: its results; the rest is page furniture
+        # §4VB: an element only its RESULT LISTING carries (the "N results" line). For some queries Ahmia
+        # answers with a notice page ("Help Us to Help You", a help programme's links in the same
+        # li.result rows); measured 11-20: 4 of 4 such pages lack it, 3 of 3 listings carry it.
+        "results_marker": "#totalResults",
     },
     {
         "name": "ahmia-onion",
@@ -168,6 +173,7 @@ _DEFAULT_ONION_ENGINES: List[Dict[str, str]] = [
         "index": "ahmia",
         "form_token_from": "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/",
         "result_selector": "li.result",
+        "results_marker": "#totalResults",
     },
     {
         # Torch, re-pointed 2026-07-29. The previous `torchdeed…` address was
@@ -681,6 +687,8 @@ def _load_engines() -> List[Dict[str, str]]:
                 entry["tier"] = "fallback"
             if e.get("result_selector"):
                 entry["result_selector"] = str(e["result_selector"])
+            if e.get("results_marker"):
+                entry["results_marker"] = str(e["results_marker"])
             engines.append(entry)
         return engines or [dict(e) for e in _DEFAULT_ONION_ENGINES]
     except Exception:
@@ -814,7 +822,9 @@ _PARSE_MAX_ANCHORS = 1500
 
 def _parse_onion_results(html: str, exclude_hosts: Optional[set] = None,
                          *, result_selector: str = "",
-                         rest: Optional[List[str]] = None) -> List[Dict[str, str]]:
+                         rest: Optional[List[str]] = None,
+                         results_marker: str = "",
+                         diag: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
     """Parse an onion search-engine result page into {url,title,snippet}.
 
     Each engine renders differently, so the parse is tolerant: an engine with a known result container
@@ -835,7 +845,16 @@ def _parse_onion_results(html: str, exclude_hosts: Optional[set] = None,
     just the link's text) — never a wrapper: r2, deleting the widest block took a banner that sat in the same
     wrapper as an ad, and the ad was booked as a result. r3: built from the text nodes outside those
     elements (nothing deleted, no string subtraction — an ad's text "No" cut the banner). Only
-    filled for a page of at most ``_NO_HITS_MAX_LINKS`` results (the only pages it is read for)."""
+    filled for a page of at most ``_NO_HITS_MAX_LINKS`` results (the only pages it is read for).
+
+    §4VB ``results_marker`` (a CSS selector, from the engine table): an element only the engine's RESULT
+    LISTING carries. A page that has the engine's result rows (``result_selector``) but not the marker is
+    judged by how many results the rows hold: at most ``_NO_HITS_MAX_LINKS`` — the engine's own notice
+    (Ahmia's "Help Us to Help You" page puts a help programme's links in those rows), so NONE is a result:
+    ``[]`` with ``diag["no_listing"] = True``; more — a listing whose marker drifted: the results are kept,
+    with ``diag["marker_missing"] = True``. A page with no result rows is read as before (review r1: an
+    error or maintenance page must still reach the empty-page diagnosis, the retry and the breaker). A
+    selector the parser rejects is ignored; a page bs4 cannot parse is read as before."""
     results: List[Dict[str, str]] = []
     if not html:
         if rest is not None:
@@ -862,12 +881,19 @@ def _parse_onion_results(html: str, exclude_hosts: Optional[set] = None,
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(html, "html.parser")
+        _listing = True
+        if results_marker:
+            try:
+                _listing = soup.select_one(results_marker) is not None
+            except Exception:  # noqa: BLE001 — a selector bs4 rejects: no marker check (read as before)
+                _listing = True
         containers = []
         if result_selector:
             try:
                 containers = soup.select(result_selector)
             except Exception:  # noqa: BLE001 — a bad selector falls back to the generic walk
                 containers = []
+        _rows_without_marker = bool(containers) and not _listing
         scopes = containers or [soup]
         # §4PD: a bound on the anchors read; the caller runs this in a thread
         anchors: List[Tuple[Any, str, Any]] = []
@@ -925,6 +951,22 @@ def _parse_onion_results(html: str, exclude_hosts: Optional[set] = None,
     except Exception:
         # BeautifulSoup unavailable or blew up — fall through to regex sweep.
         soup = None
+        _rows_without_marker = False
+
+    if soup is not None and _rows_without_marker:
+        # §4VB (review r1): result ROWS but no listing marker. More results than a notice holds: a listing whose
+        # marker drifted — keep them, and say so. At most that many: the engine's notice (its own links in
+        # its result rows) — nothing booked. A page with no rows at all is not judged here (read as before:
+        # an error or maintenance page still goes to the empty-page diagnosis, its retry and the breaker).
+        if len(results) > _NO_HITS_MAX_LINKS:
+            if diag is not None:
+                diag["marker_missing"] = True
+        else:
+            if diag is not None:
+                diag["no_listing"] = True
+            if rest is not None:
+                rest.append("")
+            return []
 
     # Regex sweep for onion URLs not captured as anchors (plain text, JSON blobs, etc.); the host is the
     # title. Not with a known container: text outside the result list is page furniture.
@@ -1591,9 +1633,29 @@ async def _query_engine(
                 _away = bool(_final) and _redirected_away(url, _final)
                 if status == 200 and body and not _away:
                     _rest: List[str] = []
+                    _pdiag: Dict[str, Any] = {}
                     parsed = await asyncio.to_thread(                 # §4PD: off the loop
                         _parse_onion_results, body, exclude_hosts,
-                        result_selector=str(engine.get("result_selector") or ""), rest=_rest)
+                        result_selector=str(engine.get("result_selector") or ""), rest=_rest,
+                        results_marker=str(engine.get("results_marker") or ""), diag=_pdiag)
+                    if _pdiag.get("no_listing"):
+                        # §4VB: the engine answered with a page that is not its result listing (Ahmia's
+                        # notice for some queries). Healthy engine, nothing for this query: the same query on a
+                        # new circuit gets the same page, so no retry and no failure charged — and none of the
+                        # notice's links is booked as a result (it was "1 onion result", then distilled).
+                        _diag["nohits"] = True
+                        _diag["outcome"] = OUTCOME_NO_MATCH
+                        pretty_log("Darkweb Engine",
+                                   f"{name}: answered, no match — served a page without its result listing "
+                                   f"(no {engine.get('results_marker')}); none of its links counted",
+                                   level="INFO", icon=Icons.SKIP)
+                        return []
+                    if _pdiag.get("marker_missing"):
+                        pretty_log("Darkweb Engine Drift",
+                                   f"{name}: {len(parsed)} results without the listing marker "
+                                   f"{engine.get('results_marker')} — kept; its layout may have changed "
+                                   f"(update results_marker in the engine table)",
+                                   level="WARNING", icon=Icons.WARN)
                     if parsed and len(parsed) <= _NO_HITS_MAX_LINKS and \
                             _NO_HITS_RE.search(_rest[0] if _rest else ""):
                         # §4UN-dark: the engine SAYS nothing matched; the few links are its page furniture
@@ -1758,6 +1820,43 @@ _NO_RESULTS_ERROR = (
 _FALLBACK_MIN_HOSTS = 5
 #: …and the fallback tier's own deadline, after the first wave.
 _FALLBACK_DEADLINE_S = 12.0
+#: §4UY N14: once one first-wave engine has ANSWERED WITH RESULTS, the others get this long more, then
+#: count as timed out (no breaker strike: a cut is not a measured failure). Live 11-13 → 11-18 every call
+#: took 50–62 s — ahmia answered, and the wave waited for torgle's 38 s deadline.
+DARK_GRACE_AFTER_ANSWER_S = 12.0
+
+
+async def _first_wave_with_grace(coros: List[Any]) -> List[Any]:
+    """The first wave's per-engine results IN ORDER (a result list, or the exception) — like
+    ``gather(return_exceptions=True)``, except that after the first non-empty result list the engines still
+    running get `DARK_GRACE_AFTER_ANSWER_S` and are then cancelled (their slot: ``asyncio.TimeoutError``)."""
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    pending = set(tasks)
+    grace_end: Optional[float] = None
+    try:
+        while pending:
+            timeout = None if grace_end is None else max(0.0, grace_end - time.monotonic())
+            done, pending = await asyncio.wait(pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                break                                              # the grace ran out
+            if grace_end is None and any(not t.cancelled() and t.exception() is None
+                                         and isinstance(t.result(), list) and t.result() for t in done):
+                grace_end = time.monotonic() + DARK_GRACE_AFTER_ANSWER_S
+    finally:
+        for t in pending:
+            t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        logging.getLogger(__name__).info("dark-web first wave: %d engine(s) cut %.0fs after the first answer",
+                                         len(pending), DARK_GRACE_AFTER_ANSWER_S)
+    out: List[Any] = []
+    for t in tasks:
+        if t in pending or t.cancelled():
+            out.append(asyncio.TimeoutError())
+        else:
+            exc = t.exception()
+            out.append(exc if exc is not None else t.result())
+    return out
 
 
 async def _darkweb_search_raw(
@@ -1786,10 +1885,8 @@ async def _darkweb_search_raw(
         first = [e for e in all_engines if e.get("tier") != "fallback"]
         later = [e for e in all_engines if e.get("tier") == "fallback"]
     engines = list(first)
-    per_engine = list(await asyncio.gather(
-        *[_query_engine(e, query, tor_proxy, exclude) for e in first],
-        return_exceptions=True,
-    )) if first else []
+    per_engine = (await _first_wave_with_grace([_query_engine(e, query, tor_proxy, exclude) for e in first])
+                  if first else [])
     _hosts = {_onion_host(r["url"]) for res in per_engine if isinstance(res, list) for r in res}
     if later and len(_hosts) < _FALLBACK_MIN_HOSTS:
         engines += later
@@ -2407,6 +2504,27 @@ async def tool_darkweb_research(query: Optional[str] = None, *args: Any, **kwarg
     return out
 
 
+def _dark_page_meta(html: str) -> Dict[str, str]:
+    """§4UY N14: what an onion page states about itself (title, published/modified dates) — the clearnet
+    reader's `content_check.page_meta`, so a dark block carries the same `[PAGE] Date:` line."""
+    try:
+        from ..utils.content_check import page_meta
+        return page_meta(html)
+    except Exception:  # noqa: BLE001 — a date is a nicety, never the read
+        return {}
+
+
+def with_page_line(block: Any, meta: Optional[Dict[str, str]]) -> Any:
+    """§4UY N14: a LOADED source block with the `[PAGE] Date: … | Title: …` line under its head (dark blocks
+    had none: "undated" was not even said). A failed block, or one that has the line, is left alone."""
+    if not isinstance(block, str) or not isinstance(meta, dict) or _source_block_failed(block):
+        return block
+    head, sep, rest = block.partition("\n")
+    if not sep or not head.startswith("### SOURCE:") or rest.startswith(_search.PAGE_META_MARK):
+        return block
+    return f"{head}\n{_search.page_meta_line('', meta)}\n{rest}"
+
+
 async def _darkweb_research_core(
     query: Optional[str] = None,
     anonymous: bool = False,
@@ -2535,8 +2653,9 @@ async def _darkweb_research_core(
     # §4UN-darkres: 4 at a time (was 2 — six dead onions held the two slots for
     # most of 212e6a8c's 140 s). Each URL's budget is issued when it starts, so
     # width no longer starves the later ones; the distill plans declare it.
+    # §4UZ: the semaphore holds a page only while it is FETCHED; its distill
+    # is taken afterwards through the worker's one queue (`_wave`, below).
     sem = asyncio.Semaphore(_RESEARCH_FETCH_WIDTH)
-    _DISTILL_FANOUT = _RESEARCH_FETCH_WIDTH      # == the semaphore width above
     # One snapshot per call, from the single definition in search.py.
     _RESEARCH_PHASE_TIMEOUT_S = _budgets._RESEARCH_PHASE_TIMEOUT_S
     # ⚠ NOT THE CLEARNET FLOOR. That one is derived from the 22s clearnet fetch
@@ -2562,11 +2681,17 @@ async def _darkweb_research_core(
     # The whole fetch+distill phase gets ONE clock; each onion is issued its
     # budget when it actually starts (see `_bounded`).
     _phase_deadline = time.monotonic() + _RESEARCH_PHASE_TIMEOUT_S
+    # §4UZ: the distills of this call, in rank order, sized from the time left when each starts
+    _wave = DistillWave(llm_client, [str(u) for u in urls], deadline=_phase_deadline,
+                        ceiling_s=_WEB_SUMMARY_TIMEOUT_S, reserve_s=_search.RESEARCH_ASSEMBLY_S,
+                        slot_allowance_s=_QUEUE_ALLOWANCE_S, max_chars=_report_share_chars,
+                        label="darkweb research")
 
     _page_texts: dict = {}     # url -> (text sent to the extractor, max_tokens) — §4NK recheck
     # §4UN-darkres: what became of each url — loaded / timeout / failed / skipped —
     # set by this code (never parsed out of page text), for the report's count line
     _outcome: Dict[str, str] = {}
+    _page_meta: Dict[str, Dict[str, str]] = {}            # §4UY N14: url -> what the page says about its date
     _retried: set = set()
     _given_set = set(_given)
 
@@ -2604,6 +2729,7 @@ async def _darkweb_research_core(
             if isinstance(_res, _RawPage):
                 # r2: stripped here, outside the fetch's timeout
                 _cut = bool(getattr(_res, "cut", False))
+                _page_meta[url] = await asyncio.to_thread(_dark_page_meta, str(_res))   # §4UY N14: its date
                 _res = await asyncio.to_thread(_strip_html, str(_res))
                 _res = _CutPage(_res) if _cut else _res
             if isinstance(_res, _FetchError):
@@ -2623,7 +2749,12 @@ async def _darkweb_research_core(
             _outcome[url] = "failed"
             return _FetchError(f"Error: {e}")
 
-    async def process_url(url: str, budget_s: float) -> str:
+    async def process_url(url: str, budget_s: float):
+        # §4UZ: the FETCH stage only — a block (a failed or cut page), or
+        # `(url, text, raw_preview)` for `_distill`. The distill budget is
+        # issued by `_wave` when the page's turn at the worker comes; the
+        # paragraphs below are the history of the per-URL clock.
+        #
         # ⚠ The distill budget is what is LEFT, not a constant. This module
         # imported search.py's 45s — but search runs under a 55s outer
         # deadline and this one under `_ONION_PAGE_TIMEOUT + 10` = 45s, of
@@ -2693,7 +2824,26 @@ async def _darkweb_research_core(
                        level="WARNING", icon=Icons.WARN)
             return (f"### SOURCE: {url}\n[PAGE CUT OFF: the read time ran out while this page was still "
                     f"loading — partial, raw page text below]\n{raw_preview}\n")
+        return url, text, raw_preview
 
+    async def _distill(url, text, raw_preview):
+        """§4UZ: the page's turn at the worker — waits in rank order, never loses the page."""
+        if llm_client is None:
+            return f"### SOURCE: {url}\n{raw_preview}\n"
+        try:
+            async with _wave.turn(url) as _turn:
+                return await _distill_sized(url, text, raw_preview, _turn)
+        except Exception as _dist_exc:                           # noqa: BLE001
+            try:
+                pretty_log("Summary Degraded",
+                           f"{str(url)[:60]}: internal error {type(_dist_exc).__name__} — "
+                           f"falling back to raw page text", level="WARNING", icon=Icons.WARN)
+            except Exception:                                   # noqa: BLE001
+                pass
+            return f"### SOURCE: {url}\n{raw_preview}\n"
+
+    async def _distill_sized(url, text, raw_preview, _turn):
+        short_url = (url[:35] + "..") if len(url) > 35 else url
         # ⚠ SIZE THE REQUEST TO WHAT THE NODE CAN FINISH. The arithmetic that
         # stood here derived the char limit from `max_context` — the MAIN
         # model's window (240,000 live), not the worker's — so it pinned to
@@ -2702,40 +2852,26 @@ async def _darkweb_research_core(
         # of prefill before the first output token, against a budget of 45s
         # at most and often far less once an onion fetch has been paid for.
         # See core/node_throughput.py for the measurements.
-        _summary_budget = 0.0
-        plan = None
-        if llm_client is not None:
-            _summary_budget = min(
-                _WEB_SUMMARY_TIMEOUT_S,
-                _url_deadline - time.monotonic() - 2.0)
-            # ⚠ PLANNING MUST NOT BE ABLE TO LOSE THE URL. A client without
-            # `plan_distill` (an older or hand-rolled one) would raise here,
-            # escape `process_url`, and be swallowed by
-            # `gather(return_exceptions=True)` — dropping the source, which is
-            # the precise loss this rewrite exists to remove. Degrade to raw
-            # text instead, and say so.
-            try:
-                if _summary_budget - _QUEUE_ALLOWANCE_S <= 0:
-                    # r1: a page that used its whole read time leaves no distill — keep it raw,
-                    # never plan on a negative clock
-                    pretty_log("Summary Degraded", f"{short_url}: no time left to distil after the "
-                               f"page loaded — raw page text kept", level="WARNING", icon=Icons.WARN)
-                    return f"### SOURCE: {url}\n{raw_preview}\n"
-                plan = llm_client.plan_distill(
-                    _summary_budget - _QUEUE_ALLOWANCE_S,
-                    max_chars=_report_share_chars,
-                    # ⚠ DECLARE THE FAN-OUT. Every URL in a wave is planned
-                    # before any of it is in flight, so the node looks idle to
-                    # all of them and each plan is sized as if it had the box
-                    # to itself. That is how four ~19,936-char plans built at
-                    # ~306/32 tok/s ended up running at 115/11 (req b86cdd59).
-                    concurrency=_DISTILL_FANOUT)
-            except Exception as _plan_exc:                      # noqa: BLE001
-                pretty_log("Summary Degraded",
-                           f"{short_url}: could not size the distill "
-                           f"({type(_plan_exc).__name__}) — falling back to "
-                           f"raw page text", level="WARNING", icon=Icons.WARN)
-                plan = None
+        # §4UZ: `_wave` made the plan when this page's turn came — from the
+        # time the phase has left, shared with the pages still waiting, at the
+        # queue's width. A phase with no time left is a refused plan (raw text).
+        _summary_budget = _turn.budget_s
+        plan = _turn.plan
+        # ⚠ PLANNING MUST NOT BE ABLE TO LOSE THE URL. A client without
+        # `plan_distill` raises inside the wave, which hands the error over:
+        # degrade to raw text, and say so.
+        if plan is None and _turn.note:
+            # no time left when its turn came, or the wave gave up after two timeouts in a row
+            pretty_log("Summary Degraded", f"{short_url}: {_turn.note} — raw page text kept",
+                       level="WARNING", icon=Icons.WARN)
+            return f"### SOURCE: {url}\n{raw_preview}\n"
+        if _turn.error is not None:
+            _plan_exc = _turn.error
+            pretty_log("Summary Degraded",
+                       f"{short_url}: could not size the distill "
+                       f"({type(_plan_exc).__name__}) — falling back to "
+                       f"raw page text", level="WARNING", icon=Icons.WARN)
+            plan = None
 
         # ⚠ DECLINE, DO NOT POST. The predecessor floored the budget at
         # `max(5.0, ...)`, which does not create time — it just guaranteed
@@ -2779,8 +2915,10 @@ async def _darkweb_research_core(
             "temperature": 0.0,
             "max_tokens": _tokens,
         }
+        _post_t0, _answered = time.monotonic(), False
         try:
-            summary_data = await llm_client.chat_completion(
+            # §4UZ: the per-URL `wait_for` no longer covers the distill, so the hard bound is here
+            summary_data = await _search._cancel_safe_wait_for(llm_client.chat_completion(
                 payload, use_worker=True,
                 # ⚠ The fallback is FREE — the `except`
                 # two lines below keeps the raw page text.
@@ -2807,7 +2945,9 @@ async def _darkweb_research_core(
                 # Bounded, and equal to what the plan reserved for it.
                 slot_wait=_QUEUE_ALLOWANCE_S,
                 total_budget=_summary_budget,
-                task_label="web summary")
+                task_label="web summary"), _summary_budget + 2.0)
+            _answered = True
+            _wave.report(_turn, True)
             try:
                 _sized = plan.describe()
             except Exception:                                   # noqa: BLE001
@@ -2843,6 +2983,14 @@ async def _darkweb_research_core(
             # FIRST, and the telemetry cannot reach it.
             preview = _neutralise(raw_preview)
             try:
+                if not _answered:
+                    # §4UZ: a call that ran into its TIME LIMIT teaches the tracker and the wave
+                    _wave.report(_turn, False, timed_out=_is_distill_timeout(_sum_exc),
+                                 burned_s=time.monotonic() - _post_t0,
+                                 prompt_chars=len(safe_text), max_tokens=_tokens)
+            except Exception:                                   # noqa: BLE001
+                pass
+            try:
                 # ⚠ AFTER the assignment, and inside the guard. This import is
                 # telemetry-only, yet it was the FIRST statement in the
                 # handler — so a renamed helper, a partially-initialised
@@ -2863,6 +3011,19 @@ async def _darkweb_research_core(
         return f"### SOURCE: {url}\n{preview}\n"
 
     async def _bounded(url: str) -> str:
+        """§4UZ: fetch (`_RESEARCH_FETCH_WIDTH` at a time), then the distill in the worker's queue."""
+        _wave.expect(str(url))
+        try:
+            _got = await _fetch_bounded(url)
+            if isinstance(_got, str):
+                return _got
+            block = await _distill(*_got)
+            _outcome.setdefault(str(url), "loaded")
+            return with_page_line(block, _page_meta.get(str(url)))       # §4UY N14
+        finally:
+            _wave.drop(str(url))
+
+    async def _fetch_bounded(url: str):
         # ⚠ The per-URL clock starts when the URL starts, not at `gather` —
         # see the clearnet sibling in search.py for the measurement. With
         # `Semaphore(2)` here, the 3rd and later onions were the starved ones.
@@ -2875,10 +3036,15 @@ async def _darkweb_research_core(
                         f"({_RESEARCH_PHASE_TIMEOUT_S:.0f}s) reached before "
                         f"this source could be fetched\n")
             try:
-                block = await asyncio.wait_for(process_url(url, budget),
-                                               timeout=budget)
+                # §4UZ r1: the cancel-safe form, as deep_research — on 3.10 the stdlib one can
+                # swallow a cancel landing as the fetch completes, and the distill then started
+                block = await _search._cancel_safe_wait_for(process_url(url, budget),
+                                                            timeout=budget)
+                if not isinstance(block, str):
+                    return block                  # §4UZ: fetched — `_bounded` distills it
                 _outcome.setdefault(str(url), "failed" if _source_block_failed(block) else "loaded")
-                return block
+                return with_page_line(block, _page_meta.get(str(url)))       # §4UY N14
+
             except asyncio.TimeoutError:
                 # Say the BUDGET. Without it an onion killed on a starved
                 # window reads exactly like one that used its full ceiling —
@@ -2929,7 +3095,7 @@ async def _darkweb_research_core(
         _recheck = await _search.recheck_all_none(
             page_contents, urls, _page_texts, _topic, llm_client, model_name,
             deadline=_phase_deadline, slot_wait=_QUEUE_ALLOWANCE_S,
-            per_call_s=_WEB_SUMMARY_TIMEOUT_S, fanout=_DISTILL_FANOUT, label="onion summary recheck")
+            per_call_s=_WEB_SUMMARY_TIMEOUT_S, label="onion summary recheck")
         page_contents = _recheck.contents
         # §4UN-dark: the recheck's summaries pass the same verbatim-address filter as the first ones
         page_contents = [_filter_block_onions(c, u, _page_texts) for c, u in zip(page_contents, urls)] + \
@@ -3045,7 +3211,8 @@ async def _darkweb_research_core(
     _status_kw = {"world_changed": False}
     if urls and _n_ok == 0:
         _finish = lambda t: ToolOutcome.failed(                # noqa: E731
-            t, reason_code="darkweb_research_all_sources_failed", **_status_kw)
+            t, reason_code=("darkweb_research_all_sources_timed_out" if _n_to and _n_to >= len(_failed)
+                            else "darkweb_research_all_sources_failed"), **_status_kw)   # §4UY N18: counted
     elif _failed_slots or _lost:
         _finish = lambda t: ToolOutcome.ok(                    # noqa: E731
             t, reason_code="darkweb_research_sources_partial", **_status_kw)

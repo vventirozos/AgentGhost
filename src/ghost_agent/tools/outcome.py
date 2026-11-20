@@ -63,6 +63,25 @@ from typing import Any, Optional
 
 
 _EXIT_CODE_RE = re.compile(r"EXIT CODE:\s*(\d+)")
+#: §4UY C17: a result's OWN exit-code envelope is a line of its head — every producer writes it on the first or
+#: second line (`EXIT CODE: N` after a `--- … RESULT ---` / `[run …]` / `[lab …]` head, or inside the
+#: `[sandbox job … EXIT CODE: N]` head), after the turn loop's own `[FAILURE BANNER]` mark when present. A banner
+#: further down is CONTENT: a `file_system` read of a saved build log that says `EXIT CODE: 1` was booked a failed
+#: action (and drew a fallback hint).
+_ENVELOPE_LINE_RE = re.compile(r"^[ \t]*(?:\[sandbox job [^\]]*?)?EXIT CODE:[ \t]*(\d+)")
+_ENVELOPE_HEAD_LINES = 2
+
+
+def envelope_exit_code(text) -> Optional[int]:
+    """The exit code a result's own envelope states (see `_ENVELOPE_LINE_RE`), else None."""
+    lines = [ln for ln in str(text or "").lstrip().splitlines()]
+    while lines and lines[0].lstrip().startswith("[FAILURE BANNER]"):
+        lines.pop(0)
+    for ln in lines[:_ENVELOPE_HEAD_LINES]:
+        m = _ENVELOPE_LINE_RE.match(ln)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 class OutcomeStatus(str, Enum):
@@ -101,6 +120,7 @@ WHO_MAY_ACT_REASONS = frozenset({
     "owner_only",                                    # introspect set_mood / manner
     "owner_write_not_owner_turn",                    # owner facts from a probe / background turn
     "owner_data_blocked", "quarantine_owner_only",   # a channel member on the owner's data / quarantine
+    "question_not_instruction",                      # §4UY P5: a deploy to the live site in a request that only asked
 })
 
 
@@ -262,8 +282,8 @@ class ToolOutcome(str):
         """
         if self.declared:
             return self.status is OutcomeStatus.FAILED
-        m = _EXIT_CODE_RE.search(self)
-        return m is not None and m.group(1).lstrip("0") != ""
+        code = envelope_exit_code(self)       # §4UY C17: the head's envelope, not a quoted banner
+        return code is not None and code != 0
 
     @property
     def shell_failed(self) -> bool:

@@ -322,38 +322,7 @@ class TestRequestData:
         assert "N4 " in block and "N0 " not in block
         assert block.index("N3 ") < block.index("N4 ")       # shown oldest first
 
-    def test_both_coding_prompts_carry_the_block(self):
-        from ghost_agent.core import coding_executor as CE
-        RD.note_result("portfolio", {}, PORTFOLIO, ok=True, req_id="d3")
-        tok = request_id_context.set("d3")
-        try:
-            msgs = CE._generate_prompt("app.js", "the app", description="build", ledger="", plan=[],
-                                       shown_files={}, research_context=None, constraints=None)
-            assert PORTFOLIO in msgs[1]["content"]
-            assert PORTFOLIO in CE._render_request_data()
-        finally:
-            request_id_context.reset(tok)
-        msgs = CE._generate_prompt("app.js", "the app", description="build", ledger="", plan=[],
-                                   shown_files={}, research_context=None, constraints=None)
-        assert PORTFOLIO not in msgs[1]["content"]          # another request: nothing
 
-    async def test_the_spec_prompt_carries_the_block(self):
-        from ghost_agent.core import coding_executor as CE
-        RD.note_result("portfolio", {}, PORTFOLIO, ok=True, req_id="d4")
-        seen = {}
-
-        async def fake_stream(llm, payload, is_background):
-            seen["user"] = payload["messages"][-1]["content"]
-            return '{"files": []}', "", None
-        tok = request_id_context.set("d4")
-        try:
-            import unittest.mock as um
-            with um.patch.object(CE, "_spec_stream", fake_stream), \
-                 um.patch.object(CE, "_think_disabled_now", lambda llm: False):
-                await CE._generate_build_spec(SimpleNamespace(), "m", "build it", "")
-        finally:
-            request_id_context.reset(tok)
-        assert PORTFOLIO in seen["user"]
 
 
 # --- the three, end to end through handle_chat --------------------------------
@@ -535,16 +504,6 @@ class TestRoundOneFixes:
                                                   tc("file_system", {"operation": "read", "path": "a"})])
         assert RE.batch_may_change_workspace([{"function": {"name": "browser", "arguments": "{bad"}}])
 
-    def test_the_agentic_leaf_prompt_carries_the_block(self):
-        from ghost_agent.core import coding_loop as CL
-        RD.note_result("portfolio", {}, PORTFOLIO, ok=True, req_id="d5")
-        tok = request_id_context.set("d5")
-        try:
-            p = CL._leaf_prompt("build", "", {}, None, False, "")
-        finally:
-            request_id_context.reset(tok)
-        assert PORTFOLIO in p and "HOW TO WORK" in p
-        assert PORTFOLIO not in CL._leaf_prompt("build", "", {}, None, False, "")
 
 
 async def test_a_write_and_a_render_in_one_batch_render_the_new_page(monkeypatch):

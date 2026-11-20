@@ -62,6 +62,10 @@ _TABLE_RULE_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$"
 # A partial line that may still turn out to be a fence or a table row: nothing
 # on it is spoken until its newline arrives and says which.
 _HOLD_PREFIX_RE = re.compile(r"^\s*[`~]")
+# The agent's sources list (link_grounding.SOURCES_NOTE_RE: "Sources:" / "Search results used (pages not
+# opened):" and its "- <url>" lines) is for the eye — never spoken (§4UY N7)
+_SOURCES_HEAD_RE = re.compile(r"^\s*(?:Sources:|Search results used \(pages not opened\):)\s*$")
+_SOURCES_ITEM_RE = re.compile(r"^\s*- ")
 
 # ── links, images, bare URLs ────────────────────────────────────────────────
 _IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
@@ -134,6 +138,7 @@ class SpeechChunker:
         self._fence = None         # (char, length) while inside a code fence
         self._in_table = False
         self._held = None          # a line with a `|` waiting to learn if it heads a table
+        self._in_sources = False   # inside the agent's sources list (§4UY N7)
 
     def feed(self, text: str) -> list:
         out = []
@@ -154,6 +159,7 @@ class SpeechChunker:
         self._line_start = True
         self._fence = None
         self._in_table = False
+        self._in_sources = False
         return out
 
     # ── internals ────────────────────────────────────────────────────────
@@ -164,6 +170,14 @@ class SpeechChunker:
     def _end_line(self, line: str) -> list:
         """A line is complete (its newline arrived, or the reply ended)."""
         start = self._line_start
+        if start and self._fence is None:
+            if _SOURCES_HEAD_RE.match(line):
+                out = self._release_held()
+                self._in_sources = True
+                return out
+            if self._in_sources and (_SOURCES_ITEM_RE.match(line) or not line.strip()):
+                return []
+            self._in_sources = False
         if self._fence is not None:
             if start and _fence_close(line, self._fence):
                 self._fence = None

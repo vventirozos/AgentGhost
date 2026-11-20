@@ -19,7 +19,7 @@ or read the error and fix it:
 import logging
 import re
 from enum import Enum
-from typing import Tuple
+from typing import Optional, Tuple
 
 logger = logging.getLogger("GhostAgent")
 
@@ -179,11 +179,66 @@ def is_blocked_page_result(text) -> bool:
     return bool(_BLOCKED_HEAD_RE.search(str(text or "")[:240]))
 
 
-def classify_tool_failure(error_text: str) -> Tuple[FailureClass, str]:
+#: §4UY N18: failures whose tool DECLARED what happened (the outcome's ``reason_code``, set where the tool
+#: counted it) — the class comes from that, never from the words of the message. Live, every web_search
+#: transport failure was booked "(timed out)" from its own sentence "… {n} attempt(s) could not connect or
+#: timed out …" with n = 0, and a dark-web count line "timed out 0" read as a timeout.
+DECLARED_FAILURE_CLASS: "dict[str, Optional[FailureClass]]" = {
+    "search_refused": FailureClass.RETRYABLE,             # the engines refused (403/429/challenge) — per exit
+    "search_unreachable": FailureClass.RETRYABLE,         # connect errors / timeouts over Tor
+    "search_proxy_down": FailureClass.RETRYABLE,          # the Tor proxy itself
+    # the engines answered — the query is the cause (UNKNOWN: the class this prose had; declared, because
+    # the low-relevance report lists outside page titles, and a title with "timeout" in it read as one)
+    "search_zero_results": FailureClass.UNKNOWN,
+    "search_only_unreadable_hosts": FailureClass.UNKNOWN,
+    "research_low_relevance": FailureClass.UNKNOWN,       # §4UY N2
+    # §4UY r3: a caller's time bound cut the work — answer from what you have (not a transient fault)
+    "research_time_bound": FailureClass.UNKNOWN,
+    "factcheck_research_timeout": FailureClass.UNKNOWN,
+    "factcheck_verify_timeout": FailureClass.UNKNOWN,
+    "darkweb_research_all_sources_timed_out": FailureClass.RETRYABLE,
+    "darkweb_research_all_sources_failed": FailureClass.UNKNOWN,
+    # §4UY r3: every reason code the internet tools return is declared (the reverse walk pins it)
+    "research_all_sources_failed": FailureClass.UNKNOWN,
+    "research_sources_partial": FailureClass.UNKNOWN,
+    "research_no_relevant_facts": FailureClass.UNKNOWN,
+    "darkweb_research_sources_partial": FailureClass.UNKNOWN,
+    "darkweb_research_no_relevant_facts": FailureClass.UNKNOWN,
+    "factcheck_research_failed": FailureClass.RETRYABLE,      # no source could be fetched
+    "factcheck_verify_call_failed": FailureClass.RETRYABLE,   # the verifier's model call failed
+    "factcheck_verifier_empty": FailureClass.UNKNOWN,
+    "factcheck_no_relevant_facts": FailureClass.UNKNOWN,
+    "factcheck_partial_coverage": FailureClass.UNKNOWN,
+    "browser_bad_arguments": FailureClass.FATAL,              # an argument error: fix the call
+    "browser_blocked": FailureClass.UNKNOWN,                  # a wall — the page text never decides
+    # one code, many causes (a runner timeout, a crash, per-action errors): declared as "the message decides"
+    # (None) — the runner's message, never the page's text (stripped below)
+    "browser_error": None,
+    "browser_interact_failed": None,
+    "browser_interact_partial": None,
+    "quarantine_bad_id": FailureClass.FATAL,
+    "quarantine_not_darkweb": FailureClass.FATAL,
+    "quarantine_owner_only": FailureClass.FATAL,
+    "quarantine_missing": FailureClass.FATAL,
+    "quarantine_full": FailureClass.FATAL,
+    "quarantine_media_refused": FailureClass.FATAL,
+    "quarantine_fetch_failed": FailureClass.RETRYABLE,
+    "quarantine_inspect_timeout": FailureClass.RETRYABLE,
+    "quarantine_inspect_unavailable": FailureClass.RETRYABLE,
+    "quarantine_inspect_failed": FailureClass.UNKNOWN,
+    "quarantine_not_the_file": FailureClass.UNKNOWN,
+}
+
+
+def classify_tool_failure(error_text: str, reason_code: Optional[str] = None) -> Tuple[FailureClass, str]:
     """Classify a tool error string into a failure category.
 
-    Returns ``(FailureClass, matched_pattern_description)``.
+    Returns ``(FailureClass, matched_pattern_description)``. §4UY N18: a ``reason_code`` the tool declared
+    (`DECLARED_FAILURE_CLASS`) decides before any pattern reads the text.
     """
+    _declared = DECLARED_FAILURE_CLASS.get(str(reason_code or ""))
+    if _declared is not None:
+        return _declared, f"declared {reason_code}"
     if not error_text or not isinstance(error_text, str):
         return FailureClass.UNKNOWN, "empty error"
     # Classify the ERROR, never the advice appended to it.
@@ -643,13 +698,10 @@ _FALLBACK_HINTS = {
         ("binary file", "This file is binary. Use vision_analysis (for images) or download/inspect via execute() instead of read."),
         ("too large", "The file exceeds the read limit. Use operation='read_chunked' with page=1, or operation='search' to find the specific line you need."),
     ],
-    "web_search": [
-        ("CAPTCHA", "DuckDuckGo is rate-limiting you. Wait, then retry with a SHORTER, keyword-focused query (no full sentences)."),
-        ("ZERO results", "Your query was too narrow. Strip dates/version numbers, or convert to a question form (e.g. 'how to ...')."),
-    ],
-    "deep_research": [
-        ("search phase failed", "Try web_search with a keyword-focused version of the query first; deep_research is for synthesising across many pages, not as a first attempt."),
-    ],
+    # §4UY N1: NO entry for an internet tool (`link_grounding.RESEARCH_TOOLS` — their failure results name
+    # their own next step; tests/test_4uy_internet.py enumerates both tables). The web_search pair matched
+    # the words "captcha page" inside a TRANSPORT failure and told the model to shorten a query the
+    # message had just said rewording cannot fix (10 of 10 live transport failures carried it).
     "vision_analysis": [
         # §4LM's remote-404 entry is gone (§4QE): the tool's own 404 result
         # now carries that advice, and never says "Client error" any more.

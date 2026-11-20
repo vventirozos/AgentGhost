@@ -19,9 +19,15 @@ import pytest
 from src.ghost_agent.tools.search import (
     _RACE_ENGINES,
     _SEARCH_CACHE,
+    _engine_spec,
     _race_search_wave,
     tool_search_ddgs,
 )
+
+# §4VA: the engines that go through ddgs (the suite switches the direct ones off — conftest), and the
+# ddgs calls one wave makes: one per CIRCUIT of each (yandex rides three)
+_DDGS_ENGINES = tuple(e for e in _RACE_ENGINES if _engine_spec(e).kind == "ddgs")
+_WAVE_CALLS = sum(_engine_spec(e).circuits for e in _DDGS_ENGINES)
 
 
 def _mock_ddgs_module(text_side_effect):
@@ -53,8 +59,11 @@ async def test_slow_valid_engine_beats_fast_junk_and_errors():
         results = await _race_search_wave("some query", "socks5h://127.0.0.1:9050", 0)
 
     assert [r["href"] for r in results] == ["http://real-site.com/x"]
-    # Every engine was actually raced (no winner existed until mojeek).
-    assert inst.text.call_count == len(_RACE_ENGINES)
+    # Every engine was actually raced, on every circuit of it — the slow winner
+    # was one of yandex's three; its siblings answer the same (no winner
+    # existed until then).
+    assert inst.text.call_count == _WAVE_CALLS
+    assert {c.kwargs["backend"] for c in inst.text.call_args_list} == set(_DDGS_ENGINES)
 
 
 @pytest.mark.asyncio
@@ -89,7 +98,7 @@ async def test_wave_deadline_bounds_a_wedged_engine():
     mod, _ = _mock_ddgs_module(hang)
     with patch.dict("sys.modules", {"ddgs": mod}), \
          patch("src.ghost_agent.tools.search._DDGS_TOR_TIMEOUT", 0.2), \
-         patch("src.ghost_agent.tools.search._DDGS_FAST_ENGINE_TIMEOUT", 0.2), \
+         patch("src.ghost_agent.tools.search._engine_timeout", lambda e: 0.2), \
          patch("src.ghost_agent.tools.search._RACE_WAVE_GRACE", 0.2):
         t0 = time.monotonic()
         results = await _race_search_wave("wedged query", None, 0)
@@ -127,7 +136,8 @@ async def test_failure_log_is_one_terse_categorized_line():
     # category — and the whole line stays short.
     # §4UN-web: the empty engines are NAMED (which engine failed how is what
     # the operator acts on), still in one short line
-    assert "empty" in line and all(e in line for e in _RACE_ENGINES)
+    assert "empty" in line and all(e in line for e in _DDGS_ENGINES)
+    assert line.count("yandex") == 1          # §4VA: one outcome per engine, however many circuits
     assert "yahoo conn-error" in line
     assert "‹some concurrent query›" in line
     assert "https://" not in line
@@ -185,4 +195,4 @@ async def test_stopiteration_from_engine_is_contained():
     # Waves + reformulation waves all raced the full set (§4UN-web: the
     # meaning-keeping form only, none when nothing can be dropped).
     from src.ghost_agent.tools.search import reformulate_keeping_meaning
-    assert inst.text.call_count == (2 + len(reformulate_keeping_meaning("doomed race query"))) * len(_RACE_ENGINES)
+    assert inst.text.call_count == (2 + len(reformulate_keeping_meaning("doomed race query"))) * _WAVE_CALLS

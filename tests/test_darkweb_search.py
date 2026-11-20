@@ -139,11 +139,15 @@ def test_engine_override_rejects_stray_placeholder(monkeypatch):
 # Search fan-out
 # --------------------------------------------------------------------------
 def _fetch_stub(engine_html: dict):
-    """Build an async _fetch_raw_html stub keyed on which engine the URL is."""
+    """Build an async _fetch_raw_html stub keyed on which engine the URL is. §4VB: an Ahmia page here stands
+    for its RESULT LISTING, so it carries the listing's marker (``#totalResults``) — a page without it is
+    Ahmia's notice page, which books no result (tests/test_4vb_darkweb_notice.py)."""
 
     async def _stub(url, proxy, timeout, **kwargs):
         for token, html in engine_html.items():
             if token in url:
+                if html and token in ("ahmia.fi", "juhanurmi"):
+                    html = '<p id="totalResults">results</p>' + html
                 return 200, html
         return 200, ""  # reached but empty
 
