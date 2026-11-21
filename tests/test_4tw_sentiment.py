@@ -494,7 +494,8 @@ def _hooked_agent(monkeypatch, tmp_path, client_env=True, shadow=None):
     ctx.self_model = SelfModel(tmp_path / "selfhood")
     seen = []
 
-    async def _fake_shadow(content, root, *, request_id="", tor_proxy=None, self_model=None, praised=None):
+    # §4VE: the request path also passes what the reply hears (register_audience / register_humour)
+    async def _fake_shadow(content, root, *, request_id="", tor_proxy=None, self_model=None, praised=None, **_kw):
         seen.append((content, Path(root), request_id))
         calls.append({"self_model": self_model, "praised": praised})
         return True
@@ -658,6 +659,29 @@ def test_the_rating_line_says_why_the_mood_did_not_move():
     neutral = {"label": "neutral", "score": 0.81, "probs": {"negative": 0.15, "neutral": 0.81, "positive": 0.04}}
     assert C.rating_line(neutral, 0.0, "neutral") == "neutral 81% (negative 15%, positive 4%) · mood unchanged: a neutral message"
     assert C.rating_line(answer, 0.0, "below 0.85") == "positive 84% (neutral 10%, negative 6%) · mood unchanged: a nudge needs 85% or more"
+
+
+def test_the_rating_line_names_the_missing_emotion_under_the_bar():
+    """Operator 11-20 (req 9166fd84): an unsure question read negative 81% with confusion 81%, and the line said
+    only "a nudge needs 85% or more" — but no score moves the mood without an emotion on the tone's side."""
+    probs = {"negative": 0.81, "neutral": 0.18, "positive": 0.02}
+    unsure = {"label": "negative", "score": 0.81, "probs": probs, "emotions": {"confusion": 0.81, "annoyance": 0.11}}
+    assert C.rating_line(unsure, 0.0, "below 0.85") == (
+        "negative 81% (neutral 18%, positive 2%) · emotion: confusion 81% · mood unchanged: no unhappy emotion "
+        "behind the tone (with one, a nudge needs 60% or more)")
+    # an unhappy emotion behind it: the bar it missed is the backed one, and the line keeps the plain form
+    backed = {"label": "negative", "score": 0.55, "probs": probs, "emotions": {"annoyance": 0.70}}
+    assert C.rating_line(backed, 0.0, "below 0.60").endswith(
+        "· emotion: annoyance 70% (counts as annoyed) · mood unchanged: a nudge needs 60% or more")
+    polite = {"label": "positive", "score": 0.82, "probs": {"positive": 0.82}, "emotions": {"curiosity": 0.44}}
+    assert C.rating_line(polite, 0.0, "below 0.85") == (
+        "positive 82% · emotion: curiosity 44% · mood unchanged: a nudge needs 85% or more, and a warm emotion "
+        "behind the tone")
+    warm = {"label": "positive", "score": 0.82, "probs": {"positive": 0.82}, "emotions": {"gratitude": 0.9}}
+    assert C.rating_line(warm, 0.0, "below 0.85").endswith("· mood unchanged: a nudge needs 85% or more")
+    # no emotion reading at all (the service runs without the emotion model): nothing is claimed about emotions
+    bare = {"label": "negative", "score": 0.81, "probs": probs}
+    assert C.rating_line(bare, 0.0, "below 0.85").endswith("· mood unchanged: a nudge needs 85% or more")
 
 
 async def test_a_scored_message_logs_its_rating_with_the_icon_and_not_its_words(client, tmp_path, monkeypatch):

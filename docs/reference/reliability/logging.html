@@ -141,7 +141,7 @@
       <tr><td>Reasoning</td><td>💭 thinking · 🧠 summary · 📋 plan · 🧩 context · 🧭 route · 🧪 verifier (🎯 frontier and 🌳 MCTS were retired with their subsystems, §4NM)</td></tr>
       <tr><td>Tools</td><td>🌐 search · 🔬 deep/vision · 🐍 code · 🐚 shell · 🌎 browser · 🐘 postgres · 🎨 image · 📄 PDF</td></tr>
       <tr><td>Inference nodes</td><td>🔧 worker (🛸 swarm edge removed 2026-10-30, §4SI)</td></tr>
-      <tr><td>Memory &amp; identity</td><td>📝 save · 🔎 recall · 📚 ingest · 📓 library · 🧬 embed · 🧮 vector-store boot · 💪 reinforce · 🧹 wipe · 🌙 maintenance cycle (<code>Icons.DREAM</code>) · 👤 profile · 🪞 selfhood (a mood change, a self-set mood) · 💗 sentiment (the sentiment service's rating of an owner message and what it did to the mood, &sect;4TW: label, score, nudge, never the words) · 💡 workspace note · 📡 activity ledger · 🔀 event bus (🧾 belief and 🎲 uncertainty were retired with their subsystems, §4NN)</td></tr>
+      <tr><td>Memory &amp; identity</td><td>📝 save · 🔎 recall · 📚 ingest · 📓 library · 🧬 embed · 🧮 vector-store boot · 💪 reinforce · 🧹 wipe · 🌙 maintenance cycle (<code>Icons.DREAM</code>) · 👤 profile · 🪞 selfhood (a mood change, a self-set mood) · 💗 sentiment (the sentiment service's rating of an owner message and what it did to the mood, &sect;4TW: label, score, nudge, never the words; since &sect;4VE one line per message for both readings &mdash; tone, emotion, intent, the pitch the reply heard, one mood statement and a correction-judge nomination &mdash; plus a second line only when the reading came too late for the reply, and the labels-only <code>read for the reply only</code> line of a probe's or member's message; formats in <a href="../selfhood/selfhood.html#intent-logs">selfhood: the intent reading's log lines</a>) · 💡 workspace note · 📡 activity ledger · 🔀 event bus (🧾 belief and 🎲 uncertainty were retired with their subsystems, §4NN)</td></tr>
       <tr id="4rw"><td>Head saves (§4RW)</td><td>💽 head saved · 📀 head restored · 🕒 restore deferred · 📛 save/restore did not happen · 📼 conversation saved · 🔙 conversation restored · 🧳 conversation left on disk (saved at another effort level) — see <a href="../performance/head_saves.html#logs">head_saves</a></td></tr>
       <tr><td>Reasoning effort (§4RW)</td><td>🪫 low · 🔋 medium · 🔥 xhigh — the icon of the level the turn runs at, the server default included</td></tr>
       <tr><td>Status</td><td>✅ ok · ❌ fail · 🔶 warn · 🛑 stop · 🔄 retry · ⏩ skip · 💡 idea · 🔒 shield (security/guard) · 🔻 cut</td></tr>
@@ -889,7 +889,7 @@
     <tr><td><code>selfhood</code></td><td>💭 🔶 🪞</td><td>INFO, WARNING</td><td>core/agent.py, main.py, selfhood/state.py, tools/introspect.py</td></tr>
     <tr><td><code>selfhood failed</code></td><td>🔶</td><td>WARNING</td><td>main.py</td></tr>
     <tr><td><code>semantic routing</code></td><td>🧭</td><td>INFO</td><td>tools/registry.py</td></tr>
-    <tr><td><code>sentiment</code></td><td>💗</td><td>INFO</td><td>selfhood/sentiment.py</td></tr>
+    <tr><td><code>sentiment</code></td><td>💗</td><td>INFO</td><td>core/agent.py, selfhood/sentiment.py</td></tr>
     <tr><td><code>service kill</code></td><td>🔒</td><td>ERROR</td><td>sandbox/services.py</td></tr>
     <tr><td><code>service probe unclear</code></td><td>🔶</td><td>WARNING</td><td>sandbox/services.py</td></tr>
     <tr><td><code>service registry</code></td><td>📦</td><td>INFO</td><td>main.py</td></tr>

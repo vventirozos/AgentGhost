@@ -548,7 +548,7 @@ class SelfModel:
             return ""
 
     def note_owner_sentiment(self, label: str, score: float, *, now=None, request_id: str = "",
-                             arrived: str = "", emotions=None) -> Tuple[Optional[MoodView], float, str]:
+                             arrived: str = "", emotions=None, event=None) -> Tuple[Optional[MoodView], float, str]:
         """§4TW: the tone of an owner's message (``mood.sentiment_event``). The caller decides that it was the
         OWNER's message. ``(mood after or None, pleasantness applied, why none)`` — §4TX: through the reaction
         ledger, and held (not applied) when the owner set the mood after the message ``arrived``.
@@ -558,9 +558,23 @@ class SelfModel:
         sentiment alone never makes a heard mood. §4UD: the fit is ``_react``'s (one for every path).
 
         §4UP: ``emotions`` — the emotion model's reading of the same message, when there is one — decides with
-        the score (``mood.sentiment_event``)."""
+        the score (``mood.sentiment_event``).
+
+        §4VE: ``event`` — the message's tone as another reading made it (``intent.mood_event``) — is booked
+        INSTEAD of the sentiment's (``label``/``score`` are then not read), in the same tone slot of the same
+        reply, with the same caps, hold and lean: one tone per message. Only a tone (kind
+        ``mood.KIND_SENTIMENT``) is taken — anything else would move the pair members hear — and refused
+        otherwise (``HELD_NOT_A_TONE``)."""
+        if event is not None:
+            if getattr(event, "kind", None) != M.KIND_SENTIMENT:
+                logger.debug("mood: a tone event of kind %r refused", getattr(event, "kind", None))
+                return None, 0.0, self.HELD_NOT_A_TONE
+            return self._react(event, now=now, request_id=request_id, arrived=arrived)
         return self._react(M.sentiment_event(label, score, emotions), now=now, request_id=request_id,
                            arrived=arrived)
+
+    #: §4VE: ``note_owner_sentiment(event=...)`` was handed something that is not a tone
+    HELD_NOT_A_TONE = "not a tone of the owner's message"
 
     def thumb_was_taken_back(self, reply_id: str) -> bool:
         """§4UD-b M1: did the owner take back the thumb on this reply (since the agent started)? The feedback

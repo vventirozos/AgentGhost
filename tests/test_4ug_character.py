@@ -1041,13 +1041,14 @@ def test_the_owners_ways_of_typing_a_command_are_the_command(tmp_path):
 
 
 def test_a_near_miss_is_told_to_the_model_and_ordinary_talk_is_not(tmp_path):
-    for text in ("character humour 3", "character humour +3", "character reset", "character humour",
+    for text in ("character humour 3", "character humour +3", "character reset humour", "character humour",
                  "character pin", "character humour up now", "character set warmth", "character undo it",
-                 "character a b c d e humour"):                  # six words: the longest that is hinted
+                 "character reset it all", "character a b c d e humour"):   # six words: the longest that is hinted
         hint = C.command_hint(text)
-        assert "was NOT changed" in hint and "character humour +1" in hint and "no reset" in hint, text
-        assert "just answer" in hint                              # … and the model may answer something else
-    for text in ("character", "character humour up", "character veto",                 # real commands: no hint
+        # 2026-11-20: the hint names the real reset and never says there is none (it claimed "no reset")
+        assert "was NOT changed" in hint and "character humour +1" in hint and "\"character reset\"" in hint, text
+        assert "no reset" not in hint.lower() and "just answer" in hint  # … and the model may answer something else
+    for text in ("character", "character humour up", "character veto", "character reset",  # real commands: no hint
                  "character development in this novel is weak", "character count of this file?",
                  "Character set design tips for a fantasy novel with seven point of view narrators",
                  "tell me about your character", "characters", "", "character set to UTF-8 please",
@@ -1453,3 +1454,167 @@ def test_a_set_mood_day_still_counts_its_corrections_tones_and_turns(tmp_path):
 def test_the_chastened_line_does_not_claim_it_was_the_last_reply():
     # §4UH-e2e review: a correction's shade is heard one reply after the corrected one
     assert "one of your replies down" in S.line(S.CHASTENED) and "last reply" not in S.line(S.CHASTENED)
+
+
+# ── the owner's reset (2026-11-20: "I can reset it if it gets too weird") ────
+
+_RESET_AT = datetime.datetime(2026, 11, 4, 12, tzinfo=UTC)
+
+
+def test_a_reset_puts_every_dial_back_lets_every_pin_go_and_keeps_the_days(tmp_path):
+    # catches: a reset that leaves a pin (or a dial) where it was, wipes `daily_through`, forgets the
+    # evidence stamps, logs a row of its own kind (no barrier for the veto, no re-base for the path), or
+    # leaves the memoised dials of before it in place
+    home = _home(tmp_path)
+    C.daily(home, _days(["playful"], ["playful"], ["playful"]))            # humour +1 → +2, by itself
+    C.set_pin(home, "warmth", True)
+    C.set_dial(home, "directness", 1)
+    assert C.dials(home) == {"warmth": -1, "humour": 2, "directness": 1}  # primes the memo
+    state, said = C.reset(home, now=_RESET_AT)
+    assert said.startswith(C.RESET_DONE) and "humour +2 → +1" in said and "directness +1 → +0" in said
+    assert "warmth no longer pinned" in said and "warmth -1" not in said     # an unchanged dial is not a span
+    got = C.load(home)
+    today = C._mood_day(_RESET_AT)
+    assert got["dials"] == C.START and got["pins"] == [] and C.dials(home) == C.START
+    assert got["changed"] == {d: today for d in C.DIALS} and got["daily_through"] == "2026-11-03"
+    row = C.log_rows(home)[-1]
+    assert row["kind"] == C.KIND_START and row["by"] == C.BY_RESET and row["dials"] == C.START
+    assert row["from"] == {"warmth": -1, "humour": 2, "directness": 1} and row["pins_from"] == ["warmth"]
+    assert C.section(home)[1] == C.stamp(C.START)
+
+
+def test_the_days_before_a_reset_never_move_a_dial_after_it(tmp_path):
+    # catches: a reset that puts the dials back but not their evidence clocks (the owner's earlier stamp on
+    # humour stays: five playful days count), one that stamps the day BEFORE the reset (the reset day and the
+    # two after it count: three days move humour), and one that deletes or rewrites the day records
+    home = _home(tmp_path)
+    C.set_dial(home, "humour", 2, now=datetime.datetime(2026, 11, 1, 12, tzinfo=UTC))
+    today = datetime.date.fromisoformat(C._mood_day(_RESET_AT))
+    # two playful days before the reset day, the reset day itself, and two after it
+    days = _days(*[["playful"]] * 5, start=today - datetime.timedelta(days=2))
+    records = home / C.SELFHOOD_REL / D.DAYS_FILENAME
+    records.write_text("".join(json.dumps(d) + "\n" for d in days), encoding="utf-8")
+    kept = records.read_bytes()
+    C.reset(home, now=_RESET_AT)
+    assert records.read_bytes() == kept                      # the day records are the norm: never touched
+    assert C.load(home)["changed"]["humour"] == today.isoformat()
+    after = today + datetime.timedelta(days=3)
+    at = datetime.datetime(after.year, after.month, after.day, 12, tzinfo=UTC)
+    assert C.daily(home, days, now=at) == [] and C.load(home)["dials"] == C.START   # only two days after it
+    # a third day after the reset moves it, as any three days do
+    more = days + _days(["playful"], start=today + datetime.timedelta(days=3))
+    said = C.daily(home, more, now=at + datetime.timedelta(days=1))
+    assert len(said) == 1 and said[0].startswith("humour +1 → +2") and C.load(home)["dials"]["humour"] == 2
+    # a file older than the stamps: the reset row in the log is the dial's last change
+    rows = [{"at": "2026-11-03T12:00:00Z", "kind": C.KIND_START, "by": C.BY_RESET, "dials": dict(C.START)}]
+    assert C._last_change(rows, "humour") == "2026-11-03"
+    before = _days(["playful"], ["playful"], ["playful"])
+    assert C.propose(before, {"dials": dict(C.START), "pins": []}, rows, "2026-11-03") == []
+    assert C._last_change([{"at": "2026-11-03T12:00:00Z", "kind": C.KIND_START}], "humour") == ""   # the first start
+
+
+def test_a_veto_after_a_reset_takes_nothing_from_before_it(tmp_path):
+    # catches: a reset row the veto does not treat as a barrier — the move humour +2 → +1 made before the
+    # reset left humour where the reset puts it, so without the barrier the veto would send it to +2
+    home = _home(tmp_path)
+    C.ensure(home)
+    C._log(home, {"at": "2026-11-02T05:00:00Z", "kind": C.KIND_MOVE, "dial": "humour", "from": 2, "to": 1})
+    assert C.veto(home)[1].startswith("humour +1 → +2")                     # (the move stands before a reset)
+    C.set_dial(home, "humour", 1)
+    C._log(home, {"at": "2026-11-02T06:00:00Z", "kind": C.KIND_MOVE, "dial": "humour", "from": 2, "to": 1})
+    C.reset(home, now=_RESET_AT)
+    assert C.command("character veto", home) == "There is no automatic move since the reset to take back."
+    assert C.load(home)["dials"]["humour"] == 1
+    # a move made after the reset can be taken back as any other
+    C.daily(home, _days(["playful"], ["playful"], ["playful"], start=datetime.date(2026, 11, 5)),
+            now=datetime.datetime(2026, 11, 8, 12, tzinfo=UTC))
+    assert C.veto(home)[1].startswith("humour +2 → +1")
+
+
+def test_the_reset_command_acts_at_once_and_only_on_its_exact_message(tmp_path):
+    # catches: a reset that asks for a yes (§4UK), one that also fires on a near miss ("character reset
+    # humour" reset everything), and a second reset that writes a second row although nothing changed
+    home = _home(tmp_path)
+    C.set_dial(home, "humour", 2)
+    for text in ("character reset", "/Character reset please!", "character: reset.", "CHARACTER RESET pls"):
+        assert C.parse_command(text) == ("reset",), text
+    for text in ("character reset humour", "character reset it", "character reset all please", "reset character",
+                 "character reset humour to 0"):
+        assert C.parse_command(text) is None and C.command(text, home, now=_RESET_AT) is None, text
+    assert C.load(home)["dials"]["humour"] == 2
+    out = C.command("character reset", home, now=_RESET_AT)
+    assert out.startswith("✓ The character starts again: humour +2 → +1") and "\n\nCharacter: «" in out
+    assert "reset by the owner, starts again as warmth -1" in out and "(it was at humour +2)" in out
+    assert C.load(home)["dials"] == C.START
+    n = len(C.log_rows(home))
+    again = C.command("character reset", home, now=_RESET_AT)
+    assert again == "The character is already the starting one, counting from today. Nothing changed."
+    assert len(C.log_rows(home)) == n
+    # at the starting dials with an older count, the reset still starts the count again (and says so)
+    fresh = _home(tmp_path / "fresh")
+    said = C.reset(fresh, now=_RESET_AT)[1]
+    assert said.startswith(C.RESET_DONE + ", its dials already where it began") and "no longer count" in said
+    assert C.reset(None)[1] == "there is no character to reset here"
+    assert "\"character reset\"" in C.USAGE and "character reset" in C.view(home)
+
+
+def test_a_reset_never_writes_over_a_file_that_cannot_be_read(tmp_path):
+    # catches: a reset that treats an unreadable file as "no character" and writes START over the owner's
+    home = _home(tmp_path)
+    C.set_dial(home, "warmth", 2)
+    p = home / "system/selfhood" / C.CHARACTER_FILENAME
+    bad = p.read_text()[:-5]
+    p.write_text(bad, encoding="utf-8")
+    C._MEMO.clear()
+    n = len(C.log_rows(home))
+    assert C.reset(home, now=_RESET_AT)[1] == C.UNREADABLE
+    out = C.command("character reset", home, now=_RESET_AT)
+    assert "cannot be read" in out and "✓" not in out and "Nothing changed. Nothing" not in out
+    assert p.read_text() == bad and len(C.log_rows(home)) == n
+
+
+def test_a_question_about_the_reset_is_not_the_reset(tmp_path):
+    # catches: the reset run by a question ("character reset?" asks what it does, and nothing undoes a reset):
+    # `_command_words` drops a closing "?", so without the check these four reset the character
+    home = _home(tmp_path)
+    C.set_dial(home, "humour", 2)
+    for text in ("character reset?", "character: reset?", "character reset, please?", "Character reset ?"):
+        assert C.parse_command(text) is None and C.command(text, home, now=_RESET_AT) is None, text
+        hint = C.command_hint(text)
+        assert "was NOT changed" in hint and "not asked as a question" in hint, text
+    assert C.load(home)["dials"]["humour"] == 2
+    # the ways of typing the command itself still are it
+    for text in ("character reset!", "character reset.", "/character reset", "Character reset please"):
+        assert C.parse_command(text) == ("reset",) and C.command_hint(text) == "", text
+    # … and only the reset is held to it: a veto or a set typed with a "?" is the command, as before
+    assert C.parse_command("character veto?") == ("veto",) and C.parse_command("character humour up?")
+
+
+def test_a_reset_whose_history_line_fails_still_stands_says_so_and_bars_the_veto(tmp_path, monkeypatch):
+    # catches: (a) a failed log append that leaves `reset` as an exception — the dials were reset but the owner
+    # got no banner; (b) a veto with only the log row as its barrier — the move humour +2 → +1 from before the
+    # reset left humour where the reset puts it, and with no reset row the veto sent humour back to +2
+    home = _home(tmp_path)
+    C.ensure(home)
+    C.set_dial(home, "warmth", 1)
+    C._log(home, {"at": "2026-11-02T05:00:00Z", "kind": C.KIND_MOVE, "dial": "humour", "from": 2, "to": 1})
+    real = C._log
+
+    def failing(h, row):
+        if row.get("kind") == C.KIND_START:
+            raise OSError("disk full")
+        return real(h, row)
+    monkeypatch.setattr(C, "_log", failing)
+    out = C.command("character reset", home, now=_RESET_AT)
+    assert out.startswith("✓ The character starts again: warmth +1 → -1") and "could not be written" in out
+    assert "\n\nCharacter: «" in out and C.load(home)["dials"] == C.START
+    assert not any(C.is_reset_row(r) for r in C.log_rows(home))
+    monkeypatch.setattr(C, "_log", real)
+    assert C.veto(home)[1] == "there is no automatic move since the reset to take back"
+    assert C.load(home)["dials"]["humour"] == 1
+    # the barrier is the reset's moment, kept by every later write; a move made after it is vetoed as usual
+    C.set_pin(home, "warmth", True)
+    assert C.load(home)["reset_at"] == "2026-11-04T12:00:00Z"
+    C.daily(home, _days(["playful"], ["playful"], ["playful"], start=datetime.date(2026, 11, 5)),
+            now=datetime.datetime(2026, 11, 8, 12, tzinfo=UTC))
+    assert C.veto(home)[1].startswith("humour +2 → +1")

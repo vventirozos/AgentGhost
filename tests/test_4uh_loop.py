@@ -447,3 +447,26 @@ def test_now_is_shown_when_the_path_cannot_be_read(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "log_rows", boom)
     b = L.banner(home)
     assert f"**Now:** «{START_SENTENCE}»" in b and "path could not be read just now" in b
+
+
+RESET_ROW = {"at": "2026-11-15T09:00:00Z", "kind": "start", "dials": dict(C.START), "by": "owner_reset",
+             "from": {"warmth": 0, "humour": 1, "directness": 1}, "pins_from": [], "why": "the owner reset the character"}
+MOVE_H = {"at": "2026-11-17T02:38:55Z", "kind": "move", "dial": "humour", "from": 1, "to": 2, "why": "x"}
+
+
+def test_the_owners_reset_is_said_as_a_reset_and_the_path_walks_on_from_the_start(tmp_path):
+    # catches: a path that does not re-base at the reset (the move after it would be walked from warmth 0,
+    # the dials MOVE_W left), and a reset step said as "started as", like the first start
+    home = _home(tmp_path)
+    _log(home, START_ROW, MOVE_W, MOVE_D, RESET_ROW, MOVE_H)
+    steps = L.path_steps(C, C.log_rows(home))
+    assert [s["by"] for s in steps] == ["start", "itself", "start", "itself"]
+    assert [bool(s.get("reset")) for s in steps] == [False, False, True, False]
+    assert steps[2]["sentence"] == START_SENTENCE
+    assert steps[3]["sentence"] == C.sentence({"warmth": -1, "humour": 2, "directness": 0})
+    b = L.banner(home)
+    assert f"started as «{START_SENTENCE}»" in b and b.count("started as") == 1
+    assert f"reset by you, starts again as «{START_SENTENCE}»" in b
+    # the character's own story says it the same way
+    assert "reset by the owner, starts again as warmth -1" in C.story(home)
+    assert "(it was at warmth +0, directness +1)" in C.story(home)

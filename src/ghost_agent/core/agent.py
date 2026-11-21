@@ -13601,6 +13601,403 @@ def _mood_shade_block(context) -> str:
         return ""
 
 
+# ── §4VE: the register — how to pitch THIS reply, read from the message it answers ──────────────────
+#
+# `selfhood.intent` reads the third reading of the sentiment-service (what the message is: advice wanted, an
+# instruction, banter, venting, … and whether it is urgent) and gives ONE line, or none. Computed ONCE per
+# request, before the turn loop, with a bounded wait for that request's reading; the state block only READS
+# the memo, behind the gate, so every step of the request carries the same bytes (the §4RC anchor re-sends a
+# section only when its bytes change). GHOST_INTENT=0: nothing here runs. "journal": the line is computed for
+# the log only and nothing reaches the prompt. "1": heard, each audience behind its own switch.
+
+#: per request, the register its replies hear — (line for the prompt, key, audience, last read). Written once,
+#: at the start of the request (`_intent_register_prepare`, which drops what an earlier request of the same id
+#: left first); read by the state block and the turn record. Bounded; in memory.
+_INTENT_REGISTER_BY_REQ: "collections.OrderedDict[str, Tuple[str, str, str, float]]" = collections.OrderedDict()
+
+
+def _intent_mod():
+    """``selfhood.intent``, or None when it cannot be imported (then nothing here runs)."""
+    try:
+        from ..selfhood import intent as _intent
+        return _intent
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _intent_mode() -> str:
+    """"0" | "journal" | "1" — anything unreadable is "0" (nothing runs). Never raises."""
+    it = _intent_mod()
+    if it is None:
+        return "0"
+    try:
+        m = str(it.mode())
+    except Exception:  # noqa: BLE001
+        return "0"
+    return m if m in ("journal", "1") else "0"
+
+
+def _register_audience_ok(context, it, *, switch: str = "acts") -> bool:
+    """§4VE: WHO hears the register: the owner's real request on a PRIVATE surface (exactly the requests whose
+    message is scored, `mood_moves_on_this_request`) and a probe of one (it must see what a real turn sees).
+    Any reply others read — a channel member's request (a member's probe too), and (coordinator, review r1)
+    the owner's reply on a PUBLIC surface, whoever wrote the message — only with the members switch on
+    (``intent.acts("members")``; ``switch="would"`` asks ``intent.would`` instead, for journal mode). A
+    member's words are sent to the service only then (the written rule of `selfhood.sentiment`). Never a
+    scheduled task, a job wake, a sub-agent, self-play, a bench or replay run, a coding leaf or a contained
+    copy. Fails closed."""
+    try:
+        from ..utils.logging import request_kind as _rk
+        if it is None or _mood_run_is_contained(context):
+            return False
+        ask = getattr(it, switch, None)
+        if not callable(ask):
+            return False
+        kind = _rk()
+        if requester_is_member() or kind == "member":
+            return kind in ("member", "probe") and ask("members") is True
+        if kind == "probe":
+            ok = True
+        else:
+            ok = kind == "owner" and mood_moves_on_this_request(context)
+        if ok and _mood_audience() != "owner":
+            return ask("members") is True
+        return ok
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def register_is_heard_on_this_request(context) -> bool:
+    """§4VE: does this request's reply carry the register line? Only with GHOST_INTENT=1 and the register
+    switch on (``intent.acts("register")``), for the audience `_register_audience_ok` lets in. Fails closed."""
+    try:
+        it = _intent_mod()
+        if it is None or _intent_mode() != "1" or it.acts("register") is not True:
+            return False
+        return _register_audience_ok(context, it)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def intent_register_heard(req_id: str) -> str:
+    """§4VE: the KEY of the register request ``req_id``'s reply heard ("" = none) — for the turn record, which
+    then drops the entry (`intent_register_end`)."""
+    with _MOOD_MEMO_LOCK:
+        got = _INTENT_REGISTER_BY_REQ.get(str(req_id or ""))
+    return got[1] if got and got[0] else ""
+
+
+#: §4VE (review r1): the requests whose message `sentiment.read_only` read (a member's, a probe's) — the reading
+#: is forgotten when the request ends (`intent_register_end`), so it does not outlive it. Bounded; in memory.
+_INTENT_READ_ONLY_REQ: "collections.OrderedDict[str, float]" = collections.OrderedDict()
+
+
+def intent_register_end(req_id: str, *, reading: bool = True, memo: bool = True) -> None:
+    """§4VE: request ``req_id`` is over — ``memo``: its register entry goes (the turn record has read it; a
+    client that sends the same id again must not find it, review r1); ``reading``: a reading `read_only`
+    stored for it is forgotten (a member's reading never outlives the request; the owner's, which the
+    correction judge may still wait for, is not touched). Never raises."""
+    try:
+        rid = str(req_id or "")
+        if not rid:
+            return
+        with _MOOD_MEMO_LOCK:
+            if memo:
+                _INTENT_REGISTER_BY_REQ.pop(rid, None)
+            read = reading and _INTENT_READ_ONLY_REQ.pop(rid, None) is not None
+        if read:
+            from ..selfhood import sentiment as _s
+            _s.forget_reading(rid)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _register_journal_kwargs(score_fn, context) -> Dict[str, Any]:
+    """§4VE (review r1/r2): what this reply really hears, for the journal row's ``register`` key that
+    ``sentiment.score_message`` writes — ``register_audience``: `_mood_audience`, or "" when this reply hears
+    no register at all (`_register_audience_ok` with ``switch="would"``: the owner on a public channel with
+    the members switch off), which makes the row's key "" — the same story the request path tells;
+    ``register_humour``: the dial only where the character is heard, else None. {} with GHOST_INTENT=0.
+    (``score_fn`` is kept in the signature for the call site; review r2 removed the signature probe that
+    fell back to "owner" in silence.)"""
+    it = _intent_mod()
+    if it is None or _intent_mode() == "0":
+        return {}
+    heard = _register_audience_ok(context, it, switch="would")
+    return {"register_audience": _mood_audience() if heard else "",
+            "register_humour": _register_humour(context) if heard else None}
+
+
+def _register_humour(context) -> Optional[int]:
+    """§4VE decision 7: the humour dial, passed so the register can withhold its joke clause — only for a reply
+    that also hears the character (the owner on a private surface, a probe of one): the character wins. None
+    for everyone else (a member, a public channel: nothing derived from the owner's character). Never raises."""
+    try:
+        if not self_image_is_heard_on_this_request(context):
+            return None
+        from ..selfhood import character as _character
+        if not _character.enabled():
+            return None
+        from ..selfhood.loop import home_from_memory_dir
+        home = home_from_memory_dir(getattr(context, "memory_dir", None))
+        if home is None:
+            return None
+        v = _character.dials(home).get("humour")
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _register_wait_s(it, content, *, text: Optional[str] = None) -> float:
+    """§4VE: how long the request waits for its reading — ``intent.REGISTER_WAIT_S`` (bounded to the judge's
+    own ``READING_WAIT_S``), and 0 when nothing can come: no service URL, the service's breaker paused (the
+    scoring answers nothing at once), or nothing left of the message to read (an empty message, only
+    pasted code; ``text``: those words already prepared, so they are not read twice; ``content`` None: not
+    looked at). A reading already in is returned by a zero wait too. Never raises."""
+    try:
+        from ..selfhood import sentiment as _s
+        if not _s.settings()[0]:
+            return 0.0
+        if not _s.BREAKER.may_ask(time.monotonic()):
+            return 0.0
+        if text is not None:
+            if not text:
+                return 0.0
+        elif content is not None and not _s.prepare_text(_s.message_text(content)):
+            return 0.0
+        w = float(getattr(it, "REGISTER_WAIT_S", 0.0) or 0.0)
+        if not math.isfinite(w):
+            return 0.0
+        return max(0.0, min(w, float(_s.READING_WAIT_S)))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+#: §4VE (review r1): what may enter the prompt from ``intent.register`` — an answer longer than this is NO line
+#: (never a cut one); the shipped line is about 330 characters, its key a few clause names
+_REGISTER_LINE_MAX = 600
+_REGISTER_KEY_MAX = 48
+
+
+def _register_from(it, reading, audience: str, humour, text: str = "",
+                   after_trouble: bool = False) -> Tuple[str, str]:
+    """``intent.register`` for one reading → (key, line ending in a blank line); ("", "") for none, an
+    answer of the wrong shape or over `_REGISTER_LINE_MAX` / `_REGISTER_KEY_MAX`, or a fault. The line goes
+    through `_defuse_rule_text` (no chat-template control tokens), as the probe's rule does. Never raises."""
+    if not isinstance(reading, dict) or not reading:
+        return "", ""
+    try:
+        got = it.register(reading, audience=audience, humour=humour, text=str(text or ""),
+                          after_trouble=bool(after_trouble))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("intent register skipped: %s: %s", type(e).__name__, e)
+        return "", ""
+    if not (isinstance(got, tuple) and len(got) == 2 and all(isinstance(x, str) for x in got)):
+        return "", ""
+    key, line = got
+    if not line.strip() or len(line) > _REGISTER_LINE_MAX or len(key) > _REGISTER_KEY_MAX:
+        return "", ""
+    line = _defuse_rule_text(line).rstrip("\n")
+    if not line.strip():
+        return "", ""
+    return key, line + "\n\n"
+
+
+def _register_late_log(waited: float, wait_s: float = 0.0, *, journal: bool = False, arrived: bool = False) -> None:
+    """§4VE (operator 11-20: "everything in one 💗 line plus a second line only on a late reading"): the ONE line
+    the request path logs — only when the message's reading was expected and did not arrive within the
+    reply's wait. The 💗 line the sentiment module writes when the reading lands carries the labels and the
+    pitch; this one carries none (never the message's words, never who sent it).
+
+    Review r3: mode 1 cannot know what a reading that has not arrived would have said, so its line says only
+    that the reply went out without one. Journal mode says ``arrived`` (a reading WITH an intent landed after
+    the reply's wait) or that none arrived within its own bound. Never raises."""
+    try:
+        if journal and arrived:
+            text = (f"a reading with an intent arrived after {waited:.1f} s (journal only): a reply waits "
+                    f"{wait_s:.1f} s, so it would have gone out without a pitch")
+        elif journal:
+            text = (f"the reading did not arrive within {waited:.1f} s (journal only): a reply waits "
+                    f"{wait_s:.1f} s, so it would have gone out without one")
+        else:
+            text = f"the reading did not arrive within {waited:.1f} s: the reply went out without a pitch"
+        pretty_log("Sentiment", text, icon=Icons.SENTIMENT)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _register_text(content) -> str:
+    """The message's words as the service read them (the register's second witnesses read them). Never raises."""
+    try:
+        from ..selfhood import sentiment as _s
+        return _s.prepare_text(_s.message_text(content)) if content is not None else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _register_after_trouble(context, audience: str) -> bool:
+    """For the owner: had the agent trouble the owner saw just now (joking then may be sarcasm — no joke
+    clause)? Always False for a member's reply: nothing of the owner's side reaches it. Never raises."""
+    try:
+        if audience == "others":
+            return False
+        sm = _mood_model(context)
+        return bool(sm.recent_trouble()) if sm is not None else False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: §4VE (review r3): the journal watcher waits this much past the service client's own whole-call cap
+#: (``sentiment.TOTAL_TIMEOUT_S``) — by then the scoring has answered or failed; the task always ends
+_JOURNAL_WATCH_SLACK_S = 0.5
+
+
+def _journal_watch_s(wait_s: float) -> float:
+    try:
+        from ..selfhood import sentiment as _s
+        return max(float(wait_s), float(_s.TOTAL_TIMEOUT_S)) + _JOURNAL_WATCH_SLACK_S
+    except Exception:  # noqa: BLE001
+        return float(wait_s)
+
+
+async def _intent_register_journal(req_id: str, wait_s: float) -> None:
+    """§4VE "journal": would this request's reading have come in time to shape the reply? Watched in the
+    background (the reply never waits in this mode), for at most `_journal_watch_s`; ONE log line only when
+    a reading WITH an intent (``intent`` / ``urgent``) landed after the reply's wait, or when none had landed
+    by the watcher's bound (the cases mode 1 logs). A reading without an intent — a service with no intent
+    model — is nothing, wherever it lands. Nothing reaches the prompt, the memo or the turn record. Never
+    raises."""
+    try:
+        from ..selfhood import sentiment as _s
+        bound = _journal_watch_s(wait_s)
+        t0 = time.monotonic()
+        reading = await _s.reading_for(req_id, wait_s=bound, part="all")
+        took = time.monotonic() - t0
+        if reading is None:
+            if took >= bound - 0.02:              # still expected at the bound (an empty answer returns early)
+                _register_late_log(took, wait_s, journal=True)
+            return
+        if took > wait_s + 0.05 and ("intent" in reading or "urgent" in reading):
+            _register_late_log(took, wait_s, journal=True, arrived=True)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("intent register journal skipped: %s: %s", type(e).__name__, e)
+
+
+def _register_offer(context, content, reading, *, switch: str = "acts",
+                    text: Optional[str] = None) -> Tuple[str, str]:
+    """§4VE: the pitch this request's reply gets — or, with ``switch="would"``, would get in journal mode —
+    for ``reading``: (key, line), ("", "") when the register is off for it or this audience does not hear it.
+    The ONE computation of the pitch (`_intent_register_prepare` uses it; a test compares it with the journal
+    row's ``register``). Never raises."""
+    try:
+        it = _intent_mod()
+        if it is None:
+            return "", ""
+        ask = getattr(it, switch, None)
+        if not callable(ask) or ask("register") is not True or not _register_audience_ok(context, it, switch=switch):
+            return "", ""
+        audience = _mood_audience()
+        return _register_from(it, reading, audience, _register_humour(context),
+                              _register_text(content) if text is None else text,
+                              _register_after_trouble(context, audience))
+    except Exception:  # noqa: BLE001
+        return "", ""
+
+
+async def _intent_register_prepare(context, content=None) -> str:
+    """§4VE: this request's register, computed ONCE before the turn loop — waits at most `_register_wait_s` for
+    this request's own reading (``sentiment.reading_for(part="all")``), asks ``intent.register`` and keeps the
+    line for the state block (`_intent_register_block`). Returns the line ("" for none). GHOST_INTENT=0: does
+    nothing at all. "journal": "" here; a background task only watches whether the reading would have come in
+    time (the pitch is on the sentiment module's 💗 line). A reading that comes after the wait is not used by
+    any later step. Logs one line only when the reading came too late (`_register_late_log`). Never raises."""
+    try:
+        mode = _intent_mode()
+        if mode == "0":
+            return ""
+        req_id = str(request_id_context.get() or "")
+        if not req_id:
+            return ""
+        with _MOOD_MEMO_LOCK:
+            # a request id sent again starts with no register of its own (whoever sends it)
+            _INTENT_REGISTER_BY_REQ.pop(req_id, None)
+        it = _intent_mod()
+        if it is None:
+            return ""
+        if mode == "1" and it.acts("register") is not True:
+            return ""                             # the register switch is off: nothing to wait for
+        if not _register_audience_ok(context, it, switch="acts" if mode == "1" else "would"):
+            return ""
+        audience = _mood_audience()
+        if mode == "journal":
+            # review r3: nothing of this costs the reply in journal mode — gate checks only; the message's
+            # words are not read here (an empty one is answered at once by the scoring, and the watcher ends)
+            wait_s = _register_wait_s(it, None)
+            if not mood_moves_on_this_request(context):
+                return ""                         # only the owner's message is read in this mode (decisions 3, 4)
+            _would = getattr(it, "would", None)
+            if callable(_would) and _would("register") is not True:
+                return ""                         # the register switch is off: nothing it would have done
+            if wait_s <= 0.0:
+                return ""                         # no reading can come (no service, paused, nothing to read)
+            # a watcher that writes nothing (one log line at most): a SERVICE task — the shutdown drain cancels
+            # it at once instead of waiting up to its 5.5 s bound
+            _glog.spawn_bg(_intent_register_journal(req_id, wait_s), name="intent-register-journal", service=True)
+            return ""
+        text = _register_text(content)                    # read once (the wait and the pitch both need it)
+        wait_s = _register_wait_s(it, content, text=text)
+        from ..selfhood import sentiment as _s
+        t0 = time.monotonic()
+        reading = await _s.reading_for(req_id, wait_s=wait_s, part="all")
+        took = time.monotonic() - t0
+        key, line = _register_offer(context, content, reading, switch="acts", text=text)
+        with _MOOD_MEMO_LOCK:
+            _INTENT_REGISTER_BY_REQ[req_id] = (line, key if line else "", audience, time.monotonic())
+            _INTENT_REGISTER_BY_REQ.move_to_end(req_id)
+            while len(_INTENT_REGISTER_BY_REQ) > _MOOD_MEMO_MAX:
+                _INTENT_REGISTER_BY_REQ.popitem(last=False)
+        if reading is None and wait_s > 0.0 and took >= wait_s - 0.02:
+            # the wait ran out on an expected reading: no pitch. The sentiment module is told, so the 💗 line
+            # and the journal row of the reading, when it lands, say it came too late and was not offered
+            _s.note_reply_stopped_waiting(req_id)
+            _register_late_log(took)
+        # (every other case — heard, no clause, none expected — is said by the 💗 line, or needs nothing)
+        return line
+    except Exception as e:  # noqa: BLE001 — the register never breaks a turn
+        logger.debug("intent register skipped: %s: %s", type(e).__name__, e)
+        return ""
+
+
+def _intent_register_block(context) -> str:
+    """§4VE: the register as its own section of the per-turn state block, right after the mood/tone line. READS
+    the memo only (`_intent_register_prepare` wrote it before the loop): the same bytes on every step, "" (zero
+    bytes) unless GHOST_INTENT=1 and this request hears it. The gate FIRST, on every call (§4UG review r1: a
+    request id sent again by a member, on a public surface or from a contained run was handed the owner's
+    line), and the entry must have been made for this same audience. Never raises."""
+    try:
+        if _intent_mode() != "1":
+            return ""
+        req_id = str(request_id_context.get() or "")
+        if not req_id:
+            return ""
+        if not register_is_heard_on_this_request(context):
+            with _MOOD_MEMO_LOCK:
+                _INTENT_REGISTER_BY_REQ.pop(req_id, None)
+            return ""
+        audience = _mood_audience()
+        with _MOOD_MEMO_LOCK:
+            got = _INTENT_REGISTER_BY_REQ.get(req_id)
+            if got is None or got[2] != audience:
+                return ""
+            # a request still running keeps its entry at the fresh end, so 256 other requests meanwhile do not
+            # evict it mid-request. (No age limit, review r1: the entry is dropped when a request of this id
+            # starts and when it ends, so an age protects nothing — it would only take the line from a long one.)
+            _INTENT_REGISTER_BY_REQ.move_to_end(req_id)
+            return got[0]
+    except Exception:  # noqa: BLE001 — a state block never breaks a turn
+        return ""
+
+
 def _defuse_rule_text(text: str) -> str:
     """No chat-template control tokens inside an injected rule (§4MB)."""
     return re.sub(r"<\|[^|>]{0,40}\|>", "", str(text or ""))
@@ -31988,9 +32385,56 @@ class GhostAgent:
                     _spawn_bg(_sentiment.score_message(
                         content, sm.root, request_id=str(request_id_context.get() or ""),
                         tor_proxy=getattr(self.context, "tor_proxy", None),
-                        self_model=sm, praised=praised), name="sentiment")
+                        self_model=sm, praised=praised,
+                        **_register_journal_kwargs(_sentiment.score_message, self.context)), name="sentiment")
         except Exception as e:  # noqa: BLE001 — never breaks a turn
             logger.debug("sentiment scoring not started: %s: %s", type(e).__name__, e)
+
+    def _intent_read_for_register(self, content) -> bool:
+        """§4VE: a request that HEARS the register but whose message is not scored for the mood (a probe; a
+        channel member's request, only with ``intent.acts("members")``) has its message read once, read-only
+        (``sentiment.read_only``: no journal, no mood), so the register has a reading to wait for. Called right
+        after `_mood_read_owner_words` (which dropped any reading an earlier request of this id left). Nothing
+        is sent anywhere unless GHOST_INTENT=1 with the register switch on and this audience lets it in —
+        with GHOST_INTENT_MEMBERS off a member's words never leave. True when the read was started. Never
+        raises."""
+        try:
+            if not register_is_heard_on_this_request(self.context):
+                return False
+            if mood_moves_on_this_request(self.context):
+                return False                      # the owner's message is scored already (`_mood_read_owner_words`)
+            it = _intent_mod()
+            if requester_is_member() and (it is None or it.acts("members") is not True):
+                return False                      # (said twice on purpose: the privacy rule)
+            if _is_foreign_row(content):
+                return False
+            from ..selfhood import sentiment as _sentiment
+            if not _sentiment.settings()[0] or not _sentiment.prepare_text(_sentiment.message_text(content)):
+                return False
+            rid = str(request_id_context.get() or "")
+            if not rid:
+                return False
+            from ..utils.logging import spawn_bg as _spawn_bg
+            read_only = _sentiment.read_only      # (looked up first: a slot expected and never filled costs a wait)
+            _sentiment.forget_reading(rid)
+            _sentiment.expect_reading(rid)        # BEFORE the spawn: the register's wait finds the slot
+            with _MOOD_MEMO_LOCK:                 # … and forgotten when the request ends (`intent_register_end`)
+                _INTENT_READ_ONLY_REQ[rid] = time.monotonic()
+                _INTENT_READ_ONLY_REQ.move_to_end(rid)
+                while len(_INTENT_READ_ONLY_REQ) > _MOOD_MEMO_MAX:
+                    _INTENT_READ_ONLY_REQ.popitem(last=False)
+            try:
+                # writes no record (no journal row, no mood; an in-memory reading this request alone reads):
+                # a SERVICE task — cut at shutdown, the register's wait still returns at its bound
+                _spawn_bg(read_only(content, request_id=rid, tor_proxy=getattr(self.context, "tor_proxy", None)),
+                          name="sentiment-read-only", service=True)
+            except Exception:  # noqa: BLE001
+                _sentiment.forget_reading(rid)
+                raise
+            return True
+        except Exception as e:  # noqa: BLE001 — never breaks a turn
+            logger.debug("register reading not started: %s: %s", type(e).__name__, e)
+            return False
 
     def _mood_owner_reaction(self, kind: str) -> None:
         """§4TC: the owner's reaction in chat (a correction of the last
@@ -32124,6 +32568,9 @@ class GhostAgent:
         req_id = _active_turn.req_id
         if req_id != request_id_context.get():
             request_id_context.set(req_id)          # §4OG-4 (g): every contextvar reader sees the uniquified id (reader C M2)
+        # §4VE (review r1): a register entry an earlier request of this id left (one that ended without its
+        # turn record — a cancel) goes before anything here can end this one
+        intent_register_end(req_id, reading=False)
         # §4TX r4: after the id is final (the reaction ledger keys this message by it)
         self._mood_owner_arrived(                   # §4TC: an owner's request ends the quiet
             ((body.get("messages") or [{}])[-1] or {}).get("content")
@@ -32569,6 +33016,8 @@ class GhostAgent:
                 # tone (the sentiment service, in the background) — once per
                 # request, a real owner request only (`_mood_read_owner_words`).
                 self._mood_read_owner_words(last_user_content)
+                # §4VE: a probe's (or, with GHOST_INTENT_MEMBERS, a member's) message read for the register only
+                self._intent_read_for_register(last_user_content)
 
                 # Stage-1 self-improvement: user-correction promotion.
                 # If `last_user_content` looks like a correction of the
@@ -33035,6 +33484,9 @@ class GhostAgent:
                                               note_delivered as _queued_note_delivered)
                 _queued_on = _queued_enabled()
                 _delivered_rows = body["_queued_delivered"] = []     # §4RZ: read by the chat route's persist
+                # §4VE: the register, ONCE per request (a bounded wait for this message's reading); every
+                # step's state block reads the same bytes back (`_intent_register_block`)
+                await _intent_register_prepare(self.context, last_user_content)
                 turn = -1
                 while turn + 1 < effective_max_turns:
                     turn += 1
@@ -33599,6 +34051,7 @@ class GhostAgent:
                         _ds_parts.append(("owner_rule_command", f"### OWNER RULE COMMAND\n{_owner_rule_note_ctx.get()}\n\n"))
                     _ds_parts.append(("owner_rules", _owner_rules_block(self.context)))    # §4NA
                     _ds_parts.append(("mood_tone", _mood_tone_block(self.context)))        # §4TC
+                    _ds_parts.append(("intent_register", _intent_register_block(self.context)))   # §4VE
                     _ds_parts.append(("mood_shade", _mood_shade_block(self.context)))      # §4UG
                     _ds_parts.append(("self_image", _self_image_block(self.context)))      # §4TZ
                     try:
@@ -34616,6 +35069,7 @@ class GhostAgent:
             _turn_reg.close_inbox(req_id, _active_turn)
             _note_request_end(req_id)            # §4RZ: no tool confirms after this
             _queued_end_request(_queued_scope)
+            intent_register_end(req_id, memo=False)   # §4VE: a member's / probe's reading ends with its request
             # §4RZ r6: the request mark lives for this turn only — the caller's
             # message dicts go back without it (and without its rendered copy)
             for _m in (body.get("messages") or []) if isinstance(body, dict) else []:
@@ -35531,8 +35985,21 @@ class GhostAgent:
         try:
             from ..selfhood import sentiment as _sentiment
             from ..selfhood.mood import sounds_displeased as _sd
-            return _sd(await _sentiment.reading_for(str(request_id_context.get() or "")))
+            _rid = str(request_id_context.get() or "")
+            if _sd(await _sentiment.reading_for(_rid)):
+                return True
         except Exception:  # noqa: BLE001 — a gate never breaks the judge's task
+            return False
+        try:
+            # §4VE: … or the intent model read the message as a correction (GHOST_INTENT=1 with the judge
+            # switch on). It only lets the message IN to the judge, which stays mood-only; the reading is in
+            # (or its wait ran out) after the wait above, so no second wait
+            it = _intent_mod()
+            if it is None or _intent_mode() != "1" or it.acts("judge") is not True:
+                return False
+            _all = await _sentiment.reading_for(_rid, wait_s=0.0, part="all")
+            return isinstance(_all, dict) and it.says_correcting(_all) is True
+        except Exception:  # noqa: BLE001
             return False
 
     async def _promote_prior_turn_after_judge(self, messages, last_user_content) -> None:
@@ -38663,7 +39130,11 @@ class GhostAgent:
         _shade_heard = mood_shade_heard(req_id or "")           # §4UG: the mood's shade this reply carried
         if _shade_heard:
             _extra["mood_shade"] = _shade_heard
-        with _MOOD_MEMO_LOCK:                                   # the request is over: a client that sends the
+        _reg_heard = intent_register_heard(req_id or "")        # §4VE: the register KEY the reply heard
+        if _reg_heard:
+            _extra["intent_register"] = _reg_heard
+        intent_register_end(req_id or "", reading=False)        # … read once: the same id again finds none
+        with _MOOD_MEMO_LOCK:                                  # the request is over: a client that sends the
             _MOOD_SHADE_BY_REQ.pop(str(req_id or ""), None)     # same id again starts a new one (review r3)
             _MOOD_TASK_DONE_REQ.pop(str(req_id or ""), None)    # §4UW: … and has closed no task yet
         # §4OG-2 (b): the DELIVERABLE decides before any shape rule — a green

@@ -1,0 +1,23 @@
+{
+  "about": "Labels in answer order, the phrase each one's hypothesis is made of (template with {} = the phrase), the urgency pair, the premise's token cap (256, as measured) and the onnxruntime threads for this model: 4 cores, not spinning between runs, so llama-server on the same machine keeps the rest. The 11-20 latency (620 ms median) was measured at onnxruntime's default (threads 0 = one per core, spinning); measure 2, 4 and 0 with --check-intent --intent-threads 2,4,0 at deploy and put the chosen count here.",
+  "template": "This example is {}",
+  "labels": {
+    "instruction": "giving an instruction or task.",
+    "question": "asking a plain factual question.",
+    "advice": "asking for advice or an opinion.",
+    "greeting": "a greeting or small talk.",
+    "reply": "a short answer or confirmation.",
+    "thanks": "thanking or praising the assistant.",
+    "correcting": "correcting or criticising the assistant.",
+    "banter": "joking or banter.",
+    "confiding": "confiding personal news.",
+    "venting": "venting or complaining about something else."
+  },
+  "urgency": [
+    "urgent.",
+    "not urgent."
+  ],
+  "max_tokens": 64,
+  "threads": 4,
+  "spinning": false
+}

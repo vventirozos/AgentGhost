@@ -978,6 +978,10 @@ _SPAWN_SITES = {
     "rubric-shadow": False, "knowledge-shadow": False, "episode-record": False, "sentiment": False,
     "user-correction-judge": False, "selfhood-correction-backfill": False, "census-stream": False,
     "census-quote": False, "session-cut": False,
+    # §4VE: write no record — the journal-mode lateness watcher (one log line at most, bounded by the sentiment
+    # client's own cap), and a member's / probe's read-only reading (in memory, read by that request alone;
+    # the owner's scoring, "sentiment" above, writes the journal row and stays a writer)
+    "intent-register-journal": True, "sentiment-read-only": True,
 }
 
 

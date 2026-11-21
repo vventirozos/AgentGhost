@@ -1,0 +1,73 @@
+{
+  "about": "Each sample passes when its 'high' label's OWN score is 0.5 or more, its 'low' (clearly unrelated) label's score is under 0.5, and, where 'urgent' is given, the urgency is on that side of 0.5. Not 'top': the scores are independent and a correct model often scores 'reply' above the expected label. A swapped entailment index turns every score p into 1-p, so both halves fail on every sample (0/13); flat scores (a broken tokenizer) fail the low half everywhere (0/13). The sentences are the 11-20 measurement's own made-up probe sentences, not anyone's messages; their real scores (torch, template C, multi-label) were: deberta-v3-large 13/13 pass (lowest high 0.84, highest low 0.02; with the indices swapped 0/13), deberta-v3-base 12/13 (thanks 0.12 fails). min_pass 9 leaves a margin of 4 for the large model and 3 for the base one against ONNX/torch drift, and is far above the 0 a swapped or flat model gets. Relabel intent.json and these labels must follow, or the head refuses to load.",
+  "samples": [
+    {
+      "text": "Should I buy the 32GB or the 64GB model? What would you pick?",
+      "high": "advice",
+      "low": "thanks"
+    },
+    {
+      "text": "rename the folder to archive",
+      "high": "instruction",
+      "low": "greeting"
+    },
+    {
+      "text": "what is the capital of Australia?",
+      "high": "question",
+      "low": "correcting",
+      "urgent": false
+    },
+    {
+      "text": "my sister had a baby girl last night!",
+      "high": "confiding",
+      "low": "correcting"
+    },
+    {
+      "text": "the traffic in Athens today was a nightmare, I sat in the car for two hours",
+      "high": "venting",
+      "low": "thanks"
+    },
+    {
+      "text": "if you were a car you'd be a 2003 fiat panda with a turbo :D",
+      "high": "banter",
+      "low": "instruction"
+    },
+    {
+      "text": "haha you and your emojis, never change",
+      "high": "banter",
+      "low": "question"
+    },
+    {
+      "text": "no, I asked for the weather in Tripoli, not Athens",
+      "high": "correcting",
+      "low": "greeting"
+    },
+    {
+      "text": "thanks, that was really helpful",
+      "high": "thanks",
+      "low": "correcting"
+    },
+    {
+      "text": "good morning!",
+      "high": "greeting",
+      "low": "correcting"
+    },
+    {
+      "text": "hey, how's it going?",
+      "high": "greeting",
+      "low": "thanks"
+    },
+    {
+      "text": "yes, go ahead",
+      "high": "reply",
+      "low": "correcting"
+    },
+    {
+      "text": "I need the report in five minutes, please hurry",
+      "high": "instruction",
+      "low": "greeting",
+      "urgent": true
+    }
+  ],
+  "min_pass": 9
+}

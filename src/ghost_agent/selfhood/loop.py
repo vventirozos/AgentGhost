@@ -113,6 +113,7 @@ def path_steps(character, rows: List[dict]) -> List[Dict[str, object]]:
     together share their "at"). Each step: {"day", "changes": [words], "by": "itself" | "you" | "start",
     "sentence" (after the step, "" when no trait is heard), "changed" (did the sentence change)}. Rows of one
     kind ("itself" or "you") stamped within the same minute are one step.
+    A ``start`` step also carries "reset" (the owner's ``character reset`` wrote that row).
     The dials are walked from the ``start`` row (or the starting character); a row it cannot read (an unknown
     dial, a "from"/"to" that is not a whole number) is skipped."""
     dials = dict(character.START)
@@ -125,8 +126,11 @@ def path_steps(character, rows: List[dict]) -> List[Dict[str, object]]:
             got = r.get("dials") if isinstance(r.get("dials"), dict) else character.START
             dials = {d: character.clamp(got.get(d, 0)) for d in character.DIALS}
             prev_sentence = character.sentence(dials)
+            # the owner's reset (2026-11-20) is a start row too: the walk re-bases here; "reset" says which
+            is_reset = getattr(character, "is_reset_row", None)
             steps.append({"at": at, "day": _local_day(at), "changes": [], "by": "start",
-                          "sentence": prev_sentence, "changed": True, "why": []})
+                          "sentence": prev_sentence, "changed": True, "why": [],
+                          "reset": bool(is_reset(r)) if callable(is_reset) else False})
             continue
         d = character.resolve_dial(r.get("dial"))
         if not d:
@@ -165,6 +169,8 @@ def _step_line(step: Dict[str, object]) -> str:
     s = str(step.get("sentence") or "")
     said = f"«{s}»" if s else "(every dial at 0 — no trait heard)"
     if step["by"] == "start":
+        if step.get("reset"):
+            return f"- **{step['day']}** — reset by you, starts again as {said}"
         return f"- **{step['day']}** — started as {said}"
     by = "by itself, from how its days went" if step["by"] == "itself" else "by you"
     out = f"- **{step['day']}** — {', '.join(step['changes'])}, {by}"
@@ -179,8 +185,18 @@ def banner(home) -> str:
     moved it) and where it is now. No reply text, no tastes, no rough kinds.
     Never raises (a broken part is said, not thrown)."""
     from . import character as C
+    # §4VE: what humour listens to follows the character's own switch (``character._intent_on``, the one the
+    # ``character`` view reads): how often the owner jokes with it on the days its messages were read for that
+    try:
+        _on = getattr(C, "_intent_on", None)
+        intent_scales = bool(_on()) if callable(_on) else False
+    except Exception:  # noqa: BLE001
+        intent_scales = False
+    listens = ("how you talk to me; how often you joke with me, or how my own work goes on a day too few of your "
+               "messages could be read for that; how my answers are judged" if intent_scales
+               else "how you talk to me, how my own work goes, how my answers are judged")
     head = ("**The strange loop** — my character is a sentence that every reply I write to you hears. What those "
-            "replies bring back (how you talk to me, how my own work goes, how my answers are judged) is counted "
+            f"replies bring back ({listens}) is counted "
             "each day against my own last three weeks, and when the days add up a dial moves, which changes the "
             "sentence the next replies hear: self → replies → days → self.")
     if not C.enabled():

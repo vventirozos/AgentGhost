@@ -13,6 +13,10 @@ written once the day is over, from the two files the mood already keeps:
 * ``sentiment.jsonl`` (§4UH-warmth) — the emotion labels of the owner's rated messages, counted as messages
   that sounded warm (gratitude, admiration, approval…) and messages that sounded annoyed (annoyance, anger,
   disapproval…): ``msgs_rated`` / ``msgs_warm`` / ``msgs_cold`` / ``msgs_thanks``. Counts only — never a word of a message.
+  §4VE: the same journal's INTENT readings (what a message was doing — advice, banter, confiding, thanks…), on a
+  day that has one: ``intent_rated``, ``intent`` {label: n}, ``urgent`` and the ``talk_*`` counts the character
+  reads (``owner_intents``). Written whenever a reading exists, whatever the intent switches say, so the
+  character's norm on its new scales is there the day they are switched on; a day without one has no such key.
 
 A row holds numbers, labels, manner names and the events' own cause sentences (the system's words: "2 tool
 calls failed (of 5) in this turn"). It never holds a message, a task name or a subject, so it can be shown
@@ -124,6 +128,16 @@ EVIDENCE_HELD = frozenset({"the owner set the mood (held until the day ends)",
                            "sentiment's share of the mood is full"})
 
 
+def _is_intent_cause(cause: str) -> bool:
+    """§4VE: is this a mood event the INTENT reading made (``intent.EVENT_CAUSES``), not the sentiment's tone?"""
+    try:
+        from .intent import EVENT_CAUSES
+    except Exception:  # noqa: BLE001
+        return False
+    c = str(cause or "").strip()
+    return any(c == x or (c.startswith(x) and c[len(x)] in " ,;:.") for x in EVENT_CAUSES)
+
+
 def _count_evidence(rec: Dict[str, object], kind: str, cause: str, dp: float, ev: dict) -> None:
     """What one event says about the day: corrections, praise, tones, the owner's moods and manners, the
     agent's own work. Thumbs are counted from the label store (``owner_thumbs``)."""
@@ -134,6 +148,12 @@ def _count_evidence(rec: Dict[str, object], kind: str, cause: str, dp: float, ev
     elif kind == M.KIND_PRAISE:
         rec["praise"] = int(rec["praise"]) + 1
     elif kind == M.KIND_SENTIMENT:
+        # §4VE: an intent's mood event is booked as a tone (the same kind, the private shares) but it is not the
+        # tone of the owner's words: venting is the owner's own bad news, not coldness toward Ghost, and banter or
+        # confiding are counted from the sentiment journal (``owner_intents``) — counted here too they would be
+        # counted twice. Told apart by its cause sentence (the ledger may add to its end: matched at the start)
+        if _is_intent_cause(cause):
+            return
         if dp:
             rec["tone_up" if dp > 0 else "tone_down"] = int(rec["tone_up" if dp > 0 else "tone_down"]) + 1
     elif kind == M.KIND_OWNER:
@@ -184,6 +204,187 @@ def owner_tones(home, day: datetime.date, *, tz=None) -> Tuple[int, int, int, in
             warm += 1
             thanks += 1 if felt(("gratitude",)) else 0
     return rated, warm, cold, thanks
+
+
+#: §4VE: what each intent label counts toward in the day record's ``talk_*`` counts (what the character reads).
+#: Every label of ``intent.LABELS`` is in exactly one of these (a test enumerates them: a label added without a
+#: decision fails it):
+#: * WARM — the owner confiding in it: how the owner talks TO it (warmth's intent scale);
+#: * BANTER — joking around (humour's banter scale). UNMEASURED (§4VE measurement 11-20: 1–5 real examples,
+#:   behind a provisional 0.90 floor in ``intent.LABEL_MIN``) — the humour dial's intent scale rests on it until a
+#:   week of journal rows re-fits it; the record keeps the per-label counts (``intent``) to re-check it by;
+#: * NONE — what a message asks for (advice, a question, an instruction), a greeting or small talk, a short reply,
+#:   the owner's own trouble (venting: not how they are with Ghost — the mood hears it, the character does not),
+#:   a correction (the correction judge already books it as a correction, which directness reads: counting the
+#:   label too would count the same message twice), and thanks — never a top label (``intent.counted``): thanks
+#:   and praise are counted from the praise check on the words and the gratitude emotion instead. §4VE: "asked for
+#:   my opinion" as a directness signal was looked at and NOT built: it counts how many opinion questions the
+#:   owner's work brings, not how its answers were judged.
+TALK_WARM_INTENTS = ("confiding",)
+TALK_BANTER_INTENTS = ("banter",)
+TALK_NO_SIGNAL_INTENTS = ("advice", "instruction", "question", "greeting", "reply", "thanks", "venting",
+                          "correcting")
+#: §4VE review: the version of the counting rules behind the ``talk_*`` counts, written into every record that has
+#: them (``talk_version``) and part of the character's scale name — so days counted under different rules never
+#: share a norm. BUMP IT whenever what ``owner_intents`` counts changes: these rules, the constants above, or
+#: anything it calls that decides a count — ``intent.counted`` / ``LABELS`` / ``LABEL_MIN`` / ``URGENT_MIN`` / ``refusal`` /
+#: ``mood_event``'s witnesses, ``sentiment``'s emotion sides and cut (``WARM_EMOTIONS``, ``COLD_EMOTIONS``,
+#: ``EMOTION_COUNT_MIN``) and held reasons, ``mood.has_praise``. A test pins the counts of a fixed table of rows
+#: to this number: it fails when they change and the number does not.
+#: 1 = the ten-label rules of the §4VE measurement (independent per-label scores, each label at its own floor —
+#: ``intent.counted``), refusal by ``intent.refusal`` alone plus the live path's doubt, the words-only counts and
+#: ``talk_readable`` (review r2/r3: the messages the service could read for intent), the first that ships
+TALK_COUNT_VERSION = 1
+#: §4VE review r3: the sentiment labels of a message the service read (``sentiment.LABELS`` less "unknown": the
+#: language gate's refusal, which never carries an intent reading)
+_READABLE = ("positive", "negative", "neutral")
+
+
+def owner_intents(home, day: datetime.date, *, tz=None) -> Optional[Dict[str, object]]:
+    """§4VE: the intent readings of the owner's messages of mood day ``day`` (``sentiment.jsonl`` and its
+    rotated ``.1``, the same day boundaries as ``owner_tones``) — or None when no message of that day carries an
+    intent or urgency reading (the record then gets no intent key at all). Counts only, never a word.
+
+    Written whenever a reading exists, whatever the switches say: rows the journal mode wrote before the owner
+    set ``GHOST_INTENT=0`` still give their day these keys (the readings were made; the character reads them only
+    while ``intent.acts("character")`` — review r2, MINOR 4: kept on purpose, a test pins it).
+
+    * ``intent_rated`` — messages with a valid intent reading (every label in ``intent.LABELS``);
+    * ``intent`` {label: n} — each message under the one label ``intent.counted`` accepts (the top-scoring label
+      at its own floor; never a second-place one, never "reply" or "thanks"), every label listed. What the
+      message was READ as — counted whether or not its effects were then refused;
+    * ``urgent`` — messages whose urgency reading ``intent.urgent`` accepts (with or without an intent);
+    * ``talk_readable`` — the day's messages the service COULD read for intent: a rated sentiment label
+      (positive, negative, neutral — not "unknown": the service's language gate refused the message, short English
+      and typos among them, and it never reads an intent for those, by design) and not held as the wording of a
+      task — read for intent or not. What the readings' cover is measured against (review r3): a day the intent
+      model missed falls back to the old scales, a day of short messages the gate refused does not;
+    * ``talk_read`` — of those, the ones with an intent reading;
+    * ``talk_emotions`` — of ``talk_read``, the ones the emotion model read too;
+    * ``talk_warm`` — of ``talk_read``, each message ONCE when it was thanks or praise (the praise check on the
+      words, ``mood.has_praise``, or gratitude felt — the intent model's "thanks" is never accepted), confided in
+      the agent (the confiding mood event: the live path's verdict, ``intent_effect``, on a row that has it), or
+      carried a warm emotion — never on a laugh's emotion alone when the message is counted as a joke;
+    * ``talk_thanks`` — of the warm ones, those that were thanks or praise;
+    * ``talk_cold`` — of ``talk_read``, the messages that sounded annoyed (a cold emotion felt) — a refused
+      message keeps its annoyance;
+    * ``talk_banter`` — of ``talk_read``, the messages counted as joking around: banter's mood event (the live
+      path's verdict on a row that has it);
+    * ``talk_warm_words`` / ``talk_thanks_words`` / ``talk_banter_words`` — the same three counted WITHOUT the
+      emotion model, for every message (with emotions or not): thanks from the praise check only, a confiding and
+      a joke re-read from the reading and the words alone (``intent.mood_event`` on the reading without its
+      emotions), nothing annoyed. A day not wholly read by the emotion model is read from these (review r2,
+      MINOR 2: one scale name, one computation);
+    * ``talk_version`` — ``TALK_COUNT_VERSION``.
+
+    Refusal — ONE rule, intent.py's (review r2, MAJOR): a message counts as no warmth and no joke exactly when
+    ``intent.refusal`` refuses its counted label (the doubt on the tone refuses every label; no backing for the
+    tone, a tone of the other sign or annoyance behind an upbeat label refuse only a label that is itself a tone,
+    ``intent.INTENT_TONE``). The sentiment's own ``held`` is not that rule and is not read — except the DOUBT the
+    live path found with the agent's recent trouble in view, which a re-read cannot see: ``held`` or
+    ``intent_held`` being ``sentiment.doubtful``'s answer (possible sarcasm, a task's wording).
+
+    Never raises: an unreadable journal or a damaged row counts as no reading."""
+    try:
+        from . import intent as I
+        from .intent import _LAUGH_EMOTIONS
+        from .sentiment import COLD_EMOTIONS, EMOTION_COUNT_MIN, HELD_SARCASM, HELD_TASK, JOURNAL_FILENAME, \
+            WARM_EMOTIONS
+    except Exception:  # noqa: BLE001 — no intent module: no intent reading
+        return None
+    if not home:
+        return None
+    try:
+        #: ``sentiment.doubtful``'s answers: what the live path doubted, the agent's trouble in view
+        doubts = (HELD_SARCASM, HELD_TASK)
+        path = Path(home) / SELFHOOD_REL / JOURNAL_FILENAME
+        rows = (read_jsonl_rows(path.with_name(path.name + ".1"), what="sentiment journal")
+                + read_jsonl_rows(path, what="sentiment journal"))
+        counts = {lab: 0 for lab in I.LABELS}
+        out = {"intent_rated": 0, "urgent": 0, "talk_readable": 0, "talk_read": 0, "talk_emotions": 0, "talk_warm": 0,
+               "talk_thanks": 0, "talk_cold": 0, "talk_banter": 0, "talk_warm_words": 0, "talk_thanks_words": 0,
+               "talk_banter_words": 0}
+        seen = False
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            at = M.parse_iso_utc(str(r.get("ts") or ""))
+            if at is None or M.mood_day(at, tz=tz) != day:
+                continue
+            held = str(r.get("held") or "")
+            if held != HELD_TASK and r.get("label") in _READABLE:   # not a task's words; past the language gate
+                out["talk_readable"] += 1
+            if "intent" not in r and "urgent" not in r:
+                continue
+            # the journal is trusted for nothing: the reading is re-checked as the service's answer is
+            got = I.parse({"intent": r.get("intent"), "urgent": r.get("urgent")}) or {}
+            if not got:
+                continue
+            seen = True
+            emo = r.get("emotions") if isinstance(r.get("emotions"), dict) else None
+            reading = {"label": r.get("label"), **({"emotions": emo} if emo is not None else {}), **got}
+            if "urgent" in got and I.urgent(reading):
+                out["urgent"] += 1
+            if "intent" not in got:
+                continue
+            out["intent_rated"] += 1
+            lab = I.counted(reading)          # THE rule: the top label at its own floor, never a second one
+            if lab in counts:
+                counts[lab] += 1
+            if held == HELD_TASK:                 # read, and nothing else
+                continue
+            out["talk_read"] += 1
+            out["talk_emotions"] += 1 if emo is not None else 0
+
+            def felt(names) -> bool:
+                return emo is not None and any(
+                    isinstance(emo.get(k), (int, float)) and not isinstance(emo.get(k), bool)
+                    and emo[k] >= EMOTION_COUNT_MIN for k in names)
+            text = str(r.get("text") or "")
+            if felt(COLD_EMOTIONS):
+                out["talk_cold"] += 1
+            if held in doubts or str(r.get("intent_held") or "") in doubts:
+                continue
+            words = {"label": r.get("label"), **got}           # the reading without the emotion model
+            thanks_w = M.has_praise(text)
+            joke_w, confided_w = _talk_events(I, words, lab, text)
+            if not I.refusal(words, lab, text):
+                out["talk_warm_words"] += 1 if (thanks_w or confided_w) else 0
+                out["talk_thanks_words"] += 1 if thanks_w else 0
+                out["talk_banter_words"] += 1 if joke_w else 0
+            if I.refusal(reading, lab, text):
+                continue
+            effect = r.get("intent_effect")
+            if isinstance(effect, str) and I.MOOD_OUTCOMES.get(lab):   # the live path's verdict, its trouble read
+                banter = lab in TALK_BANTER_INTENTS and effect == I.CAUSE_BANTER
+                confided = lab in TALK_WARM_INTENTS and effect == I.CAUSE_CONFIDED
+            else:                                  # a row from before the field: its witnesses, read now
+                banter, confided = _talk_events(I, reading, lab, text)
+            thanks = thanks_w or felt(("gratitude",))
+            warm_felt = felt(WARM_EMOTIONS - _LAUGH_EMOTIONS) if banter else felt(WARM_EMOTIONS)
+            if warm_felt or thanks or confided:
+                out["talk_warm"] += 1
+                out["talk_thanks"] += 1 if thanks else 0
+            out["talk_banter"] += 1 if banter else 0
+        if not seen:
+            return None
+        out["intent"] = counts
+        out["talk_version"] = TALK_COUNT_VERSION
+        return out
+    except Exception as e:  # noqa: BLE001
+        logger.debug("day records: intent readings not counted (%s)", type(e).__name__)
+        return None
+
+
+def _talk_events(I, reading, lab: str, text: str) -> Tuple[bool, bool]:
+    """(a joke, a confiding): the mood event ``intent.mood_event`` makes of this reading — read now, without the
+    agent's recent trouble (only the live path saw it)."""
+    if lab not in TALK_BANTER_INTENTS + TALK_WARM_INTENTS:
+        return False, False
+    ev = I.mood_event(reading, text)[0]
+    cause = ev.cause if ev is not None else ""
+    return (lab in TALK_BANTER_INTENTS and cause == I.CAUSE_BANTER,
+            lab in TALK_WARM_INTENTS and cause == I.CAUSE_CONFIDED)
 
 
 def build_day(home, day: datetime.date, *, tz=None, now: Optional[datetime.datetime] = None) -> Dict[str, object]:
@@ -244,6 +445,10 @@ def build_day(home, day: datetime.date, *, tz=None, now: Optional[datetime.datet
     rec["by_kind"] = by_kind
     rec["thumbs_up"], rec["thumbs_down"] = owner_thumbs(home, day, tz=tz)
     rec["msgs_rated"], rec["msgs_warm"], rec["msgs_cold"], rec["msgs_thanks"] = owner_tones(home, day, tz=tz)
+    # §4VE: only on a day with an intent reading — a record without one is exactly what it was before
+    talk = owner_intents(home, day, tz=tz)
+    if talk:
+        rec.update(talk)
     candidates.sort(key=lambda c: -c[0])
     rec["biggest"] = [c[1] for c in candidates[:BIGGEST] if c[0] > 0]
     rec["arc"], rec["peak"] = _arc(history, day, tz, now)
@@ -399,6 +604,17 @@ def day_line(rec: Dict[str, object]) -> str:
     if rec.get("msgs_rated"):
         talk = (f" · your messages: {rec['msgs_rated']} read for emotion, "
                 f"{rec.get('msgs_warm') or 0} warm, {rec.get('msgs_cold') or 0} annoyed")
+    # §4VE: what the messages were doing, briefly (only a day with intent readings has these)
+    if isinstance(rec.get("intent_rated"), int) and not isinstance(rec.get("intent_rated"), bool) \
+            and rec["intent_rated"] > 0:
+        got = rec.get("intent") if isinstance(rec.get("intent"), dict) else {}
+        bits = [f"{rec.get('talk_banter') or 0} joking", f"{rec.get('talk_warm') or 0} warm (thanks, praise, confiding or a warm feeling)"]
+        # review r2 (MINOR 3): what the messages were READ as — counted whether or not their effects were refused
+        if got.get("advice"):
+            bits.append(f"{got['advice']} read as asking my view")
+        if rec.get("urgent"):
+            bits.append(f"{rec['urgent']} read as urgent")
+        talk += f" · read for intent: {rec['intent_rated']}, " + ", ".join(bits)
     return (f"{rec.get('date')} · moods: {moods}"
             + (" · my turns: " + ", ".join(own_bits) if own_bits else "")
             + (" · from you: " + ", ".join(you) if you else "") + talk)

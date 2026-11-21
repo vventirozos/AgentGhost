@@ -16,9 +16,10 @@ model's own replies. It is held here as data instead:
   moves, and it survives a change of model because the model never wrote it;
 * a dial MOVES one step at a time: by the owner's word (``set_dial``), or by the daily rule (``daily``),
   which reads, over the day records (``days.py``), how far the days since the dial last moved sit from the
-  agent's own usual — warmth from how the owner talked to it, humour from how its own work went, directness
-  from how its answers were judged (§4UH, §4UP; the first rule, which counted the days the owner asked for a
-  manner, is gone). A pin holds a dial; a veto takes the last automatic move back;
+  agent's own usual — warmth from how the owner talked to it, humour from how its own work went (or, with the
+  intent reading on, §4VE, from how often the owner joked with it), directness from how its answers were judged
+  (§4UH, §4UP; the first rule, which counted the days the owner asked for a manner, is gone). A pin holds a dial; a veto takes the last automatic move back; the owner's RESET
+  (``reset``, operator 2026-11-20: "I can reset it if it gets too weird") starts the whole character again;
 * every change is a row in an append-only LOG with what was counted — the character's history, and what
   "how have you changed" is answered from (``story``).
 
@@ -86,6 +87,10 @@ RULE = ("(Your character: how you are with the owner, set by a few dials that mo
 SIGNAL_WORDS = {"warmth": "how the owner talked to it (thanks, praise and warmth in the messages, against annoyance)",
                 "humour": "how its own work went (clean turns, relief and pride against trouble)",
                 "directness": "how its answers were judged (thumbs up against thumbs down and corrections)"}
+#: §4VE: … on the days a dial read its INTENT scale (``signal_words`` picks by what the days read)
+INTENT_SIGNAL_WORDS = {"warmth": "how the owner talked to it (thanks, praise, confiding and warm feeling in the "
+                                 "messages, against annoyance)",
+                       "humour": "how often the owner joked with it"}
 #: one very good day counts no more than a good one (the older, counted scale: days before the emotion model)
 WARMTH_CAP = 3.0
 #: §4UP (evaluation 11-14: 11-12, 11-13 and 11-14 all read the cap 3.0 — three warm messages of 11 to 15 is a
@@ -108,7 +113,61 @@ BASE_MIN = 5
 BAND = 0.5
 #: §4UP: the smallest spread a norm is taken to have, on each dial's scale — a norm of identical days (every day
 #: all thumbs up) has none, and the old fallback of 1.0 made a scale-free number of it
-SPREAD_FLOOR = {"warmth": {"emotions": 0.15, "counts": 0.5}, "humour": 0.25, "directness": 0.4}
+SPREAD_FLOOR = {"warmth": {"emotions": 0.15, "counts": 0.5, "intent": 0.3},
+                "humour": {"": 0.25, "banter": 0.15}, "directness": 0.4}
+#: §4VE: on a day with an intent reading and the character's intent switch on (``intent.acts("character")``)
+#: warmth reads its intent scale — the share of the owner's messages that were warm (thanks, praise, confiding, a
+#: warm feeling; each message once) less the share that sounded annoyed: (warm − cold) / read, −1 to 1 — and
+#: humour its banter scale — the share of messages that were joking around, 0 to 1 — which REPLACES how its own
+#: work went on those days (operator decision 6). Each scale's NAME says what its number was computed from
+#: (``signal_scales``: the counting rules' version, and whether the emotion model read the messages), so a day is
+#: only ever compared with days counted the same way (§4UH-warmth review, MAJOR) and no dial moves on a new scale
+#: until ``BASE_MIN`` days on it exist. A day reads them only when its intent readings cover it
+#: (``INTENT_COVER_SHARE``: at least ``WARMTH_MIN_MSGS`` messages read, and most of the day's) — otherwise the
+#: old scales, under their old names (review r2, MINOR 1) — and a day counts in full from ``INTENT_FULL_MSGS`` messages, in proportion
+#: below it. §4VE review (MAJOR, operator: "i don't do a lot of requests each day"): at 15 a 3–6 message day
+#: carried a third of one and a real change never moved a dial — the owner's usual day must count. An annoyed
+#: message counts ONCE here (counted twice, the rare annoyed ones were most of the day-to-day spread and drowned
+#: the warm signal).
+#:
+#: §4VE measurement 11-20: the intent labels the two scales read are the LEAST measured — banter and confiding
+#: had 1–5 real examples and sit behind a provisional 0.90 floor (``intent.LABEL_MIN``). So the humour dial's
+#: banter scale rests on an UNMEASURED label until a week of journal rows re-fits it (the day records keep the
+#: per-label counts to re-check it by); warmth leans on it less (thanks and praise come from the praise check and
+#: the emotions, confiding is one of several inputs).
+#:
+#: The floors and what ONE message can do. Against the worst norm (identical days: no spread but the floor), on a
+#: day of n messages at warm share v, one more annoyed message moves warmth by (1 + v)/(n + 1), one more warm one
+#: by (1 − v)/(n + 1), one warm message read as annoyed by 2/n; weighted by min(1, n/6) each is at most 1/3 (at
+#: n ≤ 6, less above). Banter: one message more, or read the other way, moves the share by at most 1/n or
+#: 1/(n + 1), weighted at most 1/6. At floors 0.3 and 0.15 that is 1.11 spreads for either — past ``BAND``. A
+#: floor that kept one message under ``BAND`` (0.7 and 0.35) froze both dials again: in the simulation
+#: (scratchpad sim3_4ve.py, 30 runs × 120 days) warmth caught 0 of 30 real changes and humour 1–3 of 30 on 3–15
+#: messages a day. So one message's reach is held by ``INTENT_ONE_MESSAGE`` instead: a day counts as CLEARLY off
+#: its usual only when it is more than one message's worth off it, and a move needs two such days and three
+#: days read (``SHIFT_MIN_PULLS``, ``SHIFT_MIN_DAYS``). Simulated at these values, from dial 0 and from +1: a
+#: steady owner (25 % warm, 5 % annoyed, 10 % joking; 3–6 or 5–15 messages; never joking; alternating 15/3) moved
+#: a dial at most 0.13 times in 120 days from 0, and at most 0.33 from +1 (mostly back toward 0, which needs
+#: less); a real change at day 60 (warm 25 → 45 %, joking 10 → 30 %) moved humour within 21 days in 21–30 of 30
+#: runs and warmth in 6–17 of 30; the same change downward 11–28 of 30 (humour) and 9–20 of 30 (warmth)
+INTENT_FULL_MSGS = 6
+#: §4VE review: the most ONE message can move a day's number, in messages (the number × the messages read): warmth
+#: 2 (a warm message read as annoyed), banter 1. A day pulls CLEARLY (``day_pulls``, and the two clear days a move
+#: needs, ``SHIFT_MIN_PULLS``) only when it is further than that from its usual — one message never makes a
+#: clear day, whatever the floor
+INTENT_ONE_MESSAGE = {"intent": 2.0, "banter": 1.0}
+#: §4VE review r2 (MINOR 1): a day reads the intent scales only when the readings COVER it — at least
+#: ``WARMTH_MIN_MSGS`` messages read for intent AND at least this share of the day's messages the service could
+#: read for intent (``talk_readable``: past its language gate, not a task's wording — review r3: a short "ok
+#: thanks" the gate refuses never has an intent and is outside both numbers). Otherwise it reads the old scales under their
+#: old names, as a day before §4VE did. The journal row carries the intent whenever the intent model answered
+#: (the reply's wait does not decide it), so a missing reading is the model down or failing — not a random
+#: message — and the day's number would say what the read part said. Two thirds: the unread part is then at most
+#: a third of the day, so the share read is within a third of the unread messages' difference from it of the
+#: whole day's; on the owner's usual 3–6 messages it means 3 of 3, 3 of 4, 4 of 5, 4 of 6 (a strict majority
+#: would read 3 of 5 — two unread against three). Every message read on a normal day, so the simulation's steady
+#: and change results do not depend on it; it decides the outage days
+INTENT_COVER_SHARE = 2.0 / 3.0
 #: §4UP: a day's shift (its distance from the norm, in spreads) counts at most this much either way. Review r1
 #: (MAJOR): at 3, ONE thumbs-down day among two ordinary ones read 3/√3 = 1.73 and undid an earned step — at 2.5 one
 #: day alone reaches 2.5/√3 = 1.44, short of ``SHIFT_IN`` (with ``SHIFT_MIN_PULLS`` besides). Simulated (40 × 120
@@ -132,8 +191,83 @@ SHIFT_MIN_DAYS = 3
 SHIFT_MIN_PULLS = 2
 
 
-def day_signals(rec: Dict[str, object]) -> Dict[str, Optional[float]]:
-    """Each dial's number for one day record, or None when the day says nothing about it. Pure."""
+def _intent_on(intent: Optional[bool] = None) -> bool:
+    """§4VE: does the character read the intent scales? ``intent`` when given, else ``intent.acts("character")``
+    (only with ``GHOST_INTENT=1`` and ``GHOST_INTENT_CHARACTER`` on). False when the module cannot be read."""
+    if intent is not None:
+        return bool(intent)
+    try:
+        from . import intent as _I
+        return bool(_I.acts("character"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _count(rec, key) -> int:
+    try:
+        v = rec.get(key)
+        return max(0, int(v)) if not isinstance(v, bool) and v is not None else 0
+    except (TypeError, ValueError, AttributeError, OverflowError):
+        return 0
+
+
+def _has_intent(rec) -> bool:
+    """A day the intent readings cover (``INTENT_COVER_SHARE``): at least ``WARMTH_MIN_MSGS`` messages read for
+    intent, and at least that share of the day's messages the service could read (``talk_readable``). A count that
+    is not a whole number (a hand edit, a damaged row), or a record without ``talk_readable``, is no reading."""
+    if not (_count(rec, "intent_rated") > 0 and isinstance(rec.get("intent_rated"), int)):
+        return False
+    rows, read = rec.get("talk_readable"), _count(rec, "talk_read")
+    if not isinstance(rows, int) or isinstance(rows, bool):
+        return False
+    return read >= WARMTH_MIN_MSGS and read >= INTENT_COVER_SHARE * max(rows, read) - 1e-9
+
+
+def _words_only(rec) -> bool:
+    """§4VE review r2 (MINOR 2): is this day read from the words-only counts — every message not read by the
+    emotion model (``_talk_variant`` "words")? A day the emotion model read wholly is read from its counts."""
+    return _count(rec, "talk_emotions") < _count(rec, "talk_read")
+
+
+def _talk(rec) -> Tuple[int, int, int, int]:
+    """(read, warm, cold, banter) of a day on the intent scales — from the emotion model's counts on a day it read
+    wholly, else from the words-only counts for EVERY message (nothing annoyed: the words carry no annoyance the
+    counts read). The praise check's thanks beyond the thanks the reading saw count as warm messages read (as on
+    the emotion scale — a thanks counted by both is ONE message)."""
+    sfx = "_words" if _words_only(rec) else ""
+    extra = max(0, _count(rec, "praise") - _count(rec, "talk_thanks" + sfx))
+    read = _count(rec, "talk_read")
+    cold = 0 if sfx else min(read, _count(rec, "talk_cold"))
+    return (read + extra, min(read, _count(rec, "talk_warm" + sfx)) + extra, cold,
+            min(read, _count(rec, "talk_banter" + sfx)))
+
+
+def _talk_variant(rec) -> str:
+    """§4VE review (MAJOR): what the day's talk counts were computed FROM — part of its scale's name. The counting
+    rules' version (``days.TALK_COUNT_VERSION``, written as ``talk_version``; 0 when absent), and which counts it
+    read (``_talk``): "emotions" (the emotion model read every message) or "words" (it missed one or more: EVERY
+    message is then counted from the words-only counts — warm only from thanks, praise and confiding, nothing
+    annoyed). Review r2 (MINOR 2): no third name — one name, one computation. E.g. "1/emotions"."""
+    v = rec.get("talk_version")
+    version = v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+    return f"{version}/{'words' if _words_only(rec) else 'emotions'}"
+
+
+def day_signals(rec: Dict[str, object], *, intent: Optional[bool] = None) -> Dict[str, Optional[float]]:
+    """Each dial's number for one day record, or None when the day says nothing about it. Pure (``intent``:
+    read the §4VE scales; None = ``intent.acts("character")``). With them off, every record — with intent keys
+    or without — reads exactly as before §4VE."""
+    if _intent_on(intent) and _has_intent(rec):
+        out = day_signals(rec, intent=False)
+        read, warm, cold, banter = _talk(rec)
+        # −1 to 1 by construction (warm and cold are each at most the messages read)
+        out["warmth"] = (warm - cold) / read if read >= WARMTH_MIN_MSGS else None
+        # the banter share — "how its own work went" is not read on these days (decision 6), and a thin day has
+        # no number (never the work's: its scale is named for the banter)
+        talk = _count(rec, "talk_read")
+        out["humour"] = banter / talk if talk >= WARMTH_MIN_MSGS else None
+        return out
+
     def n(key) -> int:
         try:
             v = rec.get(key)
@@ -171,9 +305,34 @@ def day_signals(rec: Dict[str, object]) -> Dict[str, Optional[float]]:
     return {"warmth": warm, "humour": ease, "directness": sure}
 
 
-def signal_scales(rec: Dict[str, object]) -> Dict[str, str]:
+#: §4VE: the first part of the intent scales' names (``signal_scales``), the key of their ``SPREAD_FLOOR``
+SCALE_INTENT = "intent"
+SCALE_BANTER = "banter"
+
+
+def signal_words(dial: str, scales) -> str:
+    """§4VE review: what ``dial`` listened to, in words, over days read on ``scales`` — the intent words when
+    every day was read on an intent scale, the older words when none was, both when the days were mixed."""
+    new = INTENT_SIGNAL_WORDS.get(dial)
+    names = [str(x or "") for x in scales]
+    on = [x.split("/")[0] in (SCALE_INTENT, SCALE_BANTER) for x in names]
+    if not new or not any(on):
+        return SIGNAL_WORDS[dial]
+    if all(on):
+        return new
+    return f"{SIGNAL_WORDS[dial]}, and on the days its messages were read for intent, {new}"
+
+
+def signal_scales(rec: Dict[str, object], *, intent: Optional[bool] = None) -> Dict[str, str]:
     """Which scale each dial's number is on for this day: warmth is "emotions" when the emotion model read a
-    message that day (§4UH-warmth), else "counts"; the other dials have one scale. Pure."""
+    message that day (§4UH-warmth), else "counts"; humour and directness have one scale (""). §4VE, with the
+    intent scales on (``intent``; None = ``intent.acts("character")``): a day the intent model read a message of
+    is warmth "intent/<variant>" and humour "banter/<variant>" (``_talk_variant``: "intent/1/emotions",
+    "banter/1/words", …) — read at READING time, so a day recorded before the switch was turned on reads the new
+    scales once it is on (its counts were written anyway) and the old ones again if it is turned off. Pure."""
+    if _intent_on(intent) and _has_intent(rec):
+        var = _talk_variant(rec)
+        return {"warmth": f"{SCALE_INTENT}/{var}", "humour": f"{SCALE_BANTER}/{var}", "directness": ""}
     try:
         v = rec.get("msgs_rated")
         rated = int(v) > 0 if isinstance(v, int) and not isinstance(v, bool) else False
@@ -182,30 +341,41 @@ def signal_scales(rec: Dict[str, object]) -> Dict[str, str]:
     return {"warmth": "emotions" if rated else "counts", "humour": "", "directness": ""}
 
 
-def day_shifts(days: List[Dict[str, object]]) -> Dict[str, Dict[str, float]]:
+def day_shifts(days: List[Dict[str, object]], *, intent: Optional[bool] = None) -> Dict[str, Dict[str, float]]:
     """§4UP: {date: {dial: shift}} — each day's distance from its norm in spreads (``_readings``), clamped to
     ±``SHIFT_CLAMP``, for every day and dial that has a number and a norm (0.0 included: an ordinary day is
     evidence too — it is what keeps a steady signal from moving a dial). What the daily rule reads."""
     out: Dict[str, Dict[str, float]] = {}
-    for date, dial, _v, _mean, _pull, z in _readings(days):
+    for date, dial, _v, _mean, _pull, z in _readings(days, intent=intent):
         out.setdefault(date, {})[dial] = max(-SHIFT_CLAMP, min(SHIFT_CLAMP, z))
     return out
 
 
-def day_pulls(days: List[Dict[str, object]]) -> Dict[str, Dict[str, int]]:
+def day_pulls(days: List[Dict[str, object]], *, intent: Optional[bool] = None) -> Dict[str, Dict[str, int]]:
     """{date: {dial: +1 | -1}} — for each day (in date order), which way it pulls each dial: its number
     against the mean of the same number over the ``BASE_DAYS`` before it, when at least ``BASE_MIN`` of them
     carry one and the day is more than ``BAND`` standard deviations off. A day with no pull is not listed."""
     out: Dict[str, Dict[str, int]] = {}
-    for date, dial, _v, _mean, pull, _z in _readings(days):
+    for date, dial, _v, _mean, pull, _z in _readings(days, intent=intent):
         if pull:
             out.setdefault(date, {})[dial] = pull
     return out
 
 
-def _day_weight(rec: Dict[str, object], dial: str) -> float:
+def _day_weight(rec: Dict[str, object], dial: str, *, intent: Optional[bool] = None) -> float:
     """§4US: how much of its shift a day carries for ``dial`` — humour in proportion to the day's turns that
-    did something, up to ``WORK_FULL_TURNS`` (full); every other dial in full. Pure, never raises."""
+    did something, up to ``WORK_FULL_TURNS`` (full); every other dial in full. §4VE: on the intent scales
+    (``signal_scales``) warmth and humour in proportion to the messages read, up to ``INTENT_FULL_MSGS``. Pure,
+    never raises."""
+    try:
+        scale = signal_scales(rec, intent=intent).get(dial, "")
+    except Exception:  # noqa: BLE001
+        scale = ""
+    base = str(scale or "").split("/")[0]
+    if base == SCALE_INTENT:
+        return max(0.0, min(1.0, _talk(rec)[0] / float(INTENT_FULL_MSGS)))
+    if base == SCALE_BANTER:
+        return max(0.0, min(1.0, _count(rec, "talk_read") / float(INTENT_FULL_MSGS)))
     if dial != "humour":
         return 1.0
     try:
@@ -217,14 +387,18 @@ def _day_weight(rec: Dict[str, object], dial: str) -> float:
     return max(0.0, min(1.0, work / float(WORK_FULL_TURNS)))
 
 
-def _readings(days: List[Dict[str, object]]):
+def _readings(days: List[Dict[str, object]], *, intent: Optional[bool] = None):
     """(date, dial, the day's number, its norm's mean, pull ±1 or 0, shift in spreads) for every day and dial that
     has a number and a norm (``BASE_MIN`` days on its own scale among the ``BASE_DAYS`` before it) —
     ``day_shifts``, ``day_pulls`` and the log line. §4UP: the spread is at least the dial's ``SPREAD_FLOOR``."""
     import statistics
     ordered = _by_date(days)
-    sig = [day_signals(d) for d in ordered]
-    scale = [signal_scales(d) for d in ordered]
+    on = _intent_on(intent)                  # §4VE: one reading of the switch for the whole pass
+    # passed on only when it differs from the switch: ``day_signals`` is a seam (tests replace it with a
+    # one-argument function), and the default call is the call as it was before §4VE
+    kw = {} if on == _intent_on(None) else {"intent": on}
+    sig = [day_signals(d, **kw) for d in ordered]
+    scale = [signal_scales(d, **kw) for d in ordered]
     for i, d in enumerate(ordered):
         for dial in DIALS:
             v = sig[i][dial]
@@ -238,21 +412,29 @@ def _readings(days: List[Dict[str, object]]):
                 continue
             mean = statistics.fmean(prev)
             floor = SPREAD_FLOOR[dial]
-            floor = floor.get(scale[i][dial] or "counts", 0.5) if isinstance(floor, dict) else floor
-            z = (v - mean) / max(statistics.pstdev(prev), floor) * _day_weight(d, dial)
-            yield str(d.get("date")), dial, v, mean, (1 if z > 0 else -1) if abs(z) > BAND else 0, z
+            floor = floor.get(str(scale[i][dial]).split("/")[0], 0.5) if isinstance(floor, dict) else floor
+            z = (v - mean) / max(statistics.pstdev(prev), floor) * _day_weight(d, dial, **kw)
+            clear = abs(z) > BAND
+            base = str(scale[i][dial]).split("/")[0]
+            if clear and base in INTENT_ONE_MESSAGE:
+                # §4VE review: a day is CLEARLY off its usual only when more than one message's worth off it
+                msgs = _talk(d)[0] if base == SCALE_INTENT else _count(d, "talk_read")
+                clear = round(abs(v - mean) * msgs, 6) > INTENT_ONE_MESSAGE[base]       # 6 places: 0.2 × 5 is 1.0000…02
+            yield str(d.get("date")), dial, v, mean, (1 if z > 0 else -1) if clear else 0, z
 
 
-def pull_line(days: List[Dict[str, object]], date: str) -> str:
+def pull_line(days: List[Dict[str, object]], date: str, *, intent: Optional[bool] = None) -> str:
     """One log line for a closed day, in plain words: how each dial's day score compares with its usual (the
     mean of the days before it, on its own scale) and which way that pulls the dial, e.g.
     "2026-11-13 vs usual: warmth higher (3.0 vs 1.2), pulls up · humour about usual (0.8 vs 0.7) · directness no
     signal today". A dial moves only when the days since its last change sit clearly off their usual together,
     two of them at least clearly (``propose``). Never raises."""
     try:
-        got = {dial: (v, mean, pull) for d, dial, v, mean, pull, _z in _readings(days) if d == date}
+        on = _intent_on(intent)
+        kw = {} if on == _intent_on(None) else {"intent": on}        # as in ``_readings``
+        got = {dial: (v, mean, pull) for d, dial, v, mean, pull, _z in _readings(days, intent=on) if d == date}
         day = next((d for d in _by_date(days) if str(d.get("date")) == date), None)
-        sig = day_signals(day) if day else {}
+        sig = day_signals(day, **kw) if day else {}
         parts = []
         for dial in DIALS:
             if dial in got:
@@ -262,7 +444,7 @@ def pull_line(days: List[Dict[str, object]], date: str) -> str:
                                  f"pulls {'up' if pull > 0 else 'down'}")
                 else:
                     parts.append(f"{dial} about usual ({v:.1f} vs {mean:.1f})")
-                w = _day_weight(day or {}, dial)
+                w = _day_weight(day or {}, dial, **kw)
                 if w < 1.0:                                     # §4US review r1: say why a thin day pulls less
                     parts[-1] += f" (a thin day: counts {w:.1f})"
             elif sig.get(dial) is not None:
@@ -359,8 +541,25 @@ def load(home) -> Dict[str, object]:
     state["daily_through"] = _real_date(raw.get("daily_through"))
     state["changed"] = {d: _real_date(changed.get(d)) for d in DIALS
                         if isinstance(changed, dict) and _real_date(changed.get(d))}
+    # the moment of the owner's last reset (written with the dials): ``veto`` never reaches behind it, even
+    # when the reset's log row is missing. Present only after a reset
+    got = _real_stamp(raw.get("reset_at"))
+    if got:
+        state["reset_at"] = got
     state["stored"] = True
     return state
+
+
+def _real_stamp(value) -> str:
+    """``value`` when it is a stored moment as ``_iso`` writes it (YYYY-MM-DDTHH:MM:SSZ), else ""."""
+    try:
+        s = str(value or "")
+        if len(s) == 20 and s.endswith("Z"):
+            datetime.datetime.fromisoformat(s[:-1])
+            return s
+    except (TypeError, ValueError):
+        pass
+    return ""
 
 
 def _real_date(value) -> str:
@@ -600,6 +799,8 @@ def _write(home, state: Dict[str, object]) -> None:
         # row written before a failed state write reset the evidence of a move that never happened)
         "changed": {d: _real_date(v) for d, v in (state.get("changed") or {}).items()
                     if d in DIALS and _real_date(v)},
+        # the owner's last reset, with the dials it set (the veto's barrier when its log row is missing)
+        **({"reset_at": _real_stamp(state.get("reset_at"))} if _real_stamp(state.get("reset_at")) else {}),
         "updated": _iso()})
     with _LOCK:
         _MEMO.clear()
@@ -684,12 +885,18 @@ def veto(home, *, now=None) -> Tuple[Dict[str, object], str]:
         # the log kept, or a move whose log row was lost, the veto "went back" from somewhere else — a ✓ for
         # +0 → +0, or two steps at once). A restart of the character is a barrier: nothing before it stands.
         first = max((i for i, x in enumerate(rows) if x.get("kind") == KIND_START), default=-1) + 1
+        # the owner's reset is a barrier even when its log row is missing (review 2026-11-20: the append failed,
+        # and a veto brought back humour +2 from a move made before the reset): its moment is in the state
+        # file, written with the dials. A move stamped at or before it is behind the reset
+        reset_at = _real_stamp(state.get("reset_at"))
         r, any_move = None, False
         for i in range(len(rows) - 1, first - 1, -1):
             x = rows[i]
             if (x.get("kind") != KIND_MOVE or str(x.get("dial") or "") not in DIALS
                     or any(isinstance(x.get(k), bool) or not isinstance(x.get(k), int) for k in ("from", "to"))):
                 continue                        # not a move, or a row that does not say from where to where
+            if reset_at and str(x.get("at") or "") <= reset_at:
+                continue                        # behind the reset (skipped, not a stop: the log's order is not trusted)
             any_move = True
             if state["dials"][str(x.get("dial"))] != clamp(x.get("to")):
                 continue                        # the dial is no longer where this move left it
@@ -700,6 +907,8 @@ def veto(home, *, now=None) -> Tuple[Dict[str, object], str]:
             r = x
             break
         if r is None:
+            if not any_move and (reset_at or (first > 0 and is_reset_row(rows[first - 1]))):
+                return state, "there is no automatic move since the reset to take back"
             return state, ("no automatic move still stands (each was taken back, or you set that dial since)"
                            if any_move else "there is no automatic move to take back")
         d = str(r.get("dial"))
@@ -713,6 +922,60 @@ def veto(home, *, now=None) -> Tuple[Dict[str, object], str]:
         return state, f"{d} {old:+d} → {back:+d} (the move of {str(r.get('at') or '')[:10]} taken back)"
 
 
+#: the mark a ``start`` row carries when the owner's reset wrote it (the first start has none)
+BY_RESET = "owner_reset"
+#: how a reset that did something begins (``command`` tells a done reset from a refusal by it)
+RESET_DONE = "the character starts again"
+
+
+def is_reset_row(r) -> bool:
+    """Is this log row the owner's reset (a ``start`` row marked ``BY_RESET``)?"""
+    return isinstance(r, dict) and r.get("kind") == KIND_START and r.get("by") == BY_RESET
+
+
+def reset(home, *, now=None) -> Tuple[Dict[str, object], str]:
+    """The owner's reset (operator 2026-11-20): the character starts again — every dial at ``START``, nothing
+    pinned, and each dial's evidence counted from today's mood day (``changed``), so the days up to and
+    including today no longer count toward a move. The day records are kept (they are the agent's norm), and
+    so is ``daily_through``. Written as a ``start`` row marked ``BY_RESET`` with the dials and pins it left:
+    the path walks on from the starting character there (``loop.path_steps``) and no move before it can be
+    taken back (``veto``). No confirmation (§4UK): it acts at once. A reset that would change nothing (already
+    the starting dials, no pin, every count already starting today) writes nothing. A file that cannot be
+    read is not written over, here as everywhere."""
+    with _LOCK:
+        state = ensure(home, now=now)
+        if state["unreadable"]:
+            return state, UNREADABLE
+        if _root(home) is None:
+            return state, "there is no character to reset here"
+        today = _mood_day(now)
+        old, pins = dict(state["dials"]), list(state["pins"])
+        if (old == START and not pins
+                and all((state.get("changed") or {}).get(d) == today for d in DIALS)):
+            return state, "the character is already the starting one, counting from today"
+        state["dials"] = dict(START)
+        state["pins"] = []
+        state["changed"] = {d: today for d in DIALS}
+        at = _iso(now)
+        state["reset_at"] = at                    # the veto's barrier, written with the dials (not only in the log)
+        _write(home, state)                       # the dials first, as every change: a reset is real once this returns
+        logged = True
+        try:
+            _log(home, {"at": at, "kind": KIND_START, "dials": dict(START), "by": BY_RESET, "from": old,
+                        "pins_from": pins, "why": "the owner reset the character"})
+        except Exception as e:  # noqa: BLE001 — the reset stands (review 2026-11-20); only its history line is missing
+            logger.warning("character: reset not logged (%s)", type(e).__name__)
+            logged = False
+        spans = [f"{d} {old[d]:+d} → {START[d]:+d}" for d in DIALS if old[d] != START[d]]
+        said = RESET_DONE + (": " + ", ".join(spans) if spans else ", its dials already where it began")
+        if pins:
+            said += f"; {', '.join(pins)} no longer pinned"
+        said += "; the days before today no longer count toward a move"
+        if not logged:
+            said += " (the line in its history could not be written, so the story below does not show this reset)"
+        return state, said
+
+
 # ── the daily rule ──────────────────────────────────────────────────────────
 
 def _last_change(rows: List[dict], dial: str) -> str:
@@ -720,6 +983,8 @@ def _last_change(rows: List[dict], dial: str) -> str:
     # an unpin too: what was asked while the dial was held does not move it the day it is let go
     for r in reversed(rows):
         if r.get("dial") == dial and r.get("kind") in (KIND_MOVE, KIND_OWNER, KIND_VETO, KIND_UNPIN):
+            return str(r.get("at") or "")[:10]
+        if is_reset_row(r):                     # the owner's reset changed every dial (a file without stamps)
             return str(r.get("at") or "")[:10]
     return ""
 
@@ -764,7 +1029,7 @@ def propose(days: List[Dict[str, object]], state: Dict[str, object], rows: List[
             continue
         # the state's own stamp first (a mood day, written with the dials); the log for a file older than it
         since = _real_date((state.get("changed") or {}).get(dial)) or _last_change(rows, dial)
-        up, down, read = [], [], []
+        up, down, read, read_on = [], [], [], []
         for d in usable:
             date = str(d.get("date") or "")
             if since and date <= since:
@@ -777,6 +1042,7 @@ def propose(days: List[Dict[str, object]], state: Dict[str, object], rows: List[
                     continue
                 if z == z:                                   # NaN is no reading
                     read.append(max(-SHIFT_CLAMP, min(SHIFT_CLAMP, z)))
+                    read_on.append(signal_scales(d).get(dial, ""))       # §4VE: what the day was read on
             own = int((pulls.get(date) or {}).get(dial, 0))
             if own > 0:
                 up.append(date)
@@ -798,7 +1064,7 @@ def propose(days: List[Dict[str, object]], state: Dict[str, object], rows: List[
         out.append({"dial": dial, "from": old, "to": new,
                     "why": (f"{len(read)} days read {'better' if step > 0 else 'worse'} than its usual "
                             f"({abs(shift):.1f} of a day's spread; {ups} clearly {'better' if step > 0 else 'worse'}, "
-                            f"{downs} the other way), in {SIGNAL_WORDS[dial]}"),
+                            f"{downs} the other way), in {signal_words(dial, read_on)}"),
                     "days_up": up, "days_down": down, "shift": round(shift, 2), "days_read": len(read)})
     return out
 
@@ -847,7 +1113,13 @@ def _change_line(r: dict) -> str:
     kind, d = r.get("kind"), r.get("dial")
     day = str(r.get("at") or "")[:10]
     if kind == KIND_START:
-        return f"{day}: started as {describe(r.get('dials') or START)}"
+        got = r.get("dials") if isinstance(r.get("dials"), dict) else START
+        if is_reset_row(r):
+            was = r.get("from") if isinstance(r.get("from"), dict) else {}
+            spans = [f"{x} {clamp(was[x]):+d}" for x in DIALS if x in was and clamp(was[x]) != clamp(got.get(x, 0))]
+            return (f"{day}: reset by the owner, starts again as {describe(got)}"
+                    + (f" (it was at {', '.join(spans)})" if spans else ""))
+        return f"{day}: started as {describe(got)}"
     if kind in (KIND_MOVE, KIND_OWNER, KIND_VETO):
         by = {KIND_MOVE: "moved by itself", KIND_OWNER: "set by the owner", KIND_VETO: "taken back by the owner"}[kind]
         try:
@@ -891,9 +1163,13 @@ def view(home) -> str:
            else "Nothing is pinned.",
            "Each dial moves by itself, one step at a time, when the days since it last moved (two weeks at most) "
            "sit clearly away from my own usual, taken together and by how far, with at least two days clearly "
-           "that way: warmth from how you talk to me, humour from how my own work goes, directness from how my "
-           "answers are judged. "
-           "Your commands set, hold or take back a dial whenever you want."]
+           "that way: warmth from how you talk to me, humour from "
+           + ("how often you joke with me (from how my own work goes on a day too few of your messages could be "
+              "read for that)" if _intent_on()
+              else "how my own work goes")
+           + ", directness from how my answers are judged. "
+           "Your commands set, hold or take back a dial whenever you want, and \"character reset\" starts the "
+           "whole character again from where it began."]
     try:
         from . import tastes as _tastes
         # review r2 (§4UH): this view is a system reply, and a reply goes back to the model as history —
@@ -942,7 +1218,8 @@ COMMAND_MAX_CHARS = 120
 _WORD = "character"
 USAGE = ("Commands: \"character\" (show it) · \"character humour +1\" or \"character humour up\" / \"down\" "
          "(set a dial, -2 to +2) · \"character pin warmth\" / \"character unpin warmth\" · "
-         "\"character veto\" (take the last automatic move back). Dials: " + ", ".join(
+         "\"character veto\" (take the last automatic move back) · \"character reset\" (start the whole "
+         "character again: every dial back where it began, nothing pinned). Dials: " + ", ".join(
              f"{d} ({POLES[d][0]} ↔ {POLES[d][1]})" for d in DIALS) + ".")
 
 
@@ -975,7 +1252,8 @@ def _command_words(text: str) -> Optional[List[str]]:
 def parse_command(text: str) -> Optional[Tuple[str, ...]]:
     """The command a message IS, or None. The WHOLE message must be one of the command's shapes (as the
     rule commands and `mirror` decide): "character" · "character help|show" · "character veto|undo" ·
-    "character pin|unpin <dial>" · "character [set] <dial> [to|at] <up|down|more|less|-2..+2>". Anything
+    "character reset" (2026-11-20; no word after it but "please", and never with a "?") · "character pin|unpin <dial>" ·
+    "character [set] <dial> [to|at] <up|down|more|less|-2..+2>". Anything
     else — "character development in this novel is weak", "character set in UTF-8?", "character warmth
     is what I need" — is the owner talking to the model (review r1: a looser match answered those with
     "That is not a character command")."""
@@ -986,6 +1264,10 @@ def parse_command(text: str) -> Optional[Tuple[str, ...]]:
         return ("view",)
     if words in (["veto"], ["undo"]):
         return ("veto",)
+    if words == ["reset"]:
+        # review 2026-11-20: a question is not the reset ("character reset?" asked what it does, and nothing
+        # undoes a reset) — it gets the near-miss note instead. Only the reset: the other commands can be undone
+        return None if "?" in str(text or "") else ("reset",)
     if len(words) == 2 and words[0] in ("pin", "unpin") and resolve_dial(words[1]):
         return (words[0], resolve_dial(words[1]))
     if words[0] == "set":
@@ -1001,7 +1283,8 @@ def parse_command(text: str) -> Optional[Tuple[str, ...]]:
 #: what the model is told when the owner's message is nearly a command (review r2: after the match became
 #: exact, "character humour 3", "character reset" and "character humour" went to the model with no word
 #: that nothing had changed — and the model, which reads the character in its state block, could answer
-#: as if it had changed it)
+#: as if it had changed it). Since 2026-11-20 "character reset" alone IS the command; "character reset humour"
+#: and the like are the near misses
 HINT_MAX_WORDS = 6
 _HINT_WORDS = frozenset(DIALS) | {"humor", "reset", "pin", "unpin", "veto", "undo"}
 
@@ -1018,8 +1301,9 @@ def command_hint(text: str) -> str:
             "character was NOT changed — you cannot change it yourself and must not say it changed. If the "
             "owner was asking about something else (a character set, a character in a story), just answer "
             "that. Otherwise tell the owner so in one sentence and give the exact forms: " + USAGE
-            + " There is no reset: each dial is set with its own command, and a position is a whole number "
-              "from -2 to +2.")
+            + " The reset is the message \"character reset\" with no dial or other word after it (a closing "
+              "\"please\" is fine) and not asked as a question; it resets the whole character, one dial is set "
+              "with its own command, and a position is a whole number from -2 to +2.")
 
 
 def is_command(text: str) -> bool:
@@ -1037,6 +1321,11 @@ def command(text: str, home, *, now=None) -> Optional[str]:
     if cmd[0] == "veto":
         _state, said = veto(home, now=now)
         return f"✓ {said}\n\n{view(home)}" if "→" in said else f"{said[0].upper()}{said[1:]}."
+    if cmd[0] == "reset":
+        _state, said = reset(home, now=now)
+        if said.startswith(RESET_DONE):
+            return f"✓ {said[0].upper()}{said[1:]}.\n\n{view(home)}"
+        return f"{said[0].upper()}{said[1:]}. Nothing changed." if said != UNREADABLE else f"{said[0].upper()}{said[1:]}."
     if cmd[0] in ("pin", "unpin"):
         _state, said = set_pin(home, cmd[1], cmd[0] == "pin", now=now)
         done = " is pinned at " in said or " is free to move again" in said

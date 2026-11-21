@@ -14,6 +14,11 @@ The service reads English only and answers ``unknown`` for anything else (Greek 
 letters, a word too short to tell); that answer is written too (it says the message was seen), with no
 probabilities. Only the owner's own words are sent: a row a channel member wrote is never sent, and the notes the
 clients add to a message (an attached file, a Slack mention) are taken out first.
+
+§4VE: the answer may also carry what the message is DOING (``intent``) and whether it is urgent — see
+``selfhood/intent.py`` for the switches. The one exception to "the owner's words only" is ``read_only``: a
+member's own message, read for the pitch of the reply to them, only once ``GHOST_INTENT_MEMBERS=1`` (off by
+default; nothing of it is kept or journalled).
 """
 from __future__ import annotations
 
@@ -97,6 +102,8 @@ class _Breaker:
         self.last_ok = 0.0
         self.last_fail = 0.0
         self.last_fail_why = ""
+        #: §4VE: answers that carried an intent reading
+        self.intents = 0
         #: §4UB (evaluation: an outage was logged at DEBUG only): the log was told the service is down
         self.down = False
 
@@ -150,6 +157,16 @@ def _answer(body) -> Optional[Dict[str, object]]:
             k in EMOTION_LABELS and isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0
             for k, v in emo.items()):
         out["emotions"] = {k: round(float(v), 4) for k, v in emo.items()}
+    # §4VE: the intent and the urgency — kept for an unknown tone too (operator decision 8: a multilingual intent
+    # model reads Greek the tone model does not); a bad field drops only itself. Not even read with GHOST_INTENT=0
+    try:
+        from . import intent as _intent
+        if _intent.mode() != _intent.MODE_OFF:
+            got = _intent.parse(body)
+            if got:
+                out.update(got)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("sentiment: intent field skipped: %s", type(exc).__name__)
     return out
 
 
@@ -356,47 +373,141 @@ def _feed_mood(answer: Dict[str, object], self_model, praised: bool, arrived: Op
     §4TX: through the reaction ledger (``SelfModel.note_owner_sentiment``) — the unhappy tone of a message that
     also corrected the reply is one verdict with the correction, not two — and held while the owner's set mood
     holds, or when the owner set the mood after this message arrived (the reasons are the state's own)."""
+    got = _feed(answer, self_model, praised, arrived, request_id, text)
+    return got["nudge"], got["held"]
+
+
+#: §4VE: why the intent's mood event moved nothing (beside the state's and the ledger's own reasons)
+INTENT_HELD_JOURNAL = "journal only"
+INTENT_HELD_OFF = "the intent's mood effect is switched off"
+#: the message's tone (the sentiment's event) already went to the ledger: the intent adds nothing (one verdict)
+INTENT_HELD_TONE = "the message's tone already counted"
+#: §4VE: the row's ``intent_judge`` — the correction judge's NOMINATION by the intent (``intent.says_correcting``)
+#: and nothing more: this module cannot know whether the judge then ran or what it said (the request path asks it).
+#: "" = not nominated; else one of these (``intent.acts``/``would("judge")`` as for the other effects)
+INTENT_JUDGE_NOMINATED = "nominated to the correction judge"
+INTENT_JUDGE_OFF = "the intent's judge nomination is switched off"
+
+
+def _after_trouble(self_model, arrived) -> bool:
+    try:
+        return bool(self_model.recent_trouble(arrived)) if self_model is not None else False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _feed(answer: Dict[str, object], self_model, praised: bool, arrived: Optional[datetime.datetime] = None,
+          request_id: str = "", text: str = "") -> Dict[str, object]:
+    """``_feed_mood``'s work, with the intent's part: ``{"nudge", "held", "intent_effect", "intent_held"}``.
+    ``held`` is the SENTIMENT's reason (as before §4VE); ``nudge`` what the message moved, by either reading.
+
+    §4VE: the sentiment's event first. Only when it has none (neutral, under its gate, unbacked, not English)
+    may the intent's event (``intent.mood_event``) be booked — through the SAME ledger call, as the one tone of
+    this message, so every cap, the owner's hold and "set after the message arrived" apply unchanged. When the
+    sentiment's event exists but was doubted (praised, possible sarcasm, a task's wording) the intent stays
+    silent for the same reason; when it went to the ledger the intent adds nothing (``INTENT_HELD_TONE``).
+    In journal mode the intent's event is never booked (``INTENT_HELD_JOURNAL``). Never raises."""
+    from . import intent as _intent
     from . import mood as M
+    out: Dict[str, object] = {"nudge": 0.0, "held": "", "intent_effect": "", "intent_held": ""}
     try:
         emotions = answer.get("emotions")
+        has_intent = _intent.mode() != _intent.MODE_OFF and isinstance(answer.get("intent"), dict)
+        after_trouble = _after_trouble(self_model, arrived) if (has_intent or answer.get("label") == "positive") \
+            else False
+        iev, iwhy = (_intent.mood_event(answer, text, after_trouble=after_trouble) if has_intent else (None, ""))
+        out["intent_effect"] = iev.cause if iev is not None else ""
+        out["intent_held"] = iwhy
+        arrived_s = arrived.isoformat().replace("+00:00", "Z") if arrived is not None else ""
         ev = M.sentiment_event(answer.get("label"), answer.get("score"), emotions)
         if ev is None:
             label = answer.get("label")
             if label == "unknown":
-                return 0.0, str(answer.get("reason") or "unknown")
-            if label == "neutral":
-                return 0.0, "neutral"
-            gate = M.sentiment_gate(label, emotions)
-            score = answer.get("score")
-            if isinstance(score, (int, float)) and not isinstance(score, bool) and score >= gate:
-                return 0.0, HELD_UNBACKED           # §4UP: confident, but no emotion on its side
-            return 0.0, f"below {gate:.2f}"
+                out["held"] = str(answer.get("reason") or "unknown")
+            elif label == "neutral":
+                out["held"] = "neutral"
+            else:
+                gate = M.sentiment_gate(label, emotions)
+                score = answer.get("score")
+                if isinstance(score, (int, float)) and not isinstance(score, bool) and score >= gate:
+                    out["held"] = HELD_UNBACKED     # §4UP: confident, but no emotion on its side
+                else:
+                    out["held"] = f"below {gate:.2f}"
+            if iev is None:
+                return out
+            # §4VE: no tone from the sentiment — the intent's event may be the message's one tone
+            if praised:
+                out["intent_held"] = HELD_PRAISED
+            elif self_model is None:
+                out["intent_held"] = HELD_NO_MOOD
+            elif not _intent.acts("mood"):
+                out["intent_held"] = INTENT_HELD_JOURNAL if _intent.would("mood") else INTENT_HELD_OFF
+            else:
+                after, dp, why = self_model.note_owner_sentiment(
+                    str(label or ""), 0.0, request_id=str(request_id or ""), emotions=emotions,
+                    arrived=arrived_s, event=iev)
+                if why:
+                    out["intent_held"] = why
+                elif after is None:
+                    out["intent_held"] = HELD_NO_MOOD
+                else:
+                    with BREAKER.lock:
+                        BREAKER.moved += 1
+                    out["nudge"], out["intent_held"] = dp, ""
+            return out
+        # the sentiment's event exists: the intent never books a second tone for the same message. (A doubted
+        # tone needs no line here: ``intent.refusal`` runs the same ``doubtful`` and the intent is refused there.)
         if praised:              # "thanks, perfect" is already one praise event
-            return 0.0, HELD_PRAISED
+            out["held"] = HELD_PRAISED
+            if iev is not None:
+                out["intent_held"] = HELD_PRAISED
+            return out
         if self_model is None:
-            return 0.0, HELD_NO_MOOD
-        after_trouble = False
-        if answer.get("label") == "positive":
-            try:
-                after_trouble = bool(self_model.recent_trouble(arrived))
-            except Exception:  # noqa: BLE001
-                after_trouble = False
-        doubt = doubtful(str(answer.get("label") or ""), text, after_trouble=after_trouble)
+            out["held"] = HELD_NO_MOOD
+            if iev is not None:
+                out["intent_held"] = HELD_NO_MOOD
+            return out
+        doubt = doubtful(str(answer.get("label") or ""), text,
+                         after_trouble=after_trouble if answer.get("label") == "positive" else False)
         if doubt:
-            return 0.0, doubt
+            out["held"] = doubt
+            return out
         after, dp, why = self_model.note_owner_sentiment(
             answer["label"], answer["score"], request_id=str(request_id or ""), emotions=emotions,
-            arrived=(arrived.isoformat().replace("+00:00", "Z") if arrived is not None else ""))
-        if why:
-            return 0.0, why
-        if after is None:
-            return 0.0, HELD_NO_MOOD
+            arrived=arrived_s)
+        # review r1 (MINOR 6a): the intent's reason is what really happened to the tone it deferred to
+        if why or after is None:
+            out["held"] = why or HELD_NO_MOOD
+            if iev is not None:
+                out["intent_held"] = out["held"]
+            return out
         with BREAKER.lock:
             BREAKER.moved += 1
-        return dp, ""
+        out["nudge"] = dp
+        if iev is not None:
+            out["intent_held"] = INTENT_HELD_TONE
+        return out
     except Exception as exc:  # noqa: BLE001
         logger.debug("sentiment mood event skipped: %s", type(exc).__name__)
-        return 0.0, HELD_NO_MOOD
+        out["nudge"], out["held"] = 0.0, HELD_NO_MOOD
+        if out["intent_effect"]:
+            out["intent_held"] = HELD_NO_MOOD
+        return out
+
+
+#: ``score_message(register_humour=...)``'s default: read the owner's humour dial as the reply would hear it
+REGISTER_HUMOUR_DIAL = object()
+
+
+def _owner_humour(self_model) -> Optional[int]:
+    """The character's humour dial as the owner's reply hears it, or None (no character, no self-model)."""
+    try:
+        from . import character as _C
+        if self_model is None or not _C.enabled():
+            return None
+        return int(_C.dials(Path(self_model.root).parent.parent).get("humour", 0))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ── the reading of one request's message, for whoever waits for it (§4UW) ───
@@ -412,6 +523,9 @@ _READING_POLL_S = 0.05
 _READINGS: "collections.OrderedDict[str, Optional[dict]]" = collections.OrderedDict()
 _READINGS_LOCK = threading.Lock()
 _PENDING = None            # the slot of a message whose reading has not come back yet
+#: §4VE r3: the request ids whose reply stopped waiting for the reading (``note_reply_stopped_waiting``) — only
+#: ids the store holds, dropped with them (so bounded by READINGS_MAX)
+_LATE: "collections.OrderedDict[str, bool]" = collections.OrderedDict()
 
 
 def expect_reading(request_id: str) -> None:
@@ -423,32 +537,89 @@ def expect_reading(request_id: str) -> None:
     with _READINGS_LOCK:
         _READINGS[rid] = _PENDING
         _READINGS.move_to_end(rid)
+        _LATE.pop(rid, None)               # a new message under this id: its reply has not stopped waiting yet
         while len(_READINGS) > READINGS_MAX:
-            _READINGS.popitem(last=False)
+            old, _v = _READINGS.popitem(last=False)
+            _LATE.pop(old, None)
 
 
 def forget_reading(request_id: str) -> None:
-    """Drop what is kept for ``request_id`` (a new request under an id that was used before)."""
+    """Drop what is kept for ``request_id`` (a new request under an id that was used before). §4VE: also what
+    the END of a request that used ``read_only`` (a member's, a probe's) calls, so its reading does not outlive
+    it — safe at any moment: a reading still on its way when this runs is not kept (``_note_reading`` fills only
+    a slot that is still expected), and a waiter returns None at once."""
     with _READINGS_LOCK:
         _READINGS.pop(str(request_id or ""), None)
+        _LATE.pop(str(request_id or ""), None)
 
 
-def _note_reading(request_id: str, emotions) -> None:
+def note_reply_stopped_waiting(request_id: str) -> None:
+    """§4VE r3: the reply of request ``request_id`` stopped waiting for its message's reading (the register's
+    wait ran out) — the request path calls this when its wait expires. When the scoring then lands,
+    ``score_message`` says so: in mode 1 the 💗 line's pitch part reads ``pitch: patient (too late, not
+    offered)`` and the row gains ``register_late: true`` (``register`` keeps meaning what the reading implies).
+
+    In journal mode the request path's lateness watcher may call this only AFTER the reading landed — the line
+    is written by then, so the journal-mode line never says it (it cannot know, and does not pretend); the row
+    carries ``register_late`` only when the mark was already set when the row was written.
+
+    A no-op for an id the store does not hold (none was expected, or it was forgotten); safe to call twice.
+    The mark lives and dies with the id's slot (``expect_reading`` / ``forget_reading`` / eviction). Never
+    raises."""
+    try:
+        rid = str(request_id or "")
+        with _READINGS_LOCK:
+            if rid and rid in _READINGS:
+                _LATE[rid] = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _reply_stopped_waiting(request_id: str) -> bool:
+    with _READINGS_LOCK:
+        return bool(_LATE.get(str(request_id or "")))
+
+
+#: §4VE: what a slot keeps of the answer — the whole reading (the tone, the emotions, the intent, the urgency)
+_READING_KEYS = ("label", "emotions", "intent", "urgent")
+
+
+def _note_reading(request_id: str, emotions, *, reading=None) -> None:
     """The scoring of ``request_id``'s message is over: its emotion reading, or {} when there is none (the
     service is off, failed, or carries no emotion model) — a waiter stops waiting either way. Only a slot that
-    was expected is filled, once."""
+    was expected is filled, once. §4VE: ``reading`` — the whole parsed answer — is kept beside it
+    (``reading_for(..., part="all")``)."""
     rid = str(request_id or "")
+    if reading is None and isinstance(emotions, dict):
+        reading = {"emotions": emotions}          # a caller with the emotions only (the judge's tests)
+    # review r2 MAJOR 1: the whole reading is kept in EXACTLY the parsed answer's shape — an answer with no
+    # emotion reading has no "emotions" key (``mood.sentiment_backing`` reads a missing reading as None, "no
+    # model", but {} as False, "nothing backs the tone"); the judge's view is kept beside it, as before
+    kept: dict = {}
+    if isinstance(reading, dict):
+        for k in _READING_KEYS:
+            v = reading.get(k)
+            if v is not None:
+                kept[k] = dict(v) if isinstance(v, dict) else v
+    slot = {"all": kept, "emotions": dict(emotions) if isinstance(emotions, dict) else {}}
     with _READINGS_LOCK:
         # … and only once: a message the owner sent while the turn ran is scored under the same request id,
         # and the reading the judge waits for is the request's own message's
         if rid and rid in _READINGS and _READINGS[rid] is _PENDING:
-            _READINGS[rid] = dict(emotions) if isinstance(emotions, dict) else {}
+            _READINGS[rid] = slot
 
 
-async def reading_for(request_id: str, *, wait_s: float = READING_WAIT_S) -> Optional[dict]:
+async def reading_for(request_id: str, *, wait_s: float = READING_WAIT_S, part: str = "emotions") -> Optional[dict]:
     """The emotion reading of ``request_id``'s message: at once when it is in, after at most ``wait_s`` when
-    it is on its way, None when none was expected, none came, or the wait ran out. Never raises."""
+    it is on its way, None when none was expected, none came, or the wait ran out. Never raises.
+
+    §4VE: ``part="all"`` — the whole reading instead: ``{"label", "emotions", "intent", "urgent"}``, each key
+    ONLY when the parsed answer had it (no ``emotions`` key for an answer without an emotion reading — the same
+    shape the journal's row was computed from), None as above or when the scoring had no answer. Any other
+    ``part``: None."""
     rid = str(request_id or "")
+    if part not in ("emotions", "all"):
+        return None
     try:
         deadline = time.monotonic() + max(0.0, float(wait_s))
         while True:
@@ -457,7 +628,10 @@ async def reading_for(request_id: str, *, wait_s: float = READING_WAIT_S) -> Opt
                     return None
                 got = _READINGS[rid]
             if got is not _PENDING:
-                return dict(got) or None
+                if part == "all":
+                    whole = got.get("all") or {}
+                    return {k: (dict(v) if isinstance(v, dict) else v) for k, v in whole.items()} or None
+                return dict(got.get("emotions") or {}) or None
             if time.monotonic() >= deadline:
                 return None
             await asyncio.sleep(_READING_POLL_S)
@@ -465,24 +639,98 @@ async def reading_for(request_id: str, *, wait_s: float = READING_WAIT_S) -> Opt
         return None
 
 
+async def read_only(content, *, request_id: str, tor_proxy: Optional[str] = None) -> bool:
+    """§4VE: read a message for the PITCH of the reply only — a member's own message, a probe's: classify it,
+    keep its reading for ``reading_for(request_id, part="all")``, one log line of labels (no words, no
+    numbers, no member id). No journal row, no mood, nothing stored past the slot. True when a reading came.
+
+    Only with the register on (``intent.acts("register")``); a member's words only with
+    ``intent.acts("members")`` (operator decision 3 — the written rule at the top of this module stands until
+    then). The slot is filled on every way out, so a waiter stops waiting. Never raises."""
+    rid = str(request_id or "")
+    try:
+        from . import intent as _intent
+        from ..utils.logging import request_kind, requester_is_member
+        # review r2: a member's PROBE is kind "probe" — the member test is the request path's own as well, so
+        # this gate is complete on its own
+        is_member = request_kind() == "member" or requester_is_member()
+        if not _intent.acts("register") or (is_member and not _intent.acts("members")):
+            _note_reading(rid, None)
+            return False
+        text = prepare_text(message_text(content))
+        answer = (await classify(text, tor_proxy=tor_proxy)) if text else None
+        _note_reading(rid, (answer or {}).get("emotions"), reading=answer)
+        if answer is None:
+            return False
+        if "intent" in answer:
+            with BREAKER.lock:
+                BREAKER.intents += 1
+        try:
+            from ..utils.logging import Icons, pretty_log
+            tone = str(answer.get("label") or "")
+            pretty_log("Sentiment", f"read for the reply only: {tone}{_intent.log_part(answer, percent=False)}"
+                                    " · nothing kept", icon=Icons.SENTIMENT)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sentiment read-only log line skipped: %s", type(exc).__name__)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("sentiment read-only skipped: %s", type(exc).__name__)
+        _note_reading(rid, None)
+        return False
+
+
 async def score_message(content, root, *, request_id: str = "", tor_proxy: Optional[str] = None,
-                        self_model=None, praised: bool = False) -> bool:
+                        self_model=None, praised: bool = False, register_audience: str = "",
+                        register_humour=REGISTER_HUMOUR_DIAL) -> bool:
     """Score one OWNER message (the caller decides that), feed the mood, write the journal row, log the rating.
-    ``praised``: the praise check already counted this message. True when a row was written. Never raises."""
+    ``praised``: the praise check already counted this message. True when a row was written. Never raises.
+
+    §4VE: ``register_audience`` / ``register_humour`` — what the reply to this message hears, for the row's
+    ``register`` key (what the register would say): the audience (``"owner"``, ``"public"`` for the owner on a
+    public channel, …; review r3: the default "" is "not stated" — no register on the row unless the caller
+    says who hears the reply) and the humour dial — ``REGISTER_HUMOUR_DIAL`` reads the character's dial, ``None`` = no
+    character heard. With the register switched off (``intent.would("register")``) the key is ""."""
     try:
         arrived = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
         text = prepare_text(message_text(content))
         answer = (await classify(text, tor_proxy=tor_proxy)) if text else None
         # §4UW: whoever waits for this message's reading stops waiting here, on every way out
-        _note_reading(request_id, (answer or {}).get("emotions"))
+        _note_reading(request_id, (answer or {}).get("emotions"), reading=answer)
         if answer is None:
             return False
-        nudge, held = _feed_mood(answer, self_model, praised, arrived, request_id, text)
+        got = _feed(answer, self_model, praised, arrived, request_id, text)
+        nudge, held = got["nudge"], got["held"]
         row = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-               "request_id": str(request_id or "")[:64], **answer, "nudge": nudge, "held": held,
-               "chars": len(text), "text": text[:JOURNAL_TEXT_CHARS]}
+               "request_id": str(request_id or "")[:64], **answer, "nudge": nudge, "held": held}
+        # §4VE: what the intent did — or, in journal mode, would have done. Only on a row whose answer carries
+        # an intent or urgency reading (``_answer`` keeps none with GHOST_INTENT=0): every other row is as before
+        lines = {}
+        if "intent" in answer or "urgent" in answer:
+            from . import intent as _intent
+            if "intent" in answer:
+                with BREAKER.lock:
+                    BREAKER.intents += 1
+            reg_key = ""
+            if _intent.would("register"):
+                humour = (_owner_humour(self_model) if register_humour is REGISTER_HUMOUR_DIAL
+                          else register_humour)
+                reg_key, _line = _intent.register(answer, audience=str(register_audience or ""), humour=humour,
+                                                  text=text, after_trouble=_after_trouble(self_model, arrived))
+            judge = ""
+            if _intent.says_correcting(answer):
+                judge = (INTENT_JUDGE_NOMINATED if _intent.acts("judge")
+                         else INTENT_HELD_JOURNAL if _intent.would("judge") else INTENT_JUDGE_OFF)
+            row.update({"intent_effect": got["intent_effect"], "intent_held": got["intent_held"],
+                        "register": reg_key, "intent_judge": judge})
+            # review r3: the reply stopped waiting before this reading landed (``note_reply_stopped_waiting``)
+            late = _reply_stopped_waiting(request_id)
+            if late:
+                row["register_late"] = True
+            lines = {"intent_effect": got["intent_effect"], "intent_held": got["intent_held"],
+                     "register": reg_key, "judge": judge, "register_late": late}
+        row.update({"chars": len(text), "text": text[:JOURNAL_TEXT_CHARS]})
         await asyncio.to_thread(_append, Path(root) / JOURNAL_FILENAME, row)
-        log_rating(answer, nudge, held)
+        log_rating(answer, nudge, held, **lines)
         return True
     except Exception as exc:  # noqa: BLE001
         logger.debug("sentiment scoring skipped: %s", type(exc).__name__)
@@ -490,13 +738,81 @@ async def score_message(content, root, *, request_id: str = "", tor_proxy: Optio
         return False
 
 
-def rating_line(answer: Dict[str, object], nudge: float = 0.0, held: str = "") -> str:
+def _mood_part(answer: Dict[str, object], effect: str, nudge: float, held: str, intent_effect: str,
+               intent_held: str) -> str:
+    """§4VE (operator 11-20: "everything in one 💗 line"): the line's ONE mood part for a message with an intent
+    reading — what really happened to the mood, whichever reading caused it. ``effect`` is the tone's own text
+    (unchanged); the intent adds to it only when its label HAS a mood effect: the short cause of a nudge it made
+    ("mood nudged up +0.02 (asked for my opinion)"), what it would have done in journal mode ("mood unchanged;
+    intent would nudge up +0.02 (journal only)"), or why it was held, after a semicolon — never a reason the
+    tone's text already gave (the tone's own hold, an unbacked tone), and nothing when the tone moved the mood."""
+    from . import intent as _intent
+    if nudge:                                       # review r3: a small step is never shown as "+0.00"
+        effect = f"mood nudged {'up' if nudge > 0 else 'down'} {_step(nudge)}"
+    lab = _intent.top(answer)[0]
+    if not lab or not _intent.MOOD_OUTCOMES.get(lab):
+        return effect                               # instruction, question, greeting, …, unclear: nothing to add
+    if nudge:
+        if intent_effect and not intent_held:       # the intent's event was the message's one tone
+            return f"{effect} ({_intent.CAUSE_SHORT.get(intent_effect, intent_effect)})"
+        return effect                               # the tone moved it; the intent deferred to it
+    if intent_held in (INTENT_HELD_TONE, HELD_UNBACKED, held):
+        return effect
+    if intent_effect and intent_held == INTENT_HELD_JOURNAL:
+        # review r3: journal mode cannot know what the ledger's caps would have let through — the EVENT's step,
+        # said as such, never as the nudge
+        step = _intent.event_nudge(intent_effect)
+        return (f"mood unchanged; intent would nudge {'up' if step > 0 else 'down'} ({_step(step)} before caps, "
+                "journal only)")
+    return f"{effect}; intent held: {intent_held}" if intent_held else effect
+
+
+def _step(x: float) -> str:
+    """A mood step as the 💗 line writes it: two decimals, as the sentiment's own nudge (+0.015 reads "+0.01"),
+    with the unicode minus — but never "+0.00" for a step that moved something (then three decimals)."""
+    txt = f"{x:+.2f}"
+    if x and float(txt) == 0.0:
+        txt = f"{x:+.3f}"
+    return txt.replace("-", "−")
+
+
+def _pitch_part(register: str, late: bool = False) -> str:
+    """" · pitch: patient" (the register key as the row keeps it), "(journal only)" while the register only
+    records; "" with no clause — the reply heard none, or the switch is off. ``late`` (mode 1 only): the reply
+    stopped waiting before the reading came — "(too late, not offered)"."""
+    from . import intent as _intent
+    if not register:
+        return ""
+    if not _intent.acts("register"):
+        return f" · pitch: {register} (journal only)"
+    return f" · pitch: {register}" + (" (too late, not offered)" if late else "")
+
+
+def _judge_part(judge: str) -> str:
+    # review r3: the intent only NOMINATES — the judge still needs a reply before it and its own check
+    if judge == INTENT_JUDGE_NOMINATED:
+        return " · nominated to the correction judge"
+    if judge == INTENT_HELD_JOURNAL:
+        return " · would be nominated to the correction judge (journal only)"
+    return ""
+
+
+def rating_line(answer: Dict[str, object], nudge: float = 0.0, held: str = "", *, intent_effect: str = "",
+                intent_held: str = "", register: str = "", judge: str = "", register_late: bool = False) -> str:
     """The log line's content, in plain words, never the message's words (operator 11-12: "make the logs easy to
     read and understand but informative"). Three parts: how the message read, its strongest emotions (and whether
     the day record counts them for warmth), and what it did to the mood:
     ``positive 95% (neutral 4%, negative 1%) · emotion: gratitude 99% (counts as warm) · mood nudged up +0.08``,
-    ``positive 82% (…) · emotion: curiosity 44% · mood unchanged: a nudge needs 85% or more``,
-    ``not rated: not English · mood unchanged``."""
+    ``positive 82% (…) · emotion: curiosity 44% · mood unchanged: a nudge needs 85% or more, and a warm emotion
+    behind the tone``, ``negative 81% (…) · emotion: confusion 81% · mood unchanged: no unhappy emotion behind the
+    tone (with one, a nudge needs 60% or more)``,
+    ``not rated: not English · mood unchanged``.
+
+    §4VE (operator 11-20): a message with an intent reading says it on the SAME line, in this order: tone ·
+    emotion · intent · pitch · mood · judge — ``negative 81% (…) · emotion: confusion 81% · intent: advice 97% ·
+    pitch: patient · mood nudged up +0.02 (asked for my opinion)``. ``intent_effect`` / ``intent_held`` are the
+    journal row's fields, ``register`` its register key (what the reply heard), ``judge`` its ``intent_judge``.
+    With ``GHOST_INTENT=0`` (or no intent reading) the line is exactly the line before §4VE."""
     label = str(answer.get("label") or "")
     if nudge:
         effect = f"mood nudged {'up' if nudge > 0 else 'down'} {nudge:+.2f}".replace("-", "−")
@@ -509,10 +825,32 @@ def rating_line(answer: Dict[str, object], nudge: float = 0.0, held: str = "") -
             effect = f"mood unchanged: a nudge needs {float(held.split()[1]) * 100:.0f}% or more"
         except (IndexError, ValueError):
             effect = f"mood unchanged: {held}"
+        # operator 11-20 (a live line: "negative 81% · confusion 81% · a nudge needs 85% or more" read as if 85%
+        # would have moved the mood): a tone no emotion backs moves nothing at any score, and the line says so
+        from . import mood as M
+        if M.sentiment_backing(label, answer.get("emotions")) is False:
+            if label == "negative":
+                effect = ("mood unchanged: no unhappy emotion behind the tone (with one, a nudge needs "
+                          f"{M.SENTIMENT_MIN_SCORE_BACKED * 100:.0f}% or more)")
+            elif label == "positive":
+                effect += ", and a warm emotion behind the tone"
     else:
         effect = "mood unchanged" + (f": {held}" if held else "")
+    said = pitch = judged = ""
+    try:
+        from . import intent as _intent
+        if _intent.mode() != _intent.MODE_OFF:
+            said = _intent.line_part(answer)
+            if said:
+                pitch = _pitch_part(str(register or ""), bool(register_late))
+                judged = _judge_part(str(judge or ""))
+                effect = _mood_part(answer, effect, nudge, str(held or ""), str(intent_effect or ""),
+                                    str(intent_held or ""))
+    except Exception:  # noqa: BLE001
+        said = pitch = judged = ""
+    said += pitch
     if label == "unknown":
-        return f"not rated: {answer.get('reason') or 'no reason given'} · {effect}"
+        return f"not rated: {answer.get('reason') or 'no reason given'}{said} · {effect}{judged}"
     probs = answer.get("probs") or {}
     others = ", ".join(f"{k} {float(v) * 100:.0f}%" for k, v in sorted(probs.items(), key=lambda kv: -float(kv[1]))
                        if k != label)
@@ -531,14 +869,18 @@ def rating_line(answer: Dict[str, object], nudge: float = 0.0, held: str = "") -
         shown = (" · emotion: " + ", ".join(f"{k} {v * 100:.0f}%{_tag(k, v)}" for v, k in top)) if top \
             else " · emotion: none clear"
     return (f"{label} {float(answer.get('score') or 0) * 100:.0f}%" + (f" ({others})" if others else "") + shown
-            + f" · {effect}")
+            + said + f" · {effect}" + judged)
 
 
-def log_rating(answer: Dict[str, object], nudge: float = 0.0, held: str = "") -> None:
+def log_rating(answer: Dict[str, object], nudge: float = 0.0, held: str = "", *, intent_effect: str = "",
+               intent_held: str = "", register: str = "", judge: str = "", register_late: bool = False) -> None:
     """One line in the agent's log, with its own icon. Never raises."""
     try:
         from ..utils.logging import Icons, pretty_log
-        pretty_log("Sentiment", rating_line(answer, nudge, held), icon=Icons.SENTIMENT)
+        pretty_log("Sentiment", rating_line(answer, nudge, held, intent_effect=intent_effect,
+                                            intent_held=intent_held, register=register, judge=judge,
+                                            register_late=register_late),
+                   icon=Icons.SENTIMENT)
     except Exception as exc:  # noqa: BLE001
         logger.debug("sentiment log line skipped: %s", type(exc).__name__)
 
@@ -569,7 +911,10 @@ def health_text(*, now_fn=time.monotonic) -> Optional[str]:
     with BREAKER.lock:
         scored, moved, last_ok, last_fail = BREAKER.scored, BREAKER.moved, BREAKER.last_ok, BREAKER.last_fail
         why, paused_until = BREAKER.last_fail_why, BREAKER.paused_until
+        intents = BREAKER.intents
     text = f"sentiment service: {scored} scored since start, {moved} moved the mood"
+    if intents > 0:          # §4VE: said only once an intent reading was seen (the line is pinned without it)
+        text += f", {intents} with an intent reading"
     if now < paused_until:
         return text + f", PAUSED after failures (last: {why}, {_ago(now - last_fail)}; retries by itself)"
     if last_fail and last_fail > last_ok:
