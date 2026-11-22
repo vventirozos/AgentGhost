@@ -308,6 +308,8 @@ UNBACKED_REACHABLE = {
                   "I have been feeling lost since Kosmas moved away", I.CAUSE_CONFIDED, "acknowledge"),
     "instruction": ({"label": "positive", "emotions": {"curiosity": 0.6}}, "make the chart for Elena bigger", None,
                     "brief"),
+    "question": ({"label": "negative", "emotions": {"curiosity": 0.8}},
+                 "I don't really get how DNS works, could you explain?", None, "patient"),
 }
 #: … and each label that IS a tone, under an unbacked tone of its own side
 UNBACKED_TONE = {
@@ -441,7 +443,9 @@ def test_an_unclear_or_absent_reading_moves_nothing():
     # brief is the weakest clause (form only): never said beside another one
     ({"intent": _only("instruction"), "urgent": 0.9}, "restart the server now, asap", {}, "urgent"),
     ({"intent": _only("instruction"), "urgent": 0.9}, "restart the server", {}, "brief"),  # no hurry witness
-    ({"urgent": 0.9, "emotions": {"nervousness": 0.8}}, "the server is down", {}, "urgent"),
+    # functional run 11-21: fear is not urgency — an emotion alone is no witness, only a hurry word is
+    ({"urgent": 0.9, "emotions": {"nervousness": 0.8}}, "the server is down", {}, ""),
+    ({"urgent": 0.9, "emotions": {"nervousness": 0.8}}, "the server is down, fix it right now", {}, "urgent"),
     ({"urgent": 0.9}, "quick question about the chart", {}, ""),          # "quick" is not hurry
     ({"urgent": 0.9}, "explain quicksort", {}, ""),
     ({"intent": _only("question")}, "what time is it?", {}, ""),
@@ -543,8 +547,9 @@ def test_the_decisions_per_label_are_these():
         "greeting": None, "reply": None}                   # decided: none
     assert I.REGISTER_OUTCOMES == {
         "advice": I.REG_PATIENT, "instruction": I.REG_BRIEF, "confiding": I.REG_ACKNOWLEDGE,
-        "venting": I.REG_ACKNOWLEDGE, "banter": I.REG_JOKE, "question": None, "correcting": None, "thanks": None,
-        "greeting": None, "reply": None}                   # decided: none
+        "venting": I.REG_ACKNOWLEDGE, "banter": I.REG_JOKE, "question": I.REG_PATIENT, "correcting": None,
+        "thanks": None, "greeting": None, "reply": None}   # decided: none
+    assert I.ANSWERED_AS_SUCH == {"instruction", "question", "correcting"}
     assert I.INTENT_TONE == {
         "banter": "positive", "venting": "negative", "advice": None, "confiding": None, "instruction": None,
         "question": None, "correcting": None, "thanks": None, "greeting": None, "reply": None}
@@ -1321,3 +1326,307 @@ async def test_score_message_without_an_audience_states_no_register(svc, tmp_pat
     calls = _logged(monkeypatch)
     await C.score_message(UNSURE_PLAN, tmp_path, register_humour=None)
     assert C.journal_rows(tmp_path)[0]["register"] == "" and "pitch" not in calls[0][1]
+
+
+# ── the register's wait covers the service's own budget (operator 2026-11-21: "raise the wait") ─────────
+
+def test_the_register_wait_covers_every_answer_that_can_still_carry_an_intent():
+    # catches: REGISTER_WAIT_S dropped under the service's hard budget for the whole answer (a reading the
+    # service could still give WITH an intent would miss the reply), or raised past the request path's bound
+    # (``sentiment.READING_WAIT_S``, which caps it — a higher value would silently not be the wait)
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "interface" / "sentiment-service"))
+    import sentiment_service as SVC
+    assert SVC.INTENT_BUDGET_S < I.REGISTER_WAIT_S <= C.READING_WAIT_S
+
+
+# ── functional run 11-21: the register's witnesses against the real model's readings ──────────────────
+# (made-up messages from the functional run; the readings are the real model's, rounded)
+
+GRANDMOTHER = ("My grandmother is in hospital again and I'm scared.",
+               {"label": "negative", "score": 0.86, "emotions": {"fear": 0.89, "nervousness": 0.10}, "urgent": 0.96,
+                "intent": {**_only("confiding", 0.885), "reply": 0.46, "advice": 0.03}})
+LONELY = ("I've been feeling really lonely since the move, to be honest.",
+          {"label": "negative", "score": 0.87, "emotions": {"sadness": 0.78, "disappointment": 0.19}, "urgent": 0.06,
+           "intent": {**_only("reply", 0.91), "confiding": 0.90, "venting": 0.09}})
+GUTTED = ("I failed the exam, I'm gutted.",
+          {"label": "negative", "score": 0.93, "emotions": {"sadness": 0.81}, "urgent": 0.2,
+           "intent": {**_only("confiding", 0.7), "reply": 0.4}})
+LEASE = ("I'm worried I'm reading the lease wrong. Can you check whether I can leave early?",
+         {"label": "negative", "score": 0.71, "emotions": {"nervousness": 0.49, "curiosity": 0.36}, "urgent": 0.37,
+          "intent": {**_only("advice", 0.98), "correcting": 0.24}})
+
+
+def test_fear_is_not_urgency_and_bad_news_is_acknowledged():
+    # catches: the urgency witnessed by fear ("Answer first" for frightened personal news), and bad news under
+    # every label's floor getting no pitch at all
+    text, reading = GRANDMOTHER
+    assert I.top(reading) == ("", 0.0) and I.urgent(reading)                  # the premise: no label, urgency high
+    assert I.register(reading, audience="owner", text=text)[0] == "acknowledge"
+    for text, reading in (LONELY, GUTTED):
+        assert I.register(reading, audience="owner", text=text)[0] == "acknowledge", text
+    # register only: no new mood event (the tone already moved the mood)
+    assert I.mood_event(GRANDMOTHER[1], GRANDMOTHER[0])[0] is None
+
+
+@pytest.mark.parametrize("text,emotions,intent,want", [
+    # a task, a factual question, a correction is answered as such — never "acknowledge" from the tone alone;
+    # the instruction keeps the existing rules: urgent with a hurry word, and no "brief" with distress behind it
+    ("the server is down and I'm stressed, restart it right now", {"nervousness": 0.8}, _only("instruction"),
+     "urgent"),
+    ("the server is down and I'm stressed, restart it", {"nervousness": 0.8}, _only("instruction"), ""),
+    ("is the hospital open on Sundays?", {"fear": 0.8}, _only("question"), ""),
+    ("no, the appointment is on Tuesday", {"sadness": 0.8}, _only("correcting"), ""),
+    # annoyance AT the assistant (a cold emotion only) is not the owner's own bad news
+    ("this is the third wrong answer today", {"annoyance": 0.8}, {**_only("reply", 0.5)}, ""),
+    ("this is the third wrong answer today", {"annoyance": 0.8, "disappointment": 0.6}, {**_only("reply", 0.5)}, ""),
+])
+def test_acknowledge_from_bad_news_only_where_it_belongs(text, emotions, intent, want):
+    reading = {"label": "negative", "score": 0.9, "emotions": emotions, "intent": intent, "urgent": 0.95}
+    assert I.register(reading, audience="owner", text=text)[0] == want
+
+
+def test_acknowledge_from_bad_news_needs_a_backed_negative_tone_and_passes_the_doubt(monkeypatch):
+    text, reading = GRANDMOTHER
+    for tone in ("neutral", "positive", "unknown"):
+        assert I.register({**reading, "label": tone}, audience="owner", text=text)[0] == "", tone
+    assert I.register({**reading, "emotions": {"fear": 0.3}}, audience="owner", text=text)[0] == ""   # unbacked
+    # no intent reading (past the service's budget): no register from the tone alone — the line shows none
+    assert I.register({k: v for k, v in reading.items() if k != "intent"}, audience="owner", text=text)[0] == ""
+    # acknowledge is NOT doubt-free: a doubted tone gets no acknowledge from this route either
+    monkeypatch.setattr(C, "doubtful", lambda *a, **k: C.HELD_TASK)
+    assert I.register(reading, audience="owner", text=text)[0] == ""
+
+
+#: the unsure messages of the functional run (offline and live) — each must be read as unsure from its WORDS
+UNSURE_TEXTS = [
+    "I'm probably overthinking this, but can you look over my budget plan before I send it to Markos? Not sure if "
+    "it even makes sense.",
+    "I'm terrible at this stuff. Not sure if I should take the job offer in Thessaloniki or stay where I am. What "
+    "would you do?",
+    "Not sure if my cover letter sounds desperate. Could you tell me honestly?",
+    "I have no idea what I'm doing with this garden layout, does it look okay to you?",
+    LEASE[0],
+    "Sorry, I'm probably overthinking this and I'm honestly not great at planning. I'm not sure if my plan even "
+    "makes sense: learn basic SQL in two weeks by doing one tutorial chapter each evening, then build a tiny "
+    "expense tracker. Could you look it over?",
+    "I'm honestly not sure if I'm doing this right, I'm a bit lost with backups and probably missing something "
+    "obvious. My plan for my laptop: copy my documents folder to a USB stick every Sunday. Could you look it over?",
+    "I'm a complete beginner with vegetable beds, is this even a good idea?",
+    "I'm new to Rust, does this make sense?", "I might be wrong, but I don't know if the cron runs at all",
+    "I don't really get how DNS works, could you explain?", "am I doing it right?",
+]
+#: … and the other messages of the run: none may be read as unsure
+CALM_TEXTS = [
+    "Rename the file report_draft.txt to report_final.txt in the Kosmas project.",
+    "Add a column for the delivery date to the orders table.", "What's the capital of Australia?",
+    "How many grams of flour are in a cup?", "Is Python's sorted() function stable?",
+    "Should I refinance the mortgage now or wait until spring? What do you think?",
+    "What would you recommend for a first road bike, carbon or aluminium?",
+    "Do you think it's better to learn Rust or Go next?", "Good morning! How's it going?",
+    "sure, that works for me", "Thanks, that was exactly what I needed!", "no, that's wrong, it's 160 km",
+    "That's not what I asked. I wanted the total, not the average.", "haha you're such a nerd 😂",
+    "I finally told Markos I'm moving to Lisbon, and he took it really well",
+    "I ran my first 10k this morning, honestly I'm a bit proud of myself.",
+    "My grandmother is in hospital again and I'm scared.",
+    "Ugh, the landlord ignored my email AGAIN. I'm so fed up with him.",
+    "My neighbour's drilling has been going on since 7am, I'm losing my mind.",
+    "Urgent: the backup failed and the server is out of disk, what do I do?",
+    "great, you broke it again", "Oh wonderful, another error. Love that for me.",
+    "What would you pick for a small CLI tool, argparse or click, and why?",
+    "Here is my plan for backing up my laptop: copy the documents folder to a USB stick every Sunday and keep the "
+    "stick in a drawer at home. Please look it over and tell me what you would change.",
+    "I'm sure it works", "the image is lost", "make sure the nodes are new", "I'm confident this makes sense",
+]
+
+
+@pytest.mark.parametrize("text", UNSURE_TEXTS)
+def test_unsure_words_are_read(text):
+    assert I._UNSURE.search(C.prepare_text(text)), text
+
+
+@pytest.mark.parametrize("text", CALM_TEXTS)
+def test_other_words_are_not_read_as_unsure(text):
+    assert not I._UNSURE.search(C.prepare_text(text)), text
+
+
+def test_patient_needs_advice_or_a_question_and_unsure_words_or_emotion():
+    # catches: patient from the emotion model alone (live probe: "negative · advice", no unsure emotion → no pitch)
+    no_emotion = {"label": "negative", "score": 0.8, "emotions": {"curiosity": 0.4}}
+    assert I.register({**no_emotion, "intent": _only("advice")}, audience="owner", text=UNSURE_TEXTS[5])[0] == \
+        "patient"
+    assert I.register({**no_emotion, "intent": _only("advice")}, audience="owner", text=CALM_TEXTS[-5])[0] == ""
+    unsure_emotion = {"label": "neutral", "score": 0.8, "emotions": {"confusion": 0.8}}
+    assert I.register({**unsure_emotion, "intent": _only("advice")}, audience="owner",
+                      text=CALM_TEXTS[5])[0] == "patient"
+    # a question: the WORDS only — confusion is the emotion model's ordinary reading of any question
+    assert I.register({**no_emotion, "intent": _only("question")}, audience="owner",
+                      text="I don't really get how DNS works, could you explain?")[0] == "patient"
+    assert I.register({**unsure_emotion, "intent": _only("question")}, audience="owner",
+                      text="What's the capital of Australia?")[0] == ""
+    # the unsure words with any other label: nothing
+    for lab in ("instruction", "greeting", "correcting"):
+        assert "patient" not in I.register({**no_emotion, "intent": _only(lab)}, audience="owner",
+                                           text="I'm not sure, rename the file")[0].split("+"), lab
+
+
+def test_the_lease_message_gets_patience_from_its_words():
+    text, reading = LEASE
+    assert not I._felt(reading, I._UNSURE_EMOTIONS)                           # nervousness 0.49: under the bar
+    assert I.register(reading, audience="owner", text=text)[0] == "patient"
+
+
+def test_the_unsure_words_run_in_linear_time():
+    import time
+    for adv in ("i'm " * 25000, "not " * 25000, "i don't " * 12500, "i'm so " * 14000, "a" * 100000,
+                "doing this " * 9000, "my plan " * 12000):
+        t0 = time.perf_counter()
+        I._UNSURE.search(adv[:100000])
+        I._HURRY.search(adv[:100000])
+        assert time.perf_counter() - t0 < 0.5, adv[:20]
+
+
+# ── review 11-21: combining, negated hurry words, laughing bad news, unsure false matches ──────────────
+
+#: every SET of clauses ``register`` may return (module head, COMBINING) — a new co-occurrence fails the pin below
+ALLOWED_CLAUSE_SETS = {
+    (), ("urgent",), ("patient",), ("acknowledge",), ("joke",), ("brief",),
+    ("urgent", "patient"),            # "answer first, then explain"
+    ("urgent", "joke"),               # the joke after the answer
+    ("patient", "acknowledge"),       # acknowledge the worry, then explain patiently
+}
+
+
+def test_the_clause_sets_that_can_occur_are_these():
+    # catches: "answer first" beside "acknowledge it before anything else" (the old register offered both, from
+    # the confiding clause and from the bad-news route), "brief" beside another clause, and any NEW pair a later
+    # change makes possible without this table (and the module head's COMBINING) being looked at. It also fails
+    # when an allowed set becomes unreachable, so the space below really reaches every one
+    import itertools
+    intents = [None, {k: 0.05 for k in I.LABELS}] + [_only(lab) for lab in I.LABELS]
+    emos = [None, {}, {"sadness": 0.8}, {"embarrassment": 0.7}, {"nervousness": 0.8}, {"confusion": 0.8},
+            {"amusement": 0.8}, {"annoyance": 0.8}, {"sadness": 0.8, "confusion": 0.8}]
+    texts = ["".join(p) for p in itertools.product(
+        ["the report for Elena", "great, you broke it again"], ["", " asap"], ["", " I'm not sure if it works"],
+        ["", " lol"], ["", "?"])]
+    seen = set()
+    for intent, tone, emo, text, urg, trouble, aud in itertools.product(
+            intents, ["positive", "negative", "neutral", None], emos, texts, [None, 0.9], [False, True],
+            ["owner", "others", "public"]):
+        r = {k: v for k, v in (("intent", intent), ("label", tone), ("emotions", emo), ("urgent", urg))
+             if v is not None}
+        key, line = I.register(r, audience=aud, text=text, after_trouble=trouble)
+        got = tuple(key.split("+")) if key else ()
+        assert got in ALLOWED_CLAUSE_SETS, (got, r, text)
+        seen.add(got)
+    assert seen == ALLOWED_CLAUSE_SETS
+
+
+def test_answer_first_wins_over_acknowledge():
+    # catches: acknowledge added beside urgent from either route — the confiding clause or the owner's own bad news
+    hurried = "My grandmother is in hospital again and I'm scared, please answer right now."
+    confiding = {**GRANDMOTHER[1], "intent": _only("confiding")}
+    for reading in (GRANDMOTHER[1], confiding):
+        assert I.register(reading, audience="owner", text=hurried)[0] == "urgent"
+        # the control: without the hurry word the same message is acknowledged
+        assert I.register(reading, audience="owner", text=GRANDMOTHER[0])[0] == "acknowledge"
+    assert not I._admits([I.REG_URGENT], I.REG_ACKNOWLEDGE) and not I._admits([I.REG_ACKNOWLEDGE], I.REG_URGENT)
+    assert I._admits([I.REG_URGENT], I.REG_PATIENT) and not I._admits([I.REG_PATIENT], I.REG_BRIEF)
+
+
+#: a hurry word that does not ask for speed: negated in its own clause, telling what happened, or a noun phrase
+NOT_HURRIED = [
+    "no hurry, look at Elena's draft when you can",                      # ("rush" is no hurry word at all)
+    "not urgent, but could you check the backup log?", "nothing urgent, just curious about the cron",
+    "this isn't an emergency, but the fan is loud", "whenever, nothing urgent", "there's no need to hurry",
+    "I'm not in a hurry", "the script failed immediately", "it crashed immediately after the update",
+    "the job exited immediately with code 1", "the call returned immediately", "it crashed almost immediately",
+    "how much should go in an emergency fund?", "update Kosmas as my emergency contact",
+    "where is the emergency exit on the plan?", "the emergency brake light is on", "is urgent care open on Sunday?",
+]
+#: … and the real hurry words, which keep the clause
+HURRIED = [
+    "need this asap", "right now please", "URGENT: prod is down", "hurry", "it's an emergency",
+    "please fix it immediately", "No, do it right now", "I need it stopped immediately", "restart it now!",
+    "it's urgent, the build for Markos is broken",
+]
+
+
+@pytest.mark.parametrize("text", NOT_HURRIED)
+def test_a_negated_or_descriptive_hurry_word_is_no_urgency(text):
+    # catches: the bare ``_HURRY`` search as the witness (every one of these matched it): "no hurry" made the reply
+    # "answer first" and, beside it, took away the acknowledge a sad message would get
+    reading = {"urgent": 0.95, "label": "neutral", "emotions": {}}
+    assert I._HURRY.search(C.prepare_text(text))                              # the premise: the word is there
+    assert I.register(reading, audience="owner", text=C.prepare_text(text)) == ("", ""), text
+
+
+@pytest.mark.parametrize("text", HURRIED)
+def test_a_real_hurry_word_still_makes_the_message_urgent(text):
+    # catches: a negation or sense filter so broad it removes the clause (a comma before "do it right now", "need
+    # it stopped immediately" read as a description)
+    reading = {"urgent": 0.95, "label": "neutral", "emotions": {}}
+    assert I.register(reading, audience="owner", text=C.prepare_text(text))[0] == "urgent", text
+    assert I.register({**reading, "urgent": 0.5}, audience="owner", text=C.prepare_text(text)) == ("", "")
+
+
+def test_the_hurry_read_runs_in_linear_time():
+    # catches: a negation look-behind that re-reads the text before every hurry word (quadratic on "not urgent "
+    # repeated), or a nested repetition in a pattern
+    import time
+    for adv in (" " * 100000, "no " * 33334, "not urgent " * 9091, "a" * 100000, "failed immediately " * 5264,
+                "isn't " * 16667 + "urgent", "emergency " * 10000, "now!" * 25000, "," + " " * 99999):
+        t0 = time.perf_counter()
+        I._hurried(adv[:100000])
+        I._UNSURE.search(adv[:100000])
+        assert time.perf_counter() - t0 < 0.5, adv[:20]
+
+
+def test_a_laughing_message_is_not_bad_news():
+    # catches: the bad-news route on self-deprecating humour — "lol I totally embarrassed myself" got the joke
+    # refused (negative tone) AND "acknowledge it" added
+    lol = "lol I totally embarrassed myself at standup today"
+    for intent in (_only("banter", 0.5), _only("confiding", 0.6), _only("reply")):       # no label, or banter
+        reading = {"label": "negative", "score": 0.8, "emotions": {"embarrassment": 0.7}, "intent": intent}
+        assert I.register(reading, audience="owner", text=lol)[0] == "", intent
+        # an amused emotion is a laugh too, without the word
+        amused = {**reading, "emotions": {"embarrassment": 0.7, "amusement": 0.6}}
+        assert I.register(amused, audience="owner", text=lol[4:])[0] == "", intent
+        # the other side: no laugh and sadness — the owner's own bad news is acknowledged
+        sad = {**reading, "emotions": {"sadness": 0.8}}
+        assert I.register(sad, audience="owner", text="I totally embarrassed myself at standup today")[0] == \
+            "acknowledge", intent
+    # joy beside sadness is bittersweet, not a laugh: still acknowledged
+    bitter = {"label": "negative", "emotions": {"sadness": 0.8, "joy": 0.6}, "intent": _only("reply")}
+    assert I.register(bitter, audience="owner", text="my last day at the old job with Elena")[0] == "acknowledge"
+
+
+#: words the old unsure pattern read, that are not the owner being unsure
+NOT_UNSURE = [
+    "the user said 'not sure' in the ticket, how should I answer her?", "I'm afraid I can't let you do that",
+    "I'm lost in thought about the trip", "I don't get paid enough for this, what should I ask Markos for?",
+    "No idea is too small for the brainstorm, what should we start with?", "I'm doing it right now, what next?",
+]
+#: … and the unsure messages the pattern was built from, which it must still read
+STILL_UNSURE = [
+    "I'm not sure if tomatoes next to the fennel is a good idea", "Not sure if my cover letter sounds desperate",
+    "I'm worried I'm reading the lease wrong", "I'm a complete beginner with vegetable beds",
+    "I'm probably overthinking this", "I'm hopeless at spreadsheets — does this formula even make sense?",
+    "I don't really get how DNS works, could you explain?", "I'm a bit lost with backups", "I'm totally lost.",
+    "I have no idea what I'm doing", "no idea how the cron works", "I don't get it", "I'm not sure.",
+]
+
+
+@pytest.mark.parametrize("text", NOT_UNSURE)
+def test_unsure_words_need_the_owner_as_the_one_unsure(text):
+    # catches: the old loose pattern — a bare "not sure" (a quote), "afraid", "lost", "no idea", "get", "right"
+    reading = {"label": "neutral", "emotions": {"curiosity": 0.4}, "intent": _only("advice")}
+    assert not I._UNSURE.search(C.prepare_text(text)), text
+    assert I.register(reading, audience="owner", text=C.prepare_text(text))[0] == "", text
+
+
+@pytest.mark.parametrize("text", STILL_UNSURE)
+def test_the_real_unsure_messages_are_still_read(text):
+    # catches: a tightening that loses the messages the clause was built for
+    assert I._UNSURE.search(C.prepare_text(text)), text

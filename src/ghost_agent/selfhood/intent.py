@@ -39,6 +39,31 @@ A fuzzy classifier is a witness, never the only gate: after
 classifier plus the FORM of the message only (advice: a question; brief: not a question) — so they carry the
 weakest effects (``EV_ASKED`` is the smallest event; "brief" is never said beside another clause).
 
+The register's clauses and their second witnesses (functional run 11-21 against the real model):
+
+* urgent — the urgency score at ``URGENT_MIN`` AND a hurry WORD (``_hurried``: ``_HURRY``, skipping one that
+  is negated in its own clause — "no hurry", "not urgent", "isn't an emergency" — and the cheap non-request
+  senses: "failed / crashed / returned immediately" telling what happened, "emergency fund / contact / exit",
+  "urgent care"); an emotion is no witness (fear is not urgency: the score is high on emotional messages in
+  general). Doubt-free.
+* patient — top label advice AND (an unsure emotion OR unsure / self-deprecating words, ``_UNSURE``); top label
+  question AND the words only (confusion is the emotion model's ordinary reading of any question). Doubt-free.
+* acknowledge — top label confiding or venting with something unhappy behind it (``_unhappy``); OR, whatever
+  the label except one answered as such (``ANSWERED_AS_SUCH``: instruction, question, correcting) and with no
+  label at all (but with an intent reading), the tone itself reading the owner's OWN bad news
+  (``_own_bad_news``: negative, backed, by an unhappy emotion not aimed at the assistant) in a message that does
+  not laugh (``_LAUGH`` or an amused emotion: "lol I totally embarrassed myself" is self-deprecating humour, not
+  bad news). Register only — no mood event. Refused under doubt.
+* joke — top label banter with a laugh in the words or an amused emotion, and the owner's humour dial above −1.
+  Refused under doubt.
+* brief — top label instruction, not a question, no distress; never beside another clause. Doubt-free.
+
+COMBINING (``register``, the one place clauses are put together, ``_admits``): "brief" is never said beside
+another clause; and "acknowledge it before anything else" is never said beside "answer first, then anything
+else" — one reply cannot do both first, and the owner asked for speed in words, so "answer first" wins. The sets
+that can occur: none, each clause alone, urgent+patient ("answer first, then explain"), urgent+joke (the joke
+after the answer), patient+acknowledge (acknowledge the worry, then explain patiently).
+
 Labels come from the 11-20 measurement (``LABELS``, ``LABEL_MIN``): everything takes them from there, and a
 label the service sends that is not there drops the whole intent field. The scores are INDEPENDENT (not a
 softmax); the top label counts only at its own floor (``top``), and a top label below it is no reading — the
@@ -98,10 +123,13 @@ LABEL_MIN: Dict[str, Optional[float]] = {
     "reply": NEVER, "thanks": NEVER}
 #: unmeasured (no urgent message in the 166)
 URGENT_MIN = 0.7
-#: how long the reply waits for the reading before its first state block (the request path). Measured 11-20: the
-#: intent model takes ~620 ms median and ~980 ms at the 90th percentile ON TOP of the sentiment and emotion
-#: models — 0.8 s would miss most readings; 1.5 s covers the 90th percentile with the other two models' time
-REGISTER_WAIT_S = 1.5
+#: how long the reply waits for the reading before its first state block (the request path, which bounds it by
+#: ``sentiment.READING_WAIT_S``, 3.0 s). Measured on the real service after deploy (2026-11-21, 4 threads,
+#: ``max_tokens`` 64): short messages answer in about 0.4–0.5 s, a 139-word request took 1.6 s end to end. The
+#: service's own hard budget for the whole answer is 2.0 s (``INTENT_BUDGET_S`` in
+#: ``interface/sentiment-service/sentiment_service.py``), so 2.2 s covers every answer that can still carry an
+#: intent reading plus the network hop — anything later would have come back without one anyway
+REGISTER_WAIT_S = 2.2
 
 #: the mood events (operator decision 5: banter through the tone path and its caps, no cap raised). Advice is
 #: the SMALLEST: its second witness is only the form of the message (a question) — see THE RULE above
@@ -160,7 +188,11 @@ CLAUSES = {
 #: what each label may add to the register (None: nothing); every label has an entry (a test enumerates it)
 REGISTER_OUTCOMES: Dict[str, Optional[str]] = {
     "advice": REG_PATIENT, "instruction": REG_BRIEF, "confiding": REG_ACKNOWLEDGE, "venting": REG_ACKNOWLEDGE,
-    "banter": REG_JOKE, "question": None, "correcting": None, "thanks": None, "greeting": None, "reply": None}
+    "banter": REG_JOKE, "question": REG_PATIENT, "correcting": None, "thanks": None, "greeting": None,
+    "reply": None}
+#: functional run 11-21: the labels whose message is answered AS SUCH — a task, a factual question, a correction —
+#: and never gets "acknowledge it" from the owner's own bad news alone (``_own_bad_news``)
+ANSWERED_AS_SUCH = frozenset(("instruction", "question", "correcting"))
 #: THE RULE: the clauses that cannot offend when the reading is wrong — they skip the doubt. Only clauses that are
 #: not a tone label's may be here (a tone label's refusal is about whether the feeling is there at all). "answer
 #: first, then anything else" is here: putting the answer first costs nothing to a sarcastic owner either. Every
@@ -179,14 +211,104 @@ _LAUGH = re.compile(
     r"(?:\b(?:l+o+l+z?|lmf?ao+|rofl|ha(?:ha)+h?|he(?:he)+|jk|j/k)\b|χα(?:χα)+|"
     r"[😂🤣😄😆😅😜😉😛😝😁]|(?:^|\s)[:;]-?[)DPp](?=\s|$))", re.IGNORECASE)
 _LAUGH_EMOTIONS = frozenset(("amusement", "joy"))
+#: review 11-21: the emotion that says a negative message LAUGHS at itself (the bad-news route's exception) — only
+#: amusement: joy beside sadness is a bittersweet message, still worth acknowledging
+_AMUSED_EMOTIONS = frozenset(("amusement",))
 _ASK_EMOTIONS = frozenset(("curiosity", "confusion"))
 _UNSURE_EMOTIONS = frozenset(("confusion", "nervousness"))
-_HURRY_EMOTIONS = frozenset(("nervousness", "fear"))
+#: the owner's OWN bad news (functional run 11-21): the unhappy emotions that are not aimed at the assistant —
+#: ``mood.SENTIMENT_UNHAPPY`` minus ``mood.SENTIMENT_COLD`` (sadness, grief, fear, nervousness, remorse, …)
+_OWN_BAD_NEWS = M.SENTIMENT_UNHAPPY - M.SENTIMENT_COLD
+_AP = "['\u2019]"
+#: unsureness and self-deprecation in the owner's own words (functional run 11-21: "patient" came only when the
+#: emotion model happened to read confusion). English, whole words, no nested repetition (linear time). Review
+#: 11-21: the phrases that need the owner as the one unsure say so — "I'm not sure", "not sure if …" opening a
+#: clause, "I have no idea", "I don't get it / how …" — so a quoted "not sure", "No idea is too small", "I don't
+#: get paid enough" are not read; "afraid" only before "I'm / I am / I might / I may" ("I'm afraid I can't" is a
+#: polite formula); "lost" only as the end of the thought or before with/on/about/here ("lost in thought" is
+#: not); "doing it right" not before now/away/… ("doing it right now")
+_CLAUSE_START = "(?:^|[.!?,;:\n—–(]\\s{0,3})"
+_UNSURE = re.compile(
+    rf"\bi(?:{_AP}?m| am) (?:really |honestly |just |still |genuinely )?"
+    r"not (?:really |entirely |quite |totally |even |completely )?sure\b"
+    rf"|{_CLAUSE_START}not (?:really |entirely |quite |totally |even )?sure "
+    r"(?:if|whether|how|what|about|why|where|when|which|that|i)\b"
+    rf"|\bi(?:{_AP}?ve| have| had)?(?: got)? (?:no|zero) (?:idea|clue)\b"
+    rf"|{_CLAUSE_START}no (?:idea|clue) (?:how|what|why|if|whether|where|which|when)\b"
+    rf"|\bi (?:don{_AP}?t|do not) (?:really |quite |even )?(?:know (?:if|whether|how|what|where)|"
+    r"get (?:it|this|that|how|why|what|where|which|any of)|understand)\b"
+    r"|\bdoing (?:this|it|that|things|everything) (?:right|wrong|correctly)\b"
+    r"(?! (?:now|away|after|before|then|here|there)\b)"
+    r"|\b(?:does|do|would) (?:this|it|that|any of this|my \w+) (?:even |really )?make sense\b"
+    r"|\bif (?:this|it|that|my \w+) (?:even |really )?makes? sense\b"
+    rf"|\bi{_AP}?m (?:so |really |just |honestly |a bit |kind of |pretty |completely |totally )?"
+    r"(?:hopeless|terrible|useless|awful|clueless|not (?:great|good)|confused|"
+    r"lost(?= (?:with|on|about|here)\b|\s?(?:[.!?,;:—–]|$)))\b"
+    rf"|\bi{_AP}?m (?:a |an )?(?:complete |total |absolute )?(?:beginner|newbie|novice|noob)\b"
+    rf"|\bi{_AP}?m (?:\w+ )?new to\b"
+    r"|\bi (?:might|may|could) be (?:wrong|missing something)\b"
+    r"|\b(?:probably |totally )?over-?thinking\b"
+    r"|\bprobably missing something\b"
+    r"|\bis (?:this|it|that) (?:even |really )?a good idea\b"
+    rf"|\bi{_AP}?m worried (?:that )?i(?:{_AP}?m| am| might| may| did| have|{_AP}?ve)?\b"
+    rf"|\bi{_AP}?m afraid (?:that )?i(?:{_AP}?m| am| might| may)\b",
+    re.IGNORECASE)
 #: the owner as the SUBJECT ("I", "I'm", "me") — a possessive alone ("send my report") is an instruction's
 _FIRST_PERSON = re.compile(r"\b(?:i|i'm|im|i've|i'd|i'll|me|myself)\b", re.IGNORECASE)
 #: hurry in the words — whole words only ("quick question", "quicksort", "nowhere" are not hurry)
 _HURRY = re.compile(r"\b(?:asap|urgent|urgently|immediately|right now|right away|hurry|emergency)\b|\bnow!+",
                     re.IGNORECASE)
+#: review 11-21 (``_hurried``): a negator among the last ``_NEGATION_WORDS`` words before a hurry word, in its own
+#: clause ("no hurry", "not urgent", "nothing urgent", "this isn't an emergency", "no need to hurry")
+_NEGATION_WORDS = 3
+_NEGATOR = re.compile(rf"^(?:(?:no|not|nothing|never|none|nobody)(?:{_AP}s)?|without|isnt|arent|wasnt|dont|"
+                      rf"doesnt|didnt|cant|wont|aint|\w+n{_AP}t)$", re.IGNORECASE)
+#: … the clause ends at punctuation ("No, do it right now" is urgent)
+_CLAUSE_END = re.compile(r"[.!?,;:\n—–()\[\]]")
+#: … "immediately" telling what HAPPENED, within the two words before it ("it failed immediately", "crashed
+#: almost immediately") — past or third-person forms only, so "fix it immediately" stays a request …
+_HAPPENED = re.compile(
+    r"^(?:failed|fails|failing|crashed|crashes|crashing|exited|exits|exiting|returned|returns|returning|stopped|"
+    r"stops|died|dies|quit|quits|closed|closes|errored|errors|aborted|aborts|disconnected|disconnects|timed|"
+    r"froze|freezes|hung|hangs|broke|breaks|ran|terminated|vanished|disappeared|bounced|segfaulted|panicked|"
+    r"happened|started|finished|ended|appeared|jammed|stalled|rebooted|restarted|rejected|refused|replied|"
+    r"responded|answered|dropped)$", re.IGNORECASE)
+#: … unless the clause asks for it ("I need it stopped immediately", "please have it returned immediately")
+_ASKS = re.compile(r"^(?:need|needs|want|wants|please|pls|plz|get|must|should|have)$", re.IGNORECASE)
+#: … and the noun phrases that name a thing, not a hurry ("emergency fund", "emergency exit"; "urgent care")
+_EMERGENCY_NOUN = re.compile(
+    r"\s(?:funds?|contacts?|exits?|brakes?|numbers?|kits?|rooms?|services|savings|lights?|lighting|vehicles?|"
+    r"stops?|landing|powers?|supply|supplies|plans?|blankets?)\b", re.IGNORECASE)
+_URGENT_NOUN = re.compile(r"\scare\b", re.IGNORECASE)
+#: how far back a negator or a "happened" verb is looked for (characters; bounded, so the whole read is linear)
+_HURRY_LOOKBACK = 60
+
+
+def _hurried(text: str) -> bool:
+    """Is there a hurry WORD (``_HURRY``) that asks for speed — not negated in its own clause (a negator among the
+    last ``_NEGATION_WORDS`` words before it), not "immediately" after a verb telling what happened, not the
+    first word of a noun phrase ("emergency fund", "urgent care")? Each look is bounded, so linear time."""
+    text = text or ""
+    for m in _HURRY.finditer(text):
+        before = text[max(0, m.start() - _HURRY_LOOKBACK):m.start()]
+        cut = None
+        for cut in _CLAUSE_END.finditer(before):
+            pass
+        if cut is not None:
+            before = before[cut.end():]
+        words = [w.strip("'\"’“”*_") for w in before.split()]
+        if any(_NEGATOR.match(w) for w in words[-_NEGATION_WORDS:]):
+            continue
+        word = m.group(0).lower()
+        if word == "immediately" and any(_HAPPENED.match(w) for w in words[-2:]) and not any(
+                _ASKS.match(w) for w in words):
+            continue
+        if word == "emergency" and _EMERGENCY_NOUN.match(text, m.end(), m.end() + 20):
+            continue
+        if word == "urgent" and _URGENT_NOUN.match(text, m.end(), m.end() + 20):
+            continue
+        return True
+    return False
 
 
 def _env_on(name: str, default: bool) -> bool:
@@ -426,7 +548,12 @@ def _clause(lab: str, reading, text: str, after_trouble: bool, audience: str, hu
     if not _past_doubt(key, reading, lab, text, after_trouble):
         return ""
     if key == REG_PATIENT:
-        return key if _felt(reading, _UNSURE_EMOTIONS) else ""
+        # functional run 11-21: the owner's unsure WORDS witness it as well as an unsure emotion; for a question
+        # only the words (confusion is the emotion model's ordinary reading of any question)
+        worded = bool(_UNSURE.search(text or ""))
+        if lab == "question":
+            return key if worded else ""
+        return key if worded or _felt(reading, _UNSURE_EMOTIONS) else ""
     if key == REG_BRIEF:
         # the classifier plus the FORM only (not a question), and no distress behind it — the weakest clause:
         # never said beside another one (``register``)
@@ -445,6 +572,36 @@ def _clause(lab: str, reading, text: str, after_trouble: bool, audience: str, hu
     return ""
 
 
+def _own_bad_news(reading) -> bool:
+    """The tone itself reads the owner's own bad news: negative and BACKED (``mood.sentiment_backing``, the
+    existing rule) by an emotion of ``_OWN_BAD_NEWS`` at ``mood.SENTIMENT_EMOTION_MIN`` — annoyance at the
+    assistant (``SENTIMENT_COLD``) alone is not it. Register only: the tone already moved the mood."""
+    return (isinstance(reading, dict) and reading.get("label") == "negative"
+            and M.sentiment_backing("negative", reading.get("emotions")) is True and _felt(reading, _OWN_BAD_NEWS))
+
+
+def _laughs(reading, text: str) -> bool:
+    """Does the message laugh — ``_LAUGH`` in the words or an amused emotion (``_AMUSED_EMOTIONS``) at
+    ``mood.SENTIMENT_EMOTION_MIN``? The bad-news route's exception (self-deprecating humour is not bad news)."""
+    return bool(_LAUGH.search(text or "")) or _felt(reading, _AMUSED_EMOTIONS)
+
+
+#: COMBINING (module head): the clauses never said beside each other, as pairs — "brief" beside anything is
+#: handled in ``_admits`` itself
+NEVER_BESIDE = frozenset((frozenset((REG_URGENT, REG_ACKNOWLEDGE)),))
+
+
+def _admits(keys, k: str) -> bool:
+    """COMBINING, the one rule (module head): may clause ``k`` join ``keys``? Not a repeat; "brief" never beside
+    another clause (either way round); never a pair of ``NEVER_BESIDE`` ("answer first" and "acknowledge it
+    before anything else": the first one in wins, and the urgent clause is always considered first)."""
+    if not k or k in keys:
+        return False
+    if keys and (k == REG_BRIEF or REG_BRIEF in keys):
+        return False
+    return not any(frozenset((k, other)) in NEVER_BESIDE for other in keys)
+
+
 def register(reading, *, audience: str, humour: Optional[int] = None, text: str = "",
              after_trouble: bool = False) -> Tuple[str, str]:
     """``(key, line)`` — how to pitch the reply to this message (see the module's head for the arguments), or
@@ -453,14 +610,23 @@ def register(reading, *, audience: str, humour: Optional[int] = None, text: str 
         if audience not in AUDIENCES or not isinstance(reading, dict):
             return "", ""
         keys = []
-        if urgent(reading) and (_HURRY.search(text or "") or _felt(reading, _HURRY_EMOTIONS)) and _past_doubt(
+        # functional run 11-21: fear is not urgency — the urgency score is high on emotional messages in general,
+        # so only a hurry WORD witnesses it (review 11-21: one that is not negated, not a description)
+        if urgent(reading) and _hurried(text or "") and _past_doubt(
                 REG_URGENT, reading, "", text, bool(after_trouble)):
             keys.append(REG_URGENT)
         lab, _p = top(reading)
         if lab:
             k = _clause(lab, reading, text, bool(after_trouble), audience, humour)
-            if k and not (k == REG_BRIEF and keys):
+            if _admits(keys, k):
                 keys.append(k)
+        # … and from the tone, when the message carries an intent reading (an answer without one — past the
+        # service's budget, the head off — gets no register from the tone alone, as before), and the message
+        # does not laugh (review 11-21: "lol I totally embarrassed myself" is humour, not bad news)
+        if _admits(keys, REG_ACKNOWLEDGE) and lab not in ANSWERED_AS_SUCH and _intent_of(reading) is not None \
+                and _own_bad_news(reading) and not _laughs(reading, text) and _past_doubt(
+                REG_ACKNOWLEDGE, reading, "", text, bool(after_trouble)):
+            keys.append(REG_ACKNOWLEDGE)
         if not keys:
             return "", ""
         said = "; ".join(CLAUSES[k] for k in keys)

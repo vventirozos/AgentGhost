@@ -170,6 +170,51 @@ def _count_evidence(rec: Dict[str, object], kind: str, cause: str, dp: float, ev
             rec["own"][name] = int(rec["own"].get(name, 0)) + n
 
 
+def _warm_routes(label, text) -> Tuple[bool, bool]:
+    """§4VE functional run 11-21 (the real service: "great, you broke it again" → sentiment NEGATIVE 0.72, emotion
+    admiration 0.93 — the emotion model takes "great" at face value): which routes may make a message WARM, as
+    (a warm emotion, thanks — gratitude felt or the praise check on the words). THE RULE, on both warmth scales:
+
+    =================  ================  =================
+    tone label         trouble not gone  routes open
+    =================  ================  =================
+    negative           yes               neither
+    negative           no                thanks
+    positive/neutral   yes               thanks
+    positive/neutral   no                both
+    =================  ================  =================
+
+    * words about trouble that is not gone (``sentiment._TROUBLE_WORDS`` without ``sentiment._RESOLVED``: the
+      test ``sentiment.doubtful`` holds an upbeat score by) — no warm emotion, whatever the tone label says
+      ("Oh wonderful, another error. Love that for me." read as admiration): a warm-sounding emotion on a message
+      about trouble may be a complaint the emotion model took at face value;
+    * … and under a NEGATIVE tone label no thanks either ("great, you broke it again" read as negative with
+      admiration: the tone says complaint);
+    * trouble under a positive or neutral tone — thanks still count ("thank you for catching that bug!", "you
+      saved me from a huge mess, thank you!!"): the owner is a programmer talking to a coding agent, bugs and
+      errors are the subject matter, not a sign of sarcasm (independent review 11-21);
+    * a NEGATIVE tone label alone — no warm emotion (the tone and the emotion disagree: "hehe you'd make a
+      terrible weatherman"), but thanks still count ("I'm so sad but thank you for staying with me": gratitude is
+      said to someone, the sadness is the owner's own);
+    * otherwise both.
+
+    ACCEPTED COST: praise of the work that mentions trouble and carries admiration but no thanks ("great
+    debugging, the error was subtle", "I love how you handled that error message design") is NOT warm. KNOWN LEAK:
+    sarcastic thanks about trouble under a positive or neutral tone ("thanks for breaking the build again") are
+    open here; they are stopped only where the live path held the row as possible sarcasm (``held`` /
+    ``intent_held``, read by both callers) and, on the intent scale, where ``intent.refusal`` doubts a positive
+    tone label — not on the old scale for a positive score under the mood's gate, nor on either scale for a
+    neutral one.
+
+    Never what makes a message ANNOYED (a cold emotion counts as before), and never a confiding (the owner telling
+    of their own trouble is confiding). Pure."""
+    from .sentiment import _RESOLVED, _TROUBLE_WORDS
+    t = str(text or "")
+    if _TROUBLE_WORDS.search(t) and not _RESOLVED.search(t):
+        return False, label != "negative"
+    return label != "negative", True
+
+
 def owner_tones(home, day: datetime.date, *, tz=None) -> Tuple[int, int, int, int]:
     """(rated, warm, cold, thanks): the owner's messages of mood day ``day`` that the emotion model read, how many
     of them sounded warm / annoyed (a label of ``sentiment.WARM_EMOTIONS`` / ``COLD_EMOTIONS`` at
@@ -177,8 +222,12 @@ def owner_tones(home, day: datetime.date, *, tz=None) -> Tuple[int, int, int, in
     so the thanks the model did NOT read (Greek, a miss) can be told from the ones it did. Rows without emotions
     (before §4UH-warmth, the service without its emotion model, a message that was not English) are not counted.
     A rating held as the wording of a task is not counted; one held as possible sarcasm counts as read and for
-    its annoyance only (review: "great, you broke it again" is annoyed, not warm). Reads the rotated journal
-    (``.1``) too. (0, 0, 0, 0) when unreadable."""
+    its annoyance only (review: "great, you broke it again" is annoyed, not warm). §4VE functional run 11-21: a
+    message is warm only by the routes ``_warm_routes`` leaves open — the real service read "great, you broke it
+    again" as NEGATIVE with admiration 0.93, which nothing held, and it was counted warm. Days closed from then on
+    count without those false-warm messages; days closed before are not rewritten, so the old scale's norm moves
+    from the old count to the new over its 21 days (it only ever loses warm messages that were not warm). Reads
+    the rotated journal (``.1``) too. (0, 0, 0, 0) when unreadable."""
     from .sentiment import COLD_EMOTIONS, EMOTION_COUNT_MIN, HELD_SARCASM, HELD_TASK, JOURNAL_FILENAME, WARM_EMOTIONS
     if not home:
         return 0, 0, 0, 0
@@ -200,9 +249,11 @@ def owner_tones(home, day: datetime.date, *, tz=None) -> Tuple[int, int, int, in
                        and emo[k] >= EMOTION_COUNT_MIN for k in names)
         rated += 1
         cold += 1 if felt(COLD_EMOTIONS) else 0
-        if held != HELD_SARCASM and felt(WARM_EMOTIONS):
+        feeling, thanked = _warm_routes(r.get("label"), r.get("text"))
+        grateful = thanked and felt(("gratitude",))
+        if held != HELD_SARCASM and (grateful or (feeling and felt(WARM_EMOTIONS))):
             warm += 1
-            thanks += 1 if felt(("gratitude",)) else 0
+            thanks += 1 if grateful else 0
     return rated, warm, cold, thanks
 
 
@@ -233,8 +284,12 @@ TALK_NO_SIGNAL_INTENTS = ("advice", "instruction", "question", "greeting", "repl
 #: to this number: it fails when they change and the number does not.
 #: 1 = the ten-label rules of the §4VE measurement (independent per-label scores, each label at its own floor —
 #: ``intent.counted``), refusal by ``intent.refusal`` alone plus the live path's doubt, the words-only counts and
-#: ``talk_readable`` (review r2/r3: the messages the service could read for intent), the first that ships
-TALK_COUNT_VERSION = 1
+#: ``talk_readable`` (review r2/r3: the messages the service could read for intent) — shipped 2026-11-21;
+#: 2 = §4VE functional run 11-21: warm only by the routes ``_warm_routes`` leaves open (no warm emotion under a
+#: negative tone label or about trouble that is not gone; no thanks about trouble that is not gone under a negative
+#: tone label — thanks about trouble under a positive or neutral one count) — "great, you broke it again" was warm.
+#: The thanks part was refined by the independent review the same day, before version 2 shipped: still 2
+TALK_COUNT_VERSION = 2
 #: §4VE review r3: the sentiment labels of a message the service read (``sentiment.LABELS`` less "unknown": the
 #: language gate's refusal, which never carries an intent reading)
 _READABLE = ("positive", "negative", "neutral")
@@ -264,7 +319,9 @@ def owner_intents(home, day: datetime.date, *, tz=None) -> Optional[Dict[str, ob
     * ``talk_warm`` — of ``talk_read``, each message ONCE when it was thanks or praise (the praise check on the
       words, ``mood.has_praise``, or gratitude felt — the intent model's "thanks" is never accepted), confided in
       the agent (the confiding mood event: the live path's verdict, ``intent_effect``, on a row that has it), or
-      carried a warm emotion — never on a laugh's emotion alone when the message is counted as a joke;
+      carried a warm emotion — never on a laugh's emotion alone when the message is counted as a joke, and the
+      thanks and the warm emotion only as ``_warm_routes`` allows (no warm emotion about trouble that is not gone
+      or under a negative tone label; no thanks about such trouble under a negative tone label);
     * ``talk_thanks`` — of the warm ones, those that were thanks or praise;
     * ``talk_cold`` — of ``talk_read``, the messages that sounded annoyed (a cold emotion felt) — a refused
       message keeps its annoyance;
@@ -346,7 +403,8 @@ def owner_intents(home, day: datetime.date, *, tz=None) -> Optional[Dict[str, ob
             if held in doubts or str(r.get("intent_held") or "") in doubts:
                 continue
             words = {"label": r.get("label"), **got}           # the reading without the emotion model
-            thanks_w = M.has_praise(text)
+            feeling, thanked = _warm_routes(r.get("label"), text)
+            thanks_w = thanked and M.has_praise(text)
             joke_w, confided_w = _talk_events(I, words, lab, text)
             if not I.refusal(words, lab, text):
                 out["talk_warm_words"] += 1 if (thanks_w or confided_w) else 0
@@ -360,8 +418,8 @@ def owner_intents(home, day: datetime.date, *, tz=None) -> Optional[Dict[str, ob
                 confided = lab in TALK_WARM_INTENTS and effect == I.CAUSE_CONFIDED
             else:                                  # a row from before the field: its witnesses, read now
                 banter, confided = _talk_events(I, reading, lab, text)
-            thanks = thanks_w or felt(("gratitude",))
-            warm_felt = felt(WARM_EMOTIONS - _LAUGH_EMOTIONS) if banter else felt(WARM_EMOTIONS)
+            thanks = thanks_w or (thanked and felt(("gratitude",)))
+            warm_felt = feeling and (felt(WARM_EMOTIONS - _LAUGH_EMOTIONS) if banter else felt(WARM_EMOTIONS))
             if warm_felt or thanks or confided:
                 out["talk_warm"] += 1
                 out["talk_thanks"] += 1 if thanks else 0

@@ -170,14 +170,20 @@ EMOTION_MIN = 0.05
 #: the whole answer, intent included, is due this long after the request arrived; past it the answer goes without
 #: the intent. The agent's client allows 3 s per stage (5 s in all), so 2 s keeps a second of margin for the network
 #: and the sentiment and emotion models. Measured 11-20 on nova: the large model takes ~620 ms median / ~980 ms p90
-#: for the twelve hypotheses (onnxruntime's default thread count); an answer later than the agent's 1.5 s register
+#: for the twelve hypotheses (onnxruntime's default thread count); an answer later than the agent's 2.2 s register
 #: wait still reaches its journal
 INTENT_BUDGET_S = 2.0
 #: less time than this left after the other two models: the intent is not even started
 INTENT_MIN_S = 0.05
-#: the premise is cut to fit this many tokens, the hypothesis never is (the measurement ran at 256; intent.json
-#: may say otherwise, never more than the model's MAX_TOKENS)
-INTENT_MAX_TOKENS = 256
+#: the pair (premise + hypothesis + special tokens) is cut to fit this many tokens; only the premise is ever cut.
+#: intent.json says the number (64 since the 11-21 deploy: 256 took ~6 s per long message at 4 threads against the
+#: 2 s budget; 64 ≈ 1.35 s, 80 ≈ 1.7 s, 96 ≈ 2.0 s); this default is for a file without one
+INTENT_MAX_TOKENS = 64
+#: a premise too long for the budget keeps its START and its END with this between them (§4VE functional run: people
+#: put the ask at the end, and head-only truncation read every long message by its opening alone)
+INTENT_SEPARATOR = " … "
+#: the share of the premise's room given to its start; 1.0 = head-only truncation exactly as before
+INTENT_HEAD_SHARE = 0.5
 #: every label is one more hypothesis in every run: a labels file with hundreds would put every request over budget
 INTENT_MAX_LABELS = 32
 #: exists while a process loads or holds the intent model; removed when the load fails and when the process is
@@ -260,10 +266,13 @@ def load_intent_config(path: Path) -> dict:
         raise IntentError("the labels file's threads must be 0 (onnxruntime's default: one per core) or more")
     if not isinstance(spinning, bool):
         raise IntentError("the labels file's spinning must be true or false")
+    head_share = raw.get("head_share", INTENT_HEAD_SHARE)
+    if isinstance(head_share, bool) or not isinstance(head_share, (int, float)) or not 0.0 < head_share <= 1.0:
+        raise IntentError("the labels file's head_share must be over 0 and at most 1 (1 = the start only)")
     fill = lambda phrase: template.replace("{}", phrase)  # noqa: E731
     return {"labels": list(labels), "hypotheses": [fill(labels[k]) for k in labels],
             "urgency": [fill(p) for p in urgency] if urgency else None,
-            "max_tokens": max_tokens, "threads": threads, "spinning": spinning}
+            "max_tokens": max_tokens, "threads": threads, "spinning": spinning, "head_share": float(head_share)}
 
 
 def load_parity(path: Path, labels) -> dict:
@@ -325,6 +334,7 @@ class IntentReader:
         cfg = load_intent_config(model_dir / "intent.json")
         self.labels, self._hyps, self._urgency = cfg["labels"], cfg["hypotheses"], cfg["urgency"]
         self.max_tokens = cfg["max_tokens"]
+        self.head_share = cfg["head_share"]
         self.spinning = cfg["spinning"]
         # the check's override, else intent.json's own count (0 = onnxruntime's default, one per core), else the
         # service's --threads
@@ -349,6 +359,21 @@ class IntentReader:
         if self._pad_id is None:
             known = [self._tok.token_to_id(t) for t in ("[PAD]", "<pad>")]
             self._pad_id = next((i for i in known if i is not None), 0)
+        # the same tokenizer without truncation or padding: a long premise is tokenized ONCE with it (no truncation, so
+        # no overflowing pieces) and its rows are built as arrays from the pair layout below
+        self._raw = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
+        self._raw.no_truncation()
+        self._raw.no_padding()
+        self._sep_ids = self._raw.encode(INTENT_SEPARATOR, add_special_tokens=False).ids
+        self._sep_len = len(self._sep_ids)
+        self._all_hyps = self._hyps + (self._urgency or [])
+        #: each hypothesis's own ids, tokenized once at load
+        self._hyp_ids = [self._raw.encode(h, add_special_tokens=False).ids for h in self._all_hyps]
+        self._layout = self._pair_layout()
+        self._specials = len(self._layout["prefix"]) + len(self._layout["middle"]) + len(self._layout["suffix"]) \
+            if self._layout else self._raw.num_special_tokens_to_add(True)
+        #: the premise's room per hypothesis: max_tokens - the pair's special tokens - the hypothesis
+        self._rooms = [self.max_tokens - self._specials - len(h) for h in self._hyp_ids]
         self._ort = None
         if session_factory is None:
             import onnxruntime as ort
@@ -377,17 +402,100 @@ class IntentReader:
     def _run_options(self):
         return self._ort.RunOptions() if self._ort is not None else _RunFlag()
 
+    #: premises for the layout's derivation and its check (fictional, short: they fit any room)
+    _LAYOUT_PROBES = ("Markos planted tomatoes in the garden", "Elena")
+
+    def _pair_layout(self):
+        """The special tokens and segment ids the tokenizer's OWN pair template puts around a premise and a
+        hypothesis — derived from its encoding of a probe pair, never assumed — then checked: for every hypothesis and
+        two probe premises the hand-built row must equal the tokenizer's own pair encoding (ids, type ids, mask).
+        None (head-only truncation for long premises, logged once) when it cannot be derived or does not match."""
+        try:
+            probe = self._LAYOUT_PROBES[0]
+            p = self._raw.encode(probe, add_special_tokens=False).ids
+            h = self._hyp_ids[0]
+            pair = self._raw.encode(probe, self._all_hyps[0])
+            ids, types = pair.ids, pair.type_ids
+            i = next(k for k in range(len(ids)) if ids[k:k + len(p)] == p)
+            j = next(k for k in range(i + len(p), len(ids)) if ids[k:k + len(h)] == h)
+            layout = {"prefix": ids[:i], "middle": ids[i + len(p):j], "suffix": ids[j + len(h):],
+                      "t_prefix": types[:i], "t_a": types[i], "t_middle": types[i + len(p):j], "t_b": types[j],
+                      "t_suffix": types[j + len(h):]}
+            checked = set()
+            for text in self._LAYOUT_PROBES:
+                pid = self._raw.encode(text, add_special_tokens=False).ids
+                for k, (hyp, hid) in enumerate(zip(self._all_hyps, self._hyp_ids)):
+                    built = self._row(layout, pid, hid)
+                    if len(built[0]) > self.max_tokens:
+                        continue                  # the tokenizer's own would be truncated: not a like-for-like check
+                    own = self._tok.encode(text, hyp)
+                    if (built[0], built[2], built[1]) != (own.ids, own.type_ids, own.attention_mask):
+                        raise IntentError("a hand-built pair differs from the tokenizer's own")
+                    checked.add(k)
+            if len(checked) != len(self._all_hyps):
+                raise IntentError("a hypothesis could not be checked")
+            return layout
+        except Exception as exc:  # noqa: BLE001 - never a load failure: the start-only cut is the fallback
+            log.warning("intent model: the tokenizer's pair layout could not be derived and checked (%s): long "
+                        "messages are cut to their START only", type(exc).__name__)
+            return None
+
+    @staticmethod
+    def _row(layout, premise_ids, hyp_ids):
+        """(ids, mask, type ids) of one pair, built as the tokenizer's template builds it."""
+        ids = layout["prefix"] + premise_ids + layout["middle"] + hyp_ids + layout["suffix"]
+        types = (layout["t_prefix"] + [layout["t_a"]] * len(premise_ids) + layout["t_middle"]
+                 + [layout["t_b"]] * len(hyp_ids) + layout["t_suffix"])
+        return ids, [1] * len(ids), types
+
+    def _cut(self, premise_ids, room: int):
+        """The premise's ids cut to ``room``: its START, the separator and its END (``head_share`` of what is left
+        after the separator to the start, at least 1 token to each side); the start only when there is not room for
+        a start, a separator and an end."""
+        avail = room - self._sep_len
+        if avail < 2:
+            return premise_ids[:max(room, 0)]
+        head = min(max(int(avail * self.head_share), 1), avail - 1)
+        return premise_ids[:head] + self._sep_ids + premise_ids[len(premise_ids) - (avail - head):]
+
+    def splits(self, text: str) -> bool:
+        """True when this message's premise is too long for some row and goes in as its start and end."""
+        if self.head_share >= 1.0 or self._layout is None:
+            return False
+        return len(self._raw.encode(text, add_special_tokens=False).ids) > min(self._rooms)
+
+    def _encode(self, text: str):
+        """(ids, mask, type ids) per hypothesis. A premise that fits every row is encoded EXACTLY as before (the
+        tokenizer's own pair encoding; only_first truncation is a no-op for it), and so is every message when
+        ``head_share`` is 1.0 or the layout check failed (the start only, as before: the tokenizer's own only_first
+        truncation, per row). A premise longer than the SMALLEST room (over every hypothesis, the urgency pair
+        included) is tokenized ONCE and cut ONCE, from that smallest room, and every row is built from the checked
+        layout around the SAME slice: no two rows of a request read different premises (the urgency score is a
+        softmax across two rows). Linear in the message's length: no truncation, merge or overflow."""
+        if self.head_share < 1.0 and self._layout is not None:
+            p = self._raw.encode(text, add_special_tokens=False).ids
+            smallest = min(self._rooms)
+            if len(p) > smallest:
+                common = self._cut(p, smallest)
+                rows = []
+                for hid in self._hyp_ids:
+                    row = self._row(self._layout, common, hid)
+                    if len(row[0]) > self.max_tokens:
+                        raise IntentError("a pair did not fit the token budget")
+                    rows.append(row)
+                return rows
+        return [(e.ids, e.attention_mask, e.type_ids) for e in self._tok.encode_batch([(text, h) for h in self._all_hyps])]
+
     def _feed(self, text: str):
         np = self._np
-        hyps = self._hyps + (self._urgency or [])
-        enc = self._tok.encode_batch([(text, h) for h in hyps])
-        width = max(len(e.ids) for e in enc)
+        enc = self._encode(text)
+        width = max(len(e[0]) for e in enc)
         ids = np.full((len(enc), width), self._pad_id, dtype=np.int64)
         mask = np.zeros((len(enc), width), dtype=np.int64)
         types = np.zeros((len(enc), width), dtype=np.int64)
-        for row, e in enumerate(enc):
-            n = len(e.ids)
-            ids[row, :n], mask[row, :n], types[row, :n] = e.ids, e.attention_mask, e.type_ids
+        for row, (e_ids, e_mask, e_types) in enumerate(enc):
+            n = len(e_ids)
+            ids[row, :n], mask[row, :n], types[row, :n] = e_ids, e_mask, e_types
         feed = {"input_ids": ids, "attention_mask": mask, "token_type_ids": types}
         return {k: v for k, v in feed.items() if k in self._inputs}
 
@@ -908,6 +1016,19 @@ def check_intent(model_dir: Path, threads: int, overrides=None, runs: int = 10, 
         print(f"\n== threads {reader.threads or 'default'}: loaded {reader.name} in {time.monotonic() - t0:.1f} s; "
               f"a sentiment request arriving during the load would have waited up to {stall.longest * 1000:.0f} ms; "
               f"parity {reader.parity[0]}/{reader.parity[1]}")
+        lay = reader._layout
+        raw = reader._raw
+
+        def tokens(ids, raw=raw):
+            return " ".join(raw.id_to_token(i) or str(i) for i in ids) or "-"
+        if lay is None:
+            print("  pair layout: NOT derived/checked — long messages are cut to their start only (see the WARNING)")
+        else:
+            print(f"  pair layout: [{tokens(lay['prefix'])}] premise(type {lay['t_a']}) [{tokens(lay['middle'])}] "
+                  f"hypothesis(type {lay['t_b']}) [{tokens(lay['suffix'])}]; separator {reader._sep_len} token(s): "
+                  f"[{tokens(reader._sep_ids)}]; smallest room for the premise {min(reader._rooms)} tokens "
+                  f"(largest {max(reader._rooms)}); head_share {reader.head_share}")
+        print(f"  the model takes token_type_ids: {'yes' if 'token_type_ids' in reader._inputs else 'no'}")
         lat = []
         for text, high, low, want_urgent in reader._parity["rows"]:
             for _ in range(runs):
@@ -916,6 +1037,7 @@ def check_intent(model_dir: Path, threads: int, overrides=None, runs: int = 10, 
                 lat.append((time.perf_counter() - t) * 1000)
             ok = parity_passes(scores, urgent, high, low, want_urgent)
             print(f"  {'pass' if ok else 'FAIL'}  {high} {scores[high]:.2f} (>= 0.5)  {low} {scores[low]:.2f} (< 0.5)"
+                  + ("  [long: read as its start and end]" if reader.splits(text) else "")
                   + (f"  urgent {urgent:.2f}" if urgent is not None else ""))
         long_text = "Markos planted tomatoes and peppers in the garden behind the old house. " * 40
         long_lat = []
@@ -926,7 +1048,7 @@ def check_intent(model_dir: Path, threads: int, overrides=None, runs: int = 10, 
         long_lat.sort()
         lat.sort()
         print(f"  short messages: median {lat[len(lat) // 2]:.0f} ms, p90 {lat[int(len(lat) * 0.9)]:.0f} ms, max "
-              f"{lat[-1]:.0f} ms; a message cut to {reader.max_tokens} tokens: median "
+              f"{lat[-1]:.0f} ms; a long message (its start and end, {reader.max_tokens} tokens with the hypothesis): median "
               f"{long_lat[len(long_lat) // 2]:.0f} ms, max {long_lat[-1]:.0f} ms (budget {budget_s:.1f} s for "
               f"the whole answer)")
         rss = _rss_mb()

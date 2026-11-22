@@ -99,6 +99,11 @@ def make_judge(parity=None, fail=0, high=0.9, low=0.02, reply=0.97, flat=None):
         if flat is not None:
             return flat
         hit = samples.get(tuple(premise))
+        if hit is None and SEP[0] in premise:                # a long sample, read as its start and end
+            i = premise.index(SEP[0])
+            head, tail = premise[:i], premise[i + len(SEP):]
+            hit = next(((k, v) for w, (k, v) in samples.items()
+                        if list(w[:len(head)]) == head and list(w[len(w) - len(tail):]) == tail), None)
         if hit:
             i, s = hit
             if key.startswith("urgent:"):
@@ -116,8 +121,12 @@ def make_judge(parity=None, fail=0, high=0.9, low=0.02, reply=0.97, flat=None):
     return judge
 
 
-def build_tokenizer(texts):
-    """A word-level tokenizer with a BERT-style pair template (premise = type 0, hypothesis = type 1)."""
+BERT_PAIR = "[CLS] $A [SEP] $B:1 [SEP]:1"
+ROBERTA_PAIR = "[CLS] $A [SEP] [SEP] $B [SEP]"          # RoBERTa's shape: a double separator, one segment id
+
+
+def build_tokenizer(texts, pair=BERT_PAIR):
+    """A word-level tokenizer with a BERT-style pair template (premise = type 0, hypothesis = type 1) by default."""
     ws = pre_tokenizers.Whitespace()
     vocab = {"[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3}
     for t in texts:
@@ -127,7 +136,7 @@ def build_tokenizer(texts):
     tok.normalizer = tokenizers.normalizers.Lowercase()
     tok.pre_tokenizer = ws
     tok.post_processor = processors.TemplateProcessing(
-        single="[CLS] $A [SEP]", pair="[CLS] $A [SEP] $B:1 [SEP]:1", special_tokens=[("[CLS]", 2), ("[SEP]", 3)])
+        single="[CLS] $A [SEP]", pair=pair, special_tokens=[("[CLS]", 2), ("[SEP]", 3)])
     return tok
 
 
@@ -152,7 +161,10 @@ class FakeNLI:
         for ids, mask in zip(feed["input_ids"], feed["attention_mask"]):
             toks = [self.inv[int(i)] for i, m in zip(ids, mask) if m]
             first = toks.index("[SEP]")
-            out.append((toks[1:first], toks[first + 1:-1]))
+            hyp = toks[first + 1:-1]
+            while hyp and hyp[0] == "[SEP]":
+                hyp = hyp[1:]
+            out.append((toks[1:first], hyp))
         return out
 
     def run(self, _names, feed, opts):
@@ -186,7 +198,8 @@ class FakeNLI:
                 self.active -= 1
 
 
-def write_model(d: Path, labels_cfg=None, parity=None, id2label=("entailment", "not_entailment"), extra_texts=()):
+def write_model(d: Path, labels_cfg=None, parity=None, id2label=("entailment", "not_entailment"), extra_texts=(),
+                pair=BERT_PAIR, pad=None):
     d.mkdir(parents=True, exist_ok=True)
     labels_cfg = labels_cfg or SHIPPED
     parity = parity or SHIPPED_PARITY
@@ -200,9 +213,13 @@ def write_model(d: Path, labels_cfg=None, parity=None, id2label=("entailment", "
         yes, no = labels_cfg["urgency"]
         hyps[tmpl.replace("{}", yes)] = "urgent:yes"
         hyps[tmpl.replace("{}", no)] = "urgent:no"
-    texts = list(hyps) + [s["text"] for s in parity["samples"]] + list(PREMISES.values()) + list(extra_texts)
-    tok = build_tokenizer(texts)
+    texts = list(hyps) + [s["text"] for s in parity["samples"]] + list(PREMISES.values()) + list(extra_texts) \
+        + [S.INTENT_SEPARATOR] + list(S.IntentReader._LAYOUT_PROBES)
+    tok = build_tokenizer(texts, pair)
+    if pad is not None:                                  # the tokenizer file's own padding: (pad id, pad token)
+        tok.enable_padding(pad_id=pad[0], pad_token=pad[1])
     tok.save(str(d / "tokenizer.json"))
+    tok.no_padding()
     hyp_keys = {tuple(tok.encode(h, add_special_tokens=False).tokens): k for h, k in hyps.items()}
     return tok, hyp_keys
 
@@ -214,7 +231,10 @@ def reader_for(tmp_path, threads=2, **session_kw):
     labels_cfg = session_kw.pop("labels_cfg", None)
     parity = session_kw.pop("parity", None)
     override = session_kw.pop("threads_override", None)
-    tok, keys = write_model(tmp_path / "intent", labels_cfg, parity, id2label)
+    extra = session_kw.pop("extra_texts", ())
+    pair = session_kw.pop("pair", BERT_PAIR)
+    pad = session_kw.pop("pad", None)
+    tok, keys = write_model(tmp_path / "intent", labels_cfg, parity, id2label, extra, pair, pad)
     fake = FakeNLI(tok, keys, order=order or id2label, **session_kw)
     seen = []
     reader = S.IntentReader(tmp_path / "intent", threads, lambda path, t: seen.append(t) or fake, override)
@@ -317,7 +337,7 @@ def test_only_the_premise_is_truncated(tmp_path):
     # are long, and cutting the joined sequence from the end; the model would then judge "This example is venting or"
     long_phrase = ("venting or complaining about something else that went wrong at the allotment today and is "
                    "still bothering them a lot.")
-    cfg = {**SHIPPED, "labels": {**SHIPPED["labels"], "venting": long_phrase}, "max_tokens": 32}
+    cfg = {**SHIPPED, "labels": {**SHIPPED["labels"], "venting": long_phrase}, "max_tokens": 32, "head_share": 1.0}
     reader, fake = reader_for(tmp_path, labels_cfg=cfg)
     premise = " ".join(["Markos left the blue umbrella at the station"] * 20)
     fake.feeds.clear()
@@ -328,6 +348,374 @@ def test_only_the_premise_is_truncated(tmp_path):
     for (p, h), mask in zip(rows, fake.feeds[0]["attention_mask"]):
         assert int(mask.sum()) <= 32 and p == full[:len(p)] and p
         assert tuple(h) in fake.hyp_keys
+
+
+# ── a long premise: its start and its end ──────────────────────────────────
+
+WORDS = [f"w{i}" for i in range(500)]
+SEP = tuple(w for w, _ in pre_tokenizers.Whitespace().pre_tokenize_str(S.INTENT_SEPARATOR.lower()))
+
+
+def split_reader(tmp_path, max_tokens=32, share=None, **kw):
+    cfg = {**SHIPPED, "max_tokens": max_tokens}
+    if share is not None:
+        cfg["head_share"] = share
+    return reader_for(tmp_path, labels_cfg=cfg, extra_texts=[" ".join(WORDS)], **kw)
+
+
+def rooms_of(reader, fake):
+    """{hypothesis key: room for the premise} = max_tokens - the template's special tokens - the hypothesis's own."""
+    specials = 3 if reader._layout is None else \
+        len(reader._layout["prefix"]) + len(reader._layout["middle"]) + len(reader._layout["suffix"])
+    return {k: reader.max_tokens - specials - len(h) for h, k in fake.hyp_keys.items()}
+
+
+def cut_of(n, room, share=0.5):
+    """The premise EVERY row must read for WORDS[:n] given the smallest room: whole when it fits, else its start,
+    the separator and its end (the start only when the room cannot hold a start, the separator and an end)."""
+    if n <= room:
+        return WORDS[:n]
+    avail = room - len(SEP)
+    if avail < 2:
+        return WORDS[:room]
+    head = min(max(int(avail * share), 1), avail - 1)
+    return WORDS[:head] + list(SEP) + WORDS[n - (avail - head):n]
+
+
+def own_rows(reader, premise_tokens):
+    """The tokenizer's OWN pair post-processing of the same slice, per hypothesis: (ids, mask, type ids)."""
+    text = " ".join(premise_tokens)
+    return [(e.ids, e.attention_mask, e.type_ids) for e in (reader._raw.encode(text, h) for h in reader._all_hyps)]
+
+
+def assert_rows_are_the_tokenizers_own(reader, feed, premise_tokens):
+    """Every fed row equals the tokenizer's own pair encoding of ``premise_tokens`` in ids, mask AND type ids, and
+    every padded position holds the tokenizer file's pad id, mask 0 and type id 0."""
+    for i, (ids, mask, types) in enumerate(own_rows(reader, premise_tokens)):
+        n = len(ids)
+        assert list(feed["input_ids"][i][:n]) == ids, i
+        assert list(feed["attention_mask"][i][:n]) == mask, i
+        assert list(feed["token_type_ids"][i][:n]) == types, i
+        assert (feed["input_ids"][i][n:] == reader._pad_id).all(), i
+        assert (feed["attention_mask"][i][n:] == 0).all() and (feed["token_type_ids"][i][n:] == 0).all(), i
+
+
+TTI = ("input_ids", "attention_mask", "token_type_ids")
+
+
+def feed_rows(reader, fake, text):
+    fake.feeds.clear()
+    reader.read(text)
+    return fake.rows(fake.feeds[0]), fake.feeds[0]
+
+
+@pytest.mark.parametrize("text", list(PREMISES.values()) + ["ok", " ".join(WORDS[:10])])
+def test_a_premise_that_fits_is_fed_exactly_as_before(tmp_path, text):
+    # catches: short premises altered (the measured accuracy was on short messages): every input array must be the
+    # head-only path's, byte for byte
+    new, nf = split_reader(tmp_path / "split")
+    old, of = split_reader(tmp_path / "head", share=1.0)
+    nf.feeds.clear()
+    of.feeds.clear()
+    new.read(text)
+    old.read(text)
+    assert set(nf.feeds[0]) == set(of.feeds[0])
+    for k in nf.feeds[0]:
+        assert np.array_equal(nf.feeds[0][k], of.feeds[0][k])
+
+
+@pytest.mark.parametrize("max_tokens", [32, 64])
+@pytest.mark.parametrize("extra", [0, 1, 2, 7, 150, 360])
+def test_a_long_premise_keeps_its_start_and_its_end(tmp_path, max_tokens, extra):
+    # catches: the tail dropped (the ask at the end of a long message unseen), a separator that pushes the pair over
+    # the budget, the hypothesis cut, and a split applied at exactly the limit (extra 0 must be untouched)
+    reader, fake = split_reader(tmp_path, max_tokens=max_tokens)
+    room = rooms_of(reader, fake)
+    smallest = min(room.values())                           # the longest hypothesis has the least room
+    n = smallest + extra
+    rows, feed = feed_rows(reader, fake, " ".join(WORDS[:n]))
+    for (premise, hyp), mask in zip(rows, feed["attention_mask"]):
+        key = fake.hyp_keys[tuple(hyp)]                     # the hypothesis whole (KeyError otherwise)
+        assert int(mask.sum()) <= max_tokens
+        assert premise == cut_of(n, smallest), (key, n)
+        if n > smallest:
+            assert premise[-1] == WORDS[n - 1] and len(premise) == smallest    # the room used exactly, end kept
+            if room[key] == smallest:
+                assert int(mask.sum()) == max_tokens
+
+
+def test_exactly_at_the_limit_and_one_over(tmp_path):
+    # catches: an off-by-one in "fits" (a premise exactly at its room split, or one token over head-only-cut)
+    reader, fake = split_reader(tmp_path)
+    room = rooms_of(reader, fake)
+    r = min(room.values())
+    at, _ = feed_rows(reader, fake, " ".join(WORDS[:r]))
+    over, _ = feed_rows(reader, fake, " ".join(WORDS[:r + 1]))
+    assert all(p == WORDS[:r] for p, _ in at)                # exactly the smallest room: every row whole
+    for p, _ in over:                                        # one over: every row split, the same way
+        assert p == cut_of(r + 1, r) and p[-1] == WORDS[r] and p.count(SEP[0]) == 1
+
+
+@pytest.mark.parametrize("share", [0.25, 0.5, 0.75])
+def test_the_head_share_sets_the_split(tmp_path, share):
+    # catches: head_share read but not applied
+    reader, fake = split_reader(tmp_path, share=share)
+    room = rooms_of(reader, fake)
+    rows, _ = feed_rows(reader, fake, " ".join(WORDS[:300]))
+    avail = min(room.values()) - len(SEP)
+    head = min(max(int(avail * share), 1), avail - 1)
+    for premise, hyp in rows:
+        assert premise[:head] == WORDS[:head] and premise[head:head + len(SEP)] == list(SEP)
+        assert premise == cut_of(300, min(room.values()), share)
+
+
+def test_head_share_one_is_the_old_head_only_truncation(tmp_path):
+    # catches: no way back to the old behaviour without a code change
+    reader, fake = split_reader(tmp_path, share=1.0)
+    room = rooms_of(reader, fake)
+    rows, _ = feed_rows(reader, fake, " ".join(WORDS[:300]))
+    for premise, hyp in rows:
+        assert premise == WORDS[:room[fake.hyp_keys[tuple(hyp)]]]
+
+
+@pytest.mark.parametrize("share,ok", [(0.5, True), (1, True), (0.01, True), (0, False), (-0.2, False), (1.5, False),
+                                      (True, False), ("0.5", False), (None, False)])
+def test_head_share_is_validated(tmp_path, share, ok):
+    # catches: a share outside (0, 1] accepted (0 = no start, over 1 = a negative tail)
+    (tmp_path / "intent.json").write_text(json.dumps({**SHIPPED, "head_share": share}))
+    if ok:
+        assert S.load_intent_config(tmp_path / "intent.json")["head_share"] == float(share)
+    else:
+        with pytest.raises(S.IntentError, match="head_share"):
+            S.load_intent_config(tmp_path / "intent.json")
+    cfg = {k: v for k, v in SHIPPED.items() if k != "head_share"}
+    (tmp_path / "intent.json").write_text(json.dumps(cfg))
+    assert S.load_intent_config(tmp_path / "intent.json")["head_share"] == S.INTENT_HEAD_SHARE == 0.5
+
+
+def test_a_message_with_no_spaces_still_fits(tmp_path):
+    # catches: a split computed on words or characters rather than tokens (one 3000-character run would overflow)
+    reader, fake = split_reader(tmp_path, max_tokens=64)
+    rows, feed = feed_rows(reader, fake, "x." * 1500)
+    for (premise, hyp), mask in zip(rows, feed["attention_mask"]):
+        assert int(mask.sum()) <= 64 and tuple(hyp) in fake.hyp_keys and list(SEP)[0] in premise
+
+
+def test_parity_runs_through_the_same_split(tmp_path):
+    # catches: a parity check that feeds the model some other way than requests do: long samples whose signal is at
+    # the END pass only through the start-and-end path
+    filler = " ".join(WORDS[:120])
+    parity = {"samples": [{"text": f"{filler} thank you", "high": "thanks", "low": "correcting"},
+                          {"text": f"{filler} good morning", "high": "greeting", "low": "correcting"}], "min_pass": 2}
+
+    def judge(premise, key):
+        signal = {"thank": "thanks", "morning": "greeting"}
+        return 0.9 if any(signal.get(w) == key for w in premise) else 0.02
+    cfg = {**SHIPPED, "max_tokens": 32}
+    reader, _ = reader_for(tmp_path / "split", labels_cfg=cfg, parity=parity, judge=judge, extra_texts=[filler])
+    assert reader.parity == (2, 2)
+    with pytest.raises(S.IntentError, match="parity"):
+        reader_for(tmp_path / "head", labels_cfg={**cfg, "head_share": 1.0}, parity=parity, judge=judge,
+                   extra_texts=[filler])
+
+
+_ALL = " ".join(WORDS * 20)                              # ~50,000 characters
+
+
+def _text_of(chars: int) -> str:
+    return _ALL[:chars].rsplit(" ", 1)[0]
+
+
+def _fastest(fn, n=3):
+    best = None
+    for _ in range(n):
+        t = time.perf_counter()
+        fn()
+        took = time.perf_counter() - t
+        best = took if best is None else min(best, took)
+    return best
+
+
+def test_a_long_premise_costs_linear_time(tmp_path):
+    # catches: Encoding.truncate + merge + post_process per hypothesis (their overflowing pieces multiply: 1.6 s for a
+    # 4,000-character message, more than the model run) — the tokenizing cannot be interrupted by the time budget
+    reader, _ = split_reader(tmp_path, max_tokens=64)
+    texts = {c: _text_of(c) for c in (2000, 4000, 8000, 20000)}
+    t = {c: _fastest(lambda c=c: reader._feed(texts[c])) for c in texts}
+    assert t[4000] < 0.05 and t[20000] < 0.25, t
+    assert t[8000] < 8 * max(t[2000], 0.001), t              # linear: ~4x; quadratic: ~16x
+
+
+class _Counting:
+    def __init__(self, tok, text):
+        self._tok, self._text, self.calls = tok, text, 0
+
+    def encode(self, text, *a, **kw):
+        if text == self._text:
+            self.calls += 1
+        return self._tok.encode(text, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._tok, name)
+
+
+def test_a_long_premise_is_tokenized_once_per_request(tmp_path):
+    # catches: the premise tokenized again for every hypothesis (twelve times the work)
+    reader, _ = split_reader(tmp_path, max_tokens=64)
+    text = _text_of(4000)
+    reader._raw = counting = _Counting(reader._raw, text)
+    reader._feed(text)
+    assert counting.calls == 1
+
+
+@pytest.mark.parametrize("pair", [BERT_PAIR, ROBERTA_PAIR], ids=["bert", "roberta"])
+def test_hand_built_rows_equal_the_tokenizers_own_pairs(tmp_path, pair):
+    # catches: a hard-coded or off-by-one layout (a special token missing or doubled, segment ids wrong) — every
+    # premise that fits must give exactly the tokenizer's own pair encoding
+    reader, fake = split_reader(tmp_path, pair=pair)
+    assert reader._layout is not None
+    for n in range(1, max(reader._rooms) + 1):
+        text = " ".join(WORDS[:n])
+        p = reader._raw.encode(text, add_special_tokens=False).ids
+        for hyp, hid, room in zip(reader._all_hyps, reader._hyp_ids, reader._rooms):
+            if n > room:
+                continue
+            own = reader._tok.encode(text, hyp)
+            assert reader._row(reader._layout, p, hid) == (own.ids, own.attention_mask, own.type_ids)
+
+
+@pytest.mark.parametrize("pair", [BERT_PAIR, ROBERTA_PAIR], ids=["bert", "roberta"])
+def test_the_boundary_sweep(tmp_path, pair):
+    # catches: an off-by-one anywhere between "fits" and "split", for every length from 1 to well past every room
+    # and: a long row whose ids are right but whose hypothesis type ids, padding id, padding mask or padding type
+    # ids are not the tokenizer's own (the model would read the hypothesis as more premise, or attend to padding)
+    reader, fake = split_reader(tmp_path, pair=pair, inputs=TTI)
+    room = rooms_of(reader, fake)
+    smallest = min(room.values())
+    for n in range(1, max(room.values()) + 12):
+        rows, feed = feed_rows(reader, fake, " ".join(WORDS[:n]))
+        want = cut_of(n, smallest)
+        for (premise, hyp), mask in zip(rows, feed["attention_mask"]):
+            assert int(mask.sum()) <= reader.max_tokens
+            assert premise == want, (n, fake.hyp_keys[tuple(hyp)])
+        assert_rows_are_the_tokenizers_own(reader, feed, want)
+
+
+def test_two_hundred_short_premises_are_fed_as_before(tmp_path):
+    # catches: short premises altered (the measured accuracy was on short messages)
+    import random
+    rnd = random.Random(7)
+    new, nf = split_reader(tmp_path / "split")
+    old, of = split_reader(tmp_path / "head", share=1.0)
+    for _ in range(200):
+        text = " ".join(rnd.choice(WORDS) for _ in range(rnd.randint(1, min(new._rooms))))
+        nf.feeds.clear()
+        of.feeds.clear()
+        new.read(text)
+        old.read(text)
+        for k in nf.feeds[0]:
+            assert np.array_equal(nf.feeds[0][k], of.feeds[0][k]), text
+
+
+def test_a_row_without_room_for_start_separator_and_end_gets_the_start_only(tmp_path):
+    # catches: the "avail < 2" guard loosened — with one token of room after the separator the row would be the
+    # separator and the last word (no start), or the separator alone
+    long_phrase = " ".join(["very"] * 23) + "."               # "This example is" + 24 tokens = a 27-token hypothesis
+    cfg = {**SHIPPED, "labels": {**SHIPPED["labels"], "venting": long_phrase}, "max_tokens": 32}
+    # two-word parity samples: with a smallest room of 2 every row reads at most two words, the samples included
+    parity = {"min_pass": 2, "samples": [{"text": "thanks Elena", "high": "thanks", "low": "venting"},
+                                         {"text": "hello Markos", "high": "greeting", "low": "correcting"},
+                                         {"text": "help Kosmas", "high": "instruction", "low": "thanks"}]}
+    reader, fake = reader_for(tmp_path, labels_cfg=cfg, parity=parity, extra_texts=[" ".join(WORDS)],
+                              judge=make_judge(parity))
+    room = rooms_of(reader, fake)
+    assert room["venting"] == 2 and 2 - len(SEP) < 2
+    rows, feed = feed_rows(reader, fake, " ".join(WORDS[:100]))
+    assert min(room.values()) == 2
+    assert all(p == WORDS[:2] for p, _ in rows)              # the smallest room decides: every row the start only
+
+
+@pytest.mark.parametrize("pair", [BERT_PAIR, ROBERTA_PAIR], ids=["bert", "roberta"])
+def test_every_row_of_a_long_request_reads_the_identical_premise_slice(tmp_path, pair):
+    # catches: per-row rooms (a row with more room reading more of the message, or the message whole, than another):
+    # the labels would score different texts, and "urgent." vs "not urgent." — a softmax across two rows — would
+    # compare two different premises. Every length between the smallest and the largest room is checked.
+    reader, fake = split_reader(tmp_path, pair=pair)
+    room = rooms_of(reader, fake)
+    assert room["urgent:yes"] != room["urgent:no"]           # the urgency pair's own rooms differ
+    for n in range(min(room.values()) + 1, max(room.values()) + 3):
+        rows, _ = feed_rows(reader, fake, " ".join(WORDS[:n]))
+        by_key = {fake.hyp_keys[tuple(h)]: p for p, h in rows}
+        assert len(by_key) == len(room)
+        assert by_key["urgent:yes"] == by_key["urgent:no"], n
+        assert len({tuple(p) for p in by_key.values()}) == 1, n
+        assert by_key["urgent:yes"] == cut_of(n, min(room.values())), n
+
+
+@pytest.mark.parametrize("pad", [None, (1, "[UNK]")], ids=["pad-default", "pad-from-file"])
+def test_padding_holds_the_pad_id_mask_0_and_type_0(tmp_path, pad):
+    # catches: padding with a pad id other than the tokenizer file's own, padded positions attended (mask 1) or
+    # given type id 1 — on short rows (the tokenizer's own path) and long rows (built rows) of different lengths
+    reader, fake = split_reader(tmp_path, pad=pad, inputs=TTI)
+    assert reader._pad_id == (0 if pad is None else 1)
+    for n in (3, min(reader._rooms) + 40):
+        rows, feed = feed_rows(reader, fake, " ".join(WORDS[:n]))
+        lengths = feed["attention_mask"].sum(axis=1)
+        assert lengths.min() < lengths.max()                 # rows of different lengths: there IS padding
+        assert_rows_are_the_tokenizers_own(reader, feed, cut_of(n, min(reader._rooms)))
+
+
+@pytest.mark.parametrize("damage", ["hypothesis-types-0", "premise-types-1", "mask-0"])
+def test_the_layout_self_check_compares_mask_and_type_ids_too(tmp_path, monkeypatch, caplog, damage):
+    # catches: a self-check comparing ids only — a layout right in ids but wrong in type ids (or mask) would pass
+    # and every long row would carry the wrong segments; it must disable the start-and-end path instead
+    real = S.IntentReader._row
+
+    def wrong(layout, premise_ids, hyp_ids):
+        ids, mask, types = real(layout, premise_ids, hyp_ids)
+        n = len(ids) - len(hyp_ids) - len(layout["suffix"])
+        if damage == "hypothesis-types-0":
+            types = types[:n] + [0] * (len(types) - n)
+        elif damage == "premise-types-1":
+            types = [1] * n + types[n:]
+        else:
+            mask = mask[:-1] + [0]
+        return ids, mask, types
+    monkeypatch.setattr(S.IntentReader, "_row", staticmethod(wrong))
+    reader, _ = split_reader(tmp_path, inputs=TTI)
+    assert reader._layout is None and "pair layout" in caplog.text
+    assert not reader.splits(" ".join(WORDS[:200]))
+
+
+def test_the_layout_self_check_falls_back_to_the_start_only(tmp_path, monkeypatch, caplog):
+    # catches: the self-check removed — a layout that differs from the tokenizer's own would feed the model garbage
+    real = S.IntentReader._row
+
+    def wrong(layout, premise_ids, hyp_ids):
+        ids, mask, types = real(layout, premise_ids, hyp_ids)
+        return ids[:-1], mask[:-1], types[:-1]              # the closing special token lost
+    monkeypatch.setattr(S.IntentReader, "_row", staticmethod(wrong))
+    reader, fake = split_reader(tmp_path / "a")
+    assert reader._layout is None and "pair layout" in caplog.text
+    monkeypatch.setattr(S.IntentReader, "_row", staticmethod(real))
+    old, of = split_reader(tmp_path / "b", share=1.0)
+    text = " ".join(WORDS[:200])
+    fake.feeds.clear()
+    of.feeds.clear()
+    reader.read(text)
+    old.read(text)
+    for k in fake.feeds[0]:
+        assert np.array_equal(fake.feeds[0][k], of.feeds[0][k])      # exactly the start-only path
+
+
+def test_a_very_long_message_releases_the_run_lock_within_its_budget(tmp_path):
+    # catches: tokenizing so slow that the one-run lock stays held past the budget (the next message waits)
+    reader, fake = split_reader(tmp_path, max_tokens=64, delay=0.4)
+    t0 = time.monotonic()
+    got = S.classify(FakeClassifier(), FakeLangId(), _text_of(4000), intent=reader, deadline=t0 + 0.8)
+    assert "intent" in got
+    assert reader._busy.acquire(timeout=1.0) and time.monotonic() - t0 < 0.9
+    reader._busy.release()
 
 
 @pytest.mark.parametrize("inputs", [("input_ids", "attention_mask"), ("input_ids", "attention_mask", "token_type_ids")])
@@ -901,6 +1289,15 @@ def test_the_check_prints_each_thread_setting_with_its_stall_and_latency(tmp_pat
     assert "== threads 2:" in out and "== threads 4:" in out and "== threads default:" in out
     assert out.count("would have waited up to") == 3 and out.count("short messages: median") == 3
     assert "one per core" in out and f"parity {N_PARITY}/{N_PARITY}" in out
+    # the derived layout as tokens, the separator's tokens, the smallest room, and whether token type ids are fed
+    probe = real(d, 2, lambda p, t: FakeNLI(tok, keys))
+    sep = " ".join(tok.id_to_token(i) for i in probe._sep_ids)
+    assert out.count("pair layout: [[CLS]] premise(type 0) [[SEP]] hypothesis(type 1) [[SEP]]") == 3
+    assert out.count(f"separator {len(probe._sep_ids)} token(s): [{sep}]") == 3
+    assert out.count(f"smallest room for the premise {min(probe._rooms)} tokens") == 3
+    assert out.count("the model takes token_type_ids: no") == 3
+    long_samples = sum(probe.splits(s["text"]) for s in SHIPPED_PARITY["samples"])
+    assert long_samples == 2 and out.count("[long: read as its start and end]") == 3 * long_samples
 
 
 # ── the HTTP layer and the log ──────────────────────────────────────────────

@@ -1,5 +1,5 @@
 {
-  "about": "Each sample passes when its 'high' label's OWN score is 0.5 or more, its 'low' (clearly unrelated) label's score is under 0.5, and, where 'urgent' is given, the urgency is on that side of 0.5. Not 'top': the scores are independent and a correct model often scores 'reply' above the expected label. A swapped entailment index turns every score p into 1-p, so both halves fail on every sample (0/13); flat scores (a broken tokenizer) fail the low half everywhere (0/13). The sentences are the 11-20 measurement's own made-up probe sentences, not anyone's messages; their real scores (torch, template C, multi-label) were: deberta-v3-large 13/13 pass (lowest high 0.84, highest low 0.02; with the indices swapped 0/13), deberta-v3-base 12/13 (thanks 0.12 fails). min_pass 9 leaves a margin of 4 for the large model and 3 for the base one against ONNX/torch drift, and is far above the 0 a swapped or flat model gets. Relabel intent.json and these labels must follow, or the head refuses to load.",
+  "about": "Each sample passes when its 'high' label's OWN score is 0.5 or more, its 'low' (clearly unrelated) label's score is under 0.5, and, where 'urgent' is given, the urgency is on that side of 0.5. Not 'top': the scores are independent and a correct model often scores 'reply' above the expected label. A swapped entailment index turns every score p into 1-p, so both halves fail on every sample (0/15); flat scores (a broken tokenizer) fail the low half everywhere (0/15). The sentences are the 11-20 measurement's own made-up probe sentences, not anyone's messages; their real scores (torch, template C, multi-label) were: deberta-v3-large 13/13 pass (lowest high 0.84, highest low 0.02; with the indices swapped 0/13), deberta-v3-base 12/13 (thanks 0.12 fails). min_pass 9 leaves a margin of 4 for the large model and 3 for the base one against ONNX/torch drift, and is far above the 0 a swapped or flat model gets. Relabel intent.json and these labels must follow, or the head refuses to load. 11-21: two LONG samples added at the end (about 85 words each, well over the room a premise has at max_tokens 64), whose deciding words are at their END: they go through the start-and-end cut, so the check exercises it (--check-intent marks them '[long: read as its start and end]'). They are UNVERIFIED on the real model — look at them specifically at redeploy. min_pass is now 10 of 15: the large model's 13 measured passes leave a margin of 3 even if both new samples fail, the base model's 12 a margin of 2; a swapped index or flat scores still pass 0/15.",
   "samples": [
     {
       "text": "Should I buy the 32GB or the 64GB model? What would you pick?",
@@ -67,7 +67,17 @@
       "high": "instruction",
       "low": "greeting",
       "urgent": true
+    },
+    {
+      "text": "Last weekend Elena and I drove out to the old farmhouse near the lake, the one with the crooked blue shutters and the stone wall that her grandfather built. We spent most of Saturday clearing the vegetable beds, pulling up weeds and the last of the summer squash, and on Sunday we walked along the shore until it got dark and cold. Anyway, enough about our weekend: should I plant the garlic now, before the frost, or wait until early spring? What would you do?",
+      "high": "advice",
+      "low": "thanks"
+    },
+    {
+      "text": "This morning Markos and I took the slow train along the coast, the one that stops at every little village, and we spent the whole afternoon wandering between the harbour, the fish market and the old lighthouse on the hill. We had grilled sardines at a tiny place by the water and caught the last train back just as the sun went down. None of that would have happened without your timetable and the list of stops. Thank you so much, that was really helpful.",
+      "high": "thanks",
+      "low": "correcting"
     }
   ],
-  "min_pass": 9
+  "min_pass": 10
 }

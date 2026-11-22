@@ -132,6 +132,16 @@ def path_steps(character, rows: List[dict]) -> List[Dict[str, object]]:
                           "sentence": prev_sentence, "changed": True, "why": [],
                           "reset": bool(is_reset(r)) if callable(is_reset) else False})
             continue
+        if kind == getattr(character, "KIND_REPLAY", None):
+            # §4VF: the rule changed and the path above was worked out again under it; the dials are where it says
+            got = r.get("dials") if isinstance(r.get("dials"), dict) else {}
+            dials = {d: character.clamp(got.get(d, dials[d])) for d in character.DIALS}
+            sentence = character.sentence(dials)
+            steps.append({"at": at, "day": _local_day(at), "changes": [], "by": "replay", "sentence": sentence,
+                          "changed": sentence != prev_sentence, "why": [],
+                          "words": character.replay_words(r)})
+            prev_sentence = sentence
+            continue
         d = character.resolve_dial(r.get("dial"))
         if not d:
             continue
@@ -172,7 +182,10 @@ def _step_line(step: Dict[str, object]) -> str:
         if step.get("reset"):
             return f"- **{step['day']}** — reset by you, starts again as {said}"
         return f"- **{step['day']}** — started as {said}"
-    by = "by itself, from how its days went" if step["by"] == "itself" else "by you"
+    if step["by"] == "replay":
+        return (f"- **{step['day']}** — {step.get('words') or 'the path was worked out again under the current rule'}"
+                + (f" → {said}" if step.get("changed") else ""))
+    by ="by itself, from how its days went" if step["by"] == "itself" else "by you"
     out = f"- **{step['day']}** — {', '.join(step['changes'])}, {by}"
     out += f" → {said}" if step.get("changed") else " (the sentence did not change)"
     for w in step.get("why") or []:

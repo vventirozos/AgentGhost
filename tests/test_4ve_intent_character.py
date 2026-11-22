@@ -270,6 +270,7 @@ def test_warm_and_joking_are_counted_exactly_when_the_rows_intent_was_not_refuse
     n = 0
     for lab, tone, emo, text, effect, why, counted, refused, refused_w, effect_w in cases:
         seen = set()
+        _feeling, thanked = D._warm_routes(tone, text)                  # §4VE functional run: the thanks route
         for held in _SENT_HOLDS:
             n += 1
             home = tmp_path / str(n)
@@ -280,7 +281,7 @@ def test_warm_and_joking_are_counted_exactly_when_the_rows_intent_was_not_refuse
             assert got["talk_banter"] == (1 if effect == I.CAUSE_BANTER else 0), (lab, tone, emo, text)
             if says_refused:
                 assert (got["talk_warm"], got["talk_banter"]) == (0, 0), (lab, tone, emo, text, why)
-            elif M.has_praise(text) or (emo or {}).get("gratitude") or effect == I.CAUSE_CONFIDED:
+            elif (thanked and (M.has_praise(text) or (emo or {}).get("gratitude"))) or effect == I.CAUSE_CONFIDED:
                 assert got["talk_warm"] == 1, (lab, tone, emo, text)
             # the words-only counts: the same rule, on the reading without its emotions
             if why in (SE.HELD_SARCASM, SE.HELD_TASK):
@@ -289,7 +290,8 @@ def test_warm_and_joking_are_counted_exactly_when_the_rows_intent_was_not_refuse
             if refused_w:
                 assert (got["talk_warm_words"], got["talk_banter_words"]) == (0, 0), (lab, tone, emo, text)
             else:
-                assert got["talk_warm_words"] == (1 if M.has_praise(text) or effect_w == I.CAUSE_CONFIDED else 0)
+                assert got["talk_warm_words"] == (1 if (thanked and M.has_praise(text)) or effect_w == I.CAUSE_CONFIDED
+                                                  else 0)
         assert len(seen) == 1, (lab, tone, emo, text)          # the sentiment's own hold: no difference
     assert reasons >= {SE.HELD_UNBACKED, I.WHY_TONE_AGAINST, I.WHY_COLD, SE.HELD_SARCASM}
 
@@ -364,12 +366,28 @@ _PIN_ROWS = [
     _row(_at(14), "thanks", text="thanks a lot, you broke it", emotions={"gratitude": 0.8, "annoyance": 0.6},
          held=SE.HELD_SARCASM, sent="positive"),
     _row(_at(15), text="ok thanks", sent="unknown", held="not English"),     # the language gate: not readable
+    # version 2: the real service's reading of a sarcastic insult (negative tone, admiration)
+    _row(_at(16), "banter", text="great, you broke it again", emotions={"admiration": 0.93}, sent="negative",
+         held="below 0.85", effect="", iheld=I.WHY_UNCLEAR),
+    _row(_at(17), "question", text="I'm so sad but thank you for staying with me",
+         emotions={"sadness": 0.7, "gratitude": 0.8}, sent="negative"),
 ]
+#: version 1's line was counted on rows 0–15 (it stays as the record of what version 1 counted)
 _PINNED = {1: {"intent_rated": 14, "urgent": 2, "talk_readable": 14, "talk_read": 13, "talk_emotions": 8,
                "talk_warm": 3, "talk_thanks": 2, "talk_cold": 3, "talk_banter": 1,
                # without the emotion model: "great job!" (the praise check) and the confiding; the laugh's joke
                "talk_warm_words": 2, "talk_thanks_words": 1, "talk_banter_words": 1,
                "intent": {**{k: 0 for k in I.LABELS}, "banter": 4, "confiding": 2, "instruction": 1, "question": 1,
+                          "advice": 1, "venting": 1}},
+           # version 2 (§4VE functional run 11-21, rows 16–17 added): the sarcastic insult is no longer warm (under
+           # version 1 it was: talk_warm 5); the sad thanks is warm by its gratitude. The same day's review refined
+           # the thanks route before version 2 shipped (thanks about trouble close only under a negative tone): no
+           # row of this table changes under it — "thanks a lot, you broke it" is held as sarcasm, "lol it crashed
+           # again" has no thanks, the insult is negative — so the line stays
+           2: {"intent_rated": 16, "urgent": 2, "talk_readable": 16, "talk_read": 15, "talk_emotions": 10,
+               "talk_warm": 4, "talk_thanks": 3, "talk_cold": 3, "talk_banter": 1,
+               "talk_warm_words": 2, "talk_thanks_words": 1, "talk_banter_words": 1,
+               "intent": {**{k: 0 for k in I.LABELS}, "banter": 5, "confiding": 2, "instruction": 1, "question": 2,
                           "advice": 1, "venting": 1}}}
 
 
@@ -922,3 +940,128 @@ def test_a_joke_doubted_after_the_agents_trouble_counts_alike_whatever_the_emoti
     got = _count(tmp_path, _row(_at(0), "banter", text=text, emotions=emotions, sent="positive", effect="",
                                 iheld=why))
     assert (got["talk_banter"], got["talk_banter_words"], got["talk_warm_words"]) == (0, 0, 0)
+
+
+
+# ── §4VE functional run 11-21: what may make a message warm ─────────────────
+
+def _tones(home, *rows):
+    _journal(home, *rows)
+    return D.owner_tones(home, DAY, tz=UTC)
+
+
+#: (sentiment label, emotions, text, warm on both scales, why)
+_WARM_CASES = [
+    ("negative", {"admiration": 0.93, "approval": 0.05}, "great, you broke it again", False,
+     "the real service's reading of a sarcastic insult: about trouble, and a warm emotion under a negative tone"),
+    ("positive", {"love": 0.74, "admiration": 0.45}, "Oh wonderful, another error. Love that for me.", False,
+     "upbeat words about trouble under a positive tone — below the mood's gate, so nothing held it"),
+    ("positive", {"admiration": 0.95}, "Great job on the summary, really clear.", True, "the control"),
+    ("negative", {"sadness": 0.7, "gratitude": 0.8}, "I'm so sad but thank you for staying with me", True,
+     "thanks under a negative tone still count (gratitude)"),
+    ("negative", {"amusement": 0.7}, "hehe you'd make a terrible weatherman", False,
+     "a warm emotion under a negative tone: the tone and the emotion disagree"),
+    # review 11-21: thanks about trouble under a neutral tone count (bugs are the owner's subject matter); under
+    # version 2's first draft this row was NOT warm — the refinement changed it on purpose
+    ("neutral", {"gratitude": 0.9}, "thanks, but it crashed again", True,
+     "thanks about trouble that is not gone, under a neutral tone: the thanks count"),
+    ("positive", {"gratitude": 0.9}, "thanks, you fixed the bug", True, "trouble gone: the thanks count"),
+]
+
+
+@pytest.mark.parametrize("label,emotions,text,warm,why", _WARM_CASES)
+def test_a_warm_emotion_counts_only_where_the_reading_agrees_with_itself(tmp_path, label, emotions, text, warm, why):
+    # §4VE functional run. catches: "great, you broke it again" (negative 0.72, admiration 0.93 from the real
+    # service) counted WARM on either warmth scale — the old one (``owner_tones``: msgs_warm) or the new one
+    # (``owner_intents``: talk_warm); a thanks under a negative tone lost; the rule copied instead of the
+    # sentiment module's own trouble test
+    rated, w, cold, thanks = _tones(tmp_path / "old", _row(_at(0), "question", text=text, emotions=emotions,
+                                                            sent=label))
+    assert (rated, w) == (1, 1 if warm else 0), why
+    got = _count(tmp_path / "new", _row(_at(0), "question", text=text, emotions=emotions, sent=label))
+    assert got["talk_warm"] == (1 if warm else 0), why
+    assert got["talk_cold"] == cold                           # the annoyed count is untouched by the rule
+
+
+# ── §4VE review 11-21: thanks about trouble are warm, unless the tone says complaint ─────────────
+
+@pytest.mark.parametrize("label,trouble,routes", [
+    ("negative", True, (False, False)), ("negative", False, (False, True)),
+    ("positive", True, (False, True)), ("neutral", True, (False, True)),
+    ("positive", False, (True, True)), ("neutral", False, (True, True))])
+def test_the_warm_routes_by_tone_and_trouble(label, trouble, routes):
+    # catches: trouble closing the thanks under a positive/neutral tone (the first draft); trouble under a
+    # negative tone leaving the thanks open; the warm emotion reopened on a message about trouble
+    text = "you broke the build" if trouble else "you wrote the summary"
+    assert D._warm_routes(label, text) == routes
+
+
+#: (case, sentiment label, emotions, text, the row's ``held`` as the live path would write it, warm on the old
+#: scale ``owner_tones``, warm on the intent scale ``owner_intents``). CONSTRUCTED readings, not the service's
+#: (the scores the brief gives; the live path's hold derived from them: a positive tone at 0.85+ backed by an
+#: emotion and not the praise check is held as sarcasm about trouble — ``sentiment._feed`` / ``doubtful``)
+_ROUTE_CASES = [
+    ("a", "negative", {"admiration": 0.93}, "great, you broke it again", "below 0.85", 0, 0),
+    ("b", "positive", {"admiration": 0.8}, "Oh wonderful, another error. Love that for me.", "below 0.85", 0, 0),
+    # positive 0.9 + gratitude: a row nothing held is warm on the old scale; the intent scale refuses it
+    # (``intent.refusal`` runs ``doubtful`` on the positive tone: trouble words) — and on the live path the row
+    # IS held as sarcasm (c-live): neither scale
+    ("c", "positive", {"gratitude": 0.9}, "thank you for catching that bug!", "", 1, 0),
+    ("c-live", "positive", {"gratitude": 0.9}, "thank you for catching that bug!", SE.HELD_SARCASM, 0, 0),
+    ("c-neutral", "neutral", {"gratitude": 0.9}, "thank you for catching that bug!", "neutral", 1, 1),
+    ("d", "positive", {"gratitude": 0.9}, "you saved me from a huge mess, thank you!!", "", 1, 0),
+    ("d-neutral", "neutral", {"gratitude": 0.9}, "you saved me from a huge mess, thank you!!", "neutral", 1, 1),
+    ("e", "negative", {"gratitude": 0.9}, "thank you for catching that bug!", "", 0, 0),
+    ("f", "negative", {"sadness": 0.7, "gratitude": 0.8}, "I'm so sad but thank you for staying with me", "", 1, 1),
+    # the ACCEPTED COST: praise of the work about trouble, admiration and no thanks
+    ("g", "positive", {"admiration": 0.9}, "great debugging, the error was subtle", "", 0, 0),
+]
+
+
+@pytest.mark.parametrize("case,label,emotions,text,held,old,new", _ROUTE_CASES, ids=[c[0] for c in _ROUTE_CASES])
+def test_thanks_about_trouble_are_warm_unless_the_tone_says_complaint(tmp_path, case, label, emotions, text, held,
+                                                                      old, new):
+    # §4VE review 11-21. catches: trouble closing the thanks route under a positive or neutral tone (the first
+    # draft: c, c-neutral, d, d-neutral lost); trouble under a NEGATIVE tone leaving the thanks open (e warm); the
+    # warm-emotion route reopened on a message about trouble (b, g warm); a negative tone alone closing the
+    # thanks (f lost); the sarcastic insult warm again (a)
+    for il in ("thanks", "question"):           # what the intent model read does not decide warmth
+        row = _row(_at(0), il, text=text, emotions=emotions, sent=label, held=held)
+        rated, w, cold, thanks = _tones(tmp_path / f"old-{il}", row)
+        assert (rated, w, thanks) == (1, old, old), case
+        got = _count(tmp_path / f"new-{il}", row)
+        assert (got["talk_warm"], got["talk_thanks"]) == (new, new), case
+
+
+@pytest.mark.parametrize("case,label,emotions,text,held,old,new", _ROUTE_CASES, ids=[c[0] for c in _ROUTE_CASES])
+def test_the_warm_routes_never_change_the_annoyed_count(tmp_path, case, label, emotions, text, held, old, new):
+    # catches: the refinement reaching the cold count — a closed (or reopened) route dropping or adding an
+    # annoyed message on either scale
+    for annoyed in (False, True):
+        emo = {**emotions, "annoyance": 0.7} if annoyed else emotions
+        row = _row(_at(0), "question", text=text, emotions=emo, sent=label, held=held)
+        assert _tones(tmp_path / f"old-{annoyed}", row)[2] == int(annoyed), case
+        assert _count(tmp_path / f"new-{annoyed}", row)["talk_cold"] == int(annoyed), case
+
+
+#: (h) the KNOWN LEAK, pinned: sarcastic thanks about trouble, gratitude 0.6. (row held, old scale, intent scale)
+_SARCASTIC_THANKS = [
+    # positive 0.7: under the mood's gate (0.85), so the live path never ran ``doubtful`` and held nothing —
+    # the old scale counts it warm; the intent scale's ``intent.refusal`` doubts the positive tone: not warm
+    ("positive", "below 0.85", 1, 0),
+    # positive at 0.85+ (gratitude backs it): the live path holds it as sarcasm — neither scale
+    ("positive", SE.HELD_SARCASM, 0, 0),
+    # neutral: nothing doubts a neutral tone — warm on both scales
+    ("neutral", "neutral", 1, 1),
+]
+
+
+@pytest.mark.parametrize("label,held,old,new", _SARCASTIC_THANKS)
+def test_sarcastic_thanks_about_trouble_is_the_known_leak(tmp_path, label, held, old, new):
+    # §4VE review 11-21: PINNED so a change to it is deliberate. catches: a new rule (or a change to the live
+    # path's hold, ``intent.refusal`` or ``_warm_routes``) moving what "thanks for breaking the build again"
+    # counts without this table being updated
+    row = _row(_at(0), "thanks", text="thanks for breaking the build again", emotions={"gratitude": 0.6},
+               sent=label, held=held)
+    assert _tones(tmp_path / "old", row)[1] == old
+    assert _count(tmp_path / "new", row)["talk_warm"] == new

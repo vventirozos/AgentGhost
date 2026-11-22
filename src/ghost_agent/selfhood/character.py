@@ -462,6 +462,18 @@ KIND_OWNER = "owner_set"      # the owner's word
 KIND_PIN = "pin"
 KIND_UNPIN = "unpin"
 KIND_VETO = "veto"
+#: §4VF: the path was worked out again under the current rule (``replay``)
+KIND_REPLAY = "replay"
+
+#: §4VF (operator 2026-11-22: "i want mirror to show accurate data, not data based on old rules that no longer
+#: apply"): the version of the rule that moves the dials by itself (``propose`` with ``day_signals``). Every
+#: automatic move is written with it (``rule``); a move row without one was made by rule 1 — the lead of days, with
+#: warmth also counting thumbs — which §4UP (shift rule) and §4UH-warmth (separate signals) replaced. When a move
+#: in the log, or the character file, was made by another version, ``replay`` works the path out again from the
+#: start under this one. BUMP IT whenever ``propose``, ``day_signals`` or a constant they read changes what moves
+#: a dial: the live character is then replayed at the next idle window, and ``mirror`` never shows a move or a
+#: reason the rule that runs would not have made.
+RULE_VERSION = 2
 
 _LOCK = threading.RLock()
 _MEMO: dict = {}
@@ -513,8 +525,10 @@ def _iso(now=None) -> str:
 def load(home) -> Dict[str, object]:
     """{"dials": {...}, "pins": [...], "daily_through": "YYYY-MM-DD" | ""} — ``START`` and no pins before
     the first write or when the file cannot be read. Never raises, never writes."""
+    # "rule": the rule version the dials were worked out under (§4VF) — RULE_VERSION with no file yet (nothing
+    # to replay), 0 for a file written before the version was stored
     state = {"dials": dict(START), "pins": [], "daily_through": "", "changed": {}, "stored": False,
-             "unreadable": ""}
+             "unreadable": "", "rule": RULE_VERSION}
     root = _root(home)
     if root is None:
         return state
@@ -546,8 +560,16 @@ def load(home) -> Dict[str, object]:
     got = _real_stamp(raw.get("reset_at"))
     if got:
         state["reset_at"] = got
+    state["rule"] = _rule_of(raw, absent=0)
     state["stored"] = True
     return state
+
+
+def _rule_of(row, *, absent: int = 1) -> int:
+    """The rule version a log row or the character file was written under — ``absent`` when it says none (a move
+    row without one is rule 1's), or when what it says is not a whole number above 0."""
+    v = row.get("rule") if isinstance(row, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else absent
 
 
 def _real_stamp(value) -> str:
@@ -801,6 +823,9 @@ def _write(home, state: Dict[str, object]) -> None:
                     if d in DIALS and _real_date(v)},
         # the owner's last reset, with the dials it set (the veto's barrier when its log row is missing)
         **({"reset_at": _real_stamp(state.get("reset_at"))} if _real_stamp(state.get("reset_at")) else {}),
+        # §4VF: the rule the dials were worked out under (a file read without one stays without one until the
+        # replay: the log's own moves say which rule made them)
+        **({"rule": _rule_of(state, absent=0)} if _rule_of(state, absent=0) else {}),
         "updated": _iso()})
     with _LOCK:
         _MEMO.clear()
@@ -1077,6 +1102,12 @@ def daily(home, days: List[Dict[str, object]], *, now=None) -> List[str]:
             state = ensure(home, now=now)
             if state["unreadable"]:
                 return []
+            # §4VF: a path made under another rule is worked out again first (once; then the rule runs on)
+            if needs_replay(state, log_rows(home)):
+                replay(home, days, now=now)
+                state = load(home)
+                if state["unreadable"]:
+                    return []
             today = _mood_day(now)
             # a day record dated after today is not one (a clock that was wrong, a hand edit): it would
             # become `daily_through` and stop the rule until that date
@@ -1093,11 +1124,12 @@ def daily(home, days: List[Dict[str, object]], *, now=None) -> List[str]:
                 state["dials"][mv["dial"]] = mv["to"]
                 state["changed"][mv["dial"]] = through       # the evidence up to `through` is used up
             state["daily_through"] = through
+            state["rule"] = RULE_VERSION                     # §4VF: no path of another rule is left (checked above)
             _write(home, state)                              # the dials first: a move is real once this returns
             said = []
             for mv in moves:
                 try:
-                    _log(home, {"at": _iso(now), "kind": KIND_MOVE, **mv})
+                    _log(home, {"at": _iso(now), "kind": KIND_MOVE, "rule": RULE_VERSION, **mv})
                 except Exception as e:  # noqa: BLE001 — the move stands; only its line in the story is missing
                     logger.warning("character: move not logged (%s)", type(e).__name__)
                 said.append(f"{mv['dial']} {mv['from']:+d} → {mv['to']:+d}: {mv['why']}")
@@ -1105,6 +1137,208 @@ def daily(home, days: List[Dict[str, object]], *, now=None) -> List[str]:
     except Exception as e:  # noqa: BLE001 — the idle window never breaks on the character
         logger.warning("character: the daily rule did not run (%s: %s)", type(e).__name__, e)
         return []
+
+
+# ── a new rule: the path worked out again (§4VF) ────────────────────────────
+
+#: the owner's rows — they stand whatever the rule (a set, a pin, a release, a start or a reset, a veto)
+_OWNER_KINDS = (KIND_START, KIND_OWNER, KIND_PIN, KIND_UNPIN, KIND_VETO)
+
+
+def needs_replay(state: Dict[str, object], rows: List[dict]) -> bool:
+    """Was any part of the path made under another rule than ``RULE_VERSION``: the character file says another
+    version, or an automatic move in the log was made by one (a move row without a version is rule 1's)?"""
+    if _rule_of(state, absent=0) not in (0, RULE_VERSION):
+        return True
+    return any(isinstance(r, dict) and r.get("kind") == KIND_MOVE and _rule_of(r) != RULE_VERSION for r in rows)
+
+
+def _row_day(r: dict) -> str:
+    """The mood day a log row was written on ("" when its stamp does not parse)."""
+    try:
+        at = datetime.datetime.fromisoformat(str(r.get("at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return _mood_day(at)
+
+
+def _stamp_of(value) -> str:
+    """A stored moment ("2026-11-12T02:38:55Z", or any ISO time) in ``_iso``'s form, or "" when it does not parse
+    — the form every comparison of moments below is made in."""
+    try:
+        t = datetime.datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return _iso(t)
+
+
+def replay_path(rows: List[dict], days: List[Dict[str, object]], through: str
+                ) -> Tuple[List[dict], Dict[str, object]]:
+    """The path the CURRENT rule makes — pure. The closes are replayed at the moments they ran: the daily rule runs
+    in the same idle phase that writes the day records (``days.close_days`` then ``daily``), so each record's
+    ``written_at`` is the moment of a close, and that close read every record written by then, through the newest
+    (several days written in one window are ONE close, as live). A record without ``written_at`` (the seeded ones)
+    was there from the end of its day. The first close is the character's start (``ensure`` writes the start row in
+    the ``daily`` call that runs it). At each close the owner's rows written by then stand (``_OWNER_KINDS``, in
+    their order: a setting at 09:00 is before that night's close); the automatic moves are dropped and made again by
+    ``propose``, stamped at the close. A start row puts the dials where it says, lets every pin go and clears the
+    clocks (as ``load`` does when the file is gone; a reset stamps the clocks its day). A veto names a move of the
+    old path: it stands as the owner putting that dial back where the veto put it (its "from" is where the replayed
+    path had it, its link to the old move dropped), and goes when the dial is already there — as does a setting.
+    A log with no start row starts at its first row, from ``START``. Closes past ``through`` (the last day the
+    daily rule ran for) are left to it. (the new log rows, {"dials", "pins", "changed"} at the end)."""
+    from . import mood as _M
+    owner = [r for r in rows if isinstance(r, dict) and r.get("kind") in _OWNER_KINDS and _stamp_of(r.get("at"))]
+    starts = [i for i, r in enumerate(owner) if r.get("kind") == KIND_START]
+    if starts:
+        owner = owner[starts[0]:]
+    else:
+        first = min((_stamp_of(r.get("at")) for r in rows if isinstance(r, dict) and _stamp_of(r.get("at"))),
+                    default="")
+        if not first:
+            return [], {"dials": dict(START), "pins": [], "changed": {}}
+        owner = [{"at": first, "kind": KIND_START, "dials": dict(START),
+                  "why": "the starting character (its row was missing from the log)"}] + owner
+    begun = _stamp_of(owner[0].get("at"))
+    dials, pins, changed = dict(START), [], {}
+    out: List[dict] = []
+    ordered = [d for d in _by_date(days) if str(d.get("date")) <= through]
+
+    def avail(rec) -> str:
+        return (_stamp_of(rec.get("written_at"))
+                or _iso(_M.mood_day_end(datetime.date.fromisoformat(str(rec.get("date"))))))
+    ready = [(avail(d), d) for d in ordered]
+    closes = sorted({begun} | {t for t, _d in ready if t >= begun})
+
+    def apply(r: dict) -> None:
+        nonlocal dials, pins, changed
+        kind = r.get("kind")
+        day = _row_day(r)
+        if kind == KIND_START:
+            got = r.get("dials") if isinstance(r.get("dials"), dict) else START
+            was = dict(dials)
+            dials = {d: clamp(got.get(d, START[d])) for d in DIALS}
+            pins = []
+            changed = {d: day for d in DIALS} if is_reset_row(r) and day else {}
+            row = dict(r)
+            if is_reset_row(r) and isinstance(r.get("from"), dict):
+                row["from"] = was
+            out.append(row)
+            return
+        d = resolve_dial(r.get("dial"))
+        if not d:
+            return
+        if kind in (KIND_OWNER, KIND_VETO):
+            to = r.get("to")
+            if isinstance(to, bool) or not isinstance(to, int):
+                return
+            to = clamp(to)
+            if to == dials[d]:
+                return                                   # already there on the replayed path: nothing to set
+            row = {k: v for k, v in r.items() if k not in ("of", "of_to")}
+            row.update(dial=d, to=to, **{"from": dials[d]})
+            if kind == KIND_VETO:
+                # review r2: a veto takes back a move of the REPLAYED path when one stands there — the latest move
+                # of this dial that left it where it is now, from where the veto puts it, not already taken back
+                # (``veto`` reads ``of``/``of_to``; unlinked, a second veto undid the first). Otherwise it is the
+                # owner putting the dial there: an owner's setting, which no veto reaches behind
+                taken = {(x.get("of"), x.get("dial"), x.get("of_to")) for x in out if x.get("kind") == KIND_VETO}
+                hit = next((x for x in reversed(out) if x.get("kind") == KIND_MOVE and x.get("dial") == d
+                            and x.get("to") == dials[d] and x.get("from") == to
+                            and (x.get("at"), d, x.get("to")) not in taken
+                            and not any(y.get("kind") in (KIND_OWNER, KIND_START) and y.get("dial", d) == d
+                                        for y in out[out.index(x) + 1:])), None)
+                if hit is not None:
+                    row.update(of=hit.get("at"), of_to=hit.get("to"))
+                else:
+                    row.update(kind=KIND_OWNER,
+                               why="the owner took an automatic move back (kept as the owner's setting by the replay)")
+            dials[d] = to
+            if day:
+                changed[d] = day
+            out.append(row)
+        elif kind == KIND_PIN:
+            pins = [x for x in DIALS if x in pins or x == d]
+            out.append(dict(r))
+        elif kind == KIND_UNPIN:
+            pins = [x for x in pins if x != d]
+            if day:
+                changed[d] = day
+            out.append(dict(r))
+
+    i, done = 0, ""
+    for t in closes:
+        while i < len(owner) and _stamp_of(owner[i].get("at")) <= t:
+            apply(owner[i])
+            i += 1
+        today = _mood_day(datetime.datetime.fromisoformat(t.replace("Z", "+00:00")))
+        seen = [d for a, d in ready if a <= t and str(d.get("date")) <= today]
+        if not seen or str(seen[-1].get("date")) <= done:
+            continue                                     # no new day: the live rule did nothing here either
+        done = str(seen[-1].get("date"))
+        for mv in propose(seen, {"dials": dials, "pins": pins, "changed": changed}, out, done):
+            dials[mv["dial"]] = mv["to"]
+            changed[mv["dial"]] = done
+            out.append({"at": t, "kind": KIND_MOVE, "rule": RULE_VERSION, "through": done, **mv})
+    while i < len(owner):                                # the owner's rows after the last close the rule ran
+        apply(owner[i])
+        i += 1
+    return out, {"dials": dials, "pins": pins, "changed": changed}
+
+
+def _write_rows(path: Path, rows: List[dict]) -> None:
+    """``rows`` as a JSON-lines file at ``path``, flushed to disk before it returns."""
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def replay(home, days: List[Dict[str, object]], *, now=None) -> str:
+    """§4VF: work the character's path out again under the current rule (``replay_path``) when any of it was made
+    under another (``needs_replay``), and make that the character: the log becomes the replayed path plus one
+    ``replay`` row saying so (the old log is kept beside it, ``character.log.before-rule<N>.<stamp>.jsonl``), and
+    the dials and their clocks become where the replayed path leaves them. The owner's pins stand. ``daily_through``
+    is kept: the daily rule goes on from the day it had reached. What changed, in words ("" when nothing was to
+    replay). Raises on a failure (``daily`` books it and tries again in the next idle window); the dials are
+    written before the log, and a log still holding the old rule's moves is replayed again, so a half-done replay
+    is redone whole."""
+    with _LOCK:
+        state = load(home)
+        root = _root(home)
+        if root is None or not state["stored"] or state["unreadable"]:
+            return ""
+        rows = log_rows(home)
+        if not needs_replay(state, rows):
+            return ""
+        old_moves = sum(1 for r in rows if isinstance(r, dict) and r.get("kind") == KIND_MOVE)
+        new_rows, end = replay_path(rows, days, state["daily_through"])
+        new_moves = sum(1 for r in new_rows if r.get("kind") == KIND_MOVE)
+        was = dict(state["dials"])
+        spans = [f"{d} {was[d]:+d} → {end['dials'][d]:+d}" for d in DIALS if was[d] != end["dials"][d]]
+        why = (f"the rule that moves the dials changed (now rule {RULE_VERSION}); the path was worked out again "
+               f"under it: {old_moves} automatic move{'s' if old_moves != 1 else ''} of the old rule "
+               f"replaced by {new_moves}")
+        new_rows.append({"at": _iso(now), "kind": KIND_REPLAY, "rule": RULE_VERSION, "from": was,
+                         "dials": dict(end["dials"]), "moves_before": old_moves, "moves_after": new_moves,
+                         "why": why})
+        # the dials first, as every change. A log that then fails to be written still holds the old rule's moves,
+        # so ``needs_replay`` is still true and the next idle window replays again from the same owner rows
+        state["dials"] = dict(end["dials"])
+        state["changed"] = dict(end["changed"])
+        state["rule"] = RULE_VERSION
+        _write(home, state)
+        log = root / LOG_FILENAME
+        stamp_ = _iso(now).replace(":", "").replace("-", "")
+        # the old log, kept beside the new one: the rows as read (written, not copied — no path is followed)
+        _write_rows(root / f"character.log.before-rule{RULE_VERSION}.{stamp_}.jsonl", rows)
+        tmp = root / f".{LOG_FILENAME}.replay.tmp"
+        _write_rows(tmp, new_rows)
+        os.replace(tmp, log)
+        said = why + (": " + ", ".join(spans) if spans else "; the dials stay where they are")
+        logger.info("character: %s", said)
+        return said
 
 
 # ── the views ───────────────────────────────────────────────────────────────
@@ -1129,7 +1363,22 @@ def _change_line(r: dict) -> str:
         return f"{day}: {d} {span}, {by}" + (f" — {r.get('why')}" if kind == KIND_MOVE and r.get("why") else "")
     if kind in (KIND_PIN, KIND_UNPIN):
         return f"{day}: {d} {'pinned' if kind == KIND_PIN else 'unpinned'} by the owner"
+    if kind == KIND_REPLAY:
+        return f"{day}: {replay_words(r)}"
     return ""
+
+
+def replay_words(r: dict) -> str:
+    """A ``replay`` row in words: the rule changed, the path above is the current rule's, and what it did to the
+    dials."""
+    was = r.get("from") if isinstance(r.get("from"), dict) else {}
+    got = r.get("dials") if isinstance(r.get("dials"), dict) else {}
+    def s(v) -> str:
+        return f"{clamp(v):+d}" if clamp(v) else "0"
+    spans = [f"{d} {s(was[d])} → {s(got[d])}" for d in DIALS
+             if d in was and d in got and clamp(was[d]) != clamp(got[d])]
+    return ("the rule that moves the dials changed, so the path was worked out again under the current one "
+            + ("(" + ", ".join(spans) + ")" if spans else "(the dials stayed where they were)"))
 
 
 def story(home, *, limit: int = 12) -> str:

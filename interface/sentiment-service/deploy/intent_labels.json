@@ -1,5 +1,5 @@
 {
-  "about": "Labels in answer order, the phrase each one's hypothesis is made of (template with {} = the phrase), the urgency pair, the premise's token cap (256, as measured) and the onnxruntime threads for this model: 4 cores, not spinning between runs, so llama-server on the same machine keeps the rest. The 11-20 latency (620 ms median) was measured at onnxruntime's default (threads 0 = one per core, spinning); measure 2, 4 and 0 with --check-intent --intent-threads 2,4,0 at deploy and put the chosen count here.",
+  "about": "Labels in answer order, the phrase each one's hypothesis is made of (template with {} = the phrase), the urgency pair, the token cap for the premise+hypothesis pair, how a longer premise is cut, and the onnxruntime threads. max_tokens 64 was chosen at the 2026-11-21 deploy: 256 took ~6 s per long message at 4 threads against the 2 s budget (64 ~ 1.35 s, 80 ~ 1.7 s, 96 ~ 2.0 s). A premise longer than its room keeps its START and its END with ' … ' between them (people put the ask at the end); head_share is the share of the room given to the start (0.5; 1 = the start only, the behaviour before 11-21); a premise that fits is never touched. Threads 4, not spinning between runs, so llama-server on the same machine keeps the rest of the cores (the 11-20 latency, 620 ms median, was at onnxruntime's default: threads 0 = one per core, spinning); re-measure with --check-intent --intent-threads 2,4,0.",
   "template": "This example is {}",
   "labels": {
     "instruction": "giving an instruction or task.",
@@ -19,5 +19,6 @@
   ],
   "max_tokens": 64,
   "threads": 4,
-  "spinning": false
+  "spinning": false,
+  "head_share": 0.5
 }
