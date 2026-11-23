@@ -1242,6 +1242,275 @@ _COVERED_BY_JS = """(el) => {
   return d(top) + (host && host !== top ? ' inside ' + d(host) : '');
 }"""
 
+#: §4VG (req 9d5bbe77): at the end of an interact on the model's OWN page, the
+#: visible controls a user could not click — another element sits on their
+#: centre. The live case: a "LOADING…" overlay (z-index 3) left over the
+#: app's ▶ Launch button; the sequence only ran `evaluate`, so nothing ever
+#: hit-tested the button and the app shipped unusable. A cover that holds
+#: controls of its own (another window, a dialog with buttons, a menu) is a
+#: layer the user can act on and is not reported; a cover with none (a
+#: loading screen, an invisible layer, a backdrop) is.
+_COVERED_CONTROLS_JS = """() => {
+  const out = [], t0 = performance.now();
+  const sel = 'button, [role=button], a[href], input:not([type=hidden]), select, textarea, [onclick]';
+  // what is scanned: the controls, and the page's own frames (review r2 m7: an overlay left over an app's
+  // iframe — DOOM after Start — is the same bug)
+  const scan = sel + ', iframe';
+  // page-made ids/classes reach the model: word characters only (review r1 m5)
+  const clean = (t) => String(t || '').replace(/[^\\w-]+/g, '').slice(0, 40);
+  const d = (e) => e.tagName.toLowerCase() + (e.id ? '#' + clean(e.id) : '')
+    + (e.classList && e.classList.length ? '.' + Array.from(e.classList).slice(0, 2).map(clean).join('.') : '');
+  const up = (a) => a.parentElement || (a.getRootNode && a.getRootNode().host) || null;
+  // drawn and visible: a box, and no ancestor (across shadow roots) hidden or fully transparent (review r1 m4)
+  const shown = (e) => {
+    if (!e.getClientRects().length) return false;
+    for (let a = e; a && a.nodeType === 1; a = up(a)) {
+      const cs = getComputedStyle(a);
+      if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) === 0) return false;
+      // the screen-reader-only idiom: clipped to nothing (review r4)
+      if (a === e && ((cs.clip && cs.clip !== 'auto') || /inset\\((50|100)%/.test(cs.clipPath || ''))) return false;
+    }
+    return true;
+  };
+  // a SHOWN control anywhere in the subtree, shadow roots included (review r1 M2: a display:none Retry
+  // button made the live overlay "actionable"; a web-component dialog's Close button sits in its shadow root)
+  // review r4 M4: a control in the cover counts only if the user can use it (a greyed "Cancel" on a stuck
+  // splash is not a way out); r4 M1: a frame counts only if it holds something — a blank or empty iframe
+  // left over the button is the bug (a cross-origin frame is unknown, so it counts)
+  const frameHolds = (f) => {
+    try {
+      const doc = f.contentDocument;
+      return !doc || !!(doc.body && doc.body.querySelector(sel));
+    } catch (e) { return true; }
+  };
+  const usable = (x) => {
+    const r = x.getBoundingClientRect();
+    if (r.width < 3 || r.height < 3 || x.disabled || !shown(x)) return false;
+    if (getComputedStyle(x).pointerEvents === 'none') return false;
+    return x.tagName !== 'IFRAME' || frameHolds(x);
+  };
+  const seen = new Map();          // review r2 M2: one walk per cover, however many controls it covers
+  const hasControl = (root) => {
+    if (seen.has(root)) return seen.get(root);
+    const stack = [root];
+    let found = false;
+    for (let n = 0; stack.length && n < 5000; n++) {
+      const x = stack.pop();
+      if (x.nodeType === 1 && x.matches(scan) && usable(x)) { found = true; break; }
+      if (x.shadowRoot) stack.push(x.shadowRoot);
+      for (const c of (x.children || [])) stack.push(c);
+    }
+    if (stack.length) found = true;  // review r3 m5: past the cap the answer is unknown — never a report
+    seen.set(root, found);
+    return found;
+  };
+  // scrolled out of a scrolling / clipping ancestor: not on screen, not covered (review r1 M1)
+  // the clip follows the containing-block chain: a fixed node escapes every ancestor (review r2 m5), an
+  // absolute one every static ancestor up to its containing block (review r3 m6)
+  const root = document.documentElement;
+  const clipped = (el, x, y) => {
+    let n = el;
+    for (let a = up(el); a && a.nodeType === 1 && a !== root; a = up(a)) {
+      const p = getComputedStyle(n).position;
+      if (p === 'fixed') return false;
+      if (p === 'absolute') {
+        while (a && a.nodeType === 1 && a !== root && getComputedStyle(a).position === 'static') a = up(a);
+        if (!a || a.nodeType !== 1 || a === root) return false;
+      }
+      const cs = getComputedStyle(a);
+      if (/auto|scroll|hidden|clip/.test(cs.overflowX + ' ' + cs.overflowY)) {
+        const r = a.getBoundingClientRect();
+        if (x < r.left || x >= r.right || y < r.top || y >= r.bottom) return true;
+      }
+      n = a;
+    }
+    return false;
+  };
+  // a fixed / sticky bar or toast (under a quarter of the viewport tall) hides what scrolls under it: the
+  // user scrolls, it is not a stuck layer (review r1 m4)
+  // a bar or a toast: EVERY element from the hit one up to its fixed / sticky container is shorter than a
+  // quarter of the viewport (review r2 m6: a full-screen overlay in a zero-height portal is not a bar; r3 M1:
+  // nor is the small "LOADING…" text inside a full-screen fixed overlay)
+  // review r4 M3: a FIXED one sits at an edge of the viewport — a small fixed box in the middle is a spinner
+  const band = (n) => {
+    for (let a = n; a && a.nodeType === 1; a = up(a)) {
+      const r = a.getBoundingClientRect(), cs = getComputedStyle(a), p = cs.position;
+      // a click-through layer (a toaster's full-screen container) is no wall, whatever its size (review r4 m6)
+      if (r.height >= window.innerHeight / 4 && cs.pointerEvents !== 'none') return false;
+      if (p === 'sticky') return true;
+      if (p === 'fixed') {
+        const m = 96;
+        return r.top <= m || r.left <= m || r.bottom >= window.innerHeight - m || r.right >= window.innerWidth - m;
+      }
+    }
+    return false;
+  };
+  let topModal = null;
+  try { topModal = document.querySelector(':modal'); } catch (e) { topModal = null; }
+  // no whole-page modal skip (review r3 M2/M3): a dialog with buttons is a cover with a shown control already,
+  // and a modal with none — an accessible loading screen — is the bug this looks for
+  // newest first: the window just opened (appended last, drawn on top) is what the sequence was testing, and a
+  // huge page runs out of the budget below (a hit test costs ~0.5 ms with thousands of positioned elements)
+  const clear = [];                // controls the hit test reached: checked again below for a click-through wall
+  for (const el of Array.from(document.querySelectorAll(scan)).reverse()) {
+    if (out.length >= 5 || performance.now() - t0 > 1500) break;     // review r2 M2: partial rows, never none
+    const r = el.getBoundingClientRect();
+    if (r.width < 3 || r.height < 3) continue;          // no box, or a 1 px screen-reader-only control
+    // cheapest first (review r2 M2): the hit test, then the cover (cached), then the style walks
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const top = document.elementFromPoint(cx, cy);        // null off-screen; a native modal's backdrop hits it
+    if (!top) continue;
+    if (el.contains(top)) { if (clear.length < 300) clear.push([el, cx, cy, r]); continue; }
+    let cover = top;
+    if (top.contains(el)) {
+      // review r4 M2: an ANCESTOR answering at a point inside the control's own boxes painted over it — a
+      // `::after` loading layer, a control behind its parent (a wrapped inline link's centre is between its
+      // boxes, so it is not this)
+      if (!Array.from(el.getClientRects()).some((b) => cx >= b.left && cx < b.right && cy >= b.top && cy < b.bottom))
+        continue;
+    } else {
+      if (el.labels && Array.from(el.labels).some((l) => l.contains(top))) continue;
+      const via = top.closest && top.closest('label, a, button');
+      if (via && via.contains(el)) continue;
+      // the cover is the topmost ancestor of the hit element that does not contain the control
+      while (cover.parentElement && !cover.parentElement.contains(el)) cover = cover.parentElement;
+      // (a modal dialog is small and fixed, never a bar)
+      if (hasControl(cover) || (!(topModal && topModal.contains(top)) && band(top))) continue;
+    }
+    const cs = getComputedStyle(el);
+    if (cs.pointerEvents === 'none' || el.disabled || !shown(el)) continue;
+    if (clipped(el, cx, cy)) continue;
+    const text = String(el.innerText || el.value || el.getAttribute('aria-label') || el.title || '')
+      .replace(/\\s+/g, ' ').trim().slice(0, 40);              // one line (the host prints it with repr)
+    out.push({control: d(el), text, cover: d(top) + (cover !== top ? ' inside ' + d(cover) : '')});
+  }
+  // review r5 M1 — the live DOOM app's "fix": an opaque loading layer with pointer-events:none. Clicks pass
+  // through to the button, so every hit test (Playwright's actionability check too) says it is fine, yet the
+  // user sees only the loading screen. Hit-test the reached controls again in PAINT order (every element
+  // answering), and report those an opaque layer is drawn over. The sheet goes in and out inside this one
+  // synchronous call: no frame is painted with it, and an adopted sheet is invisible to MutationObservers.
+  // the alpha of every colour in a computed value (rgb()/rgba() legacy commas, any modern `/ a` form: oklch, lab…)
+  const alphas = (v) => Array.from(String(v || '').matchAll(/(?:rgba?|hsla?|oklch|oklab|lab|lch|color)\(([^()]*)\)/g),
+    (m) => {
+      const args = m[1], slash = args.split('/');
+      const raw = slash.length > 1 ? slash[1] : (args.split(',').length > 3 ? args.split(',')[3] : '1');
+      if (/^\s*none\s*$/.test(raw)) return 0;              // a missing alpha is 0 (review r7 n7)
+      const n = parseFloat(raw);
+      return isNaN(n) ? 1 : (/%/.test(raw) ? n / 100 : n);
+    });
+  // the top-level comma-separated layers of a computed value
+  const layers = (v) => {
+    const out = [];
+    let depth = 0, cur = '';
+    for (const ch of String(v || '')) {
+      if (ch === '(') depth++;
+      if (ch === ')') depth--;
+      if (ch === ',' && depth === 0) { out.push(cur.trim()); cur = ''; } else cur += ch;
+    }
+    if (cur.trim()) out.push(cur.trim());
+    return out;
+  };
+  // painted solid: an opaque colour, or ONE gradient layer that fills the box with every stop opaque (review r6
+  // M2: a fade, a vignette, scanlines are see-through; r7 M1: an image cannot be judged — a grain texture, a
+  // watermark, a spinner gif on a clear layer — so no url() counts; r7 m3: a vignette over a solid gradient)
+  const solid = (cs) => {
+    const bg = alphas(cs.backgroundColor);
+    if (bg.length && bg[0] >= 0.9) return true;
+    const sizes = layers(cs.backgroundSize);
+    return layers(cs.backgroundImage).some((im, i) => {
+      if (!/gradient\(/.test(im) || /url\(/.test(im)) return false;
+      const size = (sizes[i % Math.max(1, sizes.length)] || 'auto').trim();
+      if (!/^(auto|auto auto|cover|100% 100%|100%)$/.test(size)) return false;
+      const st = alphas(im);
+      return st.length > 0 && st.every((x) => x >= 0.9);
+    });
+  };
+  const opaque = (h, el, r) => {
+    for (let a = h; a && a.nodeType === 1 && !a.contains(el); a = up(a)) {
+      const cs = getComputedStyle(a);
+      if (!shown(a) || parseFloat(cs.opacity) < 0.9) return null;
+      const b = a.getBoundingClientRect();
+      if (solid(cs) && b.left <= r.left + 1 && b.top <= r.top + 1
+          && b.right >= r.right - 1 && b.bottom >= r.bottom - 1) return a;
+    }
+    return null;
+  };
+  if (clear.length && out.length < 5 && performance.now() - t0 < 1500) {
+    let hits = [];
+    try {
+      const sheet = new CSSStyleSheet();
+      sheet.replaceSync('*, *::before, *::after { pointer-events: auto !important; }');
+      const before = Array.from(document.adoptedStyleSheets);   // a COPY: the property is a live array
+      try {
+        document.adoptedStyleSheets = [...before, sheet];
+        hits = clear.map(([el, cx, cy]) => document.elementFromPoint(cx, cy));
+      } finally { document.adoptedStyleSheets = before; }
+    } catch (e) { hits = []; }
+    for (let i = 0; i < hits.length && out.length < 5; i++) {
+      const [el, cx, cy, r] = clear[i], h = hits[i];
+      if (!h || el.contains(h) || h.contains(el)) continue;
+      const wall = opaque(h, el, r);
+      if (!wall) continue;
+      let cover = wall;
+      while (cover.parentElement && !cover.parentElement.contains(el)) cover = cover.parentElement;
+      // review r6 M1: an opaque wall a quarter of the viewport or taller is no bar, whatever it lets through
+      if (hasControl(cover) || (wall.getBoundingClientRect().height < window.innerHeight / 4 && band(h))) continue;
+      const cs = getComputedStyle(el);
+      if (cs.pointerEvents === 'none' || el.disabled || !shown(el) || clipped(el, cx, cy)) continue;
+      const text = String(el.innerText || el.value || el.getAttribute('aria-label') || el.title || '')
+        .replace(/\s+/g, ' ').trim().slice(0, 40);
+      out.push({control: d(el), text, cover: d(wall) + (cover !== wall ? ' inside ' + d(cover) : ''), hidden: true});
+    }
+  }
+  return out;
+}"""
+#: a frame element drawn in its parent: no ancestor (in the parent document) hidden or fully transparent
+_FRAME_SHOWN_JS = """(e) => {
+  if (!e.getClientRects().length) return false;
+  for (let a = e; a && a.nodeType === 1; a = a.parentElement) {
+    const cs = getComputedStyle(a);
+    if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) === 0) return false;
+  }
+  return true;
+}"""
+#: pages the scan runs on: the model's own work, never a public site
+_OWN_PAGE_RE = re.compile(r"^(?:file:|https?://(?:127\.0\.0\.1|localhost|\[::1\])(?:[:/]|$))", re.I)
+#: a frame of the model's own page (review r1 m3: a webOS app window is often an iframe)
+_OWN_FRAME_RE = re.compile(r"^about:(?:srcdoc|blank)$", re.I)
+
+
+async def _covered_controls(page):
+    """§4VG: [] unless the page is the model's own and a visible control is covered — in the page and in its
+    own frames (`srcdoc` / same-origin), each row of a frame prefixed with ``iframe > ``."""
+    try:
+        if not _OWN_PAGE_RE.match(page.url or ""):
+            return []
+        out = []
+        for fr in list(page.frames)[:12]:
+            main = fr == page.main_frame
+            if not main and not (_OWN_PAGE_RE.match(fr.url or "") or _OWN_FRAME_RE.match(fr.url or "")):
+                continue
+            if not main:                         # review r2 m7: a frame its parent hides shows the user nothing
+                try:
+                    fe = await fr.frame_element()
+                    if not await asyncio.wait_for(fe.evaluate(_FRAME_SHOWN_JS), timeout=2.0):
+                        continue
+                except Exception:  # noqa: BLE001
+                    continue
+            try:
+                got = await asyncio.wait_for(fr.evaluate(_COVERED_CONTROLS_JS), timeout=3.0)
+            except Exception:  # noqa: BLE001 — a frame that went away, or a slow one
+                continue
+            for g in got or []:
+                if isinstance(g, dict):
+                    out.append(g if main else dict(g, control="iframe > " + str(g.get("control"))))
+            if len(out) >= 5:
+                break
+        return out[:5]
+    except Exception:  # noqa: BLE001 — a probe never fails the interact
+        return []
+
+
 def _write_replacing(out_path: str, data: bytes) -> None:
     """Write ``data`` to a temp name next to ``out_path`` and rename it over
     the target. §4NW: re-writing a PNG on the macOS bind mount a few seconds
@@ -1981,8 +2250,10 @@ async def op_interact(op):
             results and isinstance(results[-1], dict)
             and results[-1].get("aborted_sequence")
         )
+        _covered = await _covered_controls(page)        # §4VG (an aborted goto sits on chrome-error: not scanned)
         return {
             "actions": results,
+            **({"covered_controls": _covered} if _covered else {}),
             "final_url": final_url,
             "final_title": await page.title(),
             "used_last_url": used_fallback,

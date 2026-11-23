@@ -671,6 +671,11 @@ async def _handle_chat_foreground(context, body, request_id: str, project_id=Non
     # that turn's tap into every later fire (inert while these bodies never
     # stream — defence in depth)
     from .core.reply_tap import reply_tap_context
+    try:                                  # §4VG r2: a scheduled id repeats on every run — each run starts clean
+        from .tools.host_reach import forget_request
+        forget_request(request_id)
+    except Exception:  # noqa: BLE001
+        pass
     _clean = [(v, v.set(x)) for v, x in ((requester_role_context, "owner"), (reply_surface_context, ""),
                                          (requester_member_context, ""),            # §4QG
                                          (client_deadline_context, 0.0), (verify_purpose_context, ""),

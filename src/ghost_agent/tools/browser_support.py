@@ -211,6 +211,7 @@ _PAGE_OUTCOMES = (
      "the page has no such element"),
     (r"ERR_NAME_NOT_RESOLVED", "the host name does not resolve"),
     (r"ERR_CONNECTION_(?:REFUSED|CLOSED|RESET)|ERR_EMPTY_RESPONSE", "the site dropped the connection"),
+    (r"ERR_SSL_UNRECOGNIZED_NAME_ALERT", "the server has no HTTPS site by that name"),    # §4VG
     (r"ERR_HTTP2|ERR_SSL_PROTOCOL_ERROR|ERR_CERT", "the site's HTTPS failed"),
     (r"ERR_ABORTED|Download is starting", "the address is a download, not a page"),   # §4UN-fetch: newer Playwright
     (r"ERR_BLOCKED_BY_CLIENT|redirected to a non-public address", "policy refused the address"),
@@ -340,6 +341,9 @@ def _runner_failure_hint(err: str) -> str:
     if "net::ERR_CONNECTION_REFUSED" in e:
         parts.append("Nothing is listening at that address — if it is your own app, it is down (check "
                      "`run status`); if it is a public site, use another source.")
+    if "net::ERR_SSL_UNRECOGNIZED_NAME_ALERT" in e:                 # §4VG: a parked / wrong name, not Tor
+        from .host_reach import NO_SITE_HINT
+        parts.append(NO_SITE_HINT)
     if "net::ERR_CERT" in e or "SSL" in e and "certificate" in e.lower():
         parts.append("The site's certificate failed — it cannot be read over this transport; use another source.")
     if "exceeded its" in e and "budget" in e:
@@ -476,10 +480,33 @@ def _note_shot(host_path) -> None:
     _BROWSER_WRITTEN.add(str(host_path))
 
 
-def interact_notes(action_results) -> list:
+def covered_controls_lines(covered) -> list:
+    """§4VG: the controls a user could not click at the end of the sequence (the runner's `covered_controls`)."""
+    rows = [c for c in (covered or []) if isinstance(c, dict) and c.get("control")][:5]
+    if not rows:
+        return []
+    out = ["⚠ COVERED CONTROLS at the end of the sequence — a user cannot use these as the page is drawn:"]
+    def _one_line(v, n):                       # page-made text: never a line of its own (review r1 m5)
+        return re.sub(r"[\x00-\x1f\x7f]+", " ", str(v or ""))[:n]
+    for c in rows:
+        label = f" {_one_line(c.get('text'), 40)!r}" if c.get("text") else ""
+        cover = _one_line(c.get('cover'), 120)
+        if c.get("hidden"):     # review r5 M1: an opaque click-through layer — clicks work, nobody sees it
+            out.append(f"  {_one_line(c.get('control'), 80)}{label} is drawn over by {cover} (pointer-events:none: "
+                       "a click passes through, but the user cannot see the control)")
+        else:
+            out.append(f"  {_one_line(c.get('control'), 80)}{label} is under {cover} (a click hits that instead)")
+    out.append("  If a cover is meant to be there now (a dialog's backdrop, a notice the user dismisses), ignore it; "
+               "if not (a loading screen that never hides, an invisible layer, a z-index mistake), the control is "
+               "unusable — a check that only reads state cannot see that. Click the control itself, or take a screenshot, to "
+               "confirm.")
+    return out
+
+
+def interact_notes(action_results, covered=None) -> list:
     """The lines above an interact's per-action results: clicks that missed
-    (§4NW) and, when it took screenshots, that they are working files (§4NY)."""
-    out = click_miss_summary(action_results)
+    (§4NW), controls left covered (§4VG) and, when it took screenshots, that they are working files (§4NY)."""
+    out = click_miss_summary(action_results) + covered_controls_lines(covered)
     if any(r.get("ok") and r.get("action") == "screenshot" for r in (action_results or [])):
         out.append("NOTE: new screenshots are working files — at the end of this turn they are removed from the "
                    "workspace unless your reply links them (![x](/api/download/<path>)) or the user asked for them.")

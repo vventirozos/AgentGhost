@@ -6788,7 +6788,7 @@ async def _guarded_chunks(chunks, url, clen, got, clock=None):
 
 
 def _failure_kind(e: BaseException, received: int) -> str:
-    """What an exception during a download was: "stall" | "timeout" | "cut" | "tor_down" | "other"."""
+    """What an exception during a download was: "stall" | "timeout" | "cut" | "tor_down" | "no_site" | "other"."""
     if isinstance(e, _DownloadStalled):
         return "stall"
     if isinstance(e, (_DownloadTimedOut, asyncio.TimeoutError, TimeoutError)):
@@ -6804,6 +6804,9 @@ def _failure_kind(e: BaseException, received: int) -> str:
         return "cut"
     if isinstance(e, ConnectionRefusedError) or "couldn't connect to server" in t or "connection refused" in t:
         return "tor_down"
+    from .host_reach import is_no_site
+    if is_no_site(t):
+        return "no_site"            # §4VG: the server has no HTTPS site by that name (TLS unrecognized_name)
     return "other"
 
 
@@ -6818,6 +6821,15 @@ def _proxy_down(e: BaseException, proxy_url) -> bool:
     if isinstance(e, ConnectionRefusedError) and not t:
         return True
     return bool(host) and host in t and port in t
+
+
+def _note_reach(url, reached: bool, cause: str = "") -> None:
+    """§4VG: book the attempt in the request's reach ledger (never fails the download)."""
+    try:
+        from .host_reach import note_reach
+        note_reach(url, reached, cause)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _download_log(kind: str, url, detail: str) -> None:
@@ -7078,9 +7090,10 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
             _kept_note = ""
     headers = {"User-Agent": "Mozilla/5.0"}
     last_error = None
-    _last_kind = ""          # §4UN-fetch: "status" | "timeout" | "stall" | "cut" | "other" — what the message says
+    _last_kind = ""          # §4UN-fetch: "status" | "timeout" | "stall" | "cut" | "no_site" | "other" — what the message says
     _plain = False           # switched on by the first Tor refusal (see _PLAIN_PROFILE_UA)
     _final_url = url
+    _dial = [url]            # §4VG: the URL the current attempt dialled (a redirect hop's own host)
     import secrets as _secrets
     _salt = _secrets.token_hex(3)
     # §4UN-fetch r1: ONE clock for every attempt (see _DOWNLOAD_MAX_S)
@@ -7112,7 +7125,9 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                     cur_url = url
                     resp = None
                     for _hop in range(_MAX_DOWNLOAD_REDIRECTS + 1):
+                        _dial[0] = cur_url
                         resp = await client.get(cur_url, stream=True, allow_redirects=False)
+                        _note_reach(cur_url, True)                    # §4VG: the server answered
                         _next, _rerr = _download_redirect_target(
                             resp.status_code, resp.headers, cur_url, _ssrf_check)
                         # AsyncSession streaming responses need the ASYNC
@@ -7187,7 +7202,9 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                                              timeout=_DOWNLOAD_STALL_S) as client:
                     cur_url = url
                     for _hop in range(_MAX_DOWNLOAD_REDIRECTS + 1):
+                        _dial[0] = cur_url
                         async with client.stream("GET", cur_url) as resp:
+                            _note_reach(cur_url, True)                # §4VG: the server answered
                             _next, _rerr = _download_redirect_target(
                                 resp.status_code, resp.headers, cur_url, _ssrf_check)
                             if _rerr:
@@ -7237,6 +7254,9 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
             _prev_kind = _last_kind
             last_error = e
             _last_kind = _failure_kind(e, _got[0])
+            if not _got[0] and not (_last_kind == "tor_down" and _proxy_down(e, _attempt_proxy)):   # §4VG: the
+                # host DIALLED (a redirect target) gave no answer — never a refusal by our own Tor proxy
+                _note_reach(_dial[0], False, f"{type(e).__name__}: {str(e)[:120]}")
             _download_log(_last_kind, url, f"{type(e).__name__}: {str(e)[:120]}"
                           + (f" after {_got[0] / 1e6:.1f} MB" if _got[0] else ""))
             _te = e if isinstance(e, _DownloadTimedOut) else None   # typed alias (pylint cannot narrow `e`)
@@ -7262,10 +7282,16 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                 return (f"Error: Tor is not reachable on this machine — the connection to the Tor proxy was "
                         f"refused ({str(e)[:120]}). No download can run until it is back; nothing was saved. "
                         f"Tell the user Tor is down — retrying will not help.")
+            if _last_kind == "no_site":
+                break                    # §4VG: the server's own answer — another circuit gets the same one
             if mode == "TOR":
                 await asyncio.sleep(0.5)
                 continue
 
+    if _last_kind == "no_site":
+        from .host_reach import NO_SITE_HINT
+        _via = f" (redirected from {url})" if _dial[0] != url else ""
+        return (f"Error: no site at {_dial[0]}{_via} — {last_error}. Nothing was saved. {NO_SITE_HINT}")
     if mode == "TOR":
         if _last_kind == "status":
             # The host's egress is Tor, and some sites answer a Tor client with a challenge page. The

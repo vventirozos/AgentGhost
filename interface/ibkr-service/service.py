@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import advisor
 import analytics
 import flex
 import market
@@ -33,6 +34,8 @@ PRICES_EVERY = 15 * 60
 HISTORY_EVERY = 20 * 3600
 HISTORY_RETRY = 3600
 RATE_LIMIT_PAUSE = 3600
+WATCH_EVERY = 30 * 60
+MAX_AMOUNT = 10_000_000
 FLEX_STALE_DAYS = 4
 TICK = 30
 DEFAULT_CONFIG = {
@@ -40,7 +43,23 @@ DEFAULT_CONFIG = {
     # max_fund_pct 100: no fund is a size prompt by default; the review's fund line says why instead (§4TI-d)
     "max_position_pct": 20, "max_fund_pct": 100, "loss_review_pct": -30, "gain_review_pct": 100, "gain_review_weight_pct": 10,
     "drawdown_review_pct": -25, "correlation_review": 0.7,
+    # §4VH the buy advisor. advisor_core: [{"symbol", "target", "yahoo"?, "safe"?}], empty until the owner sets it
+    "advisor_core": [], "advisor_kept": [], "watchlist": list(advisor.DEFAULT_WATCHLIST), "opportunity_pct": 10, "max_drift_pts": 25,
+    "hot_z": -2.0, "hot_fall_pct": -10, "hot_funds_only": True, "opportunity_cap_slices": 3,
 }
+#: Yahoo suffix -> the exchange's name as a broker shows it (§4VH-f: "XCS6.DE" means nothing to a new investor).
+EXCHANGE_NAMES = {".DE": "Xetra", ".MI": "Borsa Italiana (Milan)", ".AS": "Euronext Amsterdam", ".PA": "Euronext Paris",
+                  ".L": "London Stock Exchange", ".SW": "SIX Swiss Exchange"}
+
+
+def exchange(yahoo: str | None) -> str:
+    """' on Xetra (ticker XCS6)' for a known Yahoo suffix, else ''."""
+    for suffix, name in EXCHANGE_NAMES.items():
+        if yahoo and yahoo.upper().endswith(suffix.upper()):
+            return f" on {name} (ticker {yahoo[:-len(suffix)]})"
+    return ""
+
+
 NOTE_NOT_ADVICE = ("These are prompts for your own judgement from fixed rules, not financial advice. "
                    "The service doesn't know your tax position or your plans.")
 
@@ -75,7 +94,46 @@ def scrub(text, *secrets: str) -> str:
 
 #: Where a limit must lie, so a mistyped value can't turn a rule upside down or switch it off.
 LIMIT_RANGES = {"max_position_pct": (1, 100), "max_fund_pct": (1, 100), "loss_review_pct": (-100, -1), "gain_review_pct": (1, 10000),
-                "gain_review_weight_pct": (1, 100), "drawdown_review_pct": (-100, -1), "correlation_review": (0.01, 1)}
+                "gain_review_weight_pct": (1, 100), "drawdown_review_pct": (-100, -1), "correlation_review": (0.01, 1),
+                "opportunity_pct": (0, 50), "max_drift_pts": (1, 100), "hot_z": (-10, -0.5), "hot_fall_pct": (-90, -1),
+                "opportunity_cap_slices": (0, 24)}
+_YAHOO_RE = re.compile(r"[A-Za-z0-9.\-=^]{1,20}")
+
+
+def _clean_core(value):
+    """The core funds, or None when the setting is malformed (then it is named as rejected, never half-used)."""
+    if not isinstance(value, list) or len(value) > 10:
+        return None
+    core = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        symbol, target, yahoo = item.get("symbol"), item.get("target"), item.get("yahoo")
+        if not isinstance(symbol, str) or not symbol.strip() or len(symbol) > 32:
+            return None
+        if not isinstance(target, (int, float)) or isinstance(target, bool) or not math.isfinite(target) or target <= 0:
+            return None
+        if yahoo is not None and not (isinstance(yahoo, str) and _YAHOO_RE.fullmatch(yahoo)):
+            return None
+        if "safe" in item and not isinstance(item["safe"], bool):  # "true" or 1 would silently mean not safe
+            return None
+        core.append({"symbol": symbol.strip(), "target": float(target), "yahoo": yahoo, "safe": item.get("safe") is True})
+    if len({c["symbol"].upper() for c in core}) != len(core) or sum(c["safe"] for c in core) > 1:
+        return None
+    return core
+
+
+def _clean_kept(value):
+    """Holdings the owner keeps but no longer buys (an earlier plan's funds): named as kept, never as a symbol typo."""
+    if not isinstance(value, list) or len(value) > 30 or not all(isinstance(v, str) and 0 < len(v.strip()) <= 32 for v in value):
+        return None
+    return [v.strip() for v in value]
+
+
+def _clean_watchlist(value):
+    if not isinstance(value, list) or len(value) > 60 or not all(isinstance(v, str) and _YAHOO_RE.fullmatch(v) for v in value):
+        return None
+    return list(dict.fromkeys(v.upper() for v in value))
 
 
 def clean_config(raw) -> dict:
@@ -90,6 +148,21 @@ def clean_config(raw) -> dict:
             config[name] = value.strip().upper() if isinstance(value, str) and value.strip() else None
         elif name == "flex_query_id":
             config[name] = str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+        elif name in ("advisor_core", "watchlist", "advisor_kept"):
+            if name in raw:
+                cleaned = {"advisor_core": _clean_core, "watchlist": _clean_watchlist, "advisor_kept": _clean_kept}[name](value)
+                if cleaned is None:
+                    config["rejected"].append(name)
+                else:
+                    config[name] = cleaned
+            else:
+                config[name] = list(default)
+        elif isinstance(default, bool):
+            if name in raw:
+                if isinstance(value, bool):
+                    config[name] = value
+                else:
+                    config["rejected"].append(name)
         elif isinstance(default, dict):
             config[name] = {str(k): v for k, v in value.items() if isinstance(v, str)} if isinstance(value, dict) else default
         elif isinstance(default, str):
@@ -125,7 +198,8 @@ class Service:
     def _load_state(self) -> dict:
         blank = {"flex": None, "flex_ok_at": 0, "flex_try_at": 0, "flex_error": None, "quotes": {}, "fx": {},
                  "prices_at": 0, "price_ok": 0, "price_wanted": 0, "price_errors": {}, "history_at": {},
-                 "history_try_at": {}, "history_pause_until": 0, "credentials_seen": None, "flex_due_now": False}
+                 "history_try_at": {}, "history_pause_until": 0, "credentials_seen": None, "flex_due_now": False,
+                 "watch_quotes": {}, "watch_at": 0, "watch_ok_at": 0}
         try:
             loaded = json.loads(self.state_path.read_text())
         except FileNotFoundError:
@@ -138,11 +212,11 @@ class Service:
             return blank
         state = {**blank, **loaded}
         now = self.clock()
-        for name in ("flex_ok_at", "flex_try_at", "prices_at", "history_pause_until"):  # a clock jump can't block refreshes
+        for name in ("flex_ok_at", "flex_try_at", "prices_at", "history_pause_until", "watch_at", "watch_ok_at"):  # a clock jump can't block refreshes
             value = state[name]
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value > now + 86400:
                 state[name] = 0
-        for name in ("quotes", "fx", "price_errors", "history_at", "history_try_at"):
+        for name in ("quotes", "fx", "price_errors", "history_at", "history_try_at", "watch_quotes"):
             if not isinstance(state[name], dict):
                 state[name] = {}
         if state["flex"] is not None and not isinstance(state["flex"], dict):
@@ -232,7 +306,7 @@ class Service:
         now = self.clock()
         if now < self.state["history_pause_until"]:
             return
-        names = {s for s in self.symbol_map(cfg).values() if s} | {cfg["benchmark"]}
+        names = {s for s in self.symbol_map(cfg).values() if s} | {cfg["benchmark"]} | set(self.watch_symbols(cfg))
         for name in sorted(names):
             if now - self.state["history_at"].get(name, 0) < HISTORY_EVERY:
                 continue
@@ -259,6 +333,54 @@ class Service:
                     self.state["history_at"][name] = now
                     self._save()
             self.sleep(0.3)
+
+    def watch_symbols(self, cfg: dict) -> list:
+        """The advisor's Yahoo symbols: the watchlist and every core fund's own symbol (§4VH). None until the owner
+        sets advisor_core: an unused advisor sends Yahoo no extra requests."""
+        if not cfg["advisor_core"]:
+            return []
+        fold = lambda text: re.sub(r"[^A-Z0-9]", "", str(text or "").upper())  # noqa: E731 - as _holding_rows
+        wanted = {fold(c["symbol"]) for c in cfg["advisor_core"]}
+        held = [y for p in (self.state.get("flex") or {}).get("positions") or []
+                if wanted & {fold(p.get("symbol")), fold(p.get("isin"))}
+                and (y := market.yahoo_symbol(p, cfg.get("symbol_overrides")))]
+        return list(dict.fromkeys([*cfg["watchlist"], *[c["yahoo"] for c in cfg["advisor_core"] if c.get("yahoo")], *held]))
+
+    def refresh_watch(self, cfg: dict) -> None:
+        """Latest prices for the advisor's symbols, and FX for their currencies. Kept apart from the holdings'
+        quotes, so a watchlist symbol never values a holding."""
+        base = self._base(cfg)
+        quotes, fx, limited, arrived = dict(self.state["watch_quotes"]), dict(self.state["fx"]), False, 0
+        for name in self.watch_symbols(cfg):
+            try:
+                quote = market.fetch_chart(name, self.get, json.loads)
+            except Exception as exc:  # noqa: BLE001 - one symbol must not stop the others
+                limited = isinstance(exc, market.RateLimited)
+                if limited:
+                    break
+                continue
+            quote.pop("closes", None)
+            quote["fetched"] = self.clock()  # "at" is market time: a weekend's quotes are days old though fetched now
+            quotes[name] = quote
+            arrived += 1
+            self.sleep(0.3)
+        if base and not limited:
+            have = {p.get("currency") for p in (self.state.get("flex") or {}).get("positions") or []}
+            for currency in sorted({q.get("currency") for q in quotes.values() if q.get("currency")} - have - {base}):
+                try:
+                    quote = market.fetch_chart(f"{currency}{base}=X", self.get, json.loads)
+                except Exception:  # noqa: BLE001 - the rate stays unknown and the reply says so
+                    continue
+                fx[f"{currency}{base}"] = {"rate": quote["price"], "at": quote["at"]}
+                self.sleep(0.3)
+        with self.lock:
+            # merge, never replace: the holdings' round may have written fresher rates meanwhile
+            self.state["fx"] = {**self.state["fx"], **{k: v for k, v in fx.items() if k not in self.state["fx"]
+                                                       or v["at"] > self.state["fx"][k].get("at", 0)}}
+            self.state.update(watch_quotes=quotes, watch_at=self.clock())
+            if arrived:
+                self.state["watch_ok_at"] = self.clock()
+            self._save()
 
     def _note_new_credentials(self, cfg: dict) -> None:
         """New credentials from setup-flex.sh are tried now, not after the failure or refresh interval."""
@@ -297,6 +419,9 @@ class Service:
         if self.state.get("flex"):
             if self.clock() - self.state["prices_at"] >= PRICES_EVERY:
                 self.refresh_prices(cfg)
+            missing = any(name not in self.state["watch_quotes"] for name in self.watch_symbols(cfg))
+            if self.clock() - self.state["watch_at"] >= WATCH_EVERY or (missing and self.clock() - self.state["watch_at"] >= 300):
+                self.refresh_watch(cfg)  # a symbol new to the watchlist is fetched within minutes, not half an hour
             self.refresh_history(cfg)
 
     def run_forever(self, stop: threading.Event) -> None:
@@ -545,6 +670,190 @@ class Service:
         lines.append(NOTE_NOT_ADVICE)
         return "\n".join(lines + self._freshness(cfg))
 
+    def _fx_to_base(self, base: str | None):
+        def rate(currency):
+            if not base or not currency:
+                return None
+            if currency == base:
+                return 1.0
+            entry = self.state["fx"].get(f"{currency}{base}") or {}
+            return entry.get("rate") if analytics._fresh(entry.get("at"), self.clock()) else None
+        return rate
+
+    def _advise(self, cfg: dict, amount: float, reserve: float, carry: float = 0.0) -> str:
+        core = cfg["advisor_core"]
+        if not core and "advisor_core" in (cfg.get("rejected") or []):
+            return ("PORTFOLIO ADVICE: the advisor_core setting in config.json is invalid, so it is ignored (each fund needs "
+                    "a symbol and a target above 0, symbols differ, at most one is safe). Give no split.")
+        if not core:
+            return ("PORTFOLIO ADVICE: no core funds are set. The owner sets advisor_core in config.json on the service "
+                    "machine, for example [{\"symbol\": \"<ticker>\", \"target\": 60, \"safe\": true}, ...]. Give no split.")
+        positions_known = self.state["flex"].get("positions_known", True)
+        valued = self.valued(cfg) if positions_known else {"positions": [], "base": self._base(cfg)}
+        base = valued["base"] or self._base(cfg)
+        if not base:
+            return "PORTFOLIO ADVICE: the account's base currency is unknown, so no amounts can be given."
+        rows = {}
+        for c in core:
+            matched = self._holding_rows(valued, c["symbol"])
+            if matched:
+                # one fund on several listings is one holding: its value is the sum, and unknown when any part is
+                # (review r2: taking the largest row dropped an unvalued listing and its drift gap)
+                values = [r.get("value_base") for r in matched]
+                priced = next((r for r in matched if r.get("price") is not None and r.get("fx")), matched[0])
+                rows[c["symbol"]] = {**priced, "value_base": None if None in values else sum(values)}
+        unmatched = [c["symbol"] for c in core if c["symbol"] not in rows] if positions_known else []
+        matched_keys = {r.get("key") for c in core for r in self._holding_rows(valued, c["symbol"])}
+        kept_rows = [r for k in cfg["advisor_kept"] for r in self._holding_rows(valued, k)]
+        kept_keys = {r.get("key") for r in kept_rows}
+        other_funds = [r.get("label") or r["symbol"] for r in valued["positions"]
+                       if analytics.is_fund(r) and r.get("key") not in matched_keys | kept_keys and (r.get("qty") or 0) > 0]
+        now = self.clock()
+        quotes = {k: q for k, q in self.state["watch_quotes"].items() if analytics._fresh(q.get("at"), now)}
+        settings = {"opportunity": cfg["opportunity_pct"] / 100, "max_drift": cfg["max_drift_pts"] / 100,
+                    "hot_z": cfg["hot_z"], "hot_fall": cfg["hot_fall_pct"] / 100, "funds_only": cfg["hot_funds_only"],
+                    "cap_slices": cfg["opportunity_cap_slices"]}
+        a = advisor.advise(amount, reserve, core, rows, self.histories, cfg["watchlist"], quotes,
+                           self._fx_to_base(base), base, settings, now, holdings_known=positions_known, carry=carry)
+        m = lambda v: self._money(v, base)  # noqa: E731
+        share = 1 - a["opportunity_share"]
+        parts = [f"{share:.0%} of the sum, {m(amount * share)}"] + ([f"{m(carry)} carried over from last time"] if carry else []) \
+            + ([f"{m(a['overflow'])} of opportunity cash above its cap"] if a["overflow"] else [])
+        lines = [f"PORTFOLIO ADVICE for {m(amount)} (every figure computed by the service; report them as they are)",
+                 f"Core {m(a['core_money'])}" + (f" ({' + '.join(parts)})" if len(parts) > 1 else f" ({share:.0%})")
+                 + f", opportunity slice {m(a['slice_money'])} ({a['opportunity_share']:.0%})"
+                 + (f", plus {m(reserve)} of opportunity cash you said you hold." if reserve else "."),
+                 *([f"Opportunity cash may wait up to {m(a['cap'])} ({cfg['opportunity_cap_slices']:g} slices); the "
+                    f"{m(a['overflow'])} above that joins the core now, so the core is {m(a['core_money'])}."] if a["overflow"] else []),
+                 "Core funds, cheapness against each fund's own past 5 years (0 = dearest seen, 1 = cheapest, 0.5 = usual):"]
+        for c in core:
+            f = a["funds"][c["symbol"]]
+            held = (f"{f['held']:.1%} of your core now" if f["held"] is not None else
+                    "not held yet" if a["drift_known"] else "holding unknown")
+            head = f"- {f['name']}{' (the safer fund)' if c['safe'] else ''}: aim {f['aim']:.1%} of the core, {held}."
+            sc = f["score"]
+            if sc:
+                r = sc["ranks"]
+                head += (f" Score {sc['score']:.2f}, {advisor.describe_score(sc['score'])}: {abs(sc['fall']):.1%} below its 52-week high "
+                         f"(a deeper fall than on {1 - r['fall']:.0%} of past days), {sc['gap']:+.1%} against its 200-day average "
+                         f"(lower than on {1 - r['gap']:.0%} of days), past month {sc['month']:+.1%} (weaker than {1 - r['month']:.0%} "
+                         f"of months). Closes up to {f['last']}, in {f['currency'] or 'its listing currency'}.")
+            lines.append(head)
+        statement = self.state["flex"].get("report_date") or "unknown"
+        lines.append(f"Holdings are as of IBKR's statement of {statement}: buys after it aren't counted yet, so asking again "
+                     "before the next statement repeats the same split.")
+        if kept_rows:
+            share = sum(r.get("weight") or 0 for r in kept_rows)
+            lines.append(f"Kept, not bought any more (your earlier plan; selling isn't suggested): "
+                         f"{', '.join(r.get('label') or r['symbol'] for r in kept_rows)}, {share:.1%} of your holdings.")
+        lines.append("Suggested core buy:")
+        for c in core:
+            s, f = c["symbol"], a["funds"][c["symbol"]]
+            money, count = a["money"][s], a["counts"].get(s)
+            why = a["split"]["reasons"].get(s)
+            if f["price_base"] and count is not None:
+                # §4VH-c live: the model read "USD Acc" in a fund's NAME as a currency conversion; say the trading currency
+                in_base = (f" ({m(f['price_base'])}; traded in {f['currency']}, so the order needs a conversion to {base})"
+                           if f["currency"] != base else f" (traded in {base}, the account's currency: no conversion; a "
+                           "currency in the fund's name is only its internal one)")
+                text = (f"- Buy {s}: {count} share(s) at about {self._price(f['price_local'])} {f['currency']}{exchange(f.get('yahoo')) if (quotes.get(f.get('yahoo')) or {}).get('currency') == f['currency'] else ''}{in_base}, "
+                        f"about {m(count * f['price_base'])} (its share of the split: {m(money)})")
+            else:
+                text = f"- Buy {s}: {m(money)} by the split; no share count, its price in {base} is unknown"
+            lines.append(text + (f"; {why}." if why else "."))
+        if len(core) == 1:
+            lines.append("One core fund: it takes the whole core sum every time. Its cheapness is shown for interest and "
+                         "doesn't change the amount.")
+        elif a["split"]["rule"] == "tilt" and a["drift_known"]:
+            lines.append("How the split was made: each fund's aim, multiplied up when it is cheap against its own past and down when "
+                         "it is dear, and pulled back toward the aim when your holdings have drifted.")
+        elif a["split"]["rule"] == "tilt":
+            lines.append("How the split was made: each fund's aim, multiplied up when it is cheap against its own past and down when "
+                         "it is dear. Drift from the aim is unknown, so it is not used.")
+        spent_core = sum(a["counts"].get(c["symbol"], 0) * (a["funds"][c["symbol"]]["price_base"] or 0) for c in core)
+        lines.append(f"Left over after whole shares: {m(a['left'])}. It is the core's: give it as carried over next time.")
+        if a["unplaced"]:
+            lines.append(f"Not placed: {m(a['unplaced'])}, for core funds with no price in {base} right now. Don't buy them blind: add "
+                         "this sum as carried over next time (NEXT TIME below counts it).")
+        if a["core_money"] and a["left"] > 0.25 * a["core_money"]:
+            lines.append("This sum is small next to the share prices, so whole shares can't follow the split closely. Investing "
+                         "every other month, or a larger sum, keeps closer to it.")
+        hot, rule = a["hot"], (f"Hot rule: a fall of at least {abs(cfg['hot_z']):.1f} times the name's usual move over 1 day, 5 days or "
+                               f"1 month, while {abs(cfg['hot_fall_pct']):g}% or more below its 52-week high.")
+        kind = "funds" if cfg["hot_funds_only"] else "names"
+        lines.append(f"OPPORTUNITY: {a['checked']} {kind} with usable prices, from {len(cfg['watchlist'])} on the watchlist plus the core funds. {rule}"
+                     + (" Funds only: single stocks are not candidates." if cfg["hot_funds_only"] else ""))
+        def cand(c):
+            w = c["worst"]
+            name = f"{c['symbol']} ({c['name']})" if c["name"] else c["symbol"]
+            price = (f"{self._price(c['price'])} {c['currency']}" if c["currency"] else self._price(c["price"]))
+            return (f"{name}: {w['change']:+.1%} over {w['label']}, {abs(w['z']):.1f} times its usual move for that span, "
+                    f"{abs(c['fall']):.1%} below its 52-week high, yearly volatility {c['volatility']:.0%}, last price {price} ({c['last']})")
+        buy = a["buy"]
+        if hot:
+            lines.append(f"Hot now: {len(hot)}.")
+            lines.extend(f"- {cand(c)}" for c in hot[:3])
+            if buy and buy not in hot[:3]:  # §4VH-f: the pick is always described, so its fall can be checked in the news
+                lines.append(f"- {cand(buy)}")
+            pot = a["pot"]
+            if buy:
+                conversion = ("no conversion" if buy["currency"] == base else f"traded in {buy['currency']}, so a conversion")
+                lines.append(f"Suggested: {a['buy_shares']} whole share(s) of {buy['symbol']}{exchange(buy['symbol'])} at about {self._price(buy['price'])} "
+                             f"{buy['currency'] or ''} ({conversion}), about {m(a['buy_cost'])}, the most unusual fall the opportunity money "
+                             f"({m(pot)}) can buy. The other {m(pot - a['buy_cost'])} waits as opportunity cash.")
+                if buy is not hot[0]:
+                    lines.append(f"{hot[0]['symbol']} fell more unusually, but one share costs more than the opportunity money.")
+                lines.append("Asking again before buying gives the same pick: buy it once.")
+            else:
+                lines.append(f"Suggested: keep the opportunity money ({m(pot)}) as cash: one share of each hot fund costs more "
+                             "than that, or its price in the account's currency is unknown.")
+            if len(hot) * 2 >= a["checked"] >= 4:
+                lines.append(f"{len(hot)} of {a['checked']} names meet the rule at once: this looks like a market-wide fall, not "
+                             "one company's or one sector's." + ("" if cfg["hot_funds_only"] else
+                                                                 " A broad fund on the list carries less single-company risk than one stock."))
+            lines.append("Before buying, find out WHY it fell: a fall from news that changes the business (results, a lawsuit, "
+                         "an export ban) can keep going; a fall from market mood or a rumour that turns out false often recovers. "
+                         "The service sees prices only, not news.")
+        else:
+            lines.append(f"Hot now: none. Suggested: keep the opportunity money as cash for the next one: {m(a['pot'])} in total "
+                         f"(this slice and the cash you said you hold, up to {m(a['cap'])}).")
+            if a["near"]:
+                lines.append("Closest to the rule:")
+                lines.extend(f"- {cand(c)}" for c in a["near"])
+        if a["not_fund"]:
+            lines.append("Left out as not a fund (or type unknown): " + ", ".join(a["not_fund"]))
+        if a["unusable"]:
+            lines.append("Not checked, no fresh price yet, or price history missing, short or stale: " + ", ".join(a["unusable"]))
+        lines.extend(f"Data gap: {g}." for g in a["gaps"])
+        for symbol in unmatched:
+            lines.append(f"Check: core fund {symbol} matches no holding on IBKR's statement, so it counts as not held"
+                         + (f". Funds you hold that aren't in the core: {', '.join(other_funds)}. If one of them is {symbol} under "
+                            "another symbol, fix advisor_core in config.json: until then the split sends it everything." if other_funds
+                            else ". That is expected until your first buy of it shows on a statement."))
+        total_buy = spent_core + a["buy_cost"]
+        cash = valued.get("cash")
+        if cash is not None and total_buy > cash:
+            lines.append(f"Check: these buys come to about {m(total_buy)}, more than the cash on IBKR's statement of "
+                         f"{self.state['flex'].get('report_date') or 'unknown date'} ({m(cash)}). Unless you deposited since, deposit "
+                         "first: a margin account would borrow the difference.")
+        if cfg.get("rejected"):
+            lines.append("Settings ignored as invalid, so their defaults are used: " + ", ".join(cfg["rejected"]))
+        # per symbol, not the newest arrival: one fresh quote out of 25 must not clear the label (review r2)
+        wanted = self.watch_symbols(cfg)
+        recent = sum(1 for name in wanted if now - ((self.state["watch_quotes"].get(name) or {}).get("fetched") or 0) <= 6 * 3600)
+        lines.append(f"Watchlist prices fetched in the last 6 hours: {recent} of {len(wanted)}; last arrival {self._when(self.state['watch_ok_at'])}" +
+                     (" (STALE: an older price is used for up to 4 days of market time, then dropped)." if recent < len(wanted) else "."))
+        waiting = round(a["pot"] - a["buy_cost"], 2)
+        lines.append(f"NEXT TIME: say the new sum, plus {m(a['left'] + a['unplaced'])} carried over and {m(waiting)} of opportunity cash"
+                     " (if you buy as suggested). The service doesn't remember either amount.")
+        lines.append("Costs: every order pays IBKR's commission, which has a minimum per order, and a listing traded in "
+                     "another currency pays a conversion too (each buy line says which). On small orders that can be a few percent: fewer, larger orders cost less. Prices "
+                     "here are delayed, so the fill can differ.")
+        lines.append("Cheapness says where a price sits against its own past, not where it goes next: for broad index funds "
+                     "buying dips is a small edge at best, the real gain is buying steadily. A crashed stock can keep falling. "
+                     "Public prices are delayed. " + NOTE_NOT_ADVICE)
+        return "\n".join(lines + self._freshness(cfg))
+
     def _status(self, cfg: dict) -> str:
         data = self.state.get("flex") or {}
         return "\n".join([
@@ -559,13 +868,13 @@ class Service:
             f"Histories held: {len(self.histories)}.",
         ])
 
-    def answer(self, view: str, symbol: str = "") -> tuple:
+    def answer(self, view: str, symbol: str = "", amount=None, reserve=None, carry=None) -> tuple:
         """(ok, text) for one read-only view."""
         with self.lock:
             cfg = self.config()
             if view == "status":
                 return True, self._status(cfg)
-            if view not in ("summary", "position", "health", "forecast", "review"):
+            if view not in ("summary", "position", "health", "forecast", "review", "advise"):
                 return False, f"unknown view {view!r}"
             if not self.state.get("flex"):
                 if not (self.token() and cfg.get("flex_query_id")):
@@ -573,6 +882,10 @@ class Service:
                 return False, f"no IBKR statement has arrived yet. Last error: {self.state.get('flex_error') or 'none, the first fetch is due'}"
             if view == "summary":
                 return True, self._summary(cfg)
+            if view == "advise":
+                if amount is None:
+                    return False, "advise needs an amount: a number above 0, in the account's base currency"
+                return True, self._advise(cfg, amount, reserve or 0.0, carry or 0.0)
             if not self.state["flex"].get("positions_known", True):
                 return True, "\n".join(["PORTFOLIO: holdings are unknown, because the Flex query has no Open Positions section. Give no holding figures."] + self._freshness(cfg))
             if view == "position":
@@ -604,9 +917,23 @@ def make_handler(service: Service, key: str):
             match = re.fullmatch(r"/v1/(\w+)", url.path)
             if not match:
                 return self._send(404, {"ok": False, "text": "not found"})
-            symbol = (parse_qs(url.query).get("symbol") or [""])[0][:32]
+            query = parse_qs(url.query)
+            symbol = (query.get("symbol") or [""])[0][:32]
+            numbers = {}
+            for name in ("amount", "reserve", "carry"):
+                raw = (query.get(name) or [None])[0]
+                if raw is None:
+                    continue
+                try:
+                    value = float(raw[:24])
+                except ValueError:
+                    value = math.nan
+                low = 0.01 if name == "amount" else 0.0
+                if not math.isfinite(value) or not low <= value <= MAX_AMOUNT:
+                    return self._send(200, {"ok": False, "text": f"{name} must be a number from {low:g} to {MAX_AMOUNT:,}"})
+                numbers[name] = value
             try:
-                ok, text = service.answer(match.group(1), symbol)
+                ok, text = service.answer(match.group(1), symbol, **numbers)
             except Exception as exc:  # noqa: BLE001 - say so rather than drop the connection
                 log.exception("a view did not complete")
                 return self._send(500, {"ok": False, "text": f"the service hit an internal problem ({type(exc).__name__})"})

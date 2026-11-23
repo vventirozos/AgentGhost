@@ -306,6 +306,7 @@ _VERBS: Dict[str, Tuple[str, str]] = {
     "portfolio.health": _v("checked the portfolio's health"),
     "portfolio.forecast": _v("looked at the portfolio forecast"),
     "portfolio.review": _v("reviewed the portfolio"),
+    "portfolio.advise": _v("worked out how to split the sum to invest"),
     "portfolio.status": _v("checked the portfolio service"),
     # ── checklist ──
     "checklist": _v("worked through the checklist"),

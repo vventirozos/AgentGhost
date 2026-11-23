@@ -19595,6 +19595,32 @@ class GhostAgent:
         from ..tools.checklist import status_line
         return status_line(self.context)
 
+    def _reach_note_after_write(self, result_text) -> str:
+        """§4VG: the `[REACH CHECK]` note for a successful file_system write whose code names a clearnet host this
+        request tried and never reached ("" otherwise — and always "" for a member's turn)."""
+        from ..tools import host_reach as _hr
+        if not _hr.enabled() or requester_is_member() or not _hr.unreached():
+            return ""
+        written = [p for p in dict.fromkeys(_written_paths_from_confirmation(str(result_text or "")))
+                   if _hr.is_code_path(p)]
+        if not written:
+            return ""
+        from ..tools.file_system import _get_safe_path
+        sbx = Path(self._scoped_sandbox_for(_PROJECT_ID_UNCAPTURED))
+        root = sbx.parent.parent if sbx.parent.name == "projects" else sbx
+        files = []
+        for rel in written:
+            for base in (sbx, root):              # the write's own resolution (`/workspace/…`, `./x`, project)
+                try:
+                    f = _get_safe_path(base, rel)
+                except Exception:  # noqa: BLE001
+                    continue
+                if f.is_file():
+                    with open(f, "rb") as fh:            # review r2 n13: the head only, not the whole file
+                        files.append((rel, fh.read(400_000).decode("utf-8", errors="replace")))
+                    break
+        return _hr.note_for_written(files)
+
     async def _page_check_after_write(self, result_text, i: int, batch_meta, batch_results=None) -> str:
         """§4UU-1: after a successful file_system write of a web file, load its page headless and return the
         note for the write's result ("" when nothing ran). Only the LAST web write of the batch probes (one load
@@ -26334,6 +26360,16 @@ class GhostAgent:
                                 _outcome = _with_text(_outcome, str_res)
                         except Exception as _pc_exc:  # noqa: BLE001
                             logger.debug("page check after write failed: %s", _pc_exc)
+                        try:                                              # §4VG: code naming a host never reached
+                            _rh_note = self._reach_note_after_write(str_res)
+                            if _rh_note:
+                                from ..tools.outcome import with_text as _with_text
+                                str_res = str(str_res) + _rh_note
+                                _outcome = _with_text(_outcome, str_res)
+                                pretty_log("Reach Check", _rh_note.strip().splitlines()[0][:200],
+                                           icon=Icons.WARN, level="WARNING")
+                        except Exception as _rh_exc:  # noqa: BLE001
+                            logger.debug("reach note after write failed: %s", _rh_exc)
                     if i == len(results) - 1 and not requester_is_member():
                         try:                                              # §4UU-2: the open checklist, once per batch
                             _cl_line = self._checklist_status_for_batch(tool_call_metadata, tools_run_this_turn)

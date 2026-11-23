@@ -4060,6 +4060,11 @@ async def read_top_pages(query: str, rows: List[Dict], tor_proxy: Optional[str],
                            level="INFO", icon=Icons.TOOL_PAGE_READ)
                 continue
             text = str(res)
+            try:                                             # §4VG: page text = the server answered
+                from .host_reach import note_reach
+                note_reach(url, True)
+            except Exception:  # noqa: BLE001
+                pass
             if len(text.strip()) < RESEARCH_THIN_PAGE_CHARS or is_bot_check_page(text):
                 _not_read.append((url, "a stub, consent or bot-check page, not the document"))
                 _bump_read("thin")

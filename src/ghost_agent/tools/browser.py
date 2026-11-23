@@ -443,6 +443,7 @@ def _mark_onion_dead(url: str, cause: str) -> None:
 
 # §4LG: the clearnet host memory lives in `host_memo` (browser.py is held
 # under its size guard).
+from .host_reach import note_asked_reach, note_browser_reach  # noqa: E402
 from .host_memo import (  # noqa: E402
     _clearnet_host, _mark_host_failed, _mark_host_ok, _dead_host_notice,
     _retired_onion_notice, ONION_FIRST_FAILURE_HINT)
@@ -1322,8 +1323,11 @@ async def tool_browser(
                 if _step.get("ok"):
                     if _step.get("url"):
                         _mark_onion_alive(_step["url"])
+                        note_browser_reach(_step["url"], True)              # §4VG
+                        note_asked_reach(_step, sanitised_actions, url)     # §4VG r5: a redirect's asked host
                 elif _serr and _surl:
                     _mark_onion_dead(_surl, _serr)
+                    note_browser_reach(_surl, False, _serr)                 # §4VG
         except Exception as _ie:  # noqa: BLE001
             logger.debug("interact onion-failure scan skipped: %s", _ie)
     if not ok:
@@ -1347,6 +1351,7 @@ async def tool_browser(
         # what records the real host.
         _mark_onion_dead(_nav_url, str(parsed))
         _mark_host_failed(_nav_url, str(parsed))
+        note_browser_reach(_nav_url, False, str(parsed))                    # §4VG
         # A FAILING re-fetch is the loop most worth interrupting, and the
         # success-only counter could not see it: the 2026-09-15 Revolut
         # turn hit one Telegram post five times (one of them a selector
@@ -1447,9 +1452,11 @@ async def tool_browser(
         header = (f"--- BROWSER RESULT ---\nSTATUS: BLOCKED ({_blocked})\nOP: {operation}"
                   f"\nHINT: {blocked_page_hint(_blocked, parsed.get('url') or _nav_url)}")
         _mark_host_failed(_nav_url, f"blocked: {_blocked}")      # the memo decides (host_level_block)
+        note_browser_reach(_nav_url, True)                       # §4VG: a refusal is an answer
     elif ok and operation in ("navigate", "extract_text", "click", "screenshot", "interact") and not (
             operation == "interact" and _interact_read_failed(parsed)):   # §4RX r2: an aborted goto proves nothing
         _mark_host_ok(_nav_url)                                  # §4PC: any clean load clears it
+        note_browser_reach(_nav_url, True)                       # §4VG
     if _nav_suggestion:
         header += f"\nNOTE: {_nav_suggestion}"
     if parsed.get("used_last_url"):
@@ -1615,7 +1622,7 @@ async def tool_browser(
             # the whole interact sequence — strip the leading newline the
             # helper adds (we're already line-buffered here).
             lines.append(js_diag.lstrip("\n"))
-        lines += interact_notes(action_results) + ["--- PER-ACTION RESULTS ---"]   # §4NW/§4NY
+        lines += interact_notes(action_results, parsed.get("covered_controls")) + ["--- PER-ACTION RESULTS ---"]  # §4NW/§4NY/§4VG
         for r in action_results:
             status = "OK" if r.get("ok") else "ERR"
             idx = r.get("index")

@@ -55,8 +55,8 @@
 
   <h2 id="what">What it does</h2>
   <h3>Portfolio</h3>
-  <p>The <code>portfolio</code> tool reads your Interactive Brokers holdings from a separate small service. It can tell you the value, cash, gains against cost, today's change and dividends; look at one holding with its average cost and recent trades; check concentration and currency mix, and how today's mix would have behaved in the past (volatility, worst fall, comparison with a benchmark); show the range of past returns over one month, three months and a year; and give review prompts from fixed rules, each with its reason and the case <em>against</em> acting.</p>
-  <p>It <strong>cannot trade</strong>. The service has no order code, accepts only reads, and the IBKR Flex reports it uses only hand out statements. The agent never sees the Flex token or the account id.</p>
+  <p>The <code>portfolio</code> tool reads your Interactive Brokers holdings from a separate small service. It can tell you the value, cash, gains against cost, today's change and dividends; look at one holding with its average cost and recent trades; check concentration and currency mix, and how today's mix would have behaved in the past (volatility, worst fall, comparison with a benchmark); show the range of past returns over one month, three months and a year; and give review prompts from fixed rules, each with its reason and the case <em>against</em> acting. Given a sum to invest, it suggests how to split it: the core funds by how cheap each is against its own past, in whole shares, and a small slice to an unusually sharp fall in a watchlist fund, or kept as cash until one comes.</p>
+  <p>It <strong>cannot trade</strong>, the advisor included: it suggests, and you place the orders. The service has no order code, accepts only reads, and the IBKR Flex reports it uses only hand out statements. The agent never sees the Flex token or the account id.</p>
   <h3>Weather and location</h3>
   <p>Ask about the weather and the agent gets the current conditions and a 7-day forecast, with day names in the place's own calendar. Ask for hourly detail and it adds today and tomorrow in 3-hour steps. If you name no place, it uses the location saved in your profile. It uses keyless public sources over Tor (Open-Meteo first, wttr.in as a fallback).</p>
   <h3>Games</h3>
@@ -69,6 +69,7 @@
       <tr><td>“How is my portfolio today?”</td><td>Total value, cash, gain against cost, today's change, and one line per holding.</td></tr>
       <tr><td>“Am I too concentrated in one stock?”</td><td>The health view: concentration, currency mix, volatility and worst fall of today's mix.</td></tr>
       <tr><td>“Anything I should review?”</td><td>Rule-based prompts (for example one company above 20 % of the account), each with a reason and the case against acting. Never a buy or sell instruction.</td></tr>
+      <tr><td>“I have 500 euros to invest, how should I split it?”</td><td>The buy advisor: whole shares per core fund with each fund's cheapness and the reason, and the opportunity slice to a hot fall (with the news on why it fell) or kept as cash.</td></tr>
       <tr><td>“Will it rain in Thessaloniki tomorrow?”</td><td>Current conditions plus the 7-day outlook for that place.</td></tr>
       <tr><td>“What's the weather like?”</td><td>The same, for the location saved in your profile.</td></tr>
       <tr><td>“Where am I?”</td><td>The location stored in your profile, if there is one.</td></tr>

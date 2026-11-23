@@ -150,6 +150,9 @@ MAIN_IMAGE_SOURCE: og:image — download it with file_system(operation="download
     <li>Chromium starts with <code>--disable-blink-features=AutomationControlled</code> (no <code>navigator.webdriver</code>). The user agent stays the browser's own: a hard-coded one would disagree with the real version.</li>
   </ul>
 
+  <h2 id="4vg">Covered controls; no site by that name <span class="tag">2026-11-23 &sect;4VG</span></h2>
+  <p>An <code>interact</code> on the model's own page (<code>file:</code> / loopback) that did not abort ends with a hit-test of every visible control; those under an element that has no controls of its own come back as <code>covered_controls</code> and are shown as <code>⚠ COVERED CONTROLS</code> (live case: a loading overlay over the only button, checked by <code>evaluate</code> calls alone). <code>net::ERR_SSL_UNRECOGNIZED_NAME_ALERT</code> is classified as "the server has no HTTPS site by that name" with a hint that it is not a Tor fault. Navigations are booked in the request's reach ledger (<code>tools/host_reach.py</code>). Details: <a href="../coding/build_mechanics.html#4vg">build mechanics &sect;6</a>.</p>
+
   <h2>Session persistence</h2>
   <p>Cookies, <code>localStorage</code>, and auth tokens survive across tool calls via Chromium's <code>launch_persistent_context(user_data_dir=/workspace/.browser_profile)</code>. Each op opens → runs → closes cleanly; there is no long-lived subprocess to manage. Call <code>operation="close"</code> to wipe the profile (e.g. after logging out, or when switching user contexts).</p>
 

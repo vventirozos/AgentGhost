@@ -1234,7 +1234,8 @@ class TestTheRunnerIsARealFileNotAString:
         # BLOCKED strike — tool code again, the runner still separate.
         # 1700 → 1720 on 2026-11-17: §4UU-4 refuses tailnet URLs (5 lines here; the rule lives in
         # tools/browser_tailnet.py) — tool code, the runner still separate.
-        assert len(src.splitlines()) < 1720, (
+        # 1720 → 1730 on 2026-11-23: §4VG books browser reach (4 calls; the ledger lives in tools/host_reach.py).
+        assert len(src.splitlines()) < 1730, (
             "browser.py grew back toward its pre-extraction size")
 
     def test_the_module_scope_is_now_UNAMBIGUOUS(self):
