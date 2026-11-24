@@ -119,9 +119,9 @@ def test_deploy_into_builds_from_the_archive_when_the_saved_build_is_unusable(ke
 # ---------------------------------------------------------------- MAJOR 2: restore order with a hook on a pg member
 def _pg_single(env, **extra):  # noqa: F811
     make_kept(env, "lab_a", state="up", member="db", **extra)
-    env.store.x("UPDATE members SET name='db', image='ghost-lab/pg:18' WHERE lab_id='lab_a'")
+    env.store.x("UPDATE members SET name='db', image='ghost-lab/pg:19' WHERE lab_id='lab_a'")
     if not env.store.q("SELECT * FROM members WHERE lab_id='lab_a' AND name='db'"):
-        env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18",
+        env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19",
                               "mem_mb": 512, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
 
 
@@ -169,7 +169,7 @@ def test_restore_of_postgres_files_skips_the_older_hook_dump(kept, env, monkeypa
 def test_set_restore_skips_the_hook_once_a_db_member_was_restored(kept, env, monkeypatch, tmp_path):  # noqa: F811
     make_kept(env, "lab_a", state="up", member="app", backup={"cmd": "dump", "restore_cmd": "pg_restore_it"})
     env.store.x("UPDATE members SET name='app' WHERE lab_id='lab_a'")
-    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18",
+    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19",
                           "mem_mb": 512, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
     for bid, mem in (("bk_app", "app"), ("bk_db", "db")):
         (tmp_path / f"{bid}.tar").write_bytes(TAR)
@@ -430,7 +430,7 @@ def test_name_check_never_marks_a_tcp_app_live(kept, env, monkeypatch):  # noqa:
 def test_set_restore_failing_with_a_docker_error_names_the_member(kept, env, monkeypatch, tmp_path):  # noqa: F811
     make_kept(env, "lab_a", state="up", member="app")
     env.store.x("UPDATE members SET name='app' WHERE lab_id='lab_a'")
-    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18",
+    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19",
                           "mem_mb": 512, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
     for bid, mem in (("bk_app", "app"), ("bk_db", "db")):
         (tmp_path / f"{bid}.tar").write_bytes(TAR)
@@ -527,7 +527,7 @@ def test_isolated_note_on_keep_update_and_deploy(kept, env, monkeypatch):  # noq
 def test_failed_backup_saves_what_its_cleanup_set(kept, env, monkeypatch, tmp_path):  # noqa: F811
     make_kept(env, "lab_a", state="up", member="app")
     env.store.x("UPDATE members SET name='app' WHERE lab_id='lab_a'")
-    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18",
+    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19",
                           "mem_mb": 512, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
     monkeypatch.setattr(kept, "_stop_proc", lambda *a: None)
     monkeypatch.setattr(kept, "_stop_watch", lambda *a, **k: None)
@@ -549,7 +549,7 @@ def test_failed_backup_saves_what_its_cleanup_set(kept, env, monkeypatch, tmp_pa
 def _app_and_db(env, lab="lab_a"):  # noqa: F811
     make_kept(env, lab, state="up", member="app", backup={"cmd": "dump", "restore_cmd": "pg_restore_it"})
     env.store.x("UPDATE members SET name='app' WHERE lab_id=?", (lab,))
-    env.store.put_member({"lab_id": lab, "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18",
+    env.store.put_member({"lab_id": lab, "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19",
                           "mem_mb": 512, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
 
 
@@ -572,7 +572,7 @@ def test_rollback_with_a_hook_never_runs_it_and_undoes_db_first(kept, env, monke
     a1 = app_of(env, "lab_v1")
     a1["backup"] = {"cmd": "dump", "restore_cmd": "pg_restore_it"}
     kept._save("lab_v1", a1)
-    env.store.put_member({"lab_id": "lab_v1", "name": "db", "ip": "10.89.9.12", "image": "ghost-lab/pg:18",
+    env.store.put_member({"lab_id": "lab_v1", "name": "db", "ip": "10.89.9.12", "image": "ghost-lab/pg:19",
                           "mem_mb": 512, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
     for bid, mem in (("bk_sdb", "db"), ("bk_sapp", "m1")):
         (tmp_path / f"{bid}.tar").write_bytes(TAR)
@@ -949,7 +949,7 @@ def test_protected_snapshots_survive_rotation_across_failed_restores(kept, env, 
 def test_set_restore_checks_every_file_before_touching_anything(kept, env, monkeypatch, tmp_path):  # noqa: F811
     make_kept(env, "lab_a", state="up", member="app")
     env.store.x("UPDATE members SET name='app' WHERE lab_id='lab_a'")
-    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18",
+    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19",
                           "mem_mb": 512, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
     for bid, mem, body in (("bk_app", "app", b"not a tar at all"), ("bk_db", "db", TAR)):
         (tmp_path / f"{bid}.tar").write_bytes(body)

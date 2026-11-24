@@ -126,3 +126,49 @@ def test_the_streamed_log_lines_say_hidden_too(monkeypatch):
     t = P.tree(GhostAgent._finalize_and_return)
     log = [c for c in P.calls(t, "pretty_log") if c.args and P.U(c.args[0]) == "'Quote Bound'"][0]
     assert P.U(log.args[1]).count("marks hidden") == 2       # the inline and the finished-string streamed form
+
+
+# §4VI (probe-4vi-pg19-1): a marker right after inline code sat at the start of the text
+# between code spans; _finish read that as the reply's start and ate the newline after it,
+# joining the next bullet onto the line ("…64-bit`- **Table:**").
+_VI_SRC = QB.evidence_text(["PostgreSQL 19.0 (Debian 19.0-2.pgdg13+1) on aarch64\nSELECT 100\n total 5050"])
+_VI_REPLY = ('Results:\n\n- **Version:** `PostgreSQL 19.0 64-bit` [src: "PostgreSQL 19.0 (Debian 19.0-2.pgdg13+1)"]\n'
+             '- **Table:** verified with `SELECT 100` [src: "SELECT 100"]\n'
+             '- **Sum:** **5050** [src: "total 5050"]\n- last')
+_VI_WANT = ('Results:\n\n- **Version:** `PostgreSQL 19.0 64-bit`\n- **Table:** verified with `SELECT 100`\n'
+            '- **Sum:** **5050**\n- last')
+
+
+@pytest.mark.parametrize("shown", ["0", "1"])
+def test_4vi_marker_after_inline_code_keeps_the_line_break(monkeypatch, shown):
+    monkeypatch.setenv("GHOST_QUOTE_MARKS", shown)
+    out, st = QB.apply_quotes(_VI_REPLY, _VI_SRC)
+    assert st["quotes"] == 3 and st["found"] >= 2, st       # the version quote lacks the claim's "64": figure rule
+    assert "[src" not in out
+    assert out.count("\n- ") == 4, out                     # every bullet still on its own line
+    if shown == "0":
+        assert out == _VI_WANT
+
+
+def test_4vi_safety_net_keeps_the_line_break_after_inline_code():
+    assert QB.strip_leftover_markers(_VI_REPLY) == _VI_WANT
+
+
+@pytest.mark.parametrize("fn", ["apply", "strip"])
+def test_4vi_a_reply_opening_with_a_marker_line_still_drops_that_line(fn):
+    reply = '[src: "SELECT 100"]\nOpening line\n- b'
+    out = QB.apply_quotes(reply, _VI_SRC)[0] if fn == "apply" else QB.strip_leftover_markers(reply)
+    assert out == "Opening line\n- b"
+
+
+@pytest.mark.parametrize("reply,want", [
+    ('Hi\n[src: "SELECT 100"]\n[src: "total 5050"]\nmore', "Hi\nmore"),          # marker lines in a row: no blank line
+    ('[src: "SELECT 100"]\n[src: "total 5050"]\nmore', "more"),
+    ('x `c` [src: "SELECT 100"]\n[src: "total 5050"]\nmore', "x `c`\nmore"),     # after code: the break stays
+    ('x `c`\n[src: "SELECT 100"]\nmore', "x `c`\nmore"),
+    ('Hi [src: "SELECT 100"]\n\n[src: "total 5050"]\nmore', "Hi\n\nmore"),
+    ('Hi ([src: "SELECT 100"])[src: "total 5050"]\nmore', "Hi\nmore"),       # was "Himore"
+])
+def test_4vi_marker_lines_around_code(reply, want):
+    assert QB.apply_quotes(reply, _VI_SRC)[0] == want
+    assert QB.strip_leftover_markers(reply) == want

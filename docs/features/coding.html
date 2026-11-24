@@ -112,6 +112,7 @@
     <li>The sandbox has no clearnet access; downloads are slower over Tor and some sites block Tor.</li>
     <li>probe_model takes at most 8 prompts per call and 600 seconds in total; inside your turn it shares the main model, so the conversation is re-read after it.</li>
     <li>Files downloaded from .onion sites go to a quarantine that cannot be opened or run, only inspected.</li>
+    <li>When a background job finishes, its follow-up turn runs with nobody watching and stops at 45 minutes, writing its report in the reserved time (<code>GHOST_JOB_WAKE_S</code>; 0 = no clock).</li>
     <li>Switches: <code>GHOST_SANDBOX_MEM</code> sets the container's memory limit.</li>
   </ul>
   <p>Deep reference: <a href="../reference/coding/execute.html">execute</a>, <a href="../reference/coding/jobs.html">jobs</a>, <a href="../reference/coding/services.html">services</a>, <a href="../reference/coding/docker.html">Docker sandbox</a>, <a href="../reference/coding/file_system.html">file_system</a>, <a href="../reference/coding/workspace.html">workspace</a>, <a href="../reference/coding/probe_model.html">probe_model</a>, <a href="../reference/coding/experiment_gate.html">experiment gate</a>, <a href="../reference/coding/code_claims.html">code claims</a>, <a href="../reference/coding/quarantine.html">quarantine</a>.</p>

@@ -45,7 +45,7 @@ from typing import List, Optional, Tuple
 from ..utils.logging import Icons, pretty_log
 
 #: Photos joined into one reference. Beyond three the faces get too small
-#: in the node's ~0.4 MP reference latents to carry a likeness.
+#: in the node's reference latents to carry a likeness (~0.4 MP before §4VJ, ~0.9 MP now).
 MAX_SUBJECTS = 3
 #: Height every photo is scaled to before joining.
 COMBINED_HEIGHT = 1024
@@ -57,7 +57,7 @@ COMBINED_HEIGHT = 1024
 #: the model these are separate photos to recompose. Do not rebuild it.
 COMBINED_GAP = 16
 #: The render's shape when the caller asked for none and several subjects
-#: are joined — the node's own default (768x512).
+#: are joined — the node's own default (1152x768, §4VJ; was 768x512).
 DEFAULT_ASPECT = 1.5
 #: Sandbox folder for the fetched photos: never a user's own file name.
 PHOTO_DIR = "subject_photos"
@@ -726,7 +726,7 @@ def combine_side_by_side(paths: List[Path], aspect: Optional[float] = None) -> b
 
 
 #: `keep_first` (req 8473053b): the other panels stay narrow so the picture
-#: being edited gets the most of the node's 768x512 pixel budget.
+#: being edited gets the most of the node's 1152x768 pixel budget (§4VJ).
 _OTHER_PANEL_MAX = round(COMBINED_HEIGHT * 0.75)
 _OTHER_PANEL_MIN = round(COMBINED_HEIGHT * 0.5)
 #: how far from the predicted edge the gap may have moved in a render, as a

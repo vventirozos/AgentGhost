@@ -58,7 +58,7 @@ def main() -> int:
     print(f"→ {URL}\n  {'EDIT of ' + args.edit if args.edit else 'GENERATE'}: {args.prompt!r}")
     t0 = time.time()
     try:
-        r = requests.post(URL, json=payload, timeout=1500,
+        r = requests.post(URL, json=payload, timeout=1600,  # > the node's own client window (1560 s, §4VJ)
                           headers={"X-Ghost-Key": _key()})
     except requests.exceptions.ConnectionError:
         print("❌ Connection error — check JETSON_IP and that ghost-image-node is running.")

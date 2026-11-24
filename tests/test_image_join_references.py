@@ -99,7 +99,7 @@ async def test_two_uploads_join_into_one_reference_in_the_order_given(tmp_path):
     assert _near(ref.getpixel((ref.width // 2 - 40, ref.height // 2)), RED)
     assert _near(ref.getpixel((ref.width // 2 + 40, ref.height // 2)), BLUE)
     assert "2 separate photos side by side" in sent["prompt"] and sent["prompt"].endswith("they hug")
-    assert (sent["width"], sent["height"]) == (768, 512)
+    assert (sent["width"], sent["height"]) == (1152, 768)      # §4VJ default (768x512 before)
 
 
 async def test_a_new_scene_from_uploads_gets_the_panel_check_and_a_re_render(tmp_path):

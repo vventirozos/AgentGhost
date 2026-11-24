@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""lab — the owner's own client for the ghost-labs service (outside the agent).
+
+    lab pg                      create a PostgreSQL lab (pg-single) and open a shell in it
+    lab new [TEMPLATE] [-l LABEL] [--no-shell]
+    lab ls                      your labs (made with this client)
+    lab templates
+    lab sh [LAB] [MEMBER]       interactive shell (bash -l) in a member
+    lab psql [LAB] [-- ARGS]    psql in the lab's postgres member
+    lab keep LAB NAME           keep the lab: a lasting database reachable from this Mac
+    lab rm LAB [--kept]         destroy (a kept lab needs --kept and drops its data)
+
+LAB may be the full id (lab_1a2b3c4d), its hex part, or a unique prefix of either; omitted, the
+newest lab is used. API calls go to GHOST_LABS_HOST with the key in GHOST_LABS_KEY_FILE
+(default ~/Data/AI/.ghost_labs_key), each from the environment or ~/.config/lab/config; the shell goes over `ssh -t $GHOST_LABS_SSH` (default
+"disorder") + `docker exec`, because the labs API runs one command at a time with no terminal.
+While a shell is open the lab is touched every few minutes, so its idle clean-up never removes
+it under you. Every lab made here is owned by `project:labcli`, which the agent ignores.
+Standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+OWNER = "project:labcli"
+LAUNCHER = Path.home() / "Data/AI/bin/start-ghost-agent.sh"
+KEEPALIVE_S = 300
+PG_IMAGES = ("ghost-lab/pg:", "ghost-lab/patroni:")
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")      # the service's app name rule
+
+
+class LabCliError(Exception):
+    pass
+
+
+CONFIG = Path.home() / ".config/lab/config"
+
+
+def settings(env=os.environ, config: Path = CONFIG) -> Dict[str, str]:
+    """KEY=VALUE lines from ~/.config/lab/config (GHOST_LABS_HOST, GHOST_LABS_KEY_FILE, GHOST_LABS_SSH), under the
+    environment: a variable that is set wins."""
+    out: Dict[str, str] = {}
+    try:
+        for line in config.read_text().splitlines():
+            k, sep, v = line.strip().partition("=")
+            if sep and not k.startswith("#"):
+                out[k.strip().removeprefix("export ").strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    out.update({k: v for k, v in env.items() if k.startswith("GHOST_LABS_") and v})
+    return out
+
+
+# ----------------------------------------------------------------- config
+def labs_base(env=None, launcher: Path = LAUNCHER) -> str:
+    """GHOST_LABS_HOST (host:port or URL; environment, then the config file), else the agent launcher's
+    export — never a hard-coded address."""
+    env = settings() if env is None else env
+    host = (env.get("GHOST_LABS_HOST") or "").strip()
+    if not host:
+        try:
+            m = re.search(r'^\s*export\s+GHOST_LABS_HOST=["\']?([^"\'\s#]+)', launcher.read_text(), re.M)
+        except OSError:
+            m = None
+        host = m.group(1) if m else ""
+    if not host:
+        raise LabCliError(f"no labs host: set GHOST_LABS_HOST (host:port) in the environment or in {CONFIG}")
+    if not re.match(r"^https?://", host):
+        host = "http://" + host
+    return host.rstrip("/")
+
+
+def labs_key(env=None) -> str:
+    env = settings() if env is None else env
+    path = Path(env.get("GHOST_LABS_KEY_FILE") or (Path.home() / "Data/AI/.ghost_labs_key")).expanduser()
+    try:
+        key = path.read_text().strip()
+    except OSError as e:
+        raise LabCliError(f"cannot read the labs key {path}: {e.strerror}") from None
+    if not key:
+        raise LabCliError(f"the labs key file {path} is empty")
+    return key
+
+
+def ssh_host(env=None) -> str:
+    env = settings() if env is None else env
+    return (env.get("GHOST_LABS_SSH") or "disorder").strip()
+
+
+# ----------------------------------------------------------------- API
+class Api:
+    def __init__(self, base: str, key: str, opener=urllib.request.urlopen):
+        self.base, self.key, self.opener = base, key, opener
+
+    def call(self, method: str, path: str, body: Optional[dict] = None, timeout: float = 60) -> Dict[str, Any]:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers={
+            "X-Labs-Key": self.key, "X-Labs-Origin": "owner", "Content-Type": "application/json"})
+        try:
+            with self.opener(req, timeout=timeout) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                err = json.loads(raw or b"{}")
+            except ValueError:
+                err = {}
+            msg = err.get("message") or raw[:300].decode("utf-8", "replace") or e.reason
+            hint = f" ({err['hint']})" if err.get("hint") else ""
+            raise LabCliError(f"{method} {path}: {e.code} {err.get('error') or ''} {msg}{hint}".replace("  ", " ")) from None
+        except urllib.error.URLError as e:
+            raise LabCliError(f"labs service unreachable at {self.base}: {e.reason}") from None
+        try:
+            return json.loads(raw or b"{}")
+        except ValueError:
+            raise LabCliError(f"{method} {path}: the service answered something that is not JSON") from None
+
+
+# ----------------------------------------------------------------- helpers
+def my_labs(api: Api) -> List[dict]:
+    labs = api.call("GET", "/v1/labs?" + urllib.parse.urlencode({"owner": OWNER})).get("labs") or []
+    labs = [x for x in labs if x.get("owner") == OWNER]          # the filter is the service's; check it anyway
+    return sorted(labs, key=lambda x: float(x.get("created_at") or 0))
+
+
+def resolve(api: Api, ref: Optional[str]) -> str:
+    labs = my_labs(api)
+    if not labs:
+        raise LabCliError("you have no labs; make one with `lab pg` or `lab new`")
+    if not ref:
+        return labs[-1]["lab_id"]
+    ref = ref.strip()
+    norm = ref if ref.startswith("lab_") else "lab_" + ref
+    exact = [x for x in labs if x["lab_id"] == norm]
+    if exact:
+        return exact[0]["lab_id"]
+    hits = [x for x in labs if x["lab_id"].startswith(norm)]
+    if len(hits) == 1:
+        return hits[0]["lab_id"]
+    if not hits:
+        raise LabCliError(f"no lab of yours matches {ref!r} (see `lab ls`)")
+    raise LabCliError(f"{ref!r} matches {len(hits)} labs: " + ", ".join(x["lab_id"] for x in hits))
+
+
+def pick_member(detail: dict, want: Optional[str], postgres: bool = False) -> str:
+    members = [m for m in detail.get("members") or [] if isinstance(m, dict) and m.get("name")]
+    names = [m["name"] for m in members]
+    if want:
+        if want not in names:
+            raise LabCliError(f"{detail.get('lab_id')} has no member {want!r}; members: {', '.join(names)}")
+        return want
+    if postgres:
+        pg = [m["name"] for m in members if str(m.get("image") or "").startswith(PG_IMAGES)]
+        if not pg:
+            raise LabCliError(f"{detail.get('lab_id')} has no postgres member; members: {', '.join(names)}")
+        return pg[0]
+    if not names:
+        raise LabCliError(f"{detail.get('lab_id')} has no members")
+    return names[0]
+
+
+def container(lab_id: str, member: str) -> str:
+    return f"ghost-lab-{lab_id}-{member}"
+
+
+def exec_argv(ssh: str, lab_id: str, member: str, cmd: List[str]) -> List[str]:
+    """ssh -t <host> sudo docker exec -it <container> <cmd…>; every remote word quoted for the remote shell."""
+    remote = ["sudo", "docker", "exec", "-it", "-e", "TERM=" + os.environ.get("TERM", "xterm-256color"),
+              container(lab_id, member)] + cmd
+    return ["ssh", "-t", ssh, " ".join(shlex.quote(w) for w in remote)]
+
+
+def run_interactive(api: Api, lab_id: str, argv: List[str], runner=subprocess.call,
+                    interval: float = KEEPALIVE_S) -> int:
+    """Run the shell; touch the lab every ``interval`` s while it is open (a GET counts as use)."""
+    stop = threading.Event()
+
+    def keepalive():
+        while not stop.wait(interval):
+            try:
+                api.call("GET", f"/v1/labs/{lab_id}", timeout=30)
+            except LabCliError:
+                pass                                         # the shell itself will show a lab that went away
+
+    t = threading.Thread(target=keepalive, daemon=True)
+    t.start()
+    try:
+        return runner(argv)
+    finally:
+        stop.set()
+
+
+def _age(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "-"
+    s = int(max(0, seconds))
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m" if s >= 3600 else f"{s // 60}m"
+
+
+def format_labs(labs: List[dict], now: float) -> str:
+    if not labs:
+        return "no labs (make one with `lab pg`)"
+    rows = [("LAB", "TEMPLATE", "STATE", "KIND", "IDLE-LEFT", "LABEL")]
+    for x in labs:
+        kept = x.get("lifetime") == "kept"
+        exp = x.get("expires_at")
+        rows.append((x.get("lab_id", ""), x.get("template") or "-", x.get("state") or "-",
+                     "kept" if kept else "disposable",
+                     "-" if kept or exp is None else _age(float(exp) - now), x.get("label") or ""))
+    w = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
+    return "\n".join("  ".join(str(c).ljust(w[i]) for i, c in enumerate(r)).rstrip() for r in rows)
+
+
+def describe(detail: dict) -> str:
+    lines = [f"{detail.get('lab_id')}  {detail.get('template')}  {detail.get('state')}"]
+    for m in detail.get("members") or []:
+        lines.append(f"  {m.get('name')}: {m.get('image')} ({m.get('status')})")
+    app = detail.get("app") if isinstance(detail.get("app"), dict) else None
+    if app and app.get("address"):
+        lines.append(f"  reachable from the tailnet at {app['address']}")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------- commands
+def cmd_new(api: Api, args, out=print, runner=subprocess.call) -> int:
+    body = {"template": args.template, "owner": OWNER, "label": args.label or "lab client",
+            "purpose": "owner's lab client"}
+    out(f"creating a {args.template} lab (waits until it is ready)…")
+    detail = api.call("POST", "/v1/labs", body, timeout=900)
+    out(describe(detail))
+    if args.no_shell:
+        return 0
+    lab_id = detail["lab_id"]
+    has_pg = any(str(m.get("image") or "").startswith(PG_IMAGES) for m in detail.get("members") or [])
+    member = pick_member(detail, None, postgres=has_pg)     # python-pg: the shell opens in db, where psql is
+    out(f"shell in {member} (exit to leave; the lab stays until `lab rm {lab_id[4:]}` or its idle clean-up)")
+    return run_interactive(api, lab_id, exec_argv(ssh_host(), lab_id, member, ["bash", "-l"]), runner)
+
+
+def cmd_sh(api: Api, args, runner=subprocess.call) -> int:
+    lab_id = resolve(api, args.lab)
+    member = pick_member(api.call("GET", f"/v1/labs/{lab_id}"), args.member)
+    return run_interactive(api, lab_id, exec_argv(ssh_host(), lab_id, member, ["bash", "-l"]), runner)
+
+
+def cmd_psql(api: Api, args, runner=subprocess.call) -> int:
+    lab_id = resolve(api, args.lab)
+    member = pick_member(api.call("GET", f"/v1/labs/{lab_id}"), None, postgres=True)
+    extra = [a for a in (args.psql_args or []) if a != "--"]
+    return run_interactive(api, lab_id, exec_argv(ssh_host(), lab_id, member,
+                                                   ["bash", "-lc", 'exec psql "$@"', "psql"] + extra), runner)
+
+
+def cmd_keep(api: Api, args, out=print) -> int:
+    if not NAME_RE.match(args.name):
+        raise LabCliError("NAME: lowercase letters, digits and '-', starting with a letter, at most 31 characters")
+    lab_id = resolve(api, args.lab)
+    # its own lineage: two kept labs of this client are separate databases, never versions of one app
+    res = api.call("POST", f"/v1/labs/{lab_id}/keep", {"app": {"name": args.name}, "lineage": f"labcli-{args.name}"},
+                   timeout=900)
+    app = res.get("app") if isinstance(res.get("app"), dict) else {}
+    out(f"{lab_id} is kept as {args.name!r} (backed up daily; data in /data).")
+    if app.get("address"):
+        host, _, port = str(app["address"]).rpartition(":")
+        out(f"from this Mac: psql -h {host} -p {port} -U postgres   (password: lab)")
+    out("note: data loaded BEFORE the keep is not carried over — load it now.")
+    return 0
+
+
+def cmd_rm(api: Api, args, out=print, ask=input) -> int:
+    lab_id = resolve(api, args.lab)
+    detail = api.call("GET", f"/v1/labs/{lab_id}")
+    if detail.get("lifetime") == "kept":
+        if not args.kept:
+            raise LabCliError(f"{lab_id} is kept; `lab rm {args.lab} --kept` destroys it AND its data")
+        if ask(f"destroy kept lab {lab_id} and its data? type its id to confirm: ").strip() not in (lab_id, lab_id[4:]):
+            out("not destroyed")
+            return 1
+        api.call("DELETE", f"/v1/labs/{lab_id}?include_kept=1&drop_data=1", timeout=900)
+    else:
+        api.call("DELETE", f"/v1/labs/{lab_id}", timeout=300)
+    out(f"{lab_id} destroyed")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="lab", description="Client for the ghost-labs service.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n")[1])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("pg", help="create a PostgreSQL lab and open a shell")
+    p.add_argument("-l", "--label")
+    p.add_argument("--no-shell", action="store_true")
+    p = sub.add_parser("new", help="create a lab from a template")
+    p.add_argument("template", nargs="?", default="pg-single")
+    p.add_argument("-l", "--label")
+    p.add_argument("--no-shell", action="store_true")
+    sub.add_parser("ls", help="list your labs")
+    sub.add_parser("templates", help="list templates")
+    p = sub.add_parser("sh", help="shell in a lab member")
+    p.add_argument("lab", nargs="?")
+    p.add_argument("member", nargs="?")
+    p = sub.add_parser("psql", help="psql in the lab's postgres member")
+    p.add_argument("lab", nargs="?")
+    p.add_argument("psql_args", nargs=argparse.REMAINDER)
+    p = sub.add_parser("keep", help="keep a lab as a lasting database")
+    p.add_argument("lab")
+    p.add_argument("name")
+    p = sub.add_parser("rm", help="destroy a lab")
+    p.add_argument("lab")
+    p.add_argument("--kept", action="store_true")
+    return ap
+
+
+def main(argv=None, api: Optional[Api] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        api = api or Api(labs_base(), labs_key())
+        if args.cmd == "pg":
+            args.template = "pg-single"
+            return cmd_new(api, args)
+        if args.cmd == "new":
+            return cmd_new(api, args)
+        if args.cmd == "ls":
+            import time
+            print(format_labs(my_labs(api), time.time()))
+            return 0
+        if args.cmd == "templates":
+            t = api.call("GET", "/v1/templates").get("templates") or {}
+            items = t.items() if isinstance(t, dict) else ((x.get("name"), x) for x in t)
+            for name, spec in sorted(items):
+                desc = str((spec or {}).get("description") or "")
+                print(f"{name:14} {desc[:100]}{'…' if len(desc) > 100 else ''}")
+            return 0
+        if args.cmd == "sh":
+            return cmd_sh(api, args)
+        if args.cmd == "psql":
+            return cmd_psql(api, args)
+        if args.cmd == "keep":
+            return cmd_keep(api, args)
+        if args.cmd == "rm":
+            return cmd_rm(api, args)
+    except LabCliError as e:
+        print(f"lab: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

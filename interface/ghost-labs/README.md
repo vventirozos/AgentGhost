@@ -100,6 +100,27 @@ curl "${H[@]}" -X PUT $B/v1/previews -d '{"previews":[{"name":"chess dev","url":
 Errors: `{"error","message","hint",...}` with the codes in `ghost_labs/errors.py`. The Apps page is `https://<host DNS name>/`
 (tailnet only, read-only: names, states, links).
 
+## Owner client (`client/lab`)
+
+A standalone client for the owner's own use, outside the agent (standard library only, Python 3.9+):
+
+```sh
+lab pg                 # create a pg-single lab, wait until ready, open a shell (bare psql works)
+lab new python-pg      # any template; --no-shell to only create
+lab ls | lab templates
+lab sh [LAB] [MEMBER]  # bash -l in a member;  lab psql [LAB] [-- ARGS]
+lab keep LAB NAME      # kept database, reachable over the tailnet (prints the psql line)
+lab rm LAB [--kept]    # a kept lab needs --kept + its id typed, and drops its data
+```
+
+Settings (environment first, then `~/.config/lab/config` as KEY=VALUE lines): `GHOST_LABS_HOST` (host:port; else
+the agent launcher's export), `GHOST_LABS_KEY_FILE` (default `~/Data/AI/.ghost_labs_key`), `GHOST_LABS_SSH`
+(default `disorder`). The API has no terminal, so shells go `ssh -t $GHOST_LABS_SSH sudo docker exec -it
+ghost-lab-<lab>-<member> …` — that ssh login needs passwordless sudo on the labs host. While a shell is open the
+client GETs the lab every 5 min, so the idle reaper never removes it mid-session (the 24 h hard lifetime still
+applies). Labs are owned by `project:labcli`, which the agent's kept-app adoption skips (not one of its
+projects); a keep uses its own lineage `labcli-<name>`. Tests: `tests/unit/test_client.py`.
+
 ## CLI
 
 `ghost-labs status | list | templates | gc | url | build-images [name] | destroy <lab_id> [--include-kept] | destroy --all-disposable`.

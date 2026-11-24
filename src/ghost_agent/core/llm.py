@@ -34,6 +34,11 @@ logger = logging.getLogger("GhostAgent")
 # minutes. Unbounded, this call blocks every main completion behind it.
 # How long to sit on a failed capacity probe before trying the node again.
 _NODE_CAP_RETRY_S = env_positive("GHOST_NODE_CAP_RETRY_S", 300.0)
+# The image pool's whole-request ceiling. The node derives its queue wait from
+# THIS number (img_gen_server.CLIENT_TIMEOUT_S must equal it):
+#   busy-wait 780 s + render limit 750 s + 30 s margin = 1560 s.
+# §4VJ (2026-11-23): 1200 → 1560 for 1152×768 renders (edit measured 375 s).
+IMAGE_NODE_TIMEOUT_S = 1560.0
 _EMBEDDINGS_TIMEOUT_S = env_positive("GHOST_EMBEDDINGS_TIMEOUT", 120.0)
 _STREAM_FIRST_BYTE_TIMEOUT = env_positive("GHOST_STREAM_FIRST_BYTE_TIMEOUT", 180.0)
 _STREAM_IDLE_TIMEOUT = env_positive("GHOST_STREAM_IDLE_TIMEOUT", 60.0)
@@ -491,9 +496,9 @@ def _image_node_failure_kind(exc) -> str:
 
 #: §4QG-b: how long an image call waits for the image node's one client
 #: permit — the node's own queue window (ImgGen/server.py BUSY_WAIT_TIMEOUT
-#: = 690 s: a render ahead of it, worst case, ends inside it).
+#: = 780 s since §4VJ, was 690: a render ahead of it, worst case, ends inside it).
 #: GHOST_IMAGE_SLOT_WAIT_S overrides it.
-IMAGE_NODE_SLOT_WAIT_S = 690.0
+IMAGE_NODE_SLOT_WAIT_S = 780.0
 
 
 def image_node_slot_wait_s(payload=None) -> float:
@@ -504,12 +509,12 @@ def image_node_slot_wait_s(payload=None) -> float:
     try:
         # §4QG-c: the time left BEFORE the report reserve (the same budget the
         # turn loop's preflight and the collage ladder use) — bounded by the
-        # whole remaining time, a 690 s wait could run ~110 s into the reserve
+        # whole remaining time, a 690 s wait (780 s since §4VJ) could run ~110 s into the reserve
         # and the report turn missed the client deadline (r3 review M2)
         from ..tools.image_gen import _request_time_left, _single_render_seconds
         left = _request_time_left()
         # §4QG-d: and leave room for THIS render after the permit — a call
-        # granted at the end of its wait still rendered 70-230 s into the
+        # granted at the end of its wait still rendered 70-230 s (245-375 s since §4VJ) into the
         # reserve (r4 review). The render's kind is read off the payload the
         # same way the node reads it (a reference = an edit).
         if left is not None:
@@ -526,8 +531,8 @@ def image_node_slot_wait_s(payload=None) -> float:
 #: of calling generate_image again with the same request.
 _IMAGE_NO_RETRY_HINT = {
     "deterministic": (" — this failure would repeat: do NOT call generate_image "
-                      "again with the same request (change the size/reference, "
-                      "or tell the user it failed)."),
+                      "again with the same request (change the reference — the size only "
+                      "sets the shape — or tell the user it failed)."),
     "busy": (" — the image node is busy with another render: do NOT retry "
              "now; tell the user and try again in a few minutes."),
 }
@@ -1498,7 +1503,7 @@ class LLMClient:
             for node in image_gen_nodes:
                 client = httpx.AsyncClient(
                     base_url=node["url"],
-                    timeout=1200.0,
+                    timeout=IMAGE_NODE_TIMEOUT_S,
                     limits=limits,
                     proxy=get_proxy(node["url"]),
                     trust_env=False,
@@ -2270,7 +2275,7 @@ class LLMClient:
         # meant 3 x 90s plus backoffs — roughly 273 SECONDS of pure queueing
         # for one image request (R5 lens B). Same defect as the pool loop in
         # `_do_chat_completion`, one function over; fixed the same way.
-        # §4QG-b: the image node is ONE slot and a render takes 70-230 s, so
+        # §4QG-b: the image node is ONE slot and a render takes 70-230 s (245-375 s since §4VJ), so
         # the 90 s chat-node permit wait failed the second of two image calls
         # in one batch (agent.py gathers them) as SATURATED while it only had
         # to wait its turn. Wait as long as the NODE would queue it
@@ -2347,8 +2352,8 @@ class LLMClient:
                 # Only warm-up 503s and transient faults go round again.
                 #
                 # TIMING (§4QG item 5, the node's constants in ImgGen/server.py):
-                #   node busy-wait 690 s + node hard limit 480 s + 30 s margin
-                #   = 1200 s = this pool's httpx read timeout (the node sends
+                #   node busy-wait 780 s + node hard limit 750 s + 30 s margin
+                #   = 1560 s = IMAGE_NODE_TIMEOUT_S, this pool's httpx read timeout (the node sends
                 #   nothing until done), so a request the node accepts is
                 #   answered before we give up on it. Warm-up retries cost
                 #   10 + 35 s of 503s that return at once, outside that window.

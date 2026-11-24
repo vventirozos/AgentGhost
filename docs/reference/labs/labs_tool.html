@@ -47,7 +47,7 @@
   <p class="subtitle">The <code>lab</code> tool: disposable machines on the labs host, for the system under test. <span class="tag">2026-11-04 &sect;4SX Phase B</span></p>
 
   <h2 id="why">Why it exists</h2>
-  <p>The sandbox (<code>execute</code>) is one container with no root, no extra ports and no network faults. Work like "run a Postgres 18 primary and a replica, kill the primary, watch the failover" needs real machines. The labs host runs the <code>ghost-labs</code> service (<code>interface/ghost-labs/</code>). It creates such machines from templates and removes them when their idle TTL runs out.</p>
+  <p>The sandbox (<code>execute</code>) is one container with no root, no extra ports and no network faults. Work like "run a Postgres 19 primary and a replica, kill the primary, watch the failover" needs real machines. The labs host runs the <code>ghost-labs</code> service (<code>interface/ghost-labs/</code>). It creates such machines from templates and removes them when their idle TTL runs out.</p>
   <p>There are two places, and no routing flag between them (<code>docs/labs/PLAN.md</code> &sect;4): <strong>build in the workspace</strong> (<code>file_system</code>, <code>execute</code>) and <strong>run the system under test in a lab</strong>. Labs vanish, so recipes and results must end up in the workspace (<code>lab spec</code>, <code>lab get</code>).</p>
 
   <h2 id="config">Configuration and visibility</h2>
@@ -104,7 +104,7 @@
 <pre>[lab_3f2a9c01/db exit=0 0.4s]
 EXIT CODE: 0
 STDOUT:
-PostgreSQL 18.1 …</pre>
+PostgreSQL 19.0 …</pre>
   <ul>
     <li>The literal <code>EXIT CODE: n</code> line sits beside the header, because the outcome and claim parsers read that line. A non-zero code is <code>failed</code> (<code>lab_exit_nonzero</code>).</li>
     <li>A timeout says <strong>TIMED OUT</strong> and carries <em>no</em> exit code (<code>lab_timed_out</code>).</li>
@@ -393,7 +393,7 @@ PostgreSQL 18.1 …</pre>
   <ul>
     <li><strong><code>static-site</code></strong> uses the new image <code>ghost-lab/static:1</code> (base + nginx). nginx serves <code>/app</code> on 8080 with <code>autoindex off</code>; dotfiles answer 404, except <code>/.well-known/</code>. The member gets 128&nbsp;MB and no egress. A disposable lab serves <code>/app</code> at once (start.d). A kept one runs a watchdog cmd that keeps that nginx running and stops it on TERM.</li>
     <li><strong><code>node-app</code></strong> uses the new image <code>ghost-lab/node-app:1</code> (base + Debian <code>nodejs npm</code>), 512&nbsp;MB, port 8080, Tor. Its default kept cmd is <code>npm start</code>.</li>
-    <li><strong><code>python-pg</code></strong> has members <code>app</code> (python-app, 256&nbsp;MB, 8080) and <code>db</code> (pg:18, 512&nbsp;MB; sizes from the review, <a href="#4ul-review">below</a>). The app gets <code>DATABASE_URL=postgresql://postgres:lab@db:5432/postgres</code>; members reach each other by name through the network alias. When kept, both members get <code>/data</code>, and the database lives in <code>db:/data/pg</code>.</li>
+    <li><strong><code>python-pg</code></strong> has members <code>app</code> (python-app, 256&nbsp;MB, 8080) and <code>db</code> (pg:19, 512&nbsp;MB; sizes from the review, <a href="#4ul-review">below</a>). The app gets <code>DATABASE_URL=postgresql://postgres:lab@db:5432/postgres</code>; members reach each other by name through the network alias. When kept, both members get <code>/data</code>, and the database lives in <code>db:/data/pg</code>.</li>
     <li><strong><code>pg-single</code></strong> is keepable as a service. Its app is <code>service: true</code>, so it starts with nothing deployed: <code>Kept._has_code</code> is true for it. The health check is TCP 5432. The cmd is a watchdog that restarts postgres through the image's start script when <code>pg_isready</code> fails and neither <code>postgres</code> nor <code>initdb</code> is running. It looks at process names, never <code>pgrep -f</code>, which would match the watchdog's own command line. Keep before loading data: the kept database is a fresh one in <code>/data/pg</code>.</li>
     <li><code>python-app</code> and <code>web</code>: descriptions rewritten (a kept static site is a <code>static-site</code> lab; <code>web</code> is a disposable preview).</li>
     <li>A template may carry an <code>app</code> block (<code>templates.APP_DEFAULT_KEYS</code>: member, port, cmd, health, build, service), validated at load. <code>Kept._keep</code> fills every key the keep left empty from the lab's template, so a static-site keep needs only <code>{name}</code>. <code>/v1/templates</code> lists the block. The agent's <code>lab templates</code> shows "keep fills app {…}" and the image list; its keep refusal for a missing member, port or cmd reads the template's block first.</li>

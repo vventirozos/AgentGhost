@@ -139,7 +139,8 @@ def test_a_non_positive_or_one_sided_size_is_a_400(monkeypatch):
         assert r.status_code == 400, body
     assert not seen
     r = c.post("/generate", json={"prompt": "x", "width": 768, "height": 512}, headers=H)
-    assert r.status_code == 200 and (seen["w"], seen["h"]) == (768, 512)
+    # a valid size is accepted; §4VJ renders its 3:2 SHAPE on the full budget
+    assert r.status_code == 200 and (seen["w"], seen["h"]) == (1152, 768)
 
 
 def test_error_bodies_do_not_carry_server_paths(monkeypatch):

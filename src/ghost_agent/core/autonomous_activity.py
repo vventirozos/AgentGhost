@@ -718,7 +718,7 @@ def render_activity_digest(records: List[ActivityRecord], *,
             ordered.append(r)
     lines = ["**Background activity while you were away:**"]
     for r in ordered[:max_items]:
-        label = _PHASE_LABELS.get(r.phase, r.phase)
+        label = _record_label(r)
         # Per-item clamp keeps the whole block comfortably under the
         # 1500-char leading-banner bound `_strip_leading_banners` peels —
         # a longer block would defeat the correction-fingerprint peel and
@@ -771,7 +771,7 @@ def render_activity_report(records: List[ActivityRecord], *,
     shown = ordered[:max(1, int(limit))]
     lines = [f"Background activity (last {hours:g}h, newest first):"]
     for r in shown:
-        label = _PHASE_LABELS.get(r.phase, r.phase)
+        label = _record_label(r)
         mark = "❗" if r.severity == SEVERITY_NOTIFY else "·"
         s = r.summary if len(r.summary) <= 300 else r.summary[:299] + "…"
         n = counts[(r.phase, r.summary)]
@@ -903,7 +903,7 @@ def record_scheduled_result(log: Optional[ActivityLog], *, job_id: str,
                             task_name: str = "", content=None,
                             ok: bool = True,
                             duration_s: Optional[float] = None,
-                            limit: int = 300) -> None:
+                            limit: int = 300, status: str = "") -> None:
     """Sink a scheduled turn's CONCLUSION into the ledger (severity=notify —
     a cron job's whole point is "tell me what you found"). Previously the
     final content was discarded and only pass/fail reached the workspace
@@ -913,7 +913,10 @@ def record_scheduled_result(log: Optional[ActivityLog], *, job_id: str,
     try:
         name = (task_name or job_id or "task").strip()
         body = summarize_turn_content(content, limit=limit)
-        if ok:
+        if status:
+            # §4VK: a job wake's FAILED was the JOB's exit code, read as the follow-up turn failing
+            summary = f"'{name}' {status.strip()}: {body or '(no text output)'}"
+        elif ok:
             summary = f"'{name}': {body or '(completed, no text output)'}"
         else:
             summary = f"'{name}' FAILED: {body or '(no detail)'}"
@@ -924,6 +927,18 @@ def record_scheduled_result(log: Optional[ActivityLog], *, job_id: str,
                    severity=_scheduled_severity(job_id, bool(ok)), **meta)
     except Exception as e:  # noqa: BLE001
         logger.debug("record_scheduled_result failed: %s", e)
+
+
+_JOB_WAKE_ID_RE = re.compile(r"^(?:sub-)?job-")
+
+
+def _record_label(r: "ActivityRecord") -> str:
+    """The digest's [label] for a record. §4VK: a background job's follow-up turn is recorded through the
+    scheduled-task sink but is no scheduled task — the 07:20 digest read "[scheduled task] 'background
+    job job-958c1ed3' FAILED"."""
+    if r.phase == "scheduled_task" and _JOB_WAKE_ID_RE.match(str((r.meta or {}).get("job_id") or "")):
+        return "background job"
+    return _PHASE_LABELS.get(r.phase, r.phase)
 
 
 def _clip_summary(s: str, n: int = 140) -> str:
@@ -960,7 +975,7 @@ def render_activity_brief(records: List[ActivityRecord], *,
     if notify:
         lines.append("  What changed (notify-severity, newest first):")
         for r in notify[:max_notify]:
-            lines.append(f"    ! [{_PHASE_LABELS.get(r.phase, r.phase)}] "
+            lines.append(f"    ! [{_record_label(r)}] "
                          f"{_age_str(r.ts, now_ts)} — "
                          f"{_clip_summary(r.summary)}")
         if len(notify) > max_notify:

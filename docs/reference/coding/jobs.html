@@ -217,6 +217,19 @@ STDOUT/STDERR:
   <strong>rate-capped at 12/hour</strong> — a woken turn can promote another
   job, which lands and wakes again, and the counter is the backstop on that
   recursion.</p>
+  <p><strong>The wake has a 45-minute clock (&sect;4VK, operator 2026-11-24).</strong> job-958c ran 3.5 hours with nobody
+  watching: 40 turns, up to 27 minutes of thinking each, two loop-breaker steers. <code>main._handle_chat_foreground</code>
+  now runs a <code>job-</code> / <code>sub-job-</code> turn with a client deadline of <code>GHOST_JOB_WAKE_S</code>
+  (default 2700 s, the reaper's own window; <code>0</code> or <code>inf</code> = no clock). That gives it the normal
+  report reserve, the hard limit (<code>hard_limit_applies</code>) and no turn count. Scheduled tasks and owner turns are
+  unchanged. Loop breakers stay advisory (&sect;4UI). The deadline also does what any timed request does inside
+  the wake: browser previews are capped (<code>preview_cap_chars</code>), tool turns are sized to the time left, and
+  coding leaves and project task turns are bounded by what remains. A follow-up the clock stopped is recorded as
+  stopped (<code>autonomous_activity</code> &sect;4VK).
+  <strong>Kept by the operator (2026-11-24):</strong> a wake that runs a project batch can pass 45 minutes. A running
+  <code>manage_projects</code> is spared up to 30 more minutes (<code>HARD_LIMIT_SPARE_MAX_S</code>) and then gets
+  its report grace, about 80 minutes in all. A nested <code>sub-ptask-</code> turn inherits the 2700 s as its own base,
+  counted from its own start.</p>
   <p><strong>A result the model already has is not woken again (&sect;4UO, 2026-11-14).</strong>
   <code>run collect</code> and <code>jobs collect</code> mark a job delivered (<code>mark_woken</code>). So does a
   <code>file_system read</code> of <code>.jobs/&lt;id&gt;.log</code>, the path the promotion banner gives

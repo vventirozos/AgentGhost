@@ -1683,6 +1683,10 @@ def unbacked_code_writes(tools_run: Optional[list]) -> tuple:
     return never, failed
 
 
+#: §4VK: a throwaway file a check wrote outside the workspace (`/tmp/coib/game.html` in a test script)
+_SCRATCH_PATH_RE = re.compile(r"^/(?:private/)?(?:var/)?tmp/|^/(?:private/)?var/folders/[^/]+/[^/]+/T/")
+
+
 def _unbacked(tools_run) -> tuple:
     led = code_evidence(tools_run)
     never, failed, checked = [], [], []
@@ -1693,12 +1697,24 @@ def _unbacked(tools_run) -> tuple:
                 checked.append(rec["path"])
         elif rec["run_ok"] is False:
             failed.append(rec["path"])
+    # §4VK: job-958c's footer named `game.html`, `game.html` (two test pages under /tmp) before `serve.py` —
+    # when the request wrote project files, its never-run scratch files are not what the claim is about. A
+    # FAILED scratch script stays (review r1: it is usually the test of the project's code — dropping it
+    # turned BROKEN into UNTESTED).
+    if any(not _SCRATCH_PATH_RE.match(str(p)) for p in never + failed):
+        never, checked = ([p for p in lst if not _SCRATCH_PATH_RE.match(str(p))] for lst in (never, checked))
     return never, failed, checked
 
 
 def _names(paths: list, limit: int = 3) -> str:
-    shown = [f"`{os.path.basename(str(p))}`" for p in paths[:limit]]
-    more = len(paths) - len(shown)
+    uniq = list(dict.fromkeys(str(p) for p in paths))     # §4VK: one path once
+    base = [os.path.basename(p) for p in uniq]
+    # two different files with one basename are told apart by their folder (review r1: src/ and dist/
+    # index.html merged into one name)
+    label = [os.path.join(os.path.basename(os.path.dirname(p)), b) if base.count(b) > 1 and os.path.dirname(p)
+             else b for p, b in zip(uniq, base)]
+    shown = [f"`{b}`" for b in label[:limit]]
+    more = len(uniq) - len(shown)
     return ", ".join(shown) + (f" (+{more} more)" if more > 0 else "")
 
 
@@ -1771,3 +1787,102 @@ def unbacked_claim_directive(reply: str, tools_run: Optional[list]) -> str:
             f"Actually RUN it now: execute the file or its tests (a web app: its "
             f"`tests/check_page.py` click check, or browser interact that clicks a control) and read the result. If it fails, FIX it or say so plainly — do not "
             f"claim it works. THEN give your final answer, naming what you ran.")
+
+
+# ── §4VK: the reply against the turn's LAST screenshot check ─────────
+
+#: what a screen claim is about — a claim needs one of these as its subject (review r1: a bare "shows" /
+#: "fixed" matched "the table below shows the numbers" and "a fixed-width font")
+_SCREEN_SUBJECT = (r"(?:window|page|ui|canvas|game|app|engine|frame|iframe|screen|site|menu|button|dashboard"
+                   r"|desktop|view|panel|doom|it|everything)")
+_VISUAL_CLAIM_RE = re.compile(
+    r"\b" + _SCREEN_SUBJECT + r"s?\b[^.!?\n]{0,40}?\b(?:(?:now\s+)?(?:renders?|rendered|loads|appears)"
+    r"|(?:is|are)\s+(?:now\s+)?(?:visible|showing|displayed|on\s+screen|fixed)|(?:now\s+)?shows\s+up"
+    r"|reaches\s+the)\b"
+    r"|\b(?:(?:root\s+cause\s+)?found\s+and\s+fixed|(?:it|this|that)[’']?s\s+(?:now\s+)?fixed|fixed\s+(?:it|the\s+bug|the\s+issue))\b"
+    r"|\bno\s+(?:more|longer)\b[^.!?\n]{0,60}", re.I)
+#: a sentence naming what is wrong on screen is a report of it, not a success claim
+_SCREEN_PROBLEM_RE = re.compile(
+    r"\b(?:still|black|blank|empty|spinner|stuck|frozen|nothing|missing|however|but)\b"
+    r"|\bexit(?:s|ed)?\s+(?:with\s+)?(?:code\s+)?[1-9]|\bcode\s+[1-9]\b|" + _FAILURE_WORD_RE.pattern,
+    re.I)
+_SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)|\n")     # review r2: the dot in `serve.py` ends no sentence
+_VISION_HEAD_RE = re.compile(r"^\s*UI VERIFICATION RESULT\b[^\n]*\n", re.I)
+
+SCREEN_CONTRADICTION_REASON = "screen contradicts claim: the reply claims success after the last screenshot check saw a problem"
+
+
+def claims_screen_success(text: str) -> str:
+    """The first success claim in `text` a screenshot can contradict — a works/tested/verified claim
+    (`claims_code_works`) or an on-screen one about a screen subject ("the window now loads", "the UI
+    renders", "found and fixed", "no more …") — or ""."""
+    claim = claims_code_works(text)
+    if claim:
+        return claim
+    s = str(text or "")
+    for m in _VISUAL_CLAIM_RE.finditer(s):
+        before = s[max(0, m.start() - 45):m.start()]
+        if _NEGATION_RE.search(_CLAUSE_END_RE.split(before)[-1] + " " + m.group(0)) and \
+                not re.match(r"no\s+(?:more|longer)\b", m.group(0), re.I):
+            continue                         # "it never renders", "should load", "if it shows"
+        if not re.match(r"no\s+(?:more|longer)\b", m.group(0), re.I):
+            st = max((x.end() for x in _SENTENCE_END_RE.finditer(s, 0, m.start())), default=0)
+            _end = _SENTENCE_END_RE.search(s, m.end())
+            if _SCREEN_PROBLEM_RE.search(s[st:_end.start() if _end else len(s)]):
+                continue                     # "I fixed the path; however the screen is still black."
+        return " ".join(m.group(0).split())[:80]
+    return ""
+
+
+def _vision_verdict(text: str) -> Optional[dict]:
+    """The JSON object of a `verify_ui` result, or None (not one, or unparsable)."""
+    import json
+    t = str(text or "")
+    head = _VISION_HEAD_RE.match(t)
+    if not head:
+        return None
+    body = t[head.end():]
+    i, j = body.find("{"), body.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        v = json.loads(body[i:j + 1])
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def last_screen_problem(tools_run) -> Optional[dict]:
+    """§4VK: the request's LAST answered `verify_ui` check when it saw a problem (`shows_problem` true) —
+    {"target", "evidence"} — else None. Any later clean check clears it: before/after screenshots carry
+    different names (coi.png → coi2.png), so a per-picture rule (review r1 #5) footered real fixes as
+    contradicted (review r2 MAJOR). A missed contradiction across two subjects is the accepted cost. A check
+    that predates the field (or could not be parsed) says nothing either way."""
+    last = None
+    for t in (tools_run or []):
+        if not isinstance(t, dict) or t.get("_synthetic") or _name(t) != "vision_analysis":
+            continue
+        v = _vision_verdict(t.get("content"))
+        if v is None or not isinstance(v.get("shows_problem"), bool):
+            continue
+        a = _args_of(t)
+        last = None if v["shows_problem"] is False else {
+            "target": str(a.get("target") or a.get("image_path") or a.get("path") or "the screenshot"),
+            "evidence": " ".join(str(v.get("evidence") or v.get("answer") or "").split())[:240]}
+    return last
+
+
+def screen_contradiction_note(reply: str, tools_run: Optional[list]) -> str:
+    """§4VK: the footer for a reply that claims success after a screenshot check this turn saw a problem
+    no later check of that picture cleared, or "". 16faf8b4: vision said "a solid black rectangle with no
+    visible content", the next check found no DOOM window, and the reply said "I confirmed the engine's
+    own UI renders"."""
+    prob = last_screen_problem(tools_run)
+    if not prob:
+        return ""
+    claim = claims_screen_success(reply)
+    if not claim:
+        return ""
+    return (f"\n\n---\n**⚠ Contradicted by the screen:** this reply says \"{claim}\", but the last "
+            f"screenshot check of `{os.path.basename(prob['target'])}` this turn saw: "
+            f"\"{prob['evidence'] or 'a problem'}\". Treat it as NOT WORKING until a check shows it.")

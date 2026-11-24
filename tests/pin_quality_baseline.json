@@ -86,7 +86,7 @@
     "test_hippocampus_truncation.py": 3,
     "test_http_surface_hardening_r2.py": 1,
     "test_idle_orchestration_4q.py": 6,
-    "test_image_gen_node_retune.py": 3,
+    "test_image_gen_node_retune.py": 2,
     "test_imggen_node_auth.py": 1,
     "test_interface_agent_proxies.py": 5,
     "test_interface_batch3_2026_09_11.py": 2,
@@ -212,5 +212,5 @@
     "test_workspace_cleanup_deletion_guards.py": 1,
     "test_workspace_tidy.py": 3
   },
-  "total_textual": 833
+  "total_textual": 832
 }

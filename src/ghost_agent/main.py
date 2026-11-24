@@ -646,6 +646,26 @@ def _unattended_project_scope(context, project_id):
 PROJECT_TURN_SKIPPED = "[PROJECT TURN SKIPPED"
 
 
+#: §4VK (operator 11-24): a background job's follow-up turn runs with nobody watching — job-958c ran 3.5 h
+#: (40 turns of up to 27 min thinking). It gets the job reaper's own 45 min as a deadline: the report reserve
+#: writes the reply, the hard limit stops it. Loop breakers stay advisory (§4UI). 0 = no clock.
+JOB_WAKE_DEADLINE_S_DEFAULT = 2700.0
+
+
+def unattended_turn_deadline_s(request_id) -> float:
+    """§4VK: the deadline an autonomous turn runs under — `GHOST_JOB_WAKE_S` (default 2700 s) for a job's
+    follow-up turn (`job-…`, `sub-job-…`), 0.0 (none) for every other kind (scheduled tasks keep theirs)."""
+    rid = str(request_id or "")
+    if not (rid.startswith("job-") or rid.startswith("sub-job-")):
+        return 0.0
+    raw = str(os.environ.get("GHOST_JOB_WAKE_S", "") or "").strip()
+    try:
+        v = float(raw) if raw else JOB_WAKE_DEADLINE_S_DEFAULT
+    except ValueError:
+        v = JOB_WAKE_DEADLINE_S_DEFAULT
+    return v if 0 < v < float("inf") else 0.0
+
+
 async def _handle_chat_foreground(context, body, request_id: str, project_id=None):
     """§4CB R1 A-F3 / R2 A-MAJ-4: every autonomous full-turn dispatch
     (scheduled task, job resume) is a FOREGROUND request for its duration —
@@ -678,7 +698,8 @@ async def _handle_chat_foreground(context, body, request_id: str, project_id=Non
         pass
     _clean = [(v, v.set(x)) for v, x in ((requester_role_context, "owner"), (reply_surface_context, ""),
                                          (requester_member_context, ""),            # §4QG
-                                         (client_deadline_context, 0.0), (verify_purpose_context, ""),
+                                         (client_deadline_context, unattended_turn_deadline_s(request_id)),
+                                         (verify_purpose_context, ""),
                                          (_EVENT_PROJECT_OVERRIDE, None),
                                          (reply_tap_context, None),
                                          (effort_override_context, ""))]                # §4RB: no web override
@@ -879,11 +900,20 @@ async def _resume_after_job(context, entry) -> bool:
         # internal turns are excluded from the digest and the notify
         # backstop. Recorded like a scheduled task's result.
         from .core.autonomous_activity import record_scheduled_result
+        from .core.agent import HARD_LIMIT_REASON
+        # §4VK: say whose result FAILED/finished names — the job's, not its follow-up turn's; and a follow-up
+        # the 45-min clock stopped is said as stopped, never booked ok (review r1)
+        # the stop note the turn loop appends (`_(Turn cancelled: <reason>.)_`), not a quote of it (review r2)
+        _cut = "_(Turn cancelled: " in str(_content or "")
+        _clock = f"_(Turn cancelled: {HARD_LIMIT_REASON}" in str(_content or "")
         record_scheduled_result(
             getattr(context, "activity_log", None),
             job_id=_wake_id, task_name=f"background job {jid}",
-            content=_content, ok=(state == "done" and code in (None, 0)),
-            duration_s=time.time() - _started)
+            content=_content, ok=(state == "done" and code in (None, 0) and not _cut),
+            duration_s=time.time() - _started,
+            status=(f"{state}{f' (exit {code})' if code is not None else ''} — the follow-up turn "
+                    + ("was stopped at its time limit; it says" if _clock
+                       else "was stopped; it says" if _cut else "says")))
         return True
     except asyncio.CancelledError:
         raise

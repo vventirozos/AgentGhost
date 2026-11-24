@@ -64,7 +64,9 @@ class TestStepsSemantics:
         fn = next(t for t in get_active_tool_definitions(ctx)
                   if t.get("function", {}).get("name") == "image_generation")["function"]
         assert "steps" not in fn["parameters"]["properties"]
-        assert "about 1 MINUTE" in fn["description"] and "8 MINUTES" not in fn["description"]
+        # §4VJ: 1152x768 at 12 steps — 245 s new, 375 s edit
+        assert "about 4 MINUTES (about 6 with" in fn["description"] and "an edit takes about 6 MINUTES" in fn["description"]
+        assert "1 MINUTE" not in fn["description"] and "2 MINUTES" not in fn["description"] and "8 MINUTES" not in fn["description"]
 
 
 class TestSeedAndNegative:
@@ -104,13 +106,37 @@ class TestNodeBuckets:
         assert not hasattr(image_gen, "_NODE_BUCKETS")
         assert not hasattr(image_gen, "_DEFAULT_BUCKET")
 
-    def test_schema_matches_reality(self):
+    def test_schema_matches_reality(self, monkeypatch):
         # The model-facing schema advertises the same sizes/steps the tool
         # actually enforces (the old schema said "4-8 for Lightning models").
+        import importlib.util
+        import re
         from pathlib import Path
-        src = (Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
-               / "tools" / "registry.py").read_text()
+        root = Path(__file__).resolve().parents[1]
+        src = (root / "src" / "ghost_agent" / "tools" / "registry.py").read_text()
         assert "Lightning" not in src
         # (§4OY: no steps range any more — see test_schema_offers_no_steps_knob)
-        assert "512x768" in src            # advertised bucket set
+        # §4VJ: the advertised sizes are examples of SHAPES at the full budget;
+        # each one must be exactly what the node's own resolver returns. Read
+        # from the schema the model is shown (the source splits the literal).
+        from ghost_agent.tools.registry import get_active_tool_definitions
+        ctx = MagicMock()
+        ctx.llm_client.image_gen_clients = ["http://gpu"]
+        tool = next(t for t in get_active_tool_definitions(ctx)
+                    if t.get("function", {}).get("name") == "image_generation")
+        wd = tool["function"]["parameters"]["properties"]["width"]["description"]
+        assert "SHAPE" in wd
+        examples = re.findall(r"(\d+)x(\d+) (portrait|square|landscape)", wd)
+        assert {kind for _, _, kind in examples} == {"portrait", "square", "landscape"}
+        monkeypatch.setenv("GHOST_API_KEY", "k")
+        spec = importlib.util.spec_from_file_location(
+            "img_gen_server_retune_schema",
+            root / "interface" / "externals" / "image_generation" / "img_gen_server.py")
+        node = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(node)
+        for w, h, kind in examples:
+            w, h = int(w), int(h)
+            assert node._resolve_size(node.ImageRequest(prompt="x", width=w, height=h)) == (w, h), (w, h)
+            assert {"portrait": h > w, "square": h == w, "landscape": w > h}[kind], (w, h, kind)
+        assert "512x768" not in wd         # the pre-§4VJ, below-budget example
         assert '"seed"' in src             # new capability exposed

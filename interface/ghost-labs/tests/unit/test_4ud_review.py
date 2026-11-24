@@ -978,9 +978,9 @@ def _ready_lab(m, monkeypatch, script, timeout_s=9, members=("pg1", "pg2")):
     m.store.x("DELETE FROM members WHERE lab_id='lab_r'")
     spec = {"members": [], "egress": "none", "readiness": {"member": members[0], "cmd": "tpl-check", "timeout_s": timeout_s}}
     for i, name in enumerate(members):
-        m.store.put_member({"lab_id": "lab_r", "name": name, "ip": f"10.89.9.{10 + i}", "image": "ghost-lab/pg:18",
+        m.store.put_member({"lab_id": "lab_r", "name": name, "ip": f"10.89.9.{10 + i}", "image": "ghost-lab/pg:19",
                             "mem_mb": 256, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
-        spec["members"].append({"name": name, "image": "ghost-lab/pg:18", "mem_mb": 256, "cpus": 1.0, "ports": [],
+        spec["members"].append({"name": name, "image": "ghost-lab/pg:19", "mem_mb": 256, "cpus": 1.0, "ports": [],
                                 "cap_add": [], "ready": "pg_isready -q"})
     m.store.update_lab("lab_r", spec_json=dumps(spec))
     calls, clock = [], {"t": 1000.0}

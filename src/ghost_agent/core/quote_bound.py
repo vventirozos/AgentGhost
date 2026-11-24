@@ -424,11 +424,14 @@ def evidence_text(contents: Iterable) -> List[str]:          # kept name for the
     return evidence_sources(contents)
 
 
-def _finish(done: str) -> str:
+def _finish(done: str, at_start: bool = True) -> str:
     """Replace the sentinels, in one linear pass (r2 m10): whitespace before a
     marker goes, "( marker )" leaves no "()", a failed marker on its own line
     joins the line above, a run of markers with any failure is one
-    "(unverified)"."""
+    "(unverified)". ``at_start``: ``done`` opens the reply — False for the text
+    after a code span (§4VI: "`x` [src: …]\n- next" lost its newline and
+    joined the next bullet, because empty text before the marker read as the
+    reply's start)."""
     parts = re.split("([" + _OK + _BAD + "])", done)
     out: List[str] = []
     i = 0
@@ -452,7 +455,7 @@ def _finish(done: str) -> str:
             nxt = nxt.lstrip(" \t")[1:]
         if bad and prev.endswith("\n"):
             prev = prev.rstrip("\n").rstrip(" \t")
-        elif not bad and (prev.endswith("\n") or not prev) and nxt.startswith("\n"):
+        elif not bad and (prev.endswith("\n") or (not prev and ("".join(out).endswith("\n") if any(out) else at_start))) and nxt.startswith("\n"):
             nxt = nxt[1:]                                  # a verified marker on its own line leaves no blank line
         out.append(prev + (UNVERIFIED if bad else ""))
         if i < len(parts):
@@ -536,7 +539,7 @@ def apply_quotes(reply: str, sources) -> Tuple[str, dict]:
                 stats["quotes"] += n_unclosed
                 stats["missing"].extend(["(unclosed marker)"] * n_unclosed)
                 done = _UNCLOSED_RE.sub(_BAD, done)
-            out_parts.append(_finish(done))
+            out_parts.append(_finish(done, at_start=(i == 0)))
         return "".join(out_parts), stats
     finally:
         _NEAR_BUDGET.reset(tok)
@@ -590,7 +593,7 @@ def strip_leftover_markers(text):
         if i % 2 == 1:
             parts[i] = _PH_RE.sub(lambda m: marks[int(m.group(1))].group(0), parts[i])
         else:
-            parts[i] = _finish(_UNCLOSED_RE.sub(_OK, _PH_RE.sub(_OK, parts[i])))
+            parts[i] = _finish(_UNCLOSED_RE.sub(_OK, _PH_RE.sub(_OK, parts[i])), at_start=(i == 0))
     return "".join(parts)
 
 

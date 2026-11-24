@@ -235,7 +235,7 @@ def test_daily_backup_retried_after_an_hour_not_every_tick(kept, env, monkeypatc
 # ---------------------------------------------------------------- K9 final backup covers every member
 def test_final_backup_covers_every_member(kept, env, monkeypatch):  # noqa: F811
     make_kept(env, "lab_a", state="stopped")
-    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18", "mem_mb": 256,
+    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19", "mem_mb": 256,
                           "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
     asked = []
 
@@ -720,7 +720,7 @@ def test_switch_stores_every_member_snapshot(kept, env, monkeypatch, tmp_path): 
 
 def test_restore_snapshots_the_restored_member(kept, env, monkeypatch, tmp_path):  # noqa: F811
     make_kept(env, "lab_a", state="stopped")
-    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18", "mem_mb": 256,
+    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19", "mem_mb": 256,
                           "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
     bk = tmp_path / "db.tar"
     bk.write_bytes(TAR)

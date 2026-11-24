@@ -68,6 +68,10 @@
     Sections below that give 30/20 steps, CFG 4 for edits, or ~3.3/~8 min describe the base model and are kept as history.
   </div>
 
+  <div class="note">
+    <strong>Current envelope (§4VJ, 2026-11-23).</strong> Default and budget 1152&times;768 (per-side cap 1152); a requested size sets only the shape, every render uses the whole budget. 12 steps on the distilled trajectory (<code>TURBO_SIGMAS</code>; <code>TURBO_SIGMAS_16</code> and <code>TURBO_SIGMAS_8</code> kept for rollback). Measured: new image 245 s, edit 375 s, 2-subject 369 s, cfg 4 1,066 s (nothing sends cfg &gt; 1 now). <code>GEN_TIMEOUT_S</code> = 750 s, <code>CLIENT_TIMEOUT_S</code> = 1560 s, <code>BUSY_WAIT_TIMEOUT</code> = 780 s, <code>EDIT_S_PER_STEP</code> = 23. Figures below that say 768&times;512, 8 or 16 steps are history. Why: full-body faces were cross-eyed at 768&times;512 (see the tool page, &sect;4VJ).
+  </div>
+
   <h2>Endpoints</h2>
   <div class="scroll"><table>
     <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>

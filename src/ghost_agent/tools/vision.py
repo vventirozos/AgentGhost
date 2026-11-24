@@ -549,8 +549,16 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                 '  "answer": "YES" | "NO" | "UNCERTAIN" | "<the specific value asked for>",\n'
                 '  "confidence": 0.0-1.0,\n'
                 '  "evidence": "one sentence describing exactly what you see that supports the answer",\n'
-                '  "details": "positions/coordinates/colors/text relevant to the question, if applicable"\n'
+                '  "details": "positions/coordinates/colors/text relevant to the question, if applicable",\n'
+                # §4VK: a verdict the reply can be checked against, whatever way the question was put —
+                # 16faf8b4 replied "the engine UI renders" after this check had seen a solid black window
+                '  "shows_problem": true | false\n'
                 "}\n"
+                "`shows_problem` is true when the image does NOT show what the question is checking for: an "
+                "unexpected error or crash, a blank / black / empty area where that content should be, a "
+                "loading screen or spinner still showing, or the thing asked about not there at all (no "
+                "window, a different page). An error, empty or loading screen that IS what the question asks "
+                "to see is not a problem. False only when the content asked about is visibly present.\n"
                 "If the image cannot answer the question (blank frame, loading "
                 "screen, a start MENU instead of the running app), answer "
                 "UNCERTAIN and say why in `evidence` — do NOT guess."

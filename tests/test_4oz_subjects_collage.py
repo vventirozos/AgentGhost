@@ -122,7 +122,8 @@ async def test_a_confident_collage_verdict_rerenders_with_a_fresh_seed(tmp_path,
     assert out.startswith("SUCCESS")
 
 
-async def test_the_third_attempt_runs_under_true_cfg(tmp_path, web):
+async def test_the_third_attempt_runs_under_true_cfg_when_the_leg_is_on(tmp_path, web, monkeypatch):
+    monkeypatch.setattr(IG, "COLLAGE_CFG_LEG", True)        # §4VJ: opt-in (rollback path)
     llm = _llm(verdicts=[YES, YES, NO],
                renders=[_resp(seed=1, png=PNG + b"1"), _resp(seed=2, png=PNG + b"2"), _resp(seed=3, png=PNG + b"3")])
     out = await tool_generate_image(prompt="k", subjects=TWO, llm_client=llm, sandbox_dir=tmp_path)
@@ -132,6 +133,19 @@ async def test_the_third_attempt_runs_under_true_cfg(tmp_path, web):
     # at cfg 4 — the §4OZ measurement; it used to draw a fresh seed
     assert _sent(llm, 2)["guidance_scale"] == IG.COLLAGE_RETRY_GUIDANCE == 4.0 and _sent(llm, 2)["seed"] == 1
     assert _sent(llm, 2)["negative_prompt"].startswith("collage")           # the anti-collage negative rides along
+    assert next(tmp_path.glob("gen_*.png")).read_bytes() == PNG + b"3" and "PANELS" not in out
+
+
+async def test_the_third_attempt_is_a_fresh_seed_at_cfg_1_by_default(tmp_path, web):
+    # §4VJ: a cfg-4 leg at 1152x768 measured 1,066 s (past the node's 750 s
+    # render limit) — by default attempt 3 is another fresh seed, CFG-free
+    assert IG.COLLAGE_CFG_LEG is False
+    llm = _llm(verdicts=[YES, YES, NO],
+               renders=[_resp(seed=1, png=PNG + b"1"), _resp(seed=2, png=PNG + b"2"), _resp(seed=3, png=PNG + b"3")])
+    out = await tool_generate_image(prompt="k", subjects=TWO, llm_client=llm, sandbox_dir=tmp_path)
+    assert llm.generate_image.await_count == 3
+    for i in (1, 2):
+        assert "guidance_scale" not in _sent(llm, i) and "seed" not in _sent(llm, i)
     assert next(tmp_path.glob("gen_*.png")).read_bytes() == PNG + b"3" and "PANELS" not in out
 
 
@@ -264,7 +278,7 @@ async def test_the_render_log_line_carries_the_whole_prompt_under_its_new_title(
     out = capsys.readouterr().out
     line = next(l for l in out.splitlines() if "image generation" in l.lower() and "prompt (" in l)
     assert "image gen " not in out.lower().replace("image generation", "")
-    assert "size=768x512 | refs=1 | prompt (" in line
+    assert "size=1152x768 | refs=1 | prompt (" in line
     import re
     flat = re.sub(r"\s+", " ", out)                                         # the stream wraps long content
     sent = _sent(llm)["prompt"]

@@ -498,6 +498,15 @@ class WorkSegment(str):
 
 
 WORK_SEGMENT_MAX = 1000
+#: §4VK: a longer work note is still narration when it announces its next step near the top — job-958c's
+#: reply opened with a 1,302-char note from turn 14 of 40 ("The matrix gave me the decisive architectural
+#: fact. Let me interpret it and get the one missing piece of evidence. …") and the away digest quoted it as
+#: the turn's conclusion. Review r1: a bare 4000 cap dropped a 2,158-char results table written beside a save.
+WORK_NARRATION_MAX = 4000
+#: …at the segment's start or a sentence's start, never "let me know" (review r2: a comparison that ended its
+#: first paragraph "let me know if you want EUR" was dropped)
+_STEP_BEAT_RE = re.compile(r"(?:^|[.!?:]\s+|\n)(?:let\s+me\s+(?!know\b|be\b)|let's\s|i'll\s|i\s+will\s|i'm\s+going\s+to\s"
+                           r"|now\s+i\s|next,?\s+i\s)", re.I)
 WORK_REST_FACTOR = 1.5
 
 
@@ -595,7 +604,10 @@ def drop_pre_tool_segments(text: str, segments) -> str:
         _is_work = isinstance(seg, WorkSegment) or _after_work   # before .strip(): a str op returns a plain str
         _after_work = _after_work or isinstance(seg, WorkSegment)
         seg = (seg or "").strip()
-        if not seg or len(seg) > (WORK_SEGMENT_MAX if _is_work else PRE_TOOL_SEGMENT_MAX):
+        if not seg:
+            continue
+        if len(seg) > (WORK_SEGMENT_MAX if _is_work else PRE_TOOL_SEGMENT_MAX) and not (
+                _is_work and len(seg) <= WORK_NARRATION_MAX and _STEP_BEAT_RE.search(seg[:300])):
             continue
         # whole paragraphs only (review §4LH: "Done." inside an answer was
         # cut while the recorded "Done." paragraph stayed)

@@ -269,15 +269,16 @@ def test_an_opaque_rgb_reference_at_size_still_passes_through(monkeypatch):
 
 
 # ============================================================ node: item 3
-@pytest.mark.parametrize("w,h,want", [
-    (4032, 3024, (672, 512)), (3000, 4000, (512, 672)),
-    (960, 1264, (544, 704)), (1920, 1080, (736, 416)),
+@pytest.mark.parametrize("w,h,want", [      # §4VJ: chosen at the 1152x768 budget
+    (4032, 3024, (1056, 800)), (3000, 4000, (800, 1088)),
+    (960, 1264, (800, 1056)), (1920, 1080, (1152, 640)),
 ])
 def test_in_band_aspect_is_crop_filled_without_bars(monkeypatch, w, h, want):
     from PIL import Image
     mod = _load_server(monkeypatch)
     size = mod._resolve_size(mod.ImageRequest(prompt="x"), (w, h))
     assert size == want                  # the node's own selection
+    assert abs((size[0] / size[1]) / (w / h) - 1) <= mod.ASPECT_BAND   # in band: crop-fill, not letterbox
     b = BytesIO()
     Image.new("RGB", (w, h), (200, 0, 0)).save(b, format="JPEG")
     out = Image.open(BytesIO(mod.fit_reference(b.getvalue(), *size))).convert("RGB")
@@ -449,7 +450,7 @@ def test_preflight_runs_the_turbo_schedule(monkeypatch, tmp_path):
     mod.OUT_DIR = tmp_path
     mod._load_model_blocking()
     argv = seen["argv"]
-    assert argv[argv.index("--steps") + 1] == "16" and "--sigmas" in argv
+    assert argv[argv.index("--steps") + 1] == "12" and "--sigmas" in argv   # §4VJ
 
 
 # ============================================================ node: item 9
@@ -595,12 +596,12 @@ def test_the_image_permit_wait_is_the_node_queue_bounded_by_the_request(monkeypa
     import ghost_agent.utils.logging as G
     monkeypatch.delenv("GHOST_IMAGE_SLOT_WAIT_S", raising=False)
     monkeypatch.setattr(G, "request_remaining_s", lambda rid: None)
-    assert L.image_node_slot_wait_s() == 690.0
+    assert L.image_node_slot_wait_s() == 780.0           # §4VJ: the node's BUSY_WAIT_TIMEOUT (was 690)
     # §4QG-c: bounded by the time left BEFORE the report reserve
     import ghost_agent.tools.image_gen as IG
-    monkeypatch.setattr(IG, "_request_time_left", lambda: 200.0)
+    monkeypatch.setattr(IG, "_request_time_left", lambda: 400.0)          # §4VJ: > the 245 s default render
     monkeypatch.setitem(IG.RECENT_RENDER_SECONDS, "generate", IG.collections.deque(maxlen=3))
-    assert L.image_node_slot_wait_s() == 200.0 - IG.DEFAULT_RENDER_SECONDS["generate"]     # §4QG-d: minus this render
+    assert L.image_node_slot_wait_s() == 400.0 - IG.DEFAULT_RENDER_SECONDS["generate"]     # §4QG-d: minus this render
     monkeypatch.setattr(IG, "_request_time_left", lambda: -5.0)
     assert L.image_node_slot_wait_s() == L._MIN_ACQUIRE
 

@@ -202,6 +202,8 @@
       r2 also showed that the correction prepend added in r1 could never run, because corrections are consumed only in a conversation that already has a reply. That code was removed.</li>
   </ul>
   <p>Pins: the bottom section of <code>tests/test_4qe_vision_page_links.py</code>. In the mini battery, 25 of 25 mutants were killed and the no-op control survived.</p>
+  <h2 id="4vk">verify_ui says whether the screen shows a problem <span class="tag">2026-11-24 &sect;4VK</span></h2>
+  <p>The JSON answer has a fourth field, <code>"shows_problem": true | false</code>. It is true when the image does not show what the question checks for: an unexpected error or crash, a blank, black or empty area where that content should be, a spinner still showing, or the thing asked about not being there at all. An error, empty or loading screen that is what the question asks to see is not a problem (review r1: a 404 page under test). The question's own <code>answer</code> depends on how the question was put, so it could not be checked against the reply. This field can: <code>core.code_claims.screen_contradiction_note</code> flags a reply that claims success after the last check saw a problem (req 16faf8b4). See <a href="../coding/code_claims.html#4vk">code claims §4VK</a>.</p>
 </main>
 </body>
 </html>

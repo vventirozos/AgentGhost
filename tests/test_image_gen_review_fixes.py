@@ -161,7 +161,8 @@ async def test_no_size_at_all_has_no_note(tmp_path):
 
 # ── 5. the cfg-4 leg reuses the first render's seed ──
 
-async def test_attempt_three_reuses_the_seed_the_node_reported(tmp_path, web):
+async def test_attempt_three_reuses_the_seed_the_node_reported(tmp_path, web, monkeypatch):
+    monkeypatch.setattr(IG, "COLLAGE_CFG_LEG", True)        # §4VJ: the cfg-4 leg is opt-in
     llm = _llm(verdicts=[YES, YES, NO],
                renders=[_resp(seed=11, png=PNG + b"1"), _resp(seed=22, png=PNG + b"2"), _resp(seed=33, png=PNG + b"3")])
     await tool_generate_image(prompt="k", subjects=TWO, llm_client=llm, sandbox_dir=tmp_path)   # no seed sent
@@ -182,13 +183,14 @@ def test_an_empty_history_two_subject_call_fits_an_1800s_budget(empty_history):
         w = declared_wait_s("image_generation", args)
         assert w == pytest.approx(2 * IG.DEFAULT_RENDER_SECONDS["edit"] + IG.COLLAGE_VERDICT_DEFAULT_S)
         assert not wait_crosses_deadline(w, 1800.0, effective_report_floor(1800.0))
-    # the Turbo defaults at 16 steps (§4QR: T2I 112 s, edits ~182 s) — not the base model's
-    assert IG.DEFAULT_RENDER_SECONDS == {"edit": 185.0, "generate": 115.0}
+    # §4VJ: Turbo at 12 steps, 1152x768 (T2I 245 s, edits 375 s) — still inside 1800 s
+    assert IG.DEFAULT_RENDER_SECONDS == {"edit": 375.0, "generate": 245.0}
 
 
 async def test_the_cfg_leg_does_not_inflate_the_next_estimate(tmp_path, web, empty_history, monkeypatch):
     """[CRITICAL §4QG-b] the cfg-4 leg was booked into "edit" and then
     multiplied by COLLAGE_CFG_COST again in the next estimate."""
+    monkeypatch.setattr(IG, "COLLAGE_CFG_LEG", True)        # §4VJ: the cfg-4 leg is opt-in
     clock = {"t": 0.0}
     monkeypatch.setattr(IG, "time", __import__("types").SimpleNamespace(monotonic=lambda: clock["t"]))
     durations = iter([100.0, 110.0, 230.0])
@@ -218,6 +220,7 @@ async def test_the_ladder_skips_a_retry_that_would_cross_the_report_reserve(
     """[CRITICAL §4QG-b (d)] the ladder is deadline-aware: before a re-render,
     the request's time left (before the report reserve) must cover the leg
     + its verdict + COLLAGE_LEG_MARGIN_S; otherwise the picture is kept."""
+    monkeypatch.setattr(IG, "COLLAGE_CFG_LEG", True)        # §4VJ: the cfg-leg cost row needs the leg on
     monkeypatch.setattr(IG, "_request_time_left", lambda: left)
     clock = {"t": 0.0}                     # each render takes 150 s, a verdict 0 s
     monkeypatch.setattr(IG, "time", __import__("types").SimpleNamespace(monotonic=lambda: clock["t"]))
@@ -232,6 +235,25 @@ async def test_the_ladder_skips_a_retry_that_would_cross_the_report_reserve(
     assert llm.generate_image.await_count == renders
     assert ("no time left in this request for another attempt" in out) is note
     assert "two-panel picture" in out
+
+
+async def test_the_default_ladder_prices_attempt_three_as_a_plain_render(
+        tmp_path, web, empty_history, monkeypatch):
+    # §4VJ: with the cfg leg off, 200 s left covers a 150 s reseed (+30) for
+    # BOTH re-renders — the cfg row above (2 renders) does not apply
+    assert IG.COLLAGE_CFG_LEG is False
+    monkeypatch.setattr(IG, "_request_time_left", lambda: 200.0)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(IG, "time", __import__("types").SimpleNamespace(monotonic=lambda: clock["t"]))
+
+    async def render(payload):
+        clock["t"] += 150.0
+        return _resp()
+    llm = _llm(verdicts=[YES, YES, YES])
+    llm.generate_image.side_effect = render
+    out = await tool_generate_image(prompt="k", subjects=TWO, llm_client=llm, sandbox_dir=tmp_path)
+    assert llm.generate_image.await_count == 3
+    assert "no time left in this request" not in out
 
 
 def test_time_left_reads_the_request_deadline_and_the_report_reserve(monkeypatch):

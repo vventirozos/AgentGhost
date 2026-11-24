@@ -19,7 +19,7 @@ def _stale_copy(d: Path) -> None:
     d.mkdir(parents=True, exist_ok=True)
     # what /etc held: pg-single as it was before the fix — no env, no ready check
     (d / "pg-single.yaml").write_text(
-        "name: pg-single\negress: none\nmembers:\n  - {name: pg1, image: \"ghost-lab/pg:18\", mem_mb: 768}\n")
+        "name: pg-single\negress: none\nmembers:\n  - {name: pg1, image: \"ghost-lab/pg:19\", mem_mb: 768}\n")
     (d / "mine.yaml").write_text(
         "name: mine\negress: none\nmembers:\n  - {name: box, image: \"ghost-lab/base:1\", mem_mb: 256}\n")
 

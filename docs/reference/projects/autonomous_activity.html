@@ -602,6 +602,14 @@ message went out at once. In the next turn the model saw the dashboard showed in
   A script the command heuristic does not see as changing (<code>node build.js</code>) is not named.</li>
 </ul>
 <p>Pins: <code>tests/test_4tp_notify_hold_request_data.py</code>.</p>
+<h2 id="4vk">A job's follow-up turn is labelled as one <span class="tag">2026-11-24 &sect;4VK</span></h2>
+<p>The 07:20 digest read <code>[scheduled task] 'background job job-958c1ed3' FAILED: The matrix gave me the decisive architectural fact. Let me interpret it…</code>. Three things were wrong: it was no scheduled task, FAILED was the <em>job's</em> exit 1 (the follow-up turn had written a report), and the quoted text was a note written beside a tool call at turn 14.</p>
+<ul>
+  <li><code>_record_label</code>: a <code>scheduled_task</code> record whose <code>job_id</code> starts <code>job-</code> or <code>sub-job-</code> shows as <code>[background job]</code> in the digest, the brief and the full report.</li>
+  <li><code>record_scheduled_result(…, status=)</code>: the wake passes the job's state and exit, so the line reads <code>'background job job-958c1ed3' done (exit 1) — the follow-up turn says: …</code>. A follow-up that was stopped (its reply carries the loop's <code>_(Turn cancelled: …)_</code> note) is never booked ok. It reads <code>… — the follow-up turn was stopped at its time limit; it says: …</code> for the 45-minute clock, and <code>… was stopped; it says: …</code> for any other stop. Severity still follows <code>ok</code>. Scheduled tasks are unchanged (<code>'nightly' FAILED: …</code>).</li>
+  <li>The opening note is handled in reply smoothing. A work note of 1,000–4,000 chars (<code>WORK_NARRATION_MAX</code>) is dropped when a sentence in its first 300 chars starts with a next step ("Let me…", "I'll…", "Now I…"; never "Let me know") and the rest outweighs it (<code>WORK_REST_FACTOR</code> 1.5). <code>WORK_SEGMENT_MAX</code> stays 1,000 for everything else (review r1: a bare 4,000 cap dropped a results table written beside a save).</li>
+</ul>
+<p>Pins: <code>tests/test_4vk_screen_claims_and_job_wake.py</code>.</p>
 </main>
 </body>
 </html>

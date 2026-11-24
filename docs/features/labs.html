@@ -54,7 +54,7 @@
   </section>
 
   <h2 id="what">What it does</h2>
-  <p>The agent's own sandbox is one container with no root, no extra ports and no network faults. That suits writing and running code. It does not suit "start PostgreSQL 18 with two replicas, cut the leader off the network and watch who takes over".</p>
+  <p>The agent's own sandbox is one container with no root, no extra ports and no network faults. That suits writing and running code. It does not suit "start PostgreSQL 19 with two replicas, cut the leader off the network and watch who takes over".</p>
   <p>For that there are <strong>labs</strong>. A lab is a set of Docker containers (its <em>members</em>) on a private network of their own, built from a template. The labs host has no AI in it: the agent asks for something, and the service either does exactly that or answers with an error and a hint.</p>
   <p>The rule is simple: <strong>build in the workspace, run the system under test in a lab</strong>. Code, SQL files and reports stay in the sandbox workspace, because labs disappear. Files move between the two, and a lab's recipe can be saved so the same setup can be rebuilt later.</p>
 
@@ -62,12 +62,12 @@
   <div class="scroll"><table>
     <thead><tr><th>Template</th><th>Members</th><th>Internet</th><th>Good for</th></tr></thead>
     <tbody>
-      <tr><td><code>pg-single</code></td><td>pg1 (PostgreSQL 18)</td><td>none</td><td>running SQL, testing a migration, a query plan; can be kept as a database service</td></tr>
+      <tr><td><code>pg-single</code></td><td>pg1 (PostgreSQL 19)</td><td>none</td><td>running SQL, testing a migration, a query plan; can be kept as a database service</td></tr>
       <tr><td><code>patroni-3</code></td><td>pg1, pg2, pg3 (Patroni + etcd)</td><td>none</td><td>failover, replication, split-brain experiments</td></tr>
       <tr><td><code>mysql-single</code></td><td>db1 (MySQL 8.0)</td><td>Tor</td><td>MySQL work</td></tr>
       <tr><td><code>python-app</code></td><td>app (Flask + gunicorn, port 8080)</td><td>Tor</td><td>a Python web app, disposable or kept</td></tr>
       <tr><td><code>node-app</code></td><td>app (Node.js + npm, port 8080)</td><td>Tor</td><td>a Node web app; a kept one runs <code>npm start</code> by default</td></tr>
-      <tr><td><code>python-pg</code></td><td>app (Python, port 8080) + db (PostgreSQL 18)</td><td>Tor</td><td>an app with its own database; the app gets <code>DATABASE_URL</code></td></tr>
+      <tr><td><code>python-pg</code></td><td>app (Python, port 8080) + db (PostgreSQL 19)</td><td>Tor</td><td>an app with its own database; the app gets <code>DATABASE_URL</code></td></tr>
       <tr><td><code>static-site</code></td><td>site (nginx, port 8080)</td><td>none</td><td>an HTML/CSS/JS site, disposable or kept; no folder listings, dotfiles hidden</td></tr>
       <tr><td><code>web</code></td><td>web1 (nginx, port 80)</td><td>Tor</td><td>a quick disposable preview from <code>/srv/www</code> (not keepable)</td></tr>
       <tr><td><code>blank-dev</code></td><td>dev (Debian)</td><td>Tor</td><td>anything else</td></tr>
@@ -82,7 +82,7 @@
   <div class="scroll"><table>
     <thead><tr><th>You say</th><th>What happens</th></tr></thead>
     <tbody>
-      <tr><td>“Check what <code>SELECT 41+1;</code> returns on PostgreSQL 18.”</td><td>A <code>pg-single</code> lab is created, the query runs with <code>psql</code>, the answer (42) comes back, and the lab is destroyed.</td></tr>
+      <tr><td>“Check what <code>SELECT 41+1;</code> returns on PostgreSQL 19.”</td><td>A <code>pg-single</code> lab is created, the query runs with <code>psql</code>, the answer (42) comes back, and the lab is destroyed.</td></tr>
       <tr><td>“Write a schema for Kosmas's library app, load it into a fresh database and save a dump.”</td><td>The schema is written in the workspace, copied into a lab, loaded, dumped, and the dump is copied back to the workspace.</td></tr>
       <tr><td>“Start a three-node Patroni cluster, isolate the leader, and tell me who takes over and how long it took.”</td><td>A <code>patroni-3</code> lab; the leader is taken off the lab network without stopping it; the agent reads the new leader and the time, rejoins the node, and can save the recipe for a rerun.</td></tr>
       <tr><td>“Run a 10-minute pgbench on the lab and tell me the TPS.”</td><td>A long job starts on a lab member. The agent collects it when it ends, and grades it by how it really ended, not by what it printed.</td></tr>
@@ -152,6 +152,8 @@
 <!-- /refs -->
 
   <footer><p>Ghost Agent documentation.</p></footer>
+<h2 id="owner-client">Your own client: <code>lab</code></h2>
+<p>Outside the agent, the owner has a small command-line client (<code>interface/ghost-labs/client/lab</code>): <code>lab pg</code> creates a PostgreSQL 19 lab and opens a shell in it, <code>lab psql</code> goes straight into psql, <code>lab keep LAB NAME</code> turns it into a lasting database reachable over the tailnet, <code>lab ls</code> and <code>lab rm</code> manage them. Shells go over ssh to the labs host, because the labs API runs one command at a time with no terminal. These labs are owned by <code>project:labcli</code> and the agent leaves them alone. Setup and settings: the service README, section "Owner client".</p>
 </main>
 </body>
 </html>

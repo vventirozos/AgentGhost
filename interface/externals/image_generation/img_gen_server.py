@@ -47,6 +47,10 @@ Why a subprocess per request instead of a resident pipeline:
 Measured on ghost with the base model (§4JT, seed 42, 40 steps, cfg 1.0):
 768×512 4.3 min, 768×768 6.7 min, 1024² 14.8 min. The operator chose 768×512
 as the node's envelope (base: 30 steps, ~3.3 min; Turbo: 8 steps).
+§4VJ (2026-11-23): envelope 1152×768 at 12 Turbo steps — 768×512 drew
+full-body faces cross-eyed. A requested size is only a SHAPE now: every
+render uses the whole pixel budget. Turbo, 12 steps, 1152×768: ~4 min for a
+plain image, ~6 min for an edit or a 2-subject render (see GEN_TIMEOUT_S).
 
 Editing (§4JV): a request may carry `reference_images` (base64 PNG/JPEG, at
 most MAX_REFERENCES) — sd-cli gets them as `-r` files plus the Qwen3-VL
@@ -59,10 +63,11 @@ Three things the path does NOT survive without:
     draws one and the response reports it (see its docstring).
   * A fitted reference. sd-cli encodes a reference at ITS OWN resolution,
     so `fit_reference` matches it to the render geometry first.
-Cost (Turbo, §4OY): ~2 min at 768x512 — Turbo edits CFG-free, so the TRUE
-CFG note above is the BASE model's (see EDIT_GUIDANCE); a plain image is ~70 s.
+Cost (Turbo, 12 steps, 1152×768, §4VJ): ~6 min — Turbo edits CFG-free, so the
+TRUE CFG note above is the BASE model's (see EDIT_GUIDANCE); a plain image is ~4 min.
 The reference's latents lengthen the DiT sequence, and a caller-forced CFG
-doubles the forwards per step (~3.7 min). MAX_REFERENCES is a memory cap on an 8 GB box, not a taste.
+doubles the forwards per step (cfg 4 at 1152×768: 1,066 s — past GEN_TIMEOUT_S,
+see there). MAX_REFERENCES is a memory cap on an 8 GB box, not a taste.
 With no size requested, an edit inherits the reference's shape.
 
 Transparency (§4JV, §4MH): `transparent=true` wraps the prompt in the model
@@ -150,11 +155,18 @@ VAE_PATH = os.environ.get("IMGGEN_VAE_PATH", "qwen21/models/qwen_image_2.1_vae_b
 MMPROJ_PATH = os.environ.get("IMGGEN_MMPROJ", "qwen21/models/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf")
 OUT_DIR = Path(os.environ.get("IMGGEN_OUT_DIR", "tmp"))
 
-DEFAULT_WIDTH = 768
-DEFAULT_HEIGHT = 512
+# §4VJ (operator, 2026-11-23): 768×512 → 1152×768. Faces in full-body and
+# group shots came out cross-eyed or mushy: at 768×512 a full-body face is
+# ~75 px ≈ 5 patches of 16 px. The model's own presets are ~4 MP (3:2 =
+# 2528×1696); 768×512 was 0.39 MP. Same-seed A/B on ghost (exp-faces/):
+# Q8_0 vs Q4_K_M, 8/12/16 steps and the base model all left the eyes broken;
+# only 1152×768 fixed them. Measured at 12 steps: T2I 245 s, single-reference
+# edit 375 s, 2-subject render 369 s; lowest free RAM 650–750 MB (no OOM).
+DEFAULT_WIDTH = 1152
+DEFAULT_HEIGHT = 768
 MIN_DIM = 256
-MAX_DIM = 768                  # hard per-side cap
-MAX_PIXELS = 768 * 512        # area budget the operator chose (§4JT); Turbo at 16 steps: ~112 s per image
+MAX_DIM = 1152                 # hard per-side cap (768×1152 portrait)
+MAX_PIXELS = 1152 * 768       # area budget (§4VJ; was 768×512, §4JT); Turbo at 12 steps: ~245 s per image
 SIZE_STEP = 32                # sd.cpp: Qwen-Image 2.1 dimensions must be /32
 ASPECT_BAND = 0.02            # sizes within 2% of the asked aspect compete on area
 # §4OY: Turbo is distilled to ONE trajectory — the model's own 8-step
@@ -170,11 +182,17 @@ ASPECT_BAND = 0.02            # sizes within 2% of the asked aspect compete on a
 # clean, on text-to-image, edits and subjects renders alike; sd-cli's DEFAULT
 # 16-step schedule over-sharpens (haloes). Cost: 68 → 112 s T2I, 117 → 182 s
 # edits (768×512). The 8-step list is TURBO_SIGMAS_8, kept for rollback.
+# §4VJ (operator, 2026-11-23): 12 steps on the same trajectory (the §4QP
+# 12-point interpolation). Same seeds, 768×512: 12 and 16 are visually the
+# same (face, hair, skin detail); 8 is visibly softer. 25% less time, which
+# the 1152×768 size needs. The 16-step list is TURBO_SIGMAS_16 (rollback).
 TURBO_SIGMAS_8 = (1.0, 0.978453, 0.95418, 0.926626, 0.89508,
                   0.845148, 0.704534, 0.414568, 0.0)
-TURBO_SIGMAS = (1.0, 0.989227, 0.978453, 0.966317, 0.95418, 0.940403, 0.926626, 0.910853,
-                0.89508, 0.870114, 0.845148, 0.774841, 0.704534, 0.559551, 0.414568, 0.207284, 0.0)
-TURBO_STEPS = len(TURBO_SIGMAS) - 1          # 16 (§4QR; was 8)
+TURBO_SIGMAS_16 = (1.0, 0.989227, 0.978453, 0.966317, 0.95418, 0.940403, 0.926626, 0.910853,
+                   0.89508, 0.870114, 0.845148, 0.774841, 0.704534, 0.559551, 0.414568, 0.207284, 0.0)
+TURBO_SIGMAS = (1.0, 0.985635, 0.970362, 0.95418, 0.935811, 0.916111, 0.89508,
+                0.861792, 0.798277, 0.704534, 0.511223, 0.276379, 0.0)
+TURBO_STEPS = len(TURBO_SIGMAS) - 1          # 12 (§4VJ; 16 from §4QR, 8 before)
 DEFAULT_STEPS = TURBO_STEPS
 DEFAULT_EDIT_STEPS = TURBO_STEPS
 MAX_EDIT_STEPS = TURBO_STEPS
@@ -190,32 +208,45 @@ DEFAULT_GUIDANCE = 1.0        # CFG-free is the model's default for T2I
 # 224/220 s. So 1.0 — half the time, nothing lost. A caller may still ask more.
 EDIT_GUIDANCE = 1.0
 MIN_GUIDANCE = 1.0            # below 1 is not "less guidance", it is unsupported
-MAX_GUIDANCE = 20.0
-MAX_VRAM_GIB = "4.5"          # sd-cli managed budget; at 768×512 the DiT stays monolithic
+# §4VJ: 20 → 1. At the 1152×768 budget a CFG > 1 render cannot finish inside
+# GEN_TIMEOUT_S (cfg 4 measured 1,066 s), so a caller's higher value is
+# clamped to CFG-free rather than started as a guaranteed 504. Raising this
+# needs GEN_TIMEOUT_S/CLIENT_TIMEOUT_S re-derived from a measured CFG render.
+MAX_GUIDANCE = 1.0
+MAX_VRAM_GIB = "4.5"          # sd-cli managed budget; measured at 1152×768 with one reference (§4VJ)
 # §4QG (2026-10-21): 900 → 480 s. Turbo's worst measured run is 230 s (journal
 # 10-14 → 10-21; an edit at CFG 4 was 224 s), so 480 s is still > 2× the worst
 # healthy render — but a run that reaches it is STUCK, not slow, and the old
 # 900 s let one stuck edit hold the only GPU for 15 min (×3 with the client's
 # retries ≈ 45 min). The busy-wait below is derived from THIS limit now.
-GEN_TIMEOUT_S = 480.0
+# §4VJ (2026-11-23): 480 → 750 s for 1152×768 at 12 steps. Worst healthy
+# render measured: a single-reference edit 375 s, a 2-subject render 369 s,
+# T2I 245 s — 750 s keeps the same ~2× margin. ⚠ A CFG > 1 render at the
+# full budget does NOT fit (cfg 4 measured 1,066 s, 80 s/step): MAX_GUIDANCE
+# clamps every request to 1, and the agent's cfg-4 collage leg is off
+# (image_gen.py COLLAGE_CFG_LEG).
+GEN_TIMEOUT_S = 750.0
 # How long a queued request waits for the single GPU before 503. Sized against
 # the CLIENT's own ceiling, not by feel: the agent's image pool uses httpx
-# timeout=1200 s, and the worst generation the node PERMITS is an edit at
+# timeout=1560 s (§4VJ; 1200 before), and the worst generation the node PERMITS is an edit at
 # MAX_EDIT_STEPS (derived below), so a request that waits BUSY_WAIT_
 # TIMEOUT and then runs still answers inside the client's window. The old
 # 180 s was ~4.5x a 40 s SD1.5 generation; kept literally, it failed a request
 # that only needed to wait out one edit — the agent can and does issue two
 # image calls in one turn. (An earlier version of this comment said "~660 s"
 # and "400 + 660": stale figures, corrected §4KD.)
-CLIENT_TIMEOUT_S = 1200.0     # what core/llm.py gives the image pool
+CLIENT_TIMEOUT_S = 1560.0     # what core/llm.py gives the image pool (IMAGE_NODE_TIMEOUT_S; §4VJ, was 1200)
 # MEASURED on the base model: a 768x512 CFG edit was ~28 s/step plus ~95 s of
 # fixed overhead (20 steps = 654 s and 628 s end to end). Turbo's worst case is
 # an edit a caller forces to CFG > 1: 8 steps measured 224 s (§4OY). The base
 # per-step figure is kept as the bound — 8 × 28 + 95 = 319 s covers it with
 # margin, and the worst case the node PERMITS is still an edit at MAX_EDIT_STEPS.
-EDIT_S_PER_STEP = 16.0        # §4QR: the measured cfg-4 Turbo per-step cost (224 s at 8 steps, §4OY), the worst leg; was the base model's 28
-GENERATION_OVERHEAD_S = 95.0
-WORST_GENERATION_S = MAX_EDIT_STEPS * EDIT_S_PER_STEP + GENERATION_OVERHEAD_S   # 351 s (§4QR; 319 at 8 steps)
+# §4VJ: 1152×768, 12 steps, cfg 1 (the worst the node permits now: guidance
+# is clamped to 1) — an edit sampled at 22.5 s/step and took 375 s end to end
+# (~105 s of encode, model load and decode outside sampling).
+EDIT_S_PER_STEP = 23.0        # §4VJ measured (was 16: the cfg-4 768×512 figure, §4QR)
+GENERATION_OVERHEAD_S = 105.0  # §4VJ measured (was 95, base model)
+WORST_GENERATION_S = MAX_EDIT_STEPS * EDIT_S_PER_STEP + GENERATION_OVERHEAD_S   # 381 s (§4VJ; measured 375 s)
 # ⚠ DERIVED, not chosen. A queued request must be able to wait out the worst
 # generation the node allows and STILL answer before the client gives up. The
 # previous hand-picked 400 s satisfied two pins that each passed alone —
@@ -229,10 +260,10 @@ WORST_GENERATION_S = MAX_EDIT_STEPS * EDIT_S_PER_STEP + GENERATION_OVERHEAD_S   
 # hard limit, and the wait clock starts when the request ARRIVES (reference
 # decode/resize happens before the lock, §4QG item 9, and is inside it):
 #   BUSY_WAIT_TIMEOUT + GEN_TIMEOUT_S + RESPONSE_MARGIN_S < CLIENT_TIMEOUT_S
-#   690 s             + 480 s         + 30 s              = 1200 s
-# 690 s still outlasts one full worst-case render ahead of it (480 s).
+#   780 s             + 750 s         + 30 s              = 1560 s   (§4VJ)
+# 780 s still outlasts one full worst-case render ahead of it (750 s).
 RESPONSE_MARGIN_S = 30.0      # b64 encode + network + the client's own clock skew
-BUSY_WAIT_TIMEOUT = max(60.0, CLIENT_TIMEOUT_S - GEN_TIMEOUT_S - RESPONSE_MARGIN_S)   # 690 s
+BUSY_WAIT_TIMEOUT = max(60.0, CLIENT_TIMEOUT_S - GEN_TIMEOUT_S - RESPONSE_MARGIN_S)   # 780 s
 # §4QG item 7: the preflight runs the REAL Turbo path (8 steps, TURBO_SIGMAS)
 # — the old 1-step run used sd-cli's default scheduler, so it never proved
 # the schedule every real request uses. 256x256 keeps boot short (measured
@@ -580,8 +611,9 @@ def fit_reference(data: bytes, width: int, height: int) -> bytes:
     ⚠ NOT cosmetic. sd-cli VAE-encodes the reference at ITS OWN resolution and
     those latents join the DiT sequence, so a 4000x3000 phone photo would put
     ~30x the tokens of the output through an 8 GB box that already peaks at
-    6.7 GB on a 768x512 edit. The output is capped at 768x512 either way, so a
-    larger reference buys nothing and can only OOM. Matching the output
+    6.7 GB on a 768x512 edit. The output is capped at the pixel budget
+    (1152x768, §4VJ) either way, so a larger reference buys nothing and can
+    only OOM. Matching the output
     geometry also keeps the edit aligned when the aspect ratios differ.
 
     Returns PNG bytes, or the input unchanged ONLY when it is already a plain
@@ -612,9 +644,12 @@ def fit_reference(data: bytes, width: int, height: int) -> bytes:
                 im = ImageOps.exif_transpose(im) or im
             im = _flatten_on_white(im)
             if im.size != (width, height):
-                import math
-                _err = abs(math.log((im.width / im.height) / (width / height)))
-                if _err < math.log(1.0 + ASPECT_BAND):
+                # §4VJ: the SAME band arithmetic `_resolve_size` used to pick
+                # this size. Two formulas disagreed by float rounding on the
+                # band edge: a 3:4 photo resolves to 800x1088 (exactly 2% off),
+                # which the size search called in-band and this check called
+                # out → a 21-px white bar on a common phone shape.
+                if aspect_band_index(im.width / im.height, width / height) == 0:
                     # §4QG item 3: inside the aspect band `_resolve_size`
                     # treats as "the same shape", COVER and centre-crop the
                     # few pixels instead of letterboxing. 4032x3024 (exact
@@ -734,31 +769,40 @@ def _resolve_size(req: "ImageRequest", fallback: "tuple[int, int] | None" = None
     # side on its own. ⚠ Independent clamping is what squashed extreme aspect
     # ratios: a 1200x3000 reference scaled to 396x991 and then clamped to
     # 384x768 — a 25% aspect error — while the legal 256x640 (exact) sat right
-    # there. (256x640 is what the banded search below returns for that shape;
-    # 320x768 is 4.2% off and loses the band, at the cost of 60% of the pixel
-    # budget — the price of preferring aspect over area on extreme ratios.) An edit inherits its reference's shape, so that squash would be
-    # visible in the result. Aspect first, then the closest area to what was
-    # asked (capped at the budget, so an oversized request lands on the
-    # largest legal size rather than a small one).
+    # there. (§4VJ: at the 1152x768 budget the banded search returns the exact
+    # 448x1120 for that shape; before §4VJ it was 256x640 — 320x768 was 4.2%
+    # off and lost the band — the price of preferring aspect over area.) An edit inherits its reference's shape, so that squash would be
+    # visible in the result. Aspect first, then the largest area in the band
+    # (§4VJ: the area target is the whole budget, whatever size was asked).
     target_ar = w / h
-    target_area = min(w * h, MAX_PIXELS)
+    # §4VJ: a size is a SHAPE, never a smaller render. The area target is the
+    # whole budget, so "768x512" (the old schema example, 37 live calls) or an
+    # old 768x512 reference renders at 1152x768 — at the old area, faces in
+    # full-body and group shots came out cross-eyed (the reason for §4VJ).
+    target_area = MAX_PIXELS
     # Aspect error is BANDED, not compared exactly: the /32 grid often has no
     # exact match at a usable size, and strict aspect-first threw away
     # resolution for a rounding artefact — 1920x1080 landed on 512x288
     # (147k px) because it is exactly 16:9, while 736x416 (0.5% off, 306k px)
-    # was legal. Inside a band, the closest area to what was asked wins.
+    # was legal. Inside a band, the area closest to the budget wins (§4VJ).
     # ⚠ Compare aspects in LOG space. The plain relative error
     # `|c_ar - target_ar| / target_ar` saturates at ~1.0 once the request is
     # wider than the widest legal ratio (3:1), so every candidate fell into
     # one band and the area tiebreak decided: a 100000x1 request came back
     # 288x352 — PORTRAIT. A log ratio is symmetric (a 1x100000 request was
     # always handled correctly) and never saturates.
-    import math
-    log_target = math.log(target_ar)
-    band = math.log(1.0 + ASPECT_BAND)
     return min(LEGAL_SIZES,
-               key=lambda c: (int(abs(math.log(c[0] / c[1]) - log_target) / band),
+               key=lambda c: (aspect_band_index(c[0] / c[1], target_ar),
                               abs(c[0] * c[1] - target_area)))
+
+
+def aspect_band_index(ar: float, target_ar: float) -> int:
+    """How many ASPECT_BAND widths `ar` sits from `target_ar`, in log space
+    (0 = "the same shape"). ONE formula for the size search and for
+    `fit_reference`'s crop-or-letterbox choice (§4VJ: two formulas split on
+    the band edge by float rounding)."""
+    import math
+    return int(abs(math.log(ar) - math.log(target_ar)) / math.log(1.0 + ASPECT_BAND))
 
 
 # --- the sd-cli invocation ---------------------------------------------------------
@@ -1069,7 +1113,8 @@ async def _await_render(gpu_task, request, poll_s: float = 1.0):
 
 def _generate_png(prompt: str, width: int, height: int, steps: int, *,
                   seed=None, guidance=DEFAULT_GUIDANCE, negative_prompt="",
-                  references: "list[bytes] | None" = None) -> bytes:
+                  references: "list[bytes] | None" = None,
+                  timeout: float = GEN_TIMEOUT_S) -> bytes:
     """Blocking, on the GPU thread: one image → PNG bytes; the temp output
     and the temp reference files are always removed."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1091,7 +1136,8 @@ def _generate_png(prompt: str, width: int, height: int, steps: int, *,
         run_sd_cli(build_sd_cli_args(prompt, width, height, steps, out_path,
                                      seed=seed, guidance=guidance,
                                      negative_prompt=negative_prompt,
-                                     ref_paths=ref_paths))
+                                     ref_paths=ref_paths),
+                    timeout=timeout)
         try:
             data = out_path.read_bytes()
         except OSError as e:
@@ -1457,10 +1503,13 @@ async def generate_image(req: ImageRequest, request: Request):
         _arm_render()
 
         def _render():
-            def once():
+            def once(timeout=None):
+                # `timeout` only on the retry (the first run keeps
+                # _generate_png's own default, GEN_TIMEOUT_S)
+                extra = {"timeout": timeout} if timeout is not None else {}
                 return _generate_png(prompt, width, height, steps, seed=seed,
                                      guidance=guidance, negative_prompt=req.negative_prompt,
-                                     references=references)
+                                     references=references, **extra)
             _t_first = time.monotonic()
             try:
                 return once()
@@ -1468,13 +1517,16 @@ async def generate_image(req: ImageRequest, request: Request):
                 # §4QG-b: the page-cache case — run_sd_cli drops the cache
                 # again before the second try; a second failure is a 507.
                 # §4QG-c: only when the first run failed EARLY — two full runs
-                # (2 × 480 s) behind a 690 s queue would outlast the client's
-                # 1200 s read timeout (r3 review)
-                if time.monotonic() - _t_first > NVMAP_RETRY_MAX_FIRST_S:
+                # (2 × 750 s) behind a 780 s queue would outlast the client's
+                # 1560 s read timeout (r3 review; §4VJ numbers). §4VJ review:
+                # and the retry gets only what is LEFT of one render's limit —
+                # a full second limit still overran (780 + 60 + 750 + 30 > 1560).
+                _spent = time.monotonic() - _t_first
+                if _spent > NVMAP_RETRY_MAX_FIRST_S:
                     raise RenderOOM(str(e)) from e
                 _log(f"GEN NvMap allocation failure (error 12) — retrying once: {e}")
                 try:
-                    return once()
+                    return once(timeout=max(1.0, GEN_TIMEOUT_S - _spent))
                 except RenderNvMapTransient as e2:
                     raise RenderOOM(str(e2)) from e2
         _gpu_task = asyncio.ensure_future(_run_on_gpu(_render))
@@ -1498,13 +1550,14 @@ async def generate_image(req: ImageRequest, request: Request):
         _log(f"GEN failed (timeout, 504): {e}")
         raise HTTPException(status_code=504, detail=(
             f"Image generation failed: {_public(e)}. A healthy render here takes "
-            f"~70-230 s; this one was stuck and was killed ({NOT_RETRYABLE_NOTE})."))
+            f"~245-375 s; this one was stuck and was killed ({NOT_RETRYABLE_NOTE})."))
     except RenderOOM as e:
         _log(f"GEN failed (out of memory, 507): {e}")
         raise HTTPException(status_code=507, detail=(
             f"Image generation failed: out of GPU memory for this render — "
-            f"{_public(e)} ({NOT_RETRYABLE_NOTE}; a smaller size or no "
-            f"reference image needs less memory)."))
+            f"{_public(e)} ({NOT_RETRYABLE_NOTE}; a different or no reference "
+            f"image needs less memory — the size only sets the shape, every "
+            f"render uses the full pixel budget)."))
     except RenderBadReference as e:
         _log(f"GEN failed (bad reference, 422): {e}")
         raise HTTPException(status_code=422, detail=(

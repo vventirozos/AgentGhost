@@ -213,7 +213,7 @@ class FakeDocker:
         self.containers = _Coll(self, "containers")
         self.networks = _Coll(self, "networks")
         self.volumes = _Coll(self, "volumes")
-        self.images = FakeImages(["ghost-lab/base:1", "ghost-lab/pg:18", "ghost-lab/web:1"])
+        self.images = FakeImages(["ghost-lab/base:1", "ghost-lab/pg:19", "ghost-lab/web:1"])
         self.image_volumes = {"ghost-lab/mysql:8": ["/var/lib/mysql"]}
         self.api = FakeAPI(self)
 

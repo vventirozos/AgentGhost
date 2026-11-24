@@ -8,9 +8,10 @@ swap regresses:
   * CFG is OFF by default (guidance 1.0) and the default negative prompt is
     EMPTY — a "(worst quality:1.3)…" negative would double the runtime and
     be read as literal text by the LLM encoder.
-  * Sizes are /32 inside a 768x512 budget (sd.cpp rejects other sizes for
-    this model); the agent's ladder and the node's `_resolve_size` tell ONE
-    story (R5 — one input, one story on both surfaces).
+  * Sizes are /32 inside a 1152x768 budget (§4VJ; 768x512 before — sd.cpp
+    rejects other sizes for this model); a requested size is only a SHAPE and
+    the node's `_resolve_size` tells ONE story (R5 — one input, one story on
+    both surfaces).
   * A1111 weight syntax is flattened to plain words before it reaches the
     encoder; the agent no longer advertises it.
   * The subprocess runner starts the page-cache sidecar bound to sd-cli's
@@ -50,14 +51,14 @@ class TestSwapDefaults:
         req = mod.ImageRequest(prompt="a cat")
         assert req.negative_prompt == ""
         assert mod.NEGATIVE_PROMPT_DEFAULT == ""
-        # Unset means "the mode's default": CFG-free, Turbo's 8 steps (§4OY).
+        # Unset means "the mode's default": CFG-free, Turbo's 12 steps (§4VJ).
         assert mod.resolve_guidance(req.guidance_scale, False) == 1.0
-        assert mod.resolve_steps(req.steps, False) == 16
+        assert mod.resolve_steps(req.steps, False) == 12
 
     def test_default_size_is_the_operators_envelope(self, monkeypatch):
         mod = _load_server(monkeypatch)
-        assert mod._resolve_size(mod.ImageRequest(prompt="x")) == (768, 512)
-        assert mod.MAX_PIXELS == 768 * 512
+        assert mod._resolve_size(mod.ImageRequest(prompt="x")) == (1152, 768)
+        assert mod.MAX_PIXELS == 1152 * 768          # §4VJ (768x512 before)
 
     def test_clip_skip_is_accepted_and_ignored(self, monkeypatch):
         # Wire compatibility: an old client may still send clip_skip. There
@@ -81,13 +82,18 @@ class TestResolveSize:
         assert mod.MIN_DIM <= rw <= mod.MAX_DIM and mod.MIN_DIM <= rh <= mod.MAX_DIM
         assert rw * rh <= mod.MAX_PIXELS, (rw, rh)
 
-    def test_square_lands_on_608(self, monkeypatch):
+    def test_square_lands_on_928(self, monkeypatch):
+        # §4VJ: 928x928 is the largest /32 square inside the 1152x768 budget.
         mod = _load_server(monkeypatch)
-        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=1024, height=1024)) == (608, 608)
+        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=1024, height=1024)) == (928, 928)
 
-    def test_size_string_is_honoured(self, monkeypatch):
+    def test_size_string_sets_the_shape_at_full_budget(self, monkeypatch):
+        # §4VJ: a size string is a SHAPE, never a smaller render — 512x768
+        # keeps its 2:3 portrait and renders on the whole pixel budget.
         mod = _load_server(monkeypatch)
-        assert mod._resolve_size(mod.ImageRequest(prompt="x", size="512x768")) == (512, 768)
+        w, h = mod._resolve_size(mod.ImageRequest(prompt="x", size="512x768"))
+        assert (w, h) == (768, 1152)
+        assert w / h == 512 / 768 and w * h == mod.MAX_PIXELS
 
     def test_the_tool_passes_geometry_through_untouched(self, monkeypatch):
         """R5 — one input, one story. The tool no longer keeps a ladder of its
@@ -100,8 +106,13 @@ class TestResolveSize:
         for gone in ("_NODE_BUCKETS", "_DEFAULT_BUCKET", "_snap_to_bucket"):
             assert not hasattr(image_gen, gone), f"{gone} is back"
         mod = _load_server(monkeypatch)
-        for w, h in (mod.LEGAL_SIZES[0], mod.LEGAL_SIZES[-1], (768, 512), (608, 608)):
+        # Full-budget sizes the node itself would choose come back untouched…
+        for w, h in (mod.LEGAL_SIZES[-1], (1152, 768), (768, 1152), (928, 928)):
             assert mod._resolve_size(mod.ImageRequest(prompt="x", width=w, height=h)) == (w, h)
+        # …and a small legal size is a SHAPE (§4VJ): same aspect, full budget.
+        assert mod.LEGAL_SIZES[0] == (256, 256)
+        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=256, height=256)) == (928, 928)
+        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=768, height=512)) == (1152, 768)
 
 
 # ---------------------------------------------------------------- prompt
@@ -125,7 +136,7 @@ class TestAttentionSyntax:
         argv = mod.build_sd_cli_args("(cat:1.4) on a mat", 768, 512, 30, "o.png")
         assert argv[argv.index("-p") + 1] == "cat on a mat"
 
-    def test_agent_no_longer_advertises_weights(self):
+    def test_agent_no_longer_advertises_weights(self, monkeypatch):
         # Behavioural (R4): build the schema the model is actually shown and
         # the system prompt it is actually given, then assert on those —
         # whatever these texts say, the model will do.
@@ -145,9 +156,22 @@ class TestAttentionSyntax:
         assert "(x:1.2)" in desc                       # forbidden, by name
         assert "prose" in props["prompt"]["description"]
         wd = props["width"]["description"]
-        # §4KA: the schema no longer promises a fixed ladder — it says the node
-        # chooses and the result reports what was used.
-        assert "nearest size it supports" in wd
+        # §4KA: the schema no longer promises a fixed ladder — the node
+        # chooses and the result reports what was used. §4VJ: the size is a
+        # SHAPE on the full budget, and every advertised example is a size the
+        # node's real resolver returns unchanged, in the named orientation.
+        assert "SHAPE" in wd and "full" in wd and "budget" in wd
+        assert "which size it actually used" in wd
+        assert "nearest size it supports" not in wd and "512x768" not in wd
+        import re
+        examples = re.findall(r"(\d+)x(\d+) (portrait|square|landscape)", wd)
+        assert {kind for _, _, kind in examples} == {"portrait", "square", "landscape"}
+        node = _load_server(monkeypatch)
+        for w, h, kind in examples:
+            w, h = int(w), int(h)
+            assert node._resolve_size(node.ImageRequest(prompt="x", width=w, height=h)) == (w, h), (w, h)
+            assert w * h > 0.95 * node.MAX_PIXELS, (w, h)
+            assert {"portrait": h > w, "square": h == w, "landscape": w > h}[kind], (w, h, kind)
         assert "Snapped" not in wd
         assert "624x624" not in wd                      # the SD1.5 ladder is long gone
         assert "Attention weights are supported" not in SYSTEM_PROMPT
@@ -388,11 +412,11 @@ class TestGenerateEndpoint:
                    headers={"X-Ghost-Key": "sekrit"})
         assert r.status_code == 200
         assert base64.b64decode(r.json()["data"][0]["b64_json"]) == b"PNGBYTES"
-        assert seen == dict(prompt="a cat", w=608, h=608, steps=16, seed=42, guidance=1.0)
+        assert seen == dict(prompt="a cat", w=928, h=928, steps=12, seed=42, guidance=1.0)
 
     def test_requested_steps_are_ignored_turbo_has_one_schedule(self, monkeypatch):
-        # §4OY: Turbo is distilled to ONE 8-step trajectory; the model card
-        # says other schedules are unevaluated. A caller's steps — high, low,
+        # §4OY: Turbo is distilled to ONE trajectory (12 steps on it, §4VJ);
+        # the model card says other schedules are unevaluated. A caller's steps — high, low,
         # junk — must not reach sd-cli, and the response reports what ran.
         mod = _load_server(monkeypatch)
         self._ready(mod)
@@ -403,9 +427,9 @@ class TestGenerateEndpoint:
         for asked in (500, 1, 30, "nonsense"):
             r = c.post("/generate", json={"prompt": "x", "steps": asked},
                        headers={"X-Ghost-Key": "sekrit"})
-            assert seen["steps"] == mod.TURBO_STEPS == 16, asked
+            assert seen["steps"] == mod.TURBO_STEPS == 12, asked
             if r.status_code == 200:
-                assert r.json()["steps"] == 16
+                assert r.json()["steps"] == 12
 
     def test_a_turbo_run_carries_the_models_sigma_schedule(self, monkeypatch):
         mod = _load_server(monkeypatch)
@@ -413,8 +437,9 @@ class TestGenerateEndpoint:
         sig = argv[argv.index("--sigmas") + 1].split(",")
         assert [float(x) for x in sig] == list(mod.TURBO_SIGMAS)
         assert len(sig) == int(argv[argv.index("--steps") + 1]) + 1 and float(sig[-1]) == 0.0
-        # §4QR: the card's 8-step list sits at the even positions of the 16-step schedule, verbatim
-        assert sig[::2] == ["1", "0.978453", "0.95418", "0.926626", "0.89508", "0.845148", "0.704534", "0.414568", "0"]
+        # §4VJ: the card's 8-step list at its even positions sits at every third point of the 12-step schedule, verbatim
+        assert sig[::3] == ["1", "0.95418", "0.89508", "0.704534", "0"]
+        assert [float(x) for x in sig[::3]] == list(mod.TURBO_SIGMAS_8[::2])
         assert "turbo" in mod.DIT_PATH.lower()
         # the 1-step preflight proves the pipeline, not the image: no schedule
         assert "--sigmas" not in mod.build_sd_cli_args("p", 256, 256, 1, "o.png")
@@ -435,7 +460,7 @@ class TestGenerateEndpoint:
         assert argv[argv.index("--diffusion-model") + 1] == mod.DIT_PATH
         assert argv[argv.index("--llm") + 1] == mod.TE_PATH
         # the same fixed Turbo recipe the repo card prescribes
-        assert argv[argv.index("--cfg-scale") + 1] == "1" and argv[argv.index("--steps") + 1] == "16"
+        assert argv[argv.index("--cfg-scale") + 1] == "1" and argv[argv.index("--steps") + 1] == "12"
 
     def test_failure_is_500_and_the_gpu_lock_is_released(self, monkeypatch):
         mod = _load_server(monkeypatch)
@@ -503,10 +528,11 @@ class TestReferenceDecoding:
     def test_edit_inherits_the_reference_size_when_none_requested(self, monkeypatch):
         mod = _load_server(monkeypatch)
         req = mod.ImageRequest(prompt="x")
-        assert mod._resolve_size(req, (512, 768)) == (512, 768)
+        # §4VJ: the edit inherits the reference's SHAPE at the full budget.
+        assert mod._resolve_size(req, (512, 768)) == (768, 1152)
         # …but an explicit request still wins, and a big reference is budgeted.
-        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=768, height=512), (512, 768)) == (768, 512)
-        assert mod._resolve_size(req, (2048, 2048)) == (608, 608)
+        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=768, height=512), (512, 768)) == (1152, 768)
+        assert mod._resolve_size(req, (2048, 2048)) == (928, 928)
 
 
 class TestEditArgv:
@@ -579,7 +605,8 @@ class TestEditEndpoint:
                                       "reference_images": [base64.b64encode(ref).decode()]},
                    headers={"X-Ghost-Key": "sekrit"})
         assert r.status_code == 200
-        assert seen["refs"] == [ref] and (seen["w"], seen["h"]) == (512, 768)
+        # §4VJ: the reference's 2:3 SHAPE, rendered on the full budget
+        assert seen["refs"] == [ref] and (seen["w"], seen["h"]) == (768, 1152)
         assert seen["prompt"] == "make it night"           # not wrapped: transparent is off
 
     def test_bad_reference_is_400_before_the_gpu(self, monkeypatch, tmp_path):
@@ -728,16 +755,20 @@ class TestEditGuidance:
         assert mod.resolve_guidance(None, True) == mod.EDIT_GUIDANCE == 1.0
         assert mod.resolve_guidance(None, False) == 1.0
 
-    def test_explicit_guidance_always_wins(self, monkeypatch):
+    def test_explicit_guidance_is_bounded_by_max_guidance(self, monkeypatch):
         mod = _load_server(monkeypatch)
-        assert mod.resolve_guidance(2.5, True) == 2.5
-        assert mod.resolve_guidance(1.0, True) == 1.0      # caller may opt back out
-        assert mod.resolve_guidance(7.0, False) == 7.0
+        # §4VJ: MAX_GUIDANCE = 1 — a CFG > 1 render cannot finish inside
+        # GEN_TIMEOUT_S at 1152x768 (cfg 4 measured 1,066 s), so it is clamped
+        assert mod.resolve_guidance(2.5, True) == mod.MAX_GUIDANCE == 1.0
+        assert mod.resolve_guidance(1.0, True) == 1.0
+        assert mod.resolve_guidance(7.0, False) == 1.0
+        monkeypatch.setattr(mod, "MAX_GUIDANCE", 20.0)     # the clamp is the bound, not a constant 1
+        assert mod.resolve_guidance(2.5, True) == 2.5 and mod.resolve_guidance(7.0, False) == 7.0
 
     def test_edit_runs_the_same_fixed_schedule(self, monkeypatch):
         mod = _load_server(monkeypatch)
         for asked in (None, 25, 999, "nonsense"):
-            assert mod.resolve_steps(asked, True) == mod.resolve_steps(asked, False) == 16
+            assert mod.resolve_steps(asked, True) == mod.resolve_steps(asked, False) == 12
 
     def test_the_edit_path_end_to_end_carries_cfg_into_argv(self, monkeypatch, tmp_path):
         # A request that sets NOTHING but prompt+reference must reach sd-cli
@@ -761,7 +792,7 @@ class TestEditGuidance:
                    headers={"X-Ghost-Key": "sekrit"})
         assert r.status_code == 200
         assert float(seen["cfg"]) == mod.EDIT_GUIDANCE and seen["refs"] == 1
-        assert int(seen["steps"]) == mod.DEFAULT_EDIT_STEPS == 16
+        assert int(seen["steps"]) == mod.DEFAULT_EDIT_STEPS == 12
 
     def test_plain_generation_stays_cfg_free_end_to_end(self, monkeypatch, tmp_path):
         mod = _load_server(monkeypatch)
@@ -874,9 +905,12 @@ class TestSizeGeometry:
 
     def test_the_independent_clamp_regression(self, monkeypatch):
         # The exact shape that squashed: 1200x3000 became 384x768 (25% off)
-        # while 256x640 (exact) was legal all along.
+        # while 256x640 (exact) was legal all along. At the §4VJ budget the
+        # exact legal shape is 448x1120.
         mod = _load_server(monkeypatch)
-        assert mod._resolve_size(mod.ImageRequest(prompt="x"), (1200, 3000)) == (256, 640)
+        W, H = mod._resolve_size(mod.ImageRequest(prompt="x"), (1200, 3000))
+        assert (W, H) == (448, 1120)
+        assert W / H == 1200 / 3000
 
     def test_resolution_is_not_thrown_away_for_an_exact_ratio(self, monkeypatch):
         # 1920x1080 is exactly 16:9 and 512x288 matches it exactly — but it is
@@ -886,10 +920,10 @@ class TestSizeGeometry:
         assert W * H > 250_000, (W, H)
 
     def test_an_aspect_beyond_the_models_range_is_clamped_not_crashed(self, monkeypatch):
-        # 5:1 cannot exist inside [256, 768] (max 3:1). The node must still
-        # return a legal size rather than raise or emit an illegal one.
+        # 5:1 cannot exist inside [256, 1152] (max 4.5:1, §4VJ). The node must
+        # still return a legal size rather than raise or emit an illegal one.
         mod = _load_server(monkeypatch)
-        assert mod._resolve_size(mod.ImageRequest(prompt="x"), (4000, 800)) == (768, 256)
+        assert mod._resolve_size(mod.ImageRequest(prompt="x"), (4000, 800)) == (1152, 256)
 
     def test_an_oversized_request_lands_near_the_budget(self, monkeypatch):
         mod = _load_server(monkeypatch)
@@ -933,7 +967,7 @@ class TestSeedReporting:
                                      headers={"X-Ghost-Key": "sekrit"})
         body = r.json()
         assert int(seen["seed"]) == body["seed"]        # rendered with what we report
-        assert (body["width"], body["height"]) == (768, 512) and body["steps"] == 16
+        assert (body["width"], body["height"]) == (1152, 768) and body["steps"] == 12
 
     def test_two_plain_calls_use_different_seeds(self, monkeypatch, tmp_path):
         mod = _load_server(monkeypatch)
@@ -1042,7 +1076,7 @@ def test_edit_steps_cannot_outlive_the_clients_patience(monkeypatch):
     client. On Turbo the count is fixed, so the bound is the base per-step
     figure (28 s with CFG) at 8 steps — above the 224 s measured."""
     mod = _load_server(monkeypatch)
-    assert mod.resolve_steps(50, True) == mod.MAX_EDIT_STEPS == 16
+    assert mod.resolve_steps(50, True) == mod.MAX_EDIT_STEPS == 12   # §4VJ
     # §4QR: 16 steps at the measured cfg-4 Turbo per-step cost (EDIT_S_PER_STEP), not the base model's 28
     worst_edit = mod.MAX_EDIT_STEPS * mod.EDIT_S_PER_STEP + mod.GENERATION_OVERHEAD_S
     assert worst_edit == mod.WORST_GENERATION_S < mod.CLIENT_TIMEOUT_S, worst_edit
@@ -1431,7 +1465,7 @@ class TestAnyFormatReferenceKeepsItsShape:
         mod = _load_server(monkeypatch)
         assert mod.image_size(b"\xff\xd8\xffnot-an-image") is None
         # …and the caller then uses the default rather than raising
-        assert mod._resolve_size(mod.ImageRequest(prompt="x"), None) == (768, 512)
+        assert mod._resolve_size(mod.ImageRequest(prompt="x"), None) == (1152, 768)
 
 
 class TestNodeInputHardening:
@@ -1468,8 +1502,11 @@ class TestNodeInputHardening:
 
     def test_the_good_cases_survive_the_new_metric(self, monkeypatch):
         mod = _load_server(monkeypatch)
-        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=1920, height=1080)) == (736, 416)
-        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=1024, height=1024)) == (608, 608)
+        # §4VJ budget: 1152x640 is 1.25% off 16:9 (inside the band) at 737k px
+        W, H = mod._resolve_size(mod.ImageRequest(prompt="x", width=1920, height=1080))
+        assert (W, H) == (1152, 640)
+        assert abs((W / H) / (1920 / 1080) - 1) <= mod.ASPECT_BAND
+        assert mod._resolve_size(mod.ImageRequest(prompt="x", width=1024, height=1024)) == (928, 928)
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -5.0, 1e9])
     def test_guidance_is_bounded(self, monkeypatch, bad):
@@ -1596,7 +1633,7 @@ class TestTheReportedSizeIsTheRenderedSize:
                          "width": 736, "height": 416, "seed": 1},
                         width=1920, height=1080)
         assert "Rendered at 736x416" in out
-        assert "1920x1080" in out and "nearest size it supports" in out   # and says what was asked
+        assert "1920x1080" in out and "sets only the shape" in out   # and says what was asked (§4VJ wording)
 
     def test_it_falls_back_to_reading_the_png(self, tmp_path):
         # an older node that reports no dimensions

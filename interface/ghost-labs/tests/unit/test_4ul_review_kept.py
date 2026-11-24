@@ -165,7 +165,7 @@ def test_switch_mount_unpacks_the_saved_build(kept, env, monkeypatch):  # noqa: 
 def _pg_lab(env, **extra):  # noqa: F811
     make_kept(env, "lab_a", state="up", member="app", **extra)
     env.store.x("UPDATE members SET name='app' WHERE lab_id='lab_a'")
-    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18",
+    env.store.put_member({"lab_id": "lab_a", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19",
                           "mem_mb": 512, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
 
 
@@ -312,7 +312,7 @@ def test_restart_reconcile_republishes_a_tcp_lease_as_tcp():
 def test_twin_carries_member_env_ready_and_ports(kept, env, monkeypatch):  # noqa: F811
     spec = {"members": [{"name": "app", "image": "ghost-lab/python-app:1", "mem_mb": 256, "cpus": 1.0, "cap_add": [],
                          "env": {"DATABASE_URL": "postgresql://postgres:lab@db:5432/postgres"}, "ports": [8080]},
-                        {"name": "db", "image": "ghost-lab/pg:18", "mem_mb": 512, "cpus": 1.0, "cap_add": [],
+                        {"name": "db", "image": "ghost-lab/pg:19", "mem_mb": 512, "cpus": 1.0, "cap_add": [],
                          "ready": "pg_isready -q"}], "egress": "tor", "readiness": None}
     seen = {}
     monkeypatch.setattr(env, "create", lambda body, origin, pool=None: seen.update(body=body) or
@@ -426,7 +426,7 @@ def test_keep_takes_wait_for_and_watch_from_the_template(kept, env, monkeypatch)
     add_lab(env, "lab_p", owner="project:p", mem=256)
     env.store.update_lab("lab_p", template="python-pg")
     env.store.x("UPDATE members SET name='app' WHERE lab_id='lab_p'")
-    env.store.put_member({"lab_id": "lab_p", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:18",
+    env.store.put_member({"lab_id": "lab_p", "name": "db", "ip": "10.89.9.11", "image": "ghost-lab/pg:19",
                           "mem_mb": 512, "cpus": 1.0, "cap_add": "[]", "ports_json": "[]", "isolated": 0})
     for f in ("_recreate", "_lease", "_install_cron"):
         monkeypatch.setattr(kept, f, lambda *a, **k: None)
@@ -438,7 +438,7 @@ def test_keep_takes_wait_for_and_watch_from_the_template(kept, env, monkeypatch)
 
 def test_template_watch_and_wait_for_are_validated():
     base = {"name": "x", "members": [{"name": "m", "image": "ghost-lab/base:1", "mem_mb": 128},
-                                     {"name": "d", "image": "ghost-lab/pg:18", "mem_mb": 128}]}
+                                     {"name": "d", "image": "ghost-lab/pg:19", "mem_mb": 128}]}
     for bad in ({"wait_for": "db"}, {"wait_for": "db:5432; rm -rf /"}, {"watch": [{"member": "nope", "cmd": "x"}]},
                 {"watch": [{"member": "d", "cmd": "a\nb"}]}, {"watch": "x"}):
         with pytest.raises(LabError):

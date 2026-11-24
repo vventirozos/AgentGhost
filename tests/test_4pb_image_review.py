@@ -272,7 +272,8 @@ async def test_a_picture_made_at_the_root_is_still_an_edit_reference_inside_a_pr
 
 # ── 6. each render leg books its own time ──
 
-async def test_a_three_render_ladder_books_three_legs_not_one_wall(tmp_path, web):
+async def test_a_three_render_ladder_books_three_legs_not_one_wall(tmp_path, web, monkeypatch):
+    monkeypatch.setattr(IG, "COLLAGE_CFG_LEG", True)        # §4VJ: the cfg-4 leg is opt-in
     IG.RECENT_RENDER_SECONDS["edit"].clear()
     IG.RECENT_RENDER_SECONDS["edit_cfg"].clear()
     llm = _llm()
@@ -283,6 +284,19 @@ async def test_a_three_render_ladder_books_three_legs_not_one_wall(tmp_path, web
     assert llm.generate_image.await_count == 3 and len(IG.RECENT_RENDER_SECONDS["edit"]) == 2
     assert len(IG.RECENT_RENDER_SECONDS["edit_cfg"]) == 1
     assert max(IG.RECENT_RENDER_SECONDS["edit"]) < 5.0
+
+
+async def test_the_default_ladder_books_every_leg_as_an_edit(tmp_path, web):
+    # §4VJ: with the cfg-4 leg off, attempt 3 is a plain edit — booked as one
+    IG.RECENT_RENDER_SECONDS["edit"].clear()
+    IG.RECENT_RENDER_SECONDS["edit_cfg"].clear()
+    assert IG.COLLAGE_CFG_LEG is False
+    llm = _llm()
+    llm.chat_completion.side_effect = [{"choices": [{"message": {"content": json.dumps({"collage": v, "confidence": 0.95, "evidence": "e"})}}]}
+                                       for v in ("YES", "YES", "NO")]
+    await tool_generate_image(prompt="k", subjects=TWO, llm_client=llm, sandbox_dir=tmp_path)
+    assert llm.generate_image.await_count == 3 and len(IG.RECENT_RENDER_SECONDS["edit"]) == 3
+    assert len(IG.RECENT_RENDER_SECONDS["edit_cfg"]) == 0
 
 
 # ── 7. transparent: from the bytes, never with a reference ──

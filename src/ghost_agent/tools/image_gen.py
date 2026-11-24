@@ -27,8 +27,8 @@ import re
 # Editing (§4JV): the node accepts base64 reference images and conditions
 # the DiT on their latents, so each reference costs roughly one more image
 # of tokens. Since the §4OY Turbo swap (2026-10-14) the node runs one fixed
-# distilled schedule at 16 steps (§4QR; 8 until 2026-10-22), CFG-free for edits too: measured ~112 s
-# for a new 768x512 image, ~3 min for an edit (the base model's edits needed CFG, ~8 min).
+# distilled schedule at 12 steps (§4VJ; 16 from §4QR, 8 before), CFG-free for edits too: measured
+# ~245 s for a new 1152x768 image, ~375 s for an edit (the base model's edits needed CFG, ~8 min).
 # The cap mirrors the node's MAX_REFERENCES. Measured §4JW: a second
 # reference at 768×512 OOMs the DiT after 921 s of sampling — the cap is what
 # stops the model spending a quarter-hour of GPU on a guaranteed failure.
@@ -42,23 +42,33 @@ MAX_REFERENCE_BYTES = 12 * 1024 * 1024   # mirrors the node's own cap
 #: out as separate side-by-side panels and, if so, render again: attempt 2
 #: with a fresh seed, attempt 3 with the FIRST render's seed at
 #: COLLAGE_RETRY_GUIDANCE (true CFG, where the anti-collage negative prompt is
-#: read; ~2× the time). Measured §4OZ on the 5 collages of 10 ordinary scenes:
+#: read; ~2× the time) — §4VJ: OFF (COLLAGE_CFG_LEG), attempt 3 is another
+#: fresh seed at cfg 1. Measured §4OZ on the 5 collages of 10 ordinary scenes:
 #: a reseed fixed 3/5, the SAME seed at cfg 4 fixed 4/5, different ones
 #: (§4QG: attempt 3 used to draw a fresh seed, which is not what was
 #: measured). GHOST_SUBJECTS_COLLAGE_RETRIES: 0 = never check, 1 = reseed
-#: only, 2 (default) = reseed then cfg 4.
+#: only, 2 (default) = reseed twice (§4VJ; reseed then cfg 4 with COLLAGE_CFG_LEG).
 try:
     COLLAGE_RETRIES = max(0, min(2, int(os.getenv("GHOST_SUBJECTS_COLLAGE_RETRIES", "2") or 2)))
 except ValueError:
     COLLAGE_RETRIES = 2
 COLLAGE_RETRY_GUIDANCE = 4.0
+#: §4VJ (operator, 2026-11-23): the cfg-4 leg is OFF — every re-render is a
+#: fresh seed at cfg 1. At 1152x768 a cfg-4 leg measured 1,060 s (80 s/step
+#: vs 22.5 at cfg 1, ~2.9x a plain 2-subject render) and alone would have set
+#: the node's render limit at ~20 min. True restores the §4QG ladder, and
+#: then needs ALL of: the node's MAX_GUIDANCE back above 1 (it clamps to 1),
+#: GEN_TIMEOUT_S past ~1,100 s, CLIENT_TIMEOUT_S / IMAGE_NODE_TIMEOUT_S re-derived
+#: (~2,250 s — past a channel's 1800 s budget, so the ladder's deadline check
+#: would skip the leg there), and COLLAGE_CFG_COST ≈ 2.9.
+COLLAGE_CFG_LEG = False
 #: the collage verdict's confidence floor; below it the picture is kept
 COLLAGE_MIN_CONFIDENCE = 0.7
 COLLAGE_CHECK_TIMEOUT_S = 120.0
 #: §4QG: a cfg-4 leg runs true CFG (two DiT passes per step) — its cost as a
 #: share of a single render's, used for that leg before one was timed
 #: (§4QG-b: only the ladder's own pre-leg deadline check reads it)
-COLLAGE_CFG_COST = 1.8
+COLLAGE_CFG_COST = 1.8          # §4VJ: measured 2.9× at 1152x768 (1,066 / 369 s) — see COLLAGE_CFG_LEG
 #: §4QG: how long collage verdicts take, newest last (the deadline estimate
 #: adds one per possible check); before any was timed, a quarter of the
 #: 120 s timeout — budgeting the full timeout per check would refuse most
@@ -465,7 +475,7 @@ async def _render_leg(llm_client, payload, kind: str):
     resp = await llm_client.generate_image(payload)
     took = time.monotonic() - t0
     # §4QG-c: the client reports the node's own time; the wall above includes
-    # the wait for the node's one permit (up to 690 s behind another render),
+    # the wait for the node's one permit (up to 780 s behind another render, §4VJ),
     # which is queueing, not this kind's render time (r3 review M1)
     if isinstance(resp, dict):
         try:
@@ -639,7 +649,7 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                         f"(the node's limit); the tail was dropped. ")
 
     # Steps (§4OY): NEVER sent. The node's Turbo checkpoint is distilled to
-    # one fixed 8-step schedule and ignores a requested count, so the knob is
+    # one fixed schedule (12 steps since §4VJ) and ignores a requested count, so the knob is
     # gone from the schema; a `steps` the model still emits (old habit) is
     # accepted (the signature keeps it) and dropped rather than crossing the
     # LAN to be ignored.
@@ -767,7 +777,7 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                 "Nothing was rendered.")
     subj = normalise_subjects(subjects)
     subject_note = ""
-    _size_by_tool = False      # the tool, not the caller, chose 768x512 for a joined strip
+    _size_by_tool = False      # the tool, not the caller, chose 1152x768 for a joined strip
     _uploads: list = []        # §4PA: files passed by the caller, joined beside the subjects' photos
     _scene_pic = None          # a generated picture among them: the scene to keep
     _upload_bytes = b""
@@ -906,14 +916,14 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         size_asked = bool(raw_w and raw_h)
         if not size_asked and _scene:
             # §4PB: "the scene to keep" keeps its own shape (a portrait came
-            # back landscape at the strip's 768x512 default)
+            # back landscape at the strip's landscape default)
             _scene_wh = _png_size(_upload_bytes) if _upload_bytes else None
             if _scene_wh:
                 raw_w, raw_h = _scene_wh
                 size_asked, _size_by_tool = True, True
         aspect = (raw_w / raw_h) if size_asked else (DEFAULT_ASPECT if len(photos) > 1 else None)
         if len(photos) > 1 and not size_asked and not _keep:
-            raw_w, raw_h = 768, 512
+            raw_w, raw_h = 1152, 768        # §4VJ: the node's default (was 768x512)
             _size_by_tool = True
         if aspect is not None and not (0.25 <= aspect <= 4.0):
             return (f"ERROR: the requested shape {raw_w}x{raw_h} is outside what the node renders "
@@ -1023,7 +1033,7 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                   "portrait, not this scene). "
                 + ("If the photo found was of the wrong person or thing, a retry needs a MORE SPECIFIC "
                    "name (the same name finds the same photo); " if subj else "")
-                + "Each render from photos takes about 3 minutes (up to ~12 when the layout check re-renders).\n"
+                + "Each render from photos takes about 6 minutes (up to ~20 when the layout check re-renders).\n"
                 + _articles_note + "\n")
     transparent =str(transparent).strip().lower() in ("1", "true", "yes") if not isinstance(transparent, bool) else transparent
 
@@ -1109,10 +1119,11 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
             # §4OZ: the model copies a joined reference's layout — half of the
             # ordinary two-person scenes measured on 2026-10-14 came out as two
             # panels. Look at the pixels; while the verdict is a confident YES
-            # render again, at most COLLAGE_RETRIES times: a fresh seed first
-            # (~2 min), then the FIRST render's seed under true CFG (~4 min) —
-            # §4QG: §4OZ measured the SAME seed at cfg 4 (fixed 4/5); attempt 3
-            # used to draw a fresh one. Never more.
+            # render again, at most COLLAGE_RETRIES times: a fresh seed first,
+            # then (COLLAGE_CFG_LEG only) the FIRST render's seed under true CFG —
+            # §4QG: §4OZ measured the SAME seed at cfg 4 (fixed 4/5). §4VJ: that
+            # leg is off by default (~18 min at 1152x768); attempt 3 is another
+            # fresh seed at cfg 1. Never more.
             _first_seed = resp_data.get("seed") if isinstance(resp_data, dict) else None
             if _first_seed is None or isinstance(_first_seed, bool):
                 _first_seed = payload.get("seed")       # the node did not echo it: the one we sent
@@ -1123,7 +1134,8 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                 _attempts += 1
                 _retry = {k: v for k, v in payload.items() if k != "seed"}
                 _same_seed = False
-                if _attempts >= 2:
+                _cfg_leg = COLLAGE_CFG_LEG and _attempts >= 2
+                if _cfg_leg:
                     _retry["guidance_scale"] = COLLAGE_RETRY_GUIDANCE
                     try:
                         if _first_seed is not None:
@@ -1134,7 +1146,7 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                 # §4QG-b: a re-render that cannot finish before this
                 # request's report reserve is not started — the picture we
                 # have is kept and the result says so
-                _need = _retry_leg_seconds(_attempts >= 2) + COLLAGE_LEG_MARGIN_S
+                _need = _retry_leg_seconds(_cfg_leg) + COLLAGE_LEG_MARGIN_S
                 _left = _request_time_left()
                 if _left is not None and _left < _need:
                     pretty_log("Image Generation",
@@ -1151,11 +1163,11 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
                 pretty_log("Image Generation", f"two-panel output ({_v['evidence'][:60]}) → re-render {_attempts}/"
                            f"{COLLAGE_RETRIES} with "
                            + (f"the first seed ({_retry['seed']})" if _same_seed else "a fresh seed")
-                           + (f" at cfg {COLLAGE_RETRY_GUIDANCE:g}" if _attempts >= 2 else ""),
+                           + (f" at cfg {COLLAGE_RETRY_GUIDANCE:g}" if _cfg_leg else ""),
                            icon=Icons.IMAGE_GEN)
                 try:
                     _resp2 = await _render_leg(llm_client, _retry,
-                                               "edit_cfg" if _attempts >= 2 else _kind)
+                                               "edit_cfg" if _cfg_leg else _kind)
                     _bytes2 = _image_bytes_of(_resp2)
                 except Exception as _e:  # noqa: BLE001 — keep the picture we have
                     pretty_log("Image Generation", f"re-render failed ({_e.__class__.__name__}) — previous picture kept",
@@ -1251,8 +1263,9 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
         _rw, _rh = resp_data.get("width"), resp_data.get("height")
         if not (_rw and _rh):
             _rw, _rh = _png_size(image_bytes) or (final_w, final_h)
-        _asked = (f" (you asked for {raw_w}x{raw_h}; the node renders the nearest size it "
-                  f"supports — tell the user the actual size if they asked for a specific one)"
+        _asked = (f" (you asked for {raw_w}x{raw_h}; the size sets only the shape — every "
+                  f"picture uses the node's full 1152x768 pixel budget — tell the user the "
+                  f"actual size if they asked for a specific one)"
                   if size_requested and not _size_by_tool and (_rw, _rh) != (raw_w, raw_h) else "")
         _steps_used = resp_data.get("steps")
         # §4QG: decided from the PIXELS (a decode, off the event loop) — the
@@ -1303,7 +1316,7 @@ async def _tool_generate_image_impl(prompt: str = "", llm_client=None, sandbox_d
             "re-attempt AT MOST ONCE with a differently-worded instruction; if "
             "it still did not apply, STOP and tell the user plainly which part "
             "changed and which did not. Do NOT keep retrying — each attempt "
-            "occupies the image node for about 3 minutes.\n\n"
+            "occupies the image node for about 6 minutes.\n\n"
         ) if ref_b64 and not subject_note else ""
         # §4MG: an edit sees ONLY its reference. Live 2026-10-07 the agent
         # "fixed" a two-person scene by passing one man's downloaded portrait
@@ -1382,7 +1395,7 @@ RECENT_RENDER_SECONDS = {"edit": collections.deque(maxlen=3), "generate": collec
 #: 10-08: edits 205–860 s) — ×3.8 for a 2-subject ladder = 2370 s, past
 #: every channel's 1800 s budget, so after each restart (empty history)
 #: every multi-subject call was refused by the deadline check.
-DEFAULT_RENDER_SECONDS = {"edit": 185.0, "generate": 115.0}     # §4QR: Turbo at 16 steps (measured 182 / 112 s)
+DEFAULT_RENDER_SECONDS = {"edit": 375.0, "generate": 245.0}     # §4VJ: 1152x768, 12 steps (measured 375 / 245 s); §4QR 16 steps at 768x512 was 185 / 115
 #: §4QG-b: slack on top of a collage re-render's estimate before it starts
 COLLAGE_LEG_MARGIN_S = 30.0
 

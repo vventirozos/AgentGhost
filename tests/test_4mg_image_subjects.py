@@ -32,7 +32,7 @@ def _llm():
     llm = AsyncMock()
     llm.image_gen_clients = [{"model": "Ghost"}]
     llm.generate_image.return_value = {"data": [{"b64_json": base64.b64encode(b"\x89PNG\r\n\x1a\nxx").decode()}],
-                                       "width": 768, "height": 512, "seed": 7}
+                                       "width": 1152, "height": 768, "seed": 7}   # §4VJ default
     return llm
 
 
@@ -151,13 +151,13 @@ async def test_two_subjects_are_joined_into_the_one_reference(tmp_path, web):
     # render's 3:2 — the node stretches the reference to the output size
     strip_w = round(300 * 1024 / 400) + round(400 * 1024 / 300) + SP.COMBINED_GAP
     assert combined.width == strip_w and abs(combined.width / combined.height - 1.5) < 0.01
-    assert (sent["width"], sent["height"]) == (768, 512)
+    assert (sent["width"], sent["height"]) == (1152, 768)      # §4VJ (768x512 before)
     assert "you asked for" not in out              # the tool chose that size, not the user
     # …even when the node renders another size than the one the tool sent
-    llm2 = _llm(); llm2.generate_image.return_value = {**llm2.generate_image.return_value, "width": 736}
+    llm2 = _llm(); llm2.generate_image.return_value = {**llm2.generate_image.return_value, "width": 1088}
     out2 = await tool_generate_image(prompt="k", subjects=["Alexis Tsipras", "Antonis Samaras"],
                                      llm_client=llm2, sandbox_dir=tmp_path)
-    assert "Rendered at 736x512" in out2 and "you asked for" not in out2
+    assert "Rendered at 1088x768" in out2 and "you asked for" not in out2
     mid = combined.height // 2
     # left is the first subject's (dark) photo, right the second's (light)
     assert combined.getpixel((50, mid))[0] < 60 and combined.getpixel((combined.width - 50, mid))[0] > 200

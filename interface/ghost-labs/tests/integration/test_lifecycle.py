@@ -105,12 +105,12 @@ def test_member_stop_start_keeps_ip_and_route(labs):  # noqa: F811
         labs.destroy(lid)
 
 
-def test_pg_single_version_18_and_no_leftovers(labs):  # noqa: F811
+def test_pg_single_version_19_and_no_leftovers(labs):  # noqa: F811
     lab = labs.create(template="pg-single", label="itest-pg")
     lid = lab["lab_id"]
     assert lab["state"] == "ready", lab["readiness"]
     r = labs.sh(lid, "pg1", "psql -U postgres -h localhost -tAc 'select version()'", env={"PGPASSWORD": "lab"})
-    assert "PostgreSQL 18" in r["stdout"], r
+    assert "PostgreSQL 19" in r["stdout"], r
     labs.destroy(lid)
     assert leftovers(lid) == []
 

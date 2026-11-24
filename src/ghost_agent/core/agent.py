@@ -4314,6 +4314,23 @@ def _unknown_tool_message(name, available) -> str:
     return f"Error: Unknown tool '{n}'. Available tools: {', '.join(names)}."
 
 
+def screen_contradiction_footer(reply, tools_run) -> str:
+    """§4VK: the "⚠ Contradicted by the screen" footer for a reply that claims success after a screenshot
+    check this turn saw a problem (`core.code_claims.screen_contradiction_note`), or "". Called on BOTH
+    delivery paths whatever the verifier said (review r1 MAJOR: inside the no-verdict branch, a CONFIRMED
+    or a weak REFUTED skipped it; 16faf8b4 streamed "the engine UI renders" after vision saw a black
+    window). Never raises."""
+    if not reply:
+        return ""
+    try:
+        from .code_claims import screen_contradiction_note
+        note = screen_contradiction_note(reply, tools_run)
+        return note if note and note[:40] not in str(reply) else ""
+    except Exception as _sc_exc:  # noqa: BLE001 — never costs the reply
+        logger.debug("screen-contradiction footer skipped: %s", _sc_exc)
+        return ""
+
+
 def _unverified_mutation_note(last_tool, request, tools_run, reply=""):
     """(note, failed) for a turn whose final substantive action was a file
     write never run or rendered — ("", False) otherwise. ONE wording for
@@ -29386,6 +29403,13 @@ class GhostAgent:
                             )
         except Exception as e:
             logger.debug(f"Verifier gate skipped: {e}")
+        _sc_note = screen_contradiction_footer(final_ai_content, tools_run_this_turn)   # §4VK
+        if _sc_note:
+            from .code_claims import SCREEN_CONTRADICTION_REASON
+            final_ai_content = f"{final_ai_content}{_sc_note}"
+            verifier_backfill = ("failed", SCREEN_CONTRADICTION_REASON)
+            pretty_log("Verifier", "the reply claims success after the last screenshot check saw a problem — "
+                       "footer added (outcome=failed)", icon=Icons.WARN, level="WARNING")
         try:                                       # §4UY N7: the sources, by the code — AFTER the verifier
             from .link_grounding import sources_for_reply as _sources_for_reply
             _src_note = _sources_for_reply(final_ai_content, tools_run_this_turn, last_user_content, self.context)
@@ -36350,6 +36374,8 @@ class GhostAgent:
             _drain_flags["partial"] = lambda: full_content
             _drain_flags["model"] = lambda: _model_text
             _um_failed_stream = False     # §4LK: set before [DONE]; read by the record
+            _screen_contradicted_stream = False   # §4VK: likewise
+            from .code_claims import SCREEN_CONTRADICTION_REASON as _screen_reason_s
             # §4O B-MAJOR-1: the internal drain sets stream_errored on an
             # upstream abort frame and recovers; this USER-FACING final
             # stream previously only LOGGED the abort, then persisted the
@@ -37292,6 +37318,15 @@ class GhostAgent:
                                    icon=Icons.WARN, level="WARNING")
             except Exception as _um_exc:  # noqa: BLE001 — never costs the stream
                 logger.debug("stream unverified-write note skipped: %s", _um_exc)
+            _sc_note_s = screen_contradiction_footer(full_content, stream_tools_snapshot)   # §4VK
+            if _sc_note_s:
+                yield f"data: {json.dumps({'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': created_time, 'model': stream_model, 'choices': [{'index': 0, 'delta': {'content': _sc_note_s}, 'finish_reason': None}]})}\n\n".encode('utf-8')
+                full_content = (full_content or "") + _sc_note_s
+                if locals().get("_stream_effective_content"):
+                    _stream_effective_content = _stream_effective_content + _sc_note_s
+                _screen_contradicted_stream = True
+                pretty_log("Verifier", "streamed reply claims success after the last screenshot check saw a "
+                           "problem — footer added (outcome=failed)", icon=Icons.WARN, level="WARNING")
 
             # ⚠ THE [DONE] SENTINEL IS NOW RELEASED AT THE VERY END OF THIS
             # GENERATOR (see the release site at the bottom of stream_wrapper).
@@ -37534,8 +37569,9 @@ class GhostAgent:
                             user_request=last_user_content,
                             # §4LK: an untested final write is a failed turn
                             # here too (finalize's verifier_backfill)
-                            verifier=("failed" if _um_failed_stream else None),
-                            verifier_reason=(UNVERIFIED_MUTATION_REASON if _um_failed_stream else ""),
+                            verifier=("failed" if (_um_failed_stream or _screen_contradicted_stream) else None),
+                            verifier_reason=(UNVERIFIED_MUTATION_REASON if _um_failed_stream
+                                             else _screen_reason_s if _screen_contradicted_stream else ""),
                             execution_failed=(
                                 execution_failure_count > 0
                                 and bool(last_was_failure)),
@@ -37564,8 +37600,9 @@ class GhostAgent:
                     # §4PH (R3-3): the trajectory above is stamped failed for an
                     # unverified write — the work_log booked the same turn
                     # "completed" with the claim as its note
-                    verifier_backfill=(("failed", UNVERIFIED_MUTATION_REASON)
-                                       if _um_failed_stream else None),
+                    verifier_backfill=(("failed", UNVERIFIED_MUTATION_REASON) if _um_failed_stream
+                                       else ("failed", _screen_reason_s) if _screen_contradicted_stream
+                                       else None),
                     req_id=req_id,
                 )
 
