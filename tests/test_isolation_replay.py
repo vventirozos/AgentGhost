@@ -1038,6 +1038,7 @@ _DELIBERATE_KEEPERS = {
     "tor_proxy", "_tor_guard_uninstall", "last_activity_time",
     "cached_sandbox_state", "last_user_content",
     "biological_task",   # §4PJ: the confidence/entropy/calibration stashes went
+    "_reaper_stop",      # §4VL: the job reaper's shutdown Event — read by the reaper loop only, no write path
     # containment markers this module sets (§4TD: `simulated` — False on
     # the live context, stamped True on the copy)
     "_replay_forbidden_tools", "_subagent_allowed_tools", "simulated",

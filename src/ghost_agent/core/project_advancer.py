@@ -22,6 +22,7 @@ can be plugged in later by passing ``llm_classifier=...``; the tests
 verify both paths.
 """
 
+from .model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import asyncio
 import logging
 import os
@@ -2215,7 +2216,7 @@ def default_llm_classifier(context, *, background: bool = False, on_error=None):
                 "model": model,
                 "messages": [{"role": "user", "content": CLASSIFY_PROMPT + str(description)[:500]}],
                 "temperature": 0.0, "max_tokens": 8, "stream": False,
-                "chat_template_kwargs": {"enable_thinking": False},
+                "chat_template_kwargs": _no_think_kwargs(),
             }, use_worker=True, is_background=background, off_main_only=True,
                 require_healthy=True, timeout=10.0, task_label="project-classify")
             out = ((r or {}).get("choices", [{}])[0]

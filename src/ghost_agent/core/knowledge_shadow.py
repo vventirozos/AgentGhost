@@ -22,6 +22,7 @@ worker node, never the user's slot. ``GHOST_KNOWLEDGE_SHADOW=0`` turns it off.
 """
 from __future__ import annotations
 
+from .model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import json
 import logging
@@ -142,7 +143,7 @@ async def check_and_record(request: str, answer: str, llm_client: Any, *,
                    # the critic is a THINKING model: with thinking on it spent
                    # the whole budget reasoning and returned no content, so
                    # this check never produced a row (§4MF review)
-                   "chat_template_kwargs": {"enable_thinking": False}}
+                   "chat_template_kwargs": _no_think_kwargs()}
         # off-main or not at all: a client that cannot take these keywords
         # is skipped, never retried bare on the user's slot
         res = await llm_client.chat_completion(

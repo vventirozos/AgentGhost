@@ -1937,12 +1937,31 @@ class DockerSandbox:
                 )
                 return
             code, out = self._exec_run(_te.verify_cmd(), deadline_s=60.0)
-            is_tor, ip = _te.parse_tor_check((out or b"").decode("utf-8", "replace"))
+            _text = (out or b"").decode("utf-8", "replace")
+            is_tor, ip = _te.parse_tor_check(_text)
+            # Only "don't know" is asked again: the check endpoint gives an unusable answer
+            # about once in 20 boots. A definite answer, either way, goes straight to its branch.
+            _why = [] if is_tor is not None else [_te.describe_unusable(code, _text)]
+            for _ in range(_te.VERIFY_RETRIES):
+                if is_tor is not None:
+                    break
+                time.sleep(_te.VERIFY_RETRY_S)
+                try:
+                    code, out = self._exec_run(
+                        _te.verify_cmd(_te.VERIFY_RETRY_TIMEOUT_S), deadline_s=30.0)
+                except Exception as _rexc:  # noqa: BLE001 — a retry must not leave the state at "blocked"
+                    _why.append(type(_rexc).__name__)
+                    break
+                _text = (out or b"").decode("utf-8", "replace")
+                is_tor, ip = _te.parse_tor_check(_text)
+                if is_tor is None:
+                    _why.append(_te.describe_unusable(code, _text))
             if is_tor:
                 self._set_egress_state("enforced")
                 self._egress_exit_ip = ip
-                pretty_log("Sandbox Egress", f"Tor-only egress ENFORCED — the sandbox exits via {ip}",
-                           icon=Icons.OK)
+                pretty_log("Sandbox Egress", f"Tor-only egress ENFORCED — the sandbox exits via {ip}"
+                           + (f" (after {len(_why)} unusable answer(s): {'; '.join(_why)})" if _why else ""),
+                           icon=Icons.OK, no_truncate=bool(_why))
             elif is_tor is False:
                 # ⚠ CORROBORATE BEFORE ACTING (§4GK round 5). Round 4 made this
                 # branch destructive — it disconnects the container now and the
@@ -2006,8 +2025,9 @@ class DockerSandbox:
                     "Sandbox Egress",
                     "rules loaded and Tor bootstrapped, but the verification request got no "
                     "usable answer (check.torproject.org unreachable or challenged) — treated as "
-                    "enforced-unverified; re-checked on the next container generation.",
-                    level="WARNING", icon=Icons.WARN,
+                    "enforced-unverified; re-checked on the next container generation. "
+                    f"Answers: {'; '.join(_why)}",
+                    level="WARNING", icon=Icons.WARN, no_truncate=True,
                 )
                 self._set_egress_state("enforced")
         except Exception as exc:  # noqa: BLE001 — never take a turn down

@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model profiles (core.model_profile) — Ghost Agent</title>
+<link rel="stylesheet" href="../../assets/style.css?v=ab96635d7c">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="../../index.html"><span class="mark"></span>Ghost Agent</a>
+  <nav>
+    <a href="../../index.html">What it can do</a>
+    <h3>Start</h3>
+    <a href="../../start/getting-started.html">Getting started</a>
+    <a href="../../start/installation.html">Installation</a>
+    <a href="../../start/configuration.html">Settings that matter</a>
+    <a href="../../start/troubleshooting.html">When something breaks</a>
+    <a href="../../start/glossary.html">Glossary</a>
+    <h3>Features</h3>
+    <a href="../../features/interfaces.html">Interfaces</a>
+    <a href="../../features/voice.html">Voice</a>
+    <a href="../../features/search.html">Search &amp; the web</a>
+    <a href="../../features/darkweb.html">Dark-web search</a>
+    <a href="../../features/pictures.html">Pictures</a>
+    <a href="../../features/memory.html">Memory</a>
+    <a href="../../features/documents.html">Documents (RAG)</a>
+    <a href="../../features/coding.html">Coding &amp; sandbox</a>
+    <a href="../../features/projects.html">Projects &amp; autonomy</a>
+    <a href="../../features/labs.html">Labs</a>
+    <a href="../../features/selfhood.html">Selfhood</a>
+    <a href="../../features/performance.html">Performance</a>
+    <div class="subnav">
+      <a href="context_manager.html">Context manager (core.context_manager)</a>
+      <a href="head_saves.html">Head and slot saves (core.head_saves)</a>
+      <a href="llm.html">Model client (LLM) (core.llm)</a>
+      <a class="current" href="model_profile.html">Model profiles (core.model_profile)</a>
+      <a href="node_offload.html">Off-main node offload</a>
+      <a href="node_throughput.html">Node throughput (core.node_throughput)</a>
+    </div>
+    <a href="../../features/reliability.html">Reliability</a>
+    <a href="../../features/personal.html">Personal services</a>
+    <a href="../../features/infrastructure.html">Infrastructure</a>
+    <h3>Reference</h3>
+    <a href="../index.html">All reference pages</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../../index.html">the guide</a>, or check the <a href="../../start/glossary.html">glossary</a>.</p>
+
+  <h1>core / model_profile.py</h1>
+  <p class="subtitle">One profile per model: the sampler values, the thinking-off switch, the effort levels, the tokenizer and the reply room a model needs, in one place. Callers say what they want; the send words it for the model that serves the call.</p>
+
+  <h2 id="why">Why it exists</h2>
+  <p>The agent was built around Qwen3.8-27B. Its card's sampler values were constants in <code>core/agent.py</code>, its effort sentence a pattern in <code>core/effort.py</code>, its tokenizer a repository name in <code>utils/token_counter.py</code>, and <code>enable_thinking</code> was written at 32 call sites in 15 files. A trial of a model with another template (2026-11-22) ran with all of that still in force: side calls kept reasoning because the template has no <code>enable_thinking</code>, and the token counter was about 31% low because it counted with another vocabulary (that model needs about 45% more tokens for the same text). Nothing said so.</p>
+  <p>§4VM (2026-11-26) moves those facts into a <code>ModelProfile</code>. The built-in <code>qwen38</code> profile carries the old values, so a Qwen main model receives the same requests as before.</p>
+
+  <h2 id="profile">What a profile holds</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Field</th><th>Meaning</th><th><code>qwen38</code></th></tr></thead>
+    <tbody>
+      <tr><td><code>match</code></td><td>Lower-case pieces of a model file name or node label. The profile fits a model whose name contains one.</td><td><code>qwen</code>, <code>daisyrose</code></td></tr>
+      <tr><td><code>sampling</code></td><td>Sampler settings per kind of turn: <code>default</code>, <code>general</code>, <code>factual</code>, <code>tool</code>, <code>coding</code>, <code>coding.creative</code>, <code>coding.precise</code>, <code>coding.balanced</code>. A kind with no set of its own takes its parent's (coding.precise → coding → tool → default; factual → general → default; a parent never reads a child). No set at all sends no sampler values and the server's own defaults apply; the main turn still sends <code>frequency_penalty: 0</code> unless the profile sets one.</td><td>The card's one thinking-mode set for every kind: temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence_penalty 0</td></tr>
+      <tr><td><code>think_off</code></td><td>The model's own template variables for "do not reason". <code>null</code> = it has no such switch and nothing is sent.</td><td><code>{"enable_thinking": false}</code></td></tr>
+      <tr><td><code>effort</code></td><td>How the template takes an effort level: the variable's name, the model's word for each of the agent's three levels (<code>low</code>, <code>medium</code>, <code>xhigh</code>), the sentence the template writes for a level (and, under <code>rendered</code>, what it writes when that is not the word itself: Inkling 2 takes <code>low</code> and writes <code>0.2</code>), the level that writes none, the sentence added after a request's first failure, and what ends the system block. <code>null</code> = no levels; the effort switch is then off whatever <code>GHOST_REASONING_EFFORT</code> says.</td><td><code>reasoning_effort</code>, the same three words, "Reasoning effort is set to …", <code>medium</code> unmarked</td></tr>
+      <tr><td><code>tokenizer</code></td><td>The fallback tokenizer: a Hugging Face repository, cached under <code>$GHOST_HOME/system</code>. Used only when the server's own tokenizer cannot be built from its model file (see <a href="#tokens">token counts</a>). <code>null</code> = none: tokens are then estimated from the server's own count.</td><td><code>Qwen/Qwen3-30B-A3B</code> in <code>system/tokenizer</code></td></tr>
+      <tr><td><code>dialect</code></td><td>How the model is spoken to beyond template variables (<a href="#dialect">below</a>): <code>history</code> (<code>text</code> or <code>native</code>), <code>think_tags</code> (true or false), <code>soft_no_think</code> (the suffix that ends a prompt which must not be reasoned over; <code>""</code> = none).</td><td><code>text</code>, <code>true</code>, <code>/no_think</code></td></tr>
+      <tr><td><code>reply_reserve</code></td><td>Tokens of the server's window left for the reply when the context budget is taken from the server.</td><td><code>22608</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Built in: <code>qwen38</code> (Qwen3.8-27B and its finetunes, and the Qwen3.6 35B), <code>gemma</code> (the helper model: the same thinking switch, no levels) and <code>generic</code> (nothing assumed: no sampler values, no effort, estimated tokens).</p>
+
+  <h2 id="files">Adding a model without code</h2>
+  <p>Put a JSON file in <code>system/model_profiles/</code> under the agent's home (<code>$GHOST_HOME</code>, or <code>~/ghost_llamacpp</code> when that is unset), or in the directory <code>GHOST_MODEL_PROFILES</code> names. Any <code>*.json</code> entry counts (either case of the suffix; a byte-order mark is accepted). Files are read in name order at start, and again at the next model re-sync after the directory changed (a file added, edited or removed): adding a file for the model the server already runs is enough, within about a minute of the next head warm-up.</p>
+  <p>A file may start from any profile read before it with <code>"extends"</code>; every other key replaces that profile's value whole. A file with the SAME name as a known profile replaces it: what the file does not say stays as it was, including the <code>match</code> names (a replaced <code>qwen38</code> is also the default). A file that extends a profile under another name does not inherit <code>match</code>. An entry that cannot be used (not a readable file, not JSON, larger than 256 KB, an unknown key, a value the checks below refuse) is skipped with one warning that names it and says why; the built-ins always load.</p>
+  <pre><code>{
+  "name": "example-9",
+  "match": ["example-9"],
+  "sampling": {"default": {"temperature": 0.7, "top_p": 0.8},
+               "coding":  {"temperature": 0.2}},
+  "think_off": {"reasoning_effort": "none"},
+  "effort": {"levels": {"low": "low", "medium": "medium", "xhigh": "max"},
+             "sentence_re": "\\[effort=(low|medium|max)\\]",
+             "unmarked": "medium"},
+  "tokenizer": null,
+  "reply_reserve": 8000
+}</code></pre>
+  <p>Only sampler settings are accepted under <code>sampling</code> (<code>SAMPLER_KEYS</code>: temperature, top_p, top_k, min_p, the penalties, DRY, XTC, mirostat and the like), and only as numbers. A file cannot set <code>messages</code>, <code>model</code> or <code>max_tokens</code>. Also refused: a number that is not finite, a <code>match</code> piece shorter than three characters (<code>a</code> is in "Nova"), a <code>think_off</code> that sets <code>enable_thinking</code> to anything but <code>false</code>, a level pattern longer than 300 characters or without exactly one group, two effort levels given the same word (leave out the level the model does not have: the agent then does not send it and the template's default applies), and a tokenizer that is not <code>{"repo": "org/name"}</code> (never a path; the cache directory is the agent's choice, <code>system/tokenizers-&lt;name&gt;</code>).</p>
+
+  <h2 id="choose">Which profile the main model gets</h2>
+  <ol class="flow">
+    <li><code>GHOST_MODEL_PROFILE=&lt;name&gt;</code> names one: the operator's word. An unknown name is logged and ignored.</li>
+    <li>The running server's model file (<code>/props</code>, <code>model_path</code>) fits a profile. Only the file's name is read, not its folder's.</li>
+    <li><code>--model</code> fits a profile.</li>
+    <li>Otherwise <code>qwen38</code>. When the server named a model that fits no profile, one warning says so and names the directory a profile file goes in.</li>
+  </ol>
+  <p>Among several fits the longest matching piece wins (<code>qwen4</code> over <code>qwen</code>); at the same length an operator's file wins over a built-in, and between two operator files the earlier file name.</p>
+  <p><code>core/model_boot.py</code> runs this at start and again from every head warm-up, loud or quiet (<code>GhostAgent._model_resync</code>, at most once a minute and for at most 30 seconds), so a model server restarted on another model is followed without restarting the agent. What a re-sync does depends on what the server says:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>The server</th><th>The re-sync</th></tr></thead>
+    <tbody>
+      <tr><td>is down, still loading, or answers without naming a model file (an error, an empty object)</td><td>changes nothing about the main model (profile, token counting, budget); profile files that changed are still read again</td></tr>
+      <tr><td>names the same model file, the same window</td><td>nothing; if the last token check got no answer it is tried again, and so is the model file's tokenizer when the server did not answer while it was being checked</td></tr>
+      <tr><td>names the same model file, another window</td><td>refits the context budget</td></tr>
+      <tr><td>names the same model file, no window</td><td>keeps the budget</td></tr>
+      <tr><td>names another model file, or the profile files changed</td><td>chooses the profile again, builds or loads that model's tokenizer, checks the count, refits the budget; the looked-up effort level of the old model is dropped and the context manager takes the new budget (by the warm-up that ran the re-sync, or the next one when the re-sync outlived its 30 seconds)</td></tr>
+    </tbody>
+  </table></div>
+  <p>A re-sync that fails half-way puts the profile and the token counting back as they were and is tried again a minute later. A boot that fails still ends on the default profile with a tokenizer when one can be loaded and a budget that is not zero, and the first re-sync does the whole job again.</p>
+
+  <h2 id="shape">Intent in, the model's words out</h2>
+  <p>Code that builds a request writes the agent's own two template switches: <code>no_think_kwargs()</code> for "do not reason" and a level from <code>EFFORT_LEVELS</code> under <code>reasoning_effort</code>. <code>shape(payload, profile)</code> rewrites them for the model:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>The caller wrote</th><th><code>qwen38</code>, <code>gemma</code></th><th>The example profile above</th></tr></thead>
+    <tbody>
+      <tr><td>thinking off</td><td>unchanged</td><td><code>reasoning_effort: "none"</code></td></tr>
+      <tr><td>effort <code>xhigh</code></td><td>unchanged</td><td><code>reasoning_effort: "max"</code></td></tr>
+      <tr><td>thinking off and a level</td><td>unchanged</td><td><code>reasoning_effort: "none"</code> (off wins)</td></tr>
+      <tr><td>one of the agent's levels the model has no word for</td><td>&mdash;</td><td>not sent: the template's own default applies</td></tr>
+      <tr><td>a level word neither side knows</td><td>sent as written</td><td>sent as written</td></tr>
+    </tbody>
+  </table></div>
+  <p>For a model whose words are the agent's, <code>shape</code> returns the caller's own object, so the request body cannot differ from before. Otherwise it returns a copy; the caller's payload is never edited.</p>
+  <p><code>core/llm.py</code> calls it at every send: the four node pools through <code>LLMClient._for_node</code> with the profile of the model that node runs, and the main call and the main stream through <code>shape_main</code>. A node's profile: a node that is the main server itself (the vision pool points at it; compared by host, port and path, so <code>localhost</code>, a missing scheme or a trailing <code>/v1</code> make no difference, while two paths on one port are two servers) gets the main profile; otherwise the model file its own <code>/props</code> named in the capacity probe; only when that fits no profile, its configured label; a node nothing is known about is sent the request as written. The places that post to a server without the client do the same: the head render and the members' head warm-up in <code>core/agent.py</code>, the effort lookup in <code>core/effort.py</code>, the direct call in <code>api/routes.py</code>, and the audio node's request in <code>memory/audio_ingest.py</code> (with the profile of the model that node's <code>/props</code> named). A test scans the package for a chat post that is not shaped.</p>
+
+  <h2 id="dialect">Dialect: history, thinking tags, the soft switch (§4VO)</h2>
+  <p>Three things the turn loop did in Qwen's way for every model. A profile's <code>dialect</code> now says what a model wants; the defaults are Qwen's and change nothing for it.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Setting</th><th>Qwen (default)</th><th>A model with its own formats (Inkling 2)</th></tr></thead>
+    <tbody>
+      <tr><td><code>history</code>: how the model is shown its earlier tool calls and their results</td><td><code>text</code>: the call as <code>&lt;tool_call&gt;</code> text inside the assistant message, the result as a user message in <code>&lt;tool_response&gt;</code>. For Qwen that is its template's own wire form.</td><td><code>native</code>: structured <code>tool_calls</code> and <code>role: tool</code> messages; the server's template renders them in the model's own format. Only on the native-tools path.</td></tr>
+      <tr><td><code>think_tags</code>: whether the prompt may name <code>&lt;think&gt;</code> tags</td><td><code>true</code>: "close the <code>&lt;/think&gt;</code> tag and call the tool"</td><td><code>false</code>: the same rules worded as "your reasoning" (<code>prompts.without_think_tags</code>: eleven fixed rewordings, applied to the native tool header and to the thinking-depth guidance wherever it is sent — the header, the final-generation directive, and the copy the request-context split looks up, all from <code>think_guidance_for_model</code>)</td></tr>
+      <tr><td><code>soft_no_think</code>: the suffix fifteen call sites put at the end of a prompt</td><td><code>/no_think</code></td><td><code>""</code>: removed at the send, from every user message that ends in it</td></tr>
+    </tbody>
+  </table></div>
+  <p>Why <code>history</code> matters: on 2026-11-26, with Inkling 2 Mini as the main model, 10 of 45 tool calls arrived as Qwen-style text instead of native calls, starting at the third step of multi-step turns. The prompt does not teach that form on the native path; the history did, by showing the model two earlier calls written that way. In native form a past call is rendered by Inkling's template as its own <code>content_invoke_tool_json</code> message and a result as its own tool message (checked on the running server's <code>/apply-template</code>).</p>
+  <p>Details of the native rows (<code>core/agent.py</code> <code>_native_history_row</code>): a call the model wrote as text is removed from the assistant text, so it never reads the foreign form back as its own; the parse-error bookkeeping entry is not sent as a call; arguments reach the server as the text of a JSON object a strict parser reads: they are parsed and written again, and what is not such an object (a cut call, a list, <code>NaN</code>, a lone surrogate, nesting past any parser) goes as <code>{"raw": "…"}</code> — the server parses arguments before the template sees them and answers 500 to the whole request, on every later turn, for text it cannot read; prose that only mentions <code>&lt;tool_call&gt;</code> beside a real call is kept; a tool result keeps the same defusing of hostile text as before, and a channel member's caveat reaches it as a tool row. The same form is used for the receipts of a forced final answer and for the result kept by an overflow recovery. After a malformed call, such a model is told to make a structured call, not shown Qwen's text form.</p>
+
+  <h2 id="tokens">Token counts: the model file's own tokenizer</h2>
+  <p>A GGUF carries its whole vocabulary and merge rules. When the model file the server names is readable by the agent (the server on the same machine), <code>utils/gguf_tokenizer.py</code> builds the tokenizer from it and the agent counts with that: exact for whatever model is loaded, no download.</p>
+  <p>It is adopted only when its token ids equal the server's own (<code>/tokenize</code>, which touches no slot) on every one of fifteen check strings: prose, a tool schema, code, numbers and paths, CRLF and tabs, apostrophes, decomposed accents, Greek, Hindi, Thai, Arabic, Hebrew, Chinese, Japanese, Korean, full-width forms, emoji, zero-width characters, identifiers that are tokens themselves, camel-case words with long numbers, all-caps words with accented capitals, and Chinese words that are tokens only as a whole. Three things the file does not say are settled by that check: how text is split before the merges (three rules are known, <code>SPLIT_RULES</code>: letters with their combining marks as one word; letters alone; the GPT-4o rule, which also splits where the case changes and takes digits three at a time — in llama.cpp's own rewrite of it, where only ASCII letters have a case; the regex in the model's <code>tokenizer.json</code> differs on all-caps words with a non-ASCII capital and undercounted "MÜNCHEN CAFÉS" text by up to 11% until a reviewer found it against <code>llama-tokenize</code>), whether a piece that is itself a token is emitted whole without merging, and that the server does not normalise Unicode although the file's metadata says it does. What llama.cpp does for a vocabulary name is tried first (<code>SETTINGS_FOR_PRE</code>), then every other combination.</p>
+  <p>Checked on two models: Qwen3.8 (<code>qwen35</code>: marks, merged) against a live server, and Inkling 2 Mini (<code>inkling2</code>: GPT-4o rule, whole tokens) against the build's own <code>llama-tokenize</code> on the model file, 31 texts and 21,557 tokens with identical ids; for each model exactly one combination passes the fifteen check strings, and it is the one tried first. A reviewer compared 3.4 million tokens of real files for Inkling and 2.8 million for Qwen, 10,000 random strings per model and every code point: identical, apart from about 4,400 code points the tokenizer library classifies by a newer Unicode table than llama's (unassigned in Unicode 13; no effect on text in use).</p>
+  <p>The kept file's name includes the builder's version (<code>BUILDER_VERSION</code>): after a change of the rules a file built by older code is not loaded again — it would be re-checked only against the check strings, which a wrong tokenizer once passed. To check a new vocabulary or a changed rule against llama.cpp itself, run <code>tests/test_4vm_model_file_tokenizer.py</code> with <code>GHOST_TOKENIZER_REF_BIN</code> (a <code>llama-tokenize</code> binary; with <code>-ngl 0 -c 64</code> it loads no weights) and <code>GHOST_TOKENIZER_REF_MODELS</code> (model files) set; without them that one test is skipped, and every other test takes its reference from the builder itself.</p>
+  <ul>
+    <li>Reading the vocabulary of a 17 GB model takes about 4 seconds, once. The built tokenizer is kept in <code>system/tokenizers-gguf/</code> (about 20 MB, the newest three), reloads in 0.2 s and is checked against the server again each time.</li>
+    <li>Another model file under the same profile gets its own tokenizer. A model file replaced in place under the SAME path gets a new one at the next agent start (the kept file is keyed on path, size and change time), not while the agent runs.</li>
+    <li>When it cannot be had (the file is on another machine, the <code>gguf</code> package is missing, the vocabulary is not byte-pair, the server's <code>/tokenize</code> does not answer, or no known split rule reproduces the server's ids) the profile's tokenizer is loaded instead. Only the last case is a warning; the others are logged at INFO. The boot line and <code>/api/health</code> (<code>tokens.exact</code>) say which tokenizer is counting.</li>
+    <li><code>GHOST_GGUF_TOKENIZER=0</code> switches it off.</li>
+  </ul>
+  <p>Why it was built: the agent counted with <code>Qwen/Qwen3-30B-A3B</code>, a 151,669-token vocabulary, while the Qwen3.8 model the server ran has 248,320 tokens. The two share no ids; the counts agreed only roughly because both are byte-pair vocabularies. Measured 2026-11-26 against the live server: the old tokenizer was 0.6% low on a prompt, 2% on prose, 4% on code and 16% on indented JSON (the older vocabulary has merged tokens for punctuation followed by a line end that the newer one lacks). Built from the model file, the count matched the server's on 142,648 tokens of source, docs and JSON and on 40 edge strings.</p>
+
+  <h3 id="calibrate">The check against the server</h3>
+  <p>Whatever tokenizer is in use, <code>token_counter.calibrate</code> sends one fixed sample (prose, a tool schema, code, a list with paths and numbers; 1,350 characters) to <code>/tokenize</code> and compares:</p>
+  <ul>
+    <li>The model file's tokenizer: the counts are equal and <code>exact</code> is reported.</li>
+    <li>No tokenizer loaded: the estimate becomes the server's characters-per-token figure instead of the fixed 4.</li>
+    <li>A fallback tokenizer within 3% of the server: left alone; the measured difference is reported as <code>drift</code>.</li>
+    <li>A fallback tokenizer further off: its counts are multiplied by the measured ratio and one warning says the tokenizer is not this model's.</li>
+    <li>An answer no tokenizer gives (under 1 or over 12 characters per token, a ratio outside 0.5 to 2): not believed, said once, counts stay as they were.</li>
+  </ul>
+  <p>The result is shown at start and in <code>/api/health</code> (<code>model_profile.tokens</code>).</p>
+
+  <h2 id="context">The context budget</h2>
+  <p><code>context_budget(flag, n_ctx, profile)</code>: <code>--max-context</code> is the ceiling. When the server's window minus the reply reserve (at most a quarter of the window) is smaller, the budget is lowered to that and a warning says so; it is never raised above the flag. <code>--max-context 0</code> takes the budget from the server (65,536 when the server does not answer at start). A window under 2,048 or over 16,777,216 tokens is treated as not given, and a server that gives none leaves the budget where it is. The production pair, a 196,608-token window and <code>--max-context 174000</code>, is left as it is.</p>
+
+  <h2 id="limits">Limits</h2>
+  <ul>
+    <li>Still in Qwen's words for every model: two lines of the system prompt and the persona that mention <code>&lt;tool_response&gt;</code> output; the final-generation directive's "do not emit any <code>&lt;tool_call&gt;</code> blocks"; some messages the agent sends after a failure (a cut reply, a loop, the watchdog note) that name <code>&lt;tool_call&gt;</code> or <code>&lt;/think&gt;</code>; the lazy tool grammar, which triggers on <code>&lt;tool_call&gt;</code> (only used with native tools off); the perfect-it follow-up (off by default), which builds its own history. A model's earlier reasoning is not sent back to it, though some templates (Inkling 2) could take it.</li>
+    <li>The re-sync runs when a head warm-up runs. The first request after a model server restart can still be served on the old profile and budget, and with the re-warm loop switched off (<code>GHOST_MAIN_PREFIX_REWARM_S=0</code>) there is no re-sync after start.</li>
+    <li>A node's first requests, before its capacity probe has read <code>/props</code>, are worded by its label only.</li>
+    <li><code>eval/verify_bench.py</code> posts the verifier's requests to the judge it is pointed at as written: a judge on another model is benched in the agent's words.</li>
+    <li>The catch-all proxy route forwards an outside client's request body untouched.</li>
+    <li>The server's timeouts are per read, not in total; at start a server that drips bytes can hold the boot.</li>
+    <li>A model the server runs that fits no profile gets <code>qwen38</code>, not <code>generic</code>, because every main model this agent has run is a Qwen. Set <code>GHOST_MODEL_PROFILE=generic</code> for the neutral one.</li>
+    <li>The web menu shows the agent's three effort levels whatever the model calls them. A server default the template writes but that is none of those levels (Inkling 2's own 0.9 when the launcher sets none) is reported as unknown, not as medium.</li>
+    <li>A thinking-off call is booked as the unmarked level (medium). For Qwen that is exact; a template that writes its own text for "off" (Inkling 2 writes 0) renders differently from medium, so the server re-reads from that line on (about 130 tokens on Inkling) while the agent's level bookkeeping sees no change. The saved head is keyed on the rendered text and is never served for the wrong text.</li>
+    <li>The sampler values are the main model's. A side call sets its own temperature and is not changed.</li>
+    <li>With a fallback tokenizer, the 3% band is judged on one sample. Text unlike it (indented JSON) can be further off than the band while the tokenizer is left unscaled.</li>
+    <li>A change of model or window on the main server is noticed at the next head warm-up (the re-warm loop ticks every 10 to 120 seconds), not at once. A NODE's model is read once, at first contact: a node restarted on another model keeps its profile until the agent restarts.</li>
+    <li><code>GHOST_MODEL_PROFILE</code> names the main model's profile only.</li>
+  </ul>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_4vm_model_profile.py</code>: the Qwen profile against the card, <code>shape</code> on both kinds of model, an enumeration that fails when a chat request leaves <code>LLMClient</code> unshaped and one that fails for a chat post anywhere else in the package, a scan that fails when a module other than this one writes the thinking switch or a sampler set as a literal, profile files (refused shapes, edges, entries that crash a parser, the fallback chain, ties), the choice of profile, the server probe, the calibration and its bounds, the boot and every row of the re-sync table. <code>tests/test_4vm_model_file_tokenizer.py</code>: the model file's tokenizer on small model files the test writes, against a stand-in server that splits by either rule or by none. Mutation results are in the project journal (§4VM).</p>
+</main>
+</body>
+</html>

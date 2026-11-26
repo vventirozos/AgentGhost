@@ -110,6 +110,26 @@ from tests.helpers import make_context, make_agent, FakeBgTasks  # noqa: F401  #
 
 
 @pytest.fixture(autouse=True)
+def _youtube_canary_boot_is_now():
+    """§4VL: the YouTube canary's first probe is due `BOOT_DELAY_S` (10 min) after the PROCESS started. In a
+    full serial run (~56 min) every test that drives `_biological_tick` after minute 10 started a REAL probe
+    thread, whose "YouTube route DOWN" record could land in that test's ledger before its assert
+    (test_gepa_epoch_swap failed so, 2026-11-26; alone it always passed). Each test starts as a fresh boot;
+    the canary's own tests set `ctx.boot_monotonic` / `_process_start_monotonic` themselves."""
+    import time as _t
+    yc = sys.modules.get("ghost_agent.memory.youtube_canary")
+    if yc is None:
+        yield                     # not imported yet: its start time is set at import, i.e. now
+        return
+    old = yc._process_start_monotonic
+    yc._process_start_monotonic = _t.monotonic()
+    try:
+        yield
+    finally:
+        yc._process_start_monotonic = old
+
+
+@pytest.fixture(autouse=True)
 def _logging_handlers_are_per_test():
     """Handlers attached to the Ghost loggers must not outlive the test.
 

@@ -55,6 +55,8 @@ from ..utils.tool_stop import is_user_interrupted as _s5_is_intr  # §4RZ step 5
 from ..tools.outcome import with_text as _s5_with_text  # §4RZ step 5 (s5-r13)
 from ..tools.fs_ops import FS_MUTATING_OPS as _FS_MUTATING_OPS  # §4UY r2 m1: the ONE mutating-op list
 from . import effort as _effort
+from . import model_profile as _mp
+from . import arg_shapes as _arg_shapes
 from . import head_saves as _head_saves
 from .isolation import is_simulated_context   # §4TD: THE marker of a simulated context (was skill_memory.is_read_only)
 from ..utils.constraints import extract_constraints, render_constraint_block, request_forbids_running
@@ -77,24 +79,16 @@ from ..utils.constraints import extract_constraints, render_constraint_block, re
 # temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence 0 — and no separate
 # coding value; 0.6 was the Qwen3.6 card's coding value (the abliterated RVN
 # build inherits the base card: Heretic minimises KL from the original).
-CODING_SAMPLING_PARAMS = {
-    "temperature": 1.0,
-    "top_p": 0.95,
-    "top_k": 20,
-    "min_p": 0,
-    "presence_penalty": 0,
-}
+# §4VM: the values live in the model's profile (`core/model_profile.py`); the
+# three names below are the BUILT-IN Qwen profile's sets, kept for readers and
+# tests. What a turn is sampled with comes from the MAIN model's profile
+# (`get_sampling_params`).
+CODING_SAMPLING_PARAMS = _mp.QWEN38.sampler("tool")
 # §4RG-b (2026-10-25, operator: "make all settings according to the model's
 # card"): presence 1.5 was the card's INSTRUCT value; its thinking-mode set is
 # presence 0, and the card warns 1.5 "can occasionally result in language
 # mixing" (cf. the §4JR Greek drift).
-GENERAL_SAMPLING_PARAMS = {
-    "temperature": 1.0,
-    "top_p": 0.95,
-    "top_k": 20,
-    "min_p": 0,
-    "presence_penalty": 0,
-}
+GENERAL_SAMPLING_PARAMS = _mp.QWEN38.sampler("general")
 # FACTUAL / DETERMINISTIC answer turn — a non-tool turn whose query has a single
 # correct answer (math, counting, lookup, "what is X"). It used to run
 # near-greedy (temp 0.2, top_p 0.9) on the reasoning that the conversational
@@ -104,13 +98,7 @@ GENERAL_SAMPLING_PARAMS = {
 # sits on the card too (operator: "make all settings according to the model's
 # card"). The `_is_factual_query` routing stays wired so a measured deviation
 # is a one-line change away.
-FACTUAL_SAMPLING_PARAMS = {
-    "temperature": 1.0,
-    "top_p": 0.95,
-    "top_k": 20,
-    "min_p": 0,
-    "presence_penalty": 0,
-}
+FACTUAL_SAMPLING_PARAMS = _mp.QWEN38.sampler("factual")
 
 # ---------------------------------------------------------------------------
 # Cognitive-layer toggles (2026-06 redesign — see PROJECT_JOURNAL.md §3).
@@ -606,10 +594,10 @@ _INJECTION_RESERVE_TOKENS = 24000
 # (creative temp=0.8/top_k=40, precise temp=0.3/top_p=0.90/top_k=10) drifted
 # coding turns off the model-card values; collapsing them to the "balanced"
 # baseline keeps every coding turn on-spec while preserving the mechanism.
-_CODING_TASK_PROFILES = {
-    "creative":  {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
-    "precise":   {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
-    "balanced":  {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
+_CODING_TASK_PROFILES = {       # §4VM: the built-in Qwen profile's; see CODING_SAMPLING_PARAMS
+    "creative":  _mp.QWEN38.sampler("coding.creative"),
+    "precise":   _mp.QWEN38.sampler("coding.precise"),
+    "balanced":  _mp.QWEN38.sampler("coding.balanced"),
 }
 
 _CREATIVE_KEYWORDS = {"design", "architect", "brainstorm", "creative", "alternative", "refactor", "naming", "generate", "invent"}
@@ -6529,6 +6517,25 @@ def _history_shows_tool_activity(messages) -> bool:
     return False
 
 
+#: §4VM: the longest a warm-up waits for the model re-sync.
+MODEL_RESYNC_MAX_S = 30.0
+
+
+def turn_sampler_fields(sampling_params) -> dict:
+    """§4VM: the sampler part of a main turn's request — the profile's set for
+    this kind of turn, then `frequency_penalty` (0 unless the profile sets
+    one; it was a fixed 0 after the set, and keeps that place)."""
+    sp = dict(sampling_params or {})
+    return {**sp, "frequency_penalty": sp.get("frequency_penalty", 0.00)}
+
+
+def _temp_label(sampling_params) -> str:
+    """The temperature for the request log line ("server default" when the
+    main model's profile sets none — §4VM)."""
+    t = (sampling_params or {}).get("temperature")
+    return f"{t:.2f}" if isinstance(t, (int, float)) and not isinstance(t, bool) else "server default"
+
+
 def get_sampling_params(is_tool_turn: bool, query: str = "", is_coding: bool = False) -> dict:
     """Return the sampling profile for the current turn.
 
@@ -6548,19 +6555,24 @@ def get_sampling_params(is_tool_turn: bool, query: str = "", is_coding: bool = F
     second `update_profile` on the same facts one turn after the first
     succeeded). Routing every tool turn through the precise profile
     removes that variance without costing conversational warmth.
+
+    §4VM: this function picks the ROLE of the turn (general / factual / tool /
+    coding.<kind>); the values are the main model's profile's
+    (`model_profile.main().sampler(role)`). A profile with no sampler sets
+    returns {} — nothing is sent and the server's own defaults apply.
     """
+    model = _mp.main()
     if not is_tool_turn:
         # A non-tool turn is NOT automatically chit-chat. If the query has a
         # single deterministic answer, sample near-greedy with no presence
         # penalty — temp=1.0/pp=1.5 samples AWAY from the correct tokens.
         if _is_factual_query(query):
-            return dict(FACTUAL_SAMPLING_PARAMS)
-        return dict(GENERAL_SAMPLING_PARAMS)
+            return model.sampler("factual")
+        return model.sampler("general")
     if is_coding:
-        profile = _classify_coding_task(query)
-        return dict(_CODING_TASK_PROFILES.get(profile, CODING_SAMPLING_PARAMS))
-    # Non-coding tool turn — use the base precise profile (temp=0.6).
-    return dict(CODING_SAMPLING_PARAMS)
+        return model.sampler("coding." + _classify_coding_task(query))
+    # Non-coding tool turn — the tool set.
+    return model.sampler("tool")
 
 
 # Streaming guards. When the upstream model enters a self-repeating thinking
@@ -7546,7 +7558,7 @@ def thinking_disabled(payload: Any) -> bool:
     flag or the `/no_think` soft switch on the last user message."""
     if not isinstance(payload, dict):
         return False
-    if (payload.get("chat_template_kwargs") or {}).get("enable_thinking") is False:
+    if _mp.is_no_think(payload):
         return True
     msgs = payload.get("messages") or []
     last = msgs[-1] if msgs and isinstance(msgs[-1], dict) else {}
@@ -7572,9 +7584,7 @@ def report_turn_payload(payload: dict) -> dict:
     flag and the `/no_think` soft switch on a COPY of the last user
     message — history is never edited). Returns a new dict."""
     out = dict(payload or {})
-    ctk = dict(out.get("chat_template_kwargs") or {})
-    ctk["enable_thinking"] = False
-    out["chat_template_kwargs"] = ctk
+    _mp.set_no_think(out, force=True)
     msgs = list(out.get("messages") or [])
     if msgs and isinstance(msgs[-1], dict) and msgs[-1].get("role") == "user":
         last = dict(msgs[-1])
@@ -8459,6 +8469,142 @@ from .stream_guards import (  # noqa: E402
 )
 
 
+#: A tool call written as TEXT: the tag followed by a function tag or a JSON
+#: object. Prose that merely mentions `<tool_call>` is not one.
+_TEXT_CALL_RE = re.compile(r"<tool_call>\s*(?:<function\b|\{).*?(?:</tool_call>|\Z)", re.S | re.I)
+
+
+def native_history_on(context) -> bool:
+    """§4VO: the main model is shown its earlier calls and their results in
+    its OWN format — the profile asks for it and the native-tools path is on."""
+    return (bool(getattr(getattr(context, "args", None), "native_tools", False))
+            and _mp.main().dialect.history == "native")
+
+
+def think_guidance_for_model(think_budget: str) -> str:
+    """§4VO: the thinking-depth guidance as the main model is given it — for a
+    model with no `<think>` tags, the same rules with no tag named. ONE source
+    for the tool header, the final-generation directive and the split that
+    looks the guidance up inside the header (three copies that disagreed made
+    the first message differ between a tight and an extended turn)."""
+    text = render_think_budget_guidance(think_budget)
+    if not _mp.main().dialect.think_tags:
+        from .prompts import without_think_tags
+        text = without_think_tags(text)
+    return text
+
+
+def native_tool_header(pointer: str, think_budget: str) -> str:
+    """§4VO: the native path's tool header for the main model."""
+    from .prompts import QWEN_TOOL_PROMPT_NATIVE, without_think_tags
+    header = QWEN_TOOL_PROMPT_NATIVE
+    if not _mp.main().dialect.think_tags:
+        header = without_think_tags(header)         # the agent's own rules only: nothing is spliced in yet
+    return (header.replace('{tool_schemas}', pointer)
+            .replace('{think_budget_guidance}', think_guidance_for_model(think_budget))
+            .replace("\r", ""))
+
+
+def _object_arguments(args) -> str:
+    """Tool-call arguments as the text of a JSON object a STRICT parser
+    accepts (the server parses them before the template sees them; what it
+    cannot parse fails the whole request with a 500, on every later turn).
+    Python's lenient reading — a raw newline inside a string, NaN, a lone
+    surrogate — is not the server's. What is not such an object goes as
+    ``{"raw": "<what there was>"}``."""
+    try:
+        obj = json.loads(args, strict=False) if isinstance(args, str) else args
+        if not isinstance(obj, dict):
+            raise ValueError("not an object")
+        text = json.dumps(obj, ensure_ascii=False, allow_nan=False)
+        text.encode("utf-8")                         # a lone surrogate cannot be sent
+        return text
+    except Exception:  # noqa: BLE001 — ValueError, RecursionError, UnicodeEncodeError, TypeError
+        raw = args if isinstance(args, (str, int, float, bool, type(None))) else str(args)
+        if isinstance(raw, float) and raw != raw or raw in (float("inf"), float("-inf")):
+            raw = str(raw)
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8", "replace").decode("utf-8")
+        return json.dumps({"raw": raw}, ensure_ascii=False)
+
+
+def _native_history_row(m: dict) -> dict:
+    """§4VO (phase 4): one history row for a model that is shown its own
+    earlier calls and their results in ITS format — the structured message the
+    server's template renders. An assistant row keeps its content and carries
+    its calls as ``tool_calls``; a tool row stays a tool row (its text defused
+    as ever, §4MB). Rows of any other role are not for this function.
+
+    * The strike bookkeeping entry (``system_parse_error``) is not a call.
+    * A call the model wrote as TEXT is in ``content`` too: that block is
+      removed, so the model never reads the foreign form back as its own
+      (prose that only mentions the tag stays).
+    * Arguments: see ``_object_arguments``."""
+    if m.get("role") == "tool":
+        return {"role": "tool", "tool_call_id": str(m.get("tool_call_id") or ""),
+                "name": str(m.get("name") or "unknown"), "content": _defuse_tool_text(m.get("content"))}
+    calls = []
+    for tc in m.get("tool_calls") or []:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not name or name == "system_parse_error":
+            continue
+        calls.append({"id": str(tc.get("id") or f"call_{len(calls)}"), "type": "function",
+                      "function": {"name": str(name), "arguments": _object_arguments(fn.get("arguments", "{}"))}})
+    content = m.get("content")
+    if calls and isinstance(content, str):
+        content = _TEXT_CALL_RE.sub("", content).strip()
+    row = {"role": "assistant", "content": content if content is not None else ""}
+    if calls:
+        row["tool_calls"] = calls
+    return row
+
+
+def history_row_for_model(m: dict, native_history: bool, render_native: bool) -> dict:
+    """What the model is sent for one ASSISTANT or TOOL row of the working
+    history. ``native_history`` (§4VO): the structured row. Otherwise the
+    Qwen-Agent forms the loop has always sent: a result as a user message in
+    ``<tool_response>``, a call as ``<tool_call>`` text in the assistant
+    message (``render_native`` picks the equals or the attribute dialect)."""
+    if native_history:
+        return _native_history_row(m)
+    if m.get("role") == "tool":
+        return {"role": "user", "content": _tool_row_as_user_text(m)}
+    return {"role": "assistant",
+            "content": _render_assistant_with_tool_calls(m.get("content"), m.get("tool_calls") or [],
+                                                         native=render_native)}
+
+
+def result_row_for_model(r: dict, native_history: bool) -> dict:
+    """One tool RESULT as the model is sent it outside the turn loop's own
+    rebuild (the receipts of a forced final answer): a tool row in native
+    history, else the Qwen-Agent user message — whatever role ``r`` carries."""
+    if native_history:
+        return _native_history_row({**r, "role": "tool"})
+    return {"role": "user", "content": _tool_row_as_user_text(r)}
+
+
+def recovered_result_row(name, tool_call_id, content: str, native_history: bool) -> dict:
+    """The one tool result an overflow recovery keeps (``content`` is already
+    cut and defused by the caller): a tool row in native history, else the
+    ``<tool_response>`` user message this path has always sent, byte for byte."""
+    if native_history:
+        return {"role": "tool", "tool_call_id": str(tool_call_id or ""), "name": str(name or "unknown"),
+                "content": content}
+    return {"role": "user", "content": f"<tool_response name=\"{name}\">\n{content}\n</tool_response>"}
+
+
+def shape_call_arguments(tool: dict, name: str, args: dict, definitions) -> list:
+    """§4VN: decode the list/object parameters of one call that arrived as
+    JSON text (``arg_shapes.decode_structured``) and store the result back in
+    the call, so the tool, the history and every later reader see the same
+    arguments. Returns the names decoded."""
+    shaped = _arg_shapes.decode_structured(name, args, definitions)
+    if shaped:
+        tool["function"]["arguments"] = json.dumps(args)
+    return shaped
+
+
 def _render_assistant_with_tool_calls(content: str, tool_calls: list,
                                       native: bool = False) -> str:
     """Render an assistant message + its native ``tool_calls`` list as the
@@ -9237,6 +9383,11 @@ def _tool_call_format_example(native: bool, param: str = "arg1", value: str = "v
     point is to show the model ONE dialect: the one its own prompt
     path already speaks.
     """
+    if native and _mp.main().dialect.history == "native":
+        # §4VO: a model with its own call format is not taught Qwen's
+        return ("a structured tool call through the tool-calling interface of this conversation "
+                f"(the tool's name and its arguments as a JSON object, e.g. {{\"{param}\": \"{value}\"}}) — "
+                "not written out as text")
     if native:
         return (
             "<tool_call>\n<function=the_tool_name>\n"
@@ -17074,6 +17225,46 @@ class GhostAgent:
             self._active_tool_defs_resolved = None
             self._xml_schema_cache.clear()
 
+    def _arg_shape_definitions(self):
+        """§4VN: the schemas `shape_call_arguments` reads — the ACTIVE set (the
+        static list lacks the tools defined per context: image_generation's
+        `reference_images` and `subjects` are lists too). `serve_tuned=False`:
+        this is not the prompt being built."""
+        try:
+            return get_active_tool_definitions(self.context, serve_tuned=False) or TOOL_DEFINITIONS
+        except Exception:  # noqa: BLE001
+            return TOOL_DEFINITIONS
+
+    async def _model_resync(self) -> None:
+        """§4VM: line the agent up with the model the main server runs now
+        (`model_boot.sync`: profile, tokenizer, token check, context budget) —
+        off the event loop, at most once a minute, and only in a process that
+        booted through `main.py` (a test's agent asks no server). Never raises."""
+        try:
+            from . import model_boot as _model_boot
+            if not _model_boot.booted():
+                return
+            args = self.context.args
+            try:
+                # bounded: a server that drips bytes must not hold the warm-up (the
+                # thread ends on its own; a second sync is refused while it runs)
+                from ..utils.aio import wait_for as _wait_for      # py3.10: asyncio's drops a cancel
+                await _wait_for(asyncio.to_thread(_model_boot.sync, args), MODEL_RESYNC_MAX_S)
+            finally:
+                # compared with what THIS agent last applied, not with "before this call": a
+                # sync that outlived the wait finishes later, and the next warm-up applies it
+                now = (_mp.main(), _model_boot.last().get("server_model", ""))
+                seen = getattr(self, "_model_applied", None)
+                self._model_applied = now
+                if seen is not None and seen != now:
+                    _effort.forget_server_default()     # the old model's level says nothing now
+                cm = getattr(self, "_context_manager", None)
+                budget = int(getattr(args, "max_context", 0) or 0)
+                if cm is not None and budget > 0 and cm.max_tokens != budget:
+                    cm.max_tokens = budget              # it read the budget once, at first use
+        except Exception as exc:  # noqa: BLE001 — a warm-up never fails on this
+            logger.debug("model re-sync skipped: %s", exc)
+
     async def warm_up_main_prefix(self, *, quiet: bool = False, displaced_by: str = "") -> None:
         """Warm the head of the live tool schema (§4NN: one variant — the
         `fs_batch` treatment head left with the experiments registry)."""
@@ -17132,6 +17323,9 @@ class GhostAgent:
             llm = getattr(self.context, "llm_client", None)
             if llm is None:
                 return
+            # §4VM: the model the server runs NOW (a llama restart may have changed it) —
+            # every warm-up, loud or quiet: the re-warm loop's ticks are all quiet
+            await self._model_resync()
             if not quiet and _effort.enabled():
                 # §4RC: the server's default level, for Default turns' trajectories
                 from .llm import _node_key
@@ -17849,9 +18043,11 @@ class GhostAgent:
             from .llm import with_probe_effort
             payload = with_probe_effort(payload)    # r2: an arm's level is set only at the send
             kw = (payload.get("chat_template_kwargs") or {}) if isinstance(payload, dict) else {}
-            if kw.get("enable_thinking") is False:
-                return "medium"
-            level = kw.get("reasoning_effort")
+            if _mp.is_no_think(payload):
+                off = _effort.thinking_off_level()      # §4VM: the model's unmarked level, not Qwen's
+                if off is not None:
+                    return off
+            level = kw.get(_mp.EFFORT_KEY)
             return level if level in _effort.LEVELS else default
         except Exception:  # noqa: BLE001
             return None
@@ -17866,7 +18062,7 @@ class GhostAgent:
         base = getattr(self, "_head_payload_base", None)
         hs = None
         if isinstance(base, dict):
-            kw = {k: v for k, v in (base.get("chat_template_kwargs") or {}).items() if k != "reasoning_effort"}
+            kw = {k: v for k, v in (base.get("chat_template_kwargs") or {}).items() if k != _mp.EFFORT_KEY}
             hs = await self._head_save_plan(llm, _effort.apply({**base, "chat_template_kwargs": kw}, level))
         if not isinstance(hs, dict) or hs.get("effort") != level:
             self._level_plan_failed = (rid, level)
@@ -18550,9 +18746,10 @@ class GhostAgent:
                            f"this request processes it as before", icon=Icons.HEAD_FAIL)
                 return False
             t0 = time.monotonic()
+            # §4VM: posted directly, not through the client — the model's own words here too
             body = {**hs["payload"], "stream": False, "max_tokens": 1}
             resp = await asyncio.to_thread(
-                _head_saves._http, hs["base"] + "/v1/chat/completions", body, left)
+                _head_saves._http, hs["base"] + "/v1/chat/completions", _mp.shape_main(body), left)
             dt = time.monotonic() - t0
             _v, _cached, prompt = rewarm_verdict(resp, dt)
             if prompt <= 0:
@@ -18792,7 +18989,8 @@ class GhostAgent:
             d.mkdir(parents=True, exist_ok=True)
             _head_saves.secure_dir(d)        # §4UD (H14): the owner's tokens — 0700
             ident = await asyncio.to_thread(_head_saves.server_identity, base)
-            rendered = await asyncio.to_thread(_head_saves.render, base, payload)
+            # §4VM: rendered as it is sent (the level in the model's own word)
+            rendered = await asyncio.to_thread(_head_saves.render, base, _mp.shape_main(payload))
             key = _head_saves.head_key(ident, rendered)
             n_tokens = _head_saves.stored_tokens(d, key)
             return {"base": base, "dir": d, "key": key, "identity": ident,
@@ -23588,8 +23786,8 @@ class GhostAgent:
         thinks. Nothing when the switch is off, the owner picked a level for
         this request (the pick wins), or a probe arm sets the effort itself."""
         try:
-            if not why or not _effort.enabled():
-                return
+            if not why or not _effort.enabled() or not _effort.escalation_sentence():
+                return                         # §4VM: a model with no such sentence books nothing
             from .llm import EFFORT_ARMS
             from ..utils.logging import prompt_arm, effort_override_context, request_kind
             rid = str(req_id or "")
@@ -25299,6 +25497,13 @@ class GhostAgent:
                     t_args = json.loads(tool["function"]["arguments"], strict=False)
                     if _cname == "file_system" and normalize_fs_append_alias(t_args):
                         tool["function"]["arguments"] = json.dumps(t_args)   # §4NZ review
+                    # §4VN: a list/object the model wrote as JSON text where the tool's schema
+                    # says list/object (a call that came as TEXT) — the value, not its text
+                    _shaped = shape_call_arguments(tool, _cname, t_args, self._arg_shape_definitions())
+                    if _shaped:
+                        pretty_log("Agent Parser", f"{_cname}: {', '.join(_shaped)} arrived as JSON text — "
+                                   f"passed as the {'values' if len(_shaped) > 1 else 'value'} it describes",
+                                   icon=Icons.TOOL_CODE)
 
                     # `copy` CREATES A FILE. `is_mutating` below lists it —
                     # its comment even says "`file_system` `copy` mutates
@@ -31038,13 +31243,9 @@ class GhostAgent:
                         # the stop note, every rebuilt prompt carries it too (s5-r14; r15: keyed
                         # on the record row itself — a tool_call_id can be "" or repeat)
                         _rt_content += str(real_tool.get("_stop_note") or "")
-                        recovery_msgs.append({
-                            "role": "user",
-                            "content": (
-                                f"<tool_response name=\"{real_tool.get('name', 'unknown')}\">\n"
-                                f"{_rt_content}\n</tool_response>"
-                            ),
-                        })
+                        recovery_msgs.append(recovered_result_row(                              # §4VO
+                            real_tool.get("name", "unknown"), real_tool.get("tool_call_id"), _rt_content,
+                            native_history_on(self.context)))
 
                     # §4RZ: messages the user sent while this turn ran were booked as
                     # read when drained — the recovery must carry them (the volatile
@@ -33894,7 +34095,7 @@ class GhostAgent:
                     if hasattr(self, 'disabled_tools') and self.disabled_tools:
                         all_tools = [t for t in all_tools if t["function"]["name"] not in self.disabled_tools]
 
-                    from .prompts import QWEN_TOOL_PROMPT, QWEN_TOOL_PROMPT_NATIVE
+                    from .prompts import QWEN_TOOL_PROMPT
 
                     # ARCHITECTURAL OPTIMISATION #1: NO MORE per-turn system
                     # slot mutation. The system message was already locked at
@@ -33990,7 +34191,7 @@ class GhostAgent:
                             f"DO NOT emit any <tool_call> blocks. Reply in "
                             f"plain prose only.\n\n"
                             f"ADAPT YOUR THINKING DEPTH TO THE TASK:\n"
-                            f"{render_think_budget_guidance(think_budget)}\n"
+                            f"{think_guidance_for_model(think_budget)}\n"
                         ).replace("\r", "")
                         minified_schemas = ""  # for downstream visibility
                     elif _native_tools_active:
@@ -34018,12 +34219,7 @@ class GhostAgent:
                         # proven, journal §6). The native header teaches
                         # think-discipline + parallelism only; the chat
                         # template owns the call format.
-                        tool_header_block = (
-                            QWEN_TOOL_PROMPT_NATIVE
-                            .replace('{tool_schemas}', _native_pointer)
-                            .replace('{think_budget_guidance}', render_think_budget_guidance(think_budget))
-                            .replace("\r", "")
-                        )
+                        tool_header_block = native_tool_header(_native_pointer, think_budget)   # §4VO
                         minified_schemas = _native_pointer  # for diagnostics
                     else:
                         # Legacy XML-only path: full schema in the prompt.
@@ -34048,7 +34244,7 @@ class GhostAgent:
                             f"DO NOT emit any <tool_call> blocks. Reply in "
                             f"plain prose only.\n\n"
                             f"ADAPT YOUR THINKING DEPTH TO THE TASK:\n"
-                            f"{render_think_budget_guidance(think_budget)}\n"
+                            f"{think_guidance_for_model(think_budget)}\n"
                         ).replace("\r", "")
                     # (§4TD: no "### SKILL PLAYBOOK" block — lesson retrieval,
                     # off behind a flag since §4ON, is removed with the store.)
@@ -34232,22 +34428,13 @@ class GhostAgent:
                         pretty_log("Reasoning Effort", f"xhigh note placed — turn {turn+1} thinks at xhigh",
                                    icon=Icons.EFFORT_XHIGH)
                     req_messages = []
+                    # §4VO: tool results and the model's own earlier calls — as Qwen-Agent text
+                    # (a user message in <tool_response>, a <tool_call> block), or, for a model
+                    # whose profile asks for it, as the structured rows its template renders
+                    _native_history = native_history_on(self.context)
                     for m in messages:
-                        if m.get("role") == "tool":
-                            # Translate tool results to a user message wrapped in <tool_response>
-                            req_messages.append({
-                                "role": "user",
-                                "content": _tool_row_as_user_text(m)
-                            })
-                        elif m.get("role") == "assistant":
-                            req_messages.append({
-                                "role": "assistant",
-                                "content": _render_assistant_with_tool_calls(
-                                    m.get("content"),
-                                    m.get("tool_calls") or [],
-                                    native=_render_native,
-                                ),
-                            })
+                        if m.get("role") in ("tool", "assistant"):
+                            req_messages.append(history_row_for_model(m, _native_history, _render_native))
                         elif m.get("role") == "user":
                             content_val = m.get("content", "")
                             has_vision_node = bool(getattr(self.context.llm_client, 'vision_clients', None))
@@ -34342,7 +34529,7 @@ class GhostAgent:
                             # depth, persona, recalled memory, workspace notes)
                             # opens the state block at the end instead
                             _stable_injection, _req_ctx = _split_request_context(
-                                tool_header_block, render_think_budget_guidance(think_budget),
+                                tool_header_block, think_guidance_for_model(think_budget),   # §4VO: as the header carries it
                                 active_persona, fetched_context, continuity_text)
                             dynamic_state = "".join(_req_ctx.values()) + dynamic_state
                             _ds_sections = {**_req_ctx, **_ds_sections}
@@ -34432,7 +34619,8 @@ class GhostAgent:
                         _blocked = self._member_blocked_tool_names()
                         req_messages = [
                             {**m, "content": member_steer_caveat(m.get("content"), _blocked)}
-                            if m.get("role") == "user" and isinstance(m.get("content"), str) else m
+                            if m.get("role") in ("user", "tool")       # §4VO: a result is a tool row in native history
+                            and isinstance(m.get("content"), str) else m
                             for m in req_messages]
                     _anchor = self._state_anchor(req_id) if _pin_stable else None   # §4RC
                     req_messages = self._compose_injection(
@@ -34515,8 +34703,7 @@ class GhostAgent:
                         "model": model,
                         "messages": req_messages,
                         "stream": False,
-                        **sampling_params,
-                        "frequency_penalty": 0.00,
+                        **turn_sampler_fields(sampling_params),
                         "max_tokens": tool_turn_max_tokens,
                         # Stop sequences removed for Qwen 3.6 35B-A3. The
                         # QWEN_TOOL_PROMPT explicitly invites parallel
@@ -34644,7 +34831,7 @@ class GhostAgent:
                         # §4SD: the room this turn's prompt leaves in the window, up to 64k
                         payload["max_tokens"] = await self._tool_turn_room(payload)
                     payload = self._with_turn_effort(payload, req_id)   # §4RB
-                    pretty_log("LLM Request", f"Turn {turn+1} | Temp {sampling_params['temperature']:.2f}", icon=Icons.LLM_ASK)
+                    pretty_log("LLM Request", f"Turn {turn+1} | Temp {_temp_label(sampling_params)}", icon=Icons.LLM_ASK)
 
                     if is_final_generation and stream_response:
                         payload["stream"] = True
@@ -37039,7 +37226,8 @@ class GhostAgent:
                     _ff_payload["stream"] = False
                     _ff_payload["messages"] = list(payload.get("messages") or []) + [
                         {"role": "assistant", "content": _ff_raw_turn or "(no answer)"},
-                    ] + [{"role": "user", "content": _tool_row_as_user_text(r)} for r in _ff_rows] + [   # the receipt (r2 MINOR 6)
+                    ] + [result_row_for_model(r, native_history_on(self.context))
+                         for r in _ff_rows] + [   # the receipt (r2 MINOR 6); §4VO: in the model's own result form
                         {"role": "user", "content": (
                             report_written_alert(_ff_landed, str(last_user_content or "")) if _ff_landed
                             else forced_final_answer_directive(

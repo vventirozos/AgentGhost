@@ -10,6 +10,7 @@ Two capabilities:
 2. verify_code_output — Check whether code output actually answers the user's question.
 """
 
+from .model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 from ..utils.json_store import open_append  # torn-tail-safe JSONL appends (§4MF)
 import asyncio
 import base64
@@ -2582,8 +2583,7 @@ class Verifier:
             if _STAGE_NO_THINK:
                 payload["messages"][0]["content"] = \
                     prompt + "\n\n/no_think"
-                payload["chat_template_kwargs"] = {
-                    "enable_thinking": False}
+                payload["chat_template_kwargs"] = _no_think_kwargs()
                 # §4BJ (2026-08-14): the stop-at-newline belt applies to
                 # the CHEAP legs only. It was measured on the cheap judge
                 # (99.5% minified-compliant) but rode along on force_main
@@ -2645,7 +2645,7 @@ class Verifier:
                     # motivated (json_only already kills the prelude).
                     "max_tokens": int(critic_max_tokens or _CRITIC_MAX_TOKENS),
                     "stream": False,
-                    "chat_template_kwargs": {"enable_thinking": False},
+                    "chat_template_kwargs": _no_think_kwargs(),
                 }
                 if json_only:
                     critic_payload["stop"] = ["\n"]
@@ -2807,7 +2807,7 @@ class Verifier:
                 # its cap (see _main_no_think_enabled).
                 payload["messages"][0]["content"] = (
                     payload["messages"][0]["content"] + "\n\n/no_think")
-                payload["chat_template_kwargs"] = {"enable_thinking": False}
+                payload["chat_template_kwargs"] = _no_think_kwargs()
             result = await self.llm_client.chat_completion(
                 payload, **_bounded_fallback_kwargs(self.llm_client))
             _choice = (result.get("choices") or [{}])[0] if isinstance(result, dict) else {}
@@ -3077,7 +3077,7 @@ class Verifier:
                 "temperature": 0.0,
                 "max_tokens": 4,
                 "stream": False,
-                "chat_template_kwargs": {"enable_thinking": False},
+                "chat_template_kwargs": _no_think_kwargs(),
             }
             # No `tools` on this payload, so the portable OAI fields are
             # accepted (§4PJ: the shared helper went with the entropy tracker).
@@ -5022,7 +5022,7 @@ class Verifier:
             "stream": False,
         }
         if _VISUAL_NO_THINK:
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            payload["chat_template_kwargs"] = _no_think_kwargs()
         # §4QT/§4QU: with GHOST_VISUAL_CHECK_POOL=critic (arm `check_critic`),
         # or the look's own switch GHOST_LOOK_POOL=critic (arm `look_critic`,
         # which implies this), the pixel check goes to the critic pool — the
@@ -5174,7 +5174,7 @@ class Verifier:
             return None
         payload = {"messages": [{"role": "user", "content": prompt + "\n\n/no_think"}],
                    "temperature": 0.1, "max_tokens": _CRITIC_MAX_TOKENS, "stream": False,
-                   "chat_template_kwargs": {"enable_thinking": False}}
+                   "chat_template_kwargs": _no_think_kwargs()}
         try:
             _kw = dict(_bounded_fallback_kwargs(self.llm_client))
             _kw.pop("timeout", None)

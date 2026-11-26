@@ -35,6 +35,7 @@
       <a href="../reference/performance/context_manager.html">Context manager (core.context_manager)</a>
       <a href="../reference/performance/head_saves.html">Head and slot saves (core.head_saves)</a>
       <a href="../reference/performance/llm.html">Model client (LLM) (core.llm)</a>
+      <a href="../reference/performance/model_profile.html">Model profiles (core.model_profile)</a>
       <a href="../reference/performance/node_offload.html">Off-main node offload</a>
       <a href="../reference/performance/node_throughput.html">Node throughput (core.node_throughput)</a>
     </div>
@@ -98,6 +99,7 @@
 
   <h2 id="limits">Limits and switches</h2>
   <ul>
+    <li>What is particular to a model (sampler values, the thinking-off switch, effort levels, tokenizer) is its <a href="../reference/performance/model_profile.html">model profile</a>. The agent picks it from the model file the server runs; a new model needs a JSON file, not code. Tokens are counted with the tokenizer inside the model file the server runs, checked against the server. The prompt's tool and thinking tags are still Qwen's.</li>
     <li>Saves are switched by <code>GHOST_HEAD_SAVES</code> and conversation keeping by <code>GHOST_CONV_KEEP</code>. Off, everything still works, just slower.</li>
     <li>The effort menu exists only when <code>GHOST_REASONING_EFFORT=1</code> (set by the launcher while the 27B model is the main model). There is no automatic level choice; it was removed because a level change before tools forced a large re-read.</li>
     <li>Save files are large (gigabytes each). A changed head (new tools, new instructions) makes old files useless; they cost time, not correctness. Such a conversation file is deleted the first time its conversation returns. Conversation files saved before this rule existed (at most 6) are deleted the same way, once.</li>
@@ -116,6 +118,7 @@
     <li><a href="../reference/performance/context_manager.html">Context manager (core.context_manager)</a></li>
     <li><a href="../reference/performance/head_saves.html">Head and slot saves (core.head_saves)</a></li>
     <li><a href="../reference/performance/llm.html">Model client (LLM) (core.llm)</a></li>
+    <li><a href="../reference/performance/model_profile.html">Model profiles (core.model_profile)</a></li>
     <li><a href="../reference/performance/node_offload.html">Off-main node offload</a></li>
     <li><a href="../reference/performance/node_throughput.html">Node throughput (core.node_throughput)</a></li>
 </ul>

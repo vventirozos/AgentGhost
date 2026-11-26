@@ -77,7 +77,13 @@ def test_agent_splices_native_variant_on_native_path():
     assert "QWEN_TOOL_PROMPT_NATIVE\n" in src.replace(" ", "\n") or \
         "QWEN_TOOL_PROMPT_NATIVE" in src
     # The native pointer rides in the NATIVE variant's splice…
-    native_idx = src.index("QWEN_TOOL_PROMPT_NATIVE\n                            .replace('{tool_schemas}', _native_pointer)")
+    # §4VO: the native splice moved into `native_tool_header` (one function, so the header
+    # can be tested by what it returns) — it must still be built from the NATIVE variant
+    native_idx = src.index("tool_header_block = native_tool_header(_native_pointer, think_budget)")
+    built = agent_mod.native_tool_header("(POINTER)", "tight")
+    assert built.startswith(QWEN_TOOL_PROMPT_NATIVE.split("{tool_schemas}")[0]) and "(POINTER)" in built
+    for marker in ("<function name=", "<parameter name=", "CDATA"):
+        assert marker not in built
     # …and the legacy branch still splices the full XML prompt.
     legacy_idx = src.index("QWEN_TOOL_PROMPT\n                            .replace('{tool_schemas}', minified_schemas)")
     assert native_idx > 0 and legacy_idx > 0

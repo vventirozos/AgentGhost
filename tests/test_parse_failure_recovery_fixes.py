@@ -352,7 +352,8 @@ class TestBrokenReplayScrub:
         # Source guard: the single production call site must key the
         # dialect on args.native_tools.
         src = inspect.getsource(GhostAgent.handle_chat) + inspect.getsource(GhostAgent._run_internal_turn)
-        assert "native=_render_native" in src
+        # §4VO: the row is built by `history_row_for_model`, which is handed the same flag
+        assert "history_row_for_model(m, _native_history, _render_native)" in src
         assign = src.split("_render_native = ", 1)[1].split("req_messages", 1)[0]
         assert '"native_tools"' in assign
 

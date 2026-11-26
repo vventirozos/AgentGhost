@@ -59,6 +59,7 @@ than a truncated sentence.
 
 from __future__ import annotations
 
+from ..core.model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import json
 import logging
 import os
@@ -390,6 +391,25 @@ def _post_inference(url: str, payload: dict, timeout: float) -> dict:
         raise TransientNodeError("whisper server returned a non-JSON body") from exc
 
 
+_audio_model = {"path": ""}
+
+
+def _note_audio_model(model_path) -> None:
+    """§4VM: the model file the audio node's ``/props`` named."""
+    if isinstance(model_path, str) and model_path:
+        _audio_model["path"] = model_path
+
+
+def _for_audio_node(payload: dict) -> dict:
+    """§4VM: ``payload`` in the words of the model the audio node runs (its
+    thinking-off switch); as written while that model is unknown."""
+    from ..core import model_profile as _mp
+    try:
+        return _mp.shape(payload, _mp.resolve(_mp.profiles(), _audio_model["path"]))
+    except Exception:  # noqa: BLE001 — never lose a transcript to this
+        return payload
+
+
 def node_slot_ctx() -> Optional[int]:
     """The audio node's per-slot context in tokens (llama-server ``/props``
     ``default_generation_settings.n_ctx``), or None when it cannot be read."""
@@ -398,6 +418,7 @@ def node_slot_ctx() -> Optional[int]:
     try:
         with httpx.Client(timeout=CONNECT_TIMEOUT_S) as client:
             body = client.get(f"{AUDIO_NODE_URL}/props").json()
+        _note_audio_model((body or {}).get("model_path"))
         n = int(((body or {}).get("default_generation_settings") or {}).get("n_ctx") or 0)
     except Exception as exc:  # noqa: BLE001
         logger.info("audio node slot size unknown (%s) — keeping the configured window", exc)
@@ -432,7 +453,7 @@ def build_payload(wav_bytes: bytes) -> dict:
     if not THINKING_ENABLED:
         # llama.cpp forwards this to the chat template; verified on nova's
         # Gemma 4 build 2026-09-24 (reasoning_content empty, same text).
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["chat_template_kwargs"] = _no_think_kwargs()
     return payload
 
 
@@ -488,7 +509,7 @@ def transcribe_window_full(wav_bytes: bytes, *, post_fn: Optional[Callable] = No
     if STT_URL:
         return _transcribe_window_whisper(wav_bytes, post_fn=post_fn)
     post = post_fn or _post_json
-    data = post(f"{AUDIO_NODE_URL}/v1/chat/completions", build_payload(wav_bytes), WINDOW_TIMEOUT_S)
+    data = post(f"{AUDIO_NODE_URL}/v1/chat/completions", _for_audio_node(build_payload(wav_bytes)), WINDOW_TIMEOUT_S)
     try:
         choice = data["choices"][0]
         # `or ""` rather than .get(default): the API sends explicit nulls.

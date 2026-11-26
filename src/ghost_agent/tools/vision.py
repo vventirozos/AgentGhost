@@ -1,3 +1,4 @@
+from ..core.model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import asyncio
 import base64
 import mimetypes
@@ -587,7 +588,7 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
             # the <think> prelude and content comes back empty (the exact
             # silent failure that kept the verifier's VISUAL gate inert, and
             # that emptied five of six live captions on 2026-09-24).
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            payload["chat_template_kwargs"] = _no_think_kwargs()
 
         # Bounded (§4LM): the vision node is the single main llama slot, and
         # the client default is 1200 s. A no-think caption takes seconds; a

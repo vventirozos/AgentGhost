@@ -60,6 +60,11 @@ FILTER_CHAIN = "GHOST_TOR_F"
 V6_CHAIN = "GHOST_TOR6"
 BOOTSTRAP_TIMEOUT_S = 75.0
 BOOTSTRAP_POLL_S = 2.0
+#: An UNUSABLE verification answer (no connection, HTML, another schema) is asked
+#: again this many times; a definite IsTor answer is never retried here.
+VERIFY_RETRIES = 2
+VERIFY_RETRY_S = 3.0
+VERIFY_RETRY_TIMEOUT_S = 10
 
 # §4LO: NO `User` line. Tor is STARTED as {TOR_USER} (a docker exec with that
 # user) instead of starting as root and dropping to it — which needed
@@ -219,6 +224,15 @@ def parse_tor_check(output: str) -> Tuple[Optional[bool], str]:
     if not isinstance(_is_tor, bool):
         return None, str(data.get("IP") or "")
     return _is_tor, str(data.get("IP") or "")
+
+
+def describe_unusable(code, output: str) -> str:
+    """Why a verification answer was unusable, for the log: curl's exit code and
+    the answer's SHAPE, never its text (a challenge page can carry an IP)."""
+    text = (output or "").strip()
+    shape = ("empty" if not text else "html" if text.startswith("<")
+             else "json" if text.startswith("{") else "other")
+    return f"curl exit {code}, {shape}, {len(text)} chars"
 
 
 def counters_cmd() -> str:

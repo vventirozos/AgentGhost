@@ -1,3 +1,4 @@
+from ..core.model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import asyncio
 from ..core.receipt_marks import (UNSEEN_IMAGE_NOTE as _UNSEEN_IMAGE_NOTE, IMAGE_SEEN_HEAD as _IMAGE_SEEN_HEAD,
                                   LOOK_OWNED_NOTE as _LOOK_OWNED_NOTE,
@@ -292,7 +293,7 @@ async def scene_look(llm_client, image_bytes: bytes) -> str:
             ]}],
             "temperature": 0.1,
             "max_tokens": 200,
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": _no_think_kwargs(),
         }
         _t0 = time.monotonic()
         try:
@@ -357,7 +358,7 @@ async def collage_verdict(llm_client, image_bytes: bytes):
             ]}],
             "temperature": 0.1,
             "max_tokens": 450,          # §4QJ: + the scene sentence (a cut JSON = no verdict)
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": _no_think_kwargs(),
         }
         _t0 = time.monotonic()
         try:

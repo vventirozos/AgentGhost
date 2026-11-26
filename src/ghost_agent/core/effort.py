@@ -23,6 +23,12 @@ repair re-entry) appends `escalation_note`, the template's own xhigh sentence,
 as one message at the END of the request's history. Nothing before it
 changes, so it costs its own ~50 tokens; the request runs on with it, the next
 request starts at the default without it. A level the owner picked wins.
+
+§4VM: what is Qwen's own — the level sentence, the xhigh sentence, the end of
+the system block, the template variable — lives in the main model's profile
+(`core/model_profile.py`, `ModelProfile.effort`). A main model whose profile
+has no effort is the switch off; the levels here are the agent's own scale,
+which the profile maps to the model's words at the send (`model_profile.shape`).
 """
 import json
 import os
@@ -30,13 +36,23 @@ import re
 import threading
 import time
 import urllib.request
+from typing import Optional
 
-LEVELS = ("low", "medium", "xhigh")
+from . import model_profile as _mp
+
+#: The agent's effort scale (the web UI's three levels).
+LEVELS = _mp.EFFORT_LEVELS
+
+
+def _spec():
+    """The main model's effort description (None = its template takes none)."""
+    return _mp.main().effort
 
 
 def enabled() -> bool:
-    """The startup switch (read per call; the launcher sets it once)."""
-    return os.environ.get("GHOST_REASONING_EFFORT", "0").strip() == "1"
+    """The startup switch (read per call; the launcher sets it once) — and a
+    main model whose template takes an effort (§4VM)."""
+    return os.environ.get("GHOST_REASONING_EFFORT", "0").strip() == "1" and _spec() is not None
 
 
 def parse_override(value) -> str:
@@ -46,10 +62,7 @@ def parse_override(value) -> str:
 
 
 def thinking_off(payload) -> bool:
-    try:
-        return (payload.get("chat_template_kwargs") or {}).get("enable_thinking") is False
-    except AttributeError:
-        return False
+    return _mp.is_no_think(payload)
 
 
 def apply(payload, level: str):
@@ -60,18 +73,14 @@ def apply(payload, level: str):
         return payload
     kw = payload.get("chat_template_kwargs")
     kw = dict(kw) if isinstance(kw, dict) else {}
-    kw.setdefault("reasoning_effort", level)
+    kw.setdefault(_mp.EFFORT_KEY, level)
     return {**payload, "chat_template_kwargs": kw}
 
 
 #: The 27B template's own xhigh sentence, verbatim (the 35B template has none
-#: and the model reads it as a plain note).
-XHIGH_SENTENCE = ("Reasoning effort is set to xhigh. Please think carefully through the task, "
-                  "validate key assumptions, consider plausible alternatives, and prioritize "
-                  "correctness, consistency, and clarity in the final answer.")
-
-#: The level sentence the template writes (medium writes none).
-_LEVEL_SENTENCE_RE = re.compile(r"Reasoning effort is set to (low|medium|xhigh)\b")
+#: and the model reads it as a plain note). The built-in Qwen profile's; the
+#: note a request gets is the MAIN profile's (`escalation_note`).
+XHIGH_SENTENCE = _mp.QWEN38.effort.escalation
 
 #: How long a looked-up server default is trusted: a llama restart can
 #: change it without the agent restarting.
@@ -85,15 +94,28 @@ def level_in_render(prompt: str) -> str:
     medium when it wrote none (the template's medium has no sentence)."""
     # §4RW-f r2: the system block only (a profile could quote the sentence),
     # and its last match — the template appends the sentence last
-    text = str(prompt or "").split("<|im_end|>", 1)[0]
-    found = _LEVEL_SENTENCE_RE.findall(text)
-    return found[-1] if found else "medium"
+    spec = _spec()
+    if spec is None:
+        return "medium"
+    written = _written_level(prompt, spec)
+    return (spec.agent_level(written) or spec.unmarked) if written is not None else spec.unmarked
+
+
+def _written_level(prompt, spec):
+    """What the template wrote as the level in the system part of ``prompt``
+    (the model's word, or what it renders that word as) — None = no sentence."""
+    text = str(prompt or "")
+    if spec.system_end:
+        text = text.split(spec.system_end, 1)[0]
+    found = re.findall(spec.sentence_re, text) if spec.sentence_re else []
+    return found[-1] if found else None
 
 
 def _render(base_url: str, timeout: float, kwargs=None) -> str:
     body = {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]}
     if kwargs:
         body["chat_template_kwargs"] = kwargs
+        body = _mp.shape_main(body)             # §4VM: the level in the model's own word
     req = urllib.request.Request(str(base_url).rstrip("/") + "/apply-template",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -109,10 +131,25 @@ def fetch_server_default(base_url: str, timeout: float = 3.0) -> str:
     server cannot say, or its template has no levels (review r1: the 35B's
     writes no sentence either — it is checked with a low render first)."""
     try:
-        if "Reasoning effort is set to low" not in _render(base_url, timeout, {"reasoning_effort": "low"}):
+        spec = _spec()
+        if spec is None or not spec.sentence_re:
+            return ""
+        # a level that writes a sentence, asked for: a template without levels writes none
+        probe = next((lv for lv in LEVELS if lv != spec.unmarked and lv in spec.levels), "")
+        if not probe:
+            return ""
+        marked = re.findall(spec.sentence_re, _render(base_url, timeout, {_mp.EFFORT_KEY: probe}))
+        if not any(spec.agent_level(m) == probe for m in marked):    # the word, or what the template writes for it
             return ""
         prompt = _render(base_url, timeout)
-        return level_in_render(prompt) if prompt else ""
+        if not prompt:
+            return ""
+        # §4VM-d: a default the template WRITES but that is none of the agent's levels (Inkling's
+        # own 0.9 when the launcher sets none) is not "medium" — it is unknown
+        written = _written_level(prompt, spec)
+        if written is not None and not spec.agent_level(written):
+            return ""
+        return level_in_render(prompt)
     except Exception:  # noqa: BLE001
         return ""
 
@@ -202,8 +239,41 @@ def stuck_reason(fname, op, target, *, refused, result_text="", ran_written_fail
     return ""
 
 
+def thinking_off_level() -> Optional[str]:
+    """The level a thinking-off call is BOOKED as: the main model's unmarked
+    level. For Qwen that is exact (its template writes no sentence then, the
+    same text as medium). For a template that writes something of its own for
+    "off" (Inkling 2 writes 0) it is a label only: the rendered text differs
+    from the unmarked level's, the server re-reads from that line on (about
+    130 tokens on Inkling, measured), and the saved head — keyed on the
+    rendered text — is never served for the wrong text. None when the model
+    has no switch to turn thinking off — the call then renders whatever level
+    it carries."""
+    spec, profile = _spec(), _mp.main()
+    if profile.think_off is None:
+        return None
+    return spec.unmarked if spec is not None else "medium"
+
+
+def forget_server_default() -> None:
+    """Drop the looked-up server level (the main model changed: the old
+    model's level says nothing about the new one)."""
+    with _server_default_lock:
+        _server_default.update(level="", at=0.0)
+
+
+def escalation_sentence() -> str:
+    """The main model's "think harder" sentence ("" = it has none: nothing is
+    booked or appended after a failure)."""
+    spec = _spec()
+    return spec.escalation if spec is not None else ""
+
+
 def escalation_note(why: str) -> str:
     """The message appended once per request after its first failure. "SYSTEM:"
     is a head the turn loop's own rows are known by (agent `_STEER_HEAD_RE`)
     — never read as the owner speaking."""
-    return f"SYSTEM: {str(why or 'a step failed').rstrip('.')}. {XHIGH_SENTENCE}"
+    sentence = escalation_sentence()
+    if not sentence:
+        return ""                               # a model with no words for "think harder"
+    return f"SYSTEM: {str(why or 'a step failed').rstrip('.')}. {sentence}"

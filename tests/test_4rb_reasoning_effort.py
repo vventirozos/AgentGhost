@@ -316,7 +316,10 @@ def test_one_hook_per_turn_and_no_automatic_level():
     # renders, to tell a change of level — none of them picks one)
     assert uses == {"enabled", "parse_override", "apply", "thinking_off", "stuck_reason", "escalation_note",
                     "server_default", "refresh_server_default", "known_server_default",
-                    "level_in_render", "LEVELS"}
+                    "level_in_render", "LEVELS",
+                    # §4VM: none of these picks a level either — whether the main model HAS a harder
+                    # sentence, which level a thinking-off call renders, and dropping a looked-up level
+                    "escalation_sentence", "thinking_off_level", "forget_server_default"}
 
 
 def test_routes_and_autonomous_turns():

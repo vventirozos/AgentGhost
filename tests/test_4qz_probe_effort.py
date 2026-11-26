@@ -62,6 +62,9 @@ def _post_json_args():
 
 def test_both_main_server_calls_send_through_the_helper():
     got = _post_json_args()
-    assert ("self.http_client.post", "with_probe_effort(payload)") in got
-    assert ("client_to_use.build_request", "payload if node is not None else with_probe_effort(payload)") in got
+    # §4VM: both also pass through the main model's profile (`shape_main`); a
+    # node's stream through that node's (`_for_node`), without the arm
+    assert ("self.http_client.post", "_mp.shape_main(with_probe_effort(payload))") in got
+    assert ("client_to_use.build_request",
+            "self._for_node(node, payload) if node is not None else _mp.shape_main(with_probe_effort(payload))") in got
     assert len(got) == 2

@@ -104,7 +104,7 @@ m.MUT = [
     ("R36d the reason code is not passed", AG,
      '                                                      reason_code=getattr(_outcome, "reason_code", "") or "")',
      '                                                      reason_code="")'),
-    ("R37 the note loses the template sentence", EF, "{str(why or 'a step failed').rstrip('.')}. {XHIGH_SENTENCE}\"",
+    ("R37 the note loses the template sentence", EF, "{str(why or 'a step failed').rstrip('.')}. {sentence}\"",     # §4VM: the profile's sentence
      "{str(why or 'a step failed').rstrip('.')}.\""),
     ("R38 the note is not a loop row", EF, '    return f"SYSTEM: {', '    return f"NOTE: {'),
     ("R39 escalation ignores the switch", AG, "            if not why or not _effort.enabled():\n                return\n",

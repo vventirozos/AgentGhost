@@ -21,6 +21,7 @@ a measured win. Read per call so a bench can A/B via env.
 
 from __future__ import annotations
 
+from .model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import json
 import logging
 import os
@@ -89,7 +90,7 @@ def judge_payload(prompt: str) -> Dict[str, Any]:
         "temperature": 0.0,
         "max_tokens": 256,
         "stream": False,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": _no_think_kwargs(),
         "stop": ["\n"],
     }
 

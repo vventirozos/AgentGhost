@@ -961,6 +961,33 @@ CRITICAL RULES FOR THINKING:
 CRITICAL: Do NOT regurgitate system rules.
 PARALLEL EXECUTION: You may call MULTIPLE tools in a single turn. If you need to read 3 files, search the web, and run a script simultaneously, issue all the calls together in that turn."""
 
+#: §4VO (phase 4): the same rules for a model whose reasoning is a separate
+#: channel and that never writes a ``<think>`` tag (Inkling 2). Each pair is
+#: (what the Qwen wording says, the tag-free wording); applied in this order.
+#: A test fails when a pair no longer matches the text above, or a tag is left.
+THINK_TAG_REWORDINGS = (
+    ("state your immediate next step inside <think></think> tags", "settle your immediate next step in your reasoning"),
+    ("inside the <think> block", "in your reasoning"),
+    ("immediately close the </think> tag, and", "stop reasoning, and"),
+    ("inside the think block", "while you reason"),
+    ("make a decision, close the </think> tag, and", "make a decision, stop reasoning, and"),
+    ("After closing the </think> tag, DO NOT", "After your reasoning, DO NOT"),
+    ("step by step in <think> for as long", "step by step in your reasoning for as long"),
+    ("before closing </think>", "before you stop reasoning"),
+    ("DO NOT draft runnable code inside <think>", "DO NOT draft runnable code in your reasoning"),
+    ("STOP mid-sentence, close </think>, and", "STOP mid-sentence, end your reasoning, and"),
+    ("<think> is for plan sketches", "Reasoning is for plan sketches"),
+)
+
+
+def without_think_tags(text: str) -> str:
+    """``text`` (the tool header, the thinking guidance) worded for a model
+    with no ``<think>`` tags. Text that names no tag comes back unchanged."""
+    for old, new in THINK_TAG_REWORDINGS:
+        text = text.replace(old, new)
+    return text
+
+
 SYSTEM_PROMPT = """### ROLE AND IDENTITY
 You are Ghost, an autonomous Artificial Intelligence matrix. You are a proactive digital operator with persistent memory, secure sandboxed execution, and self-directing agency.
 

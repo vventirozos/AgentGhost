@@ -22,6 +22,7 @@ a broken gate must never block builds; it logs and lets the build pass.
 """
 from __future__ import annotations
 
+from .model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import json
 import logging
 import os
@@ -129,7 +130,7 @@ async def constraint_gate(context, constraints: List[str],
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt + "\n\n/no_think"}],
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": _no_think_kwargs(),
         "temperature": 0.0,
         "max_tokens": 400,
         "stream": False,

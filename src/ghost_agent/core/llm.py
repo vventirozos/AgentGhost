@@ -179,13 +179,7 @@ def _disable_thinking(node_payload: Dict[str, Any]) -> None:
     was also measured and does NOT suppress thinking on this template — only
     the chat-template kwarg does.
     """
-    kw = node_payload.get("chat_template_kwargs")
-    if not isinstance(kw, dict):
-        kw = {}
-    else:
-        kw = dict(kw)
-    kw.setdefault("enable_thinking", False)
-    node_payload["chat_template_kwargs"] = kw
+    _mp.set_no_think(node_payload)      # §4VM: the agent's switch; the send words it for the node's model
 
 
 #: §4QZ: probe arm → the chat template's `reasoning_effort` (Qwen3.8-27B:
@@ -208,7 +202,7 @@ def with_probe_effort(payload: Dict[str, Any]) -> Dict[str, Any]:
         return payload
     kw = payload.get("chat_template_kwargs")
     kw = dict(kw) if isinstance(kw, dict) else {}
-    kw.setdefault("reasoning_effort", level)
+    kw.setdefault(_mp.EFFORT_KEY, level)
     return {**payload, "chat_template_kwargs": kw}
 
 
@@ -539,6 +533,7 @@ _IMAGE_NO_RETRY_HINT = {
 
 
 from .node_throughput import NodeThroughput, DistillPlan
+from . import model_profile as _mp
 from .think_split import repair_message as _repair_think_split, repair_stream as _repair_think_split_stream
 
 
@@ -1270,6 +1265,30 @@ BEFORE_MAIN_DISPATCH_S = 150.0
 DEFERRED_LANE_WAIT_S = 600.0
 
 
+def _same_server(a, b) -> bool:
+    """§4VM: two URLs name one server — compared by host, port and path, not
+    by spelling (scheme or its absence, letter case, a trailing ``/v1`` or
+    slash, ``localhost`` for 127.0.0.1). Two paths on one port are two servers
+    (a router in front of several models)."""
+    def norm(u):
+        u = str(u or "").strip()
+        if not u:
+            return None
+        from urllib.parse import urlsplit
+        try:
+            p = urlsplit(u if "://" in u else "http://" + u)
+            host = (p.hostname or "").lower()
+            port = p.port or (443 if p.scheme.lower() == "https" else 80)
+        except ValueError:
+            return None
+        if host == "localhost":
+            host = "127.0.0.1"
+        path = re.sub(r"/v1$", "", p.path.rstrip("/"))
+        return (host, port, path) if host else None
+    na, nb = norm(a), norm(b)
+    return na is not None and na == nb
+
+
 def _node_key(url) -> str:
     u = str(url or "").strip().rstrip("/")
     return u[:-3] if u.endswith("/v1") else u
@@ -1814,7 +1833,7 @@ class LLMClient:
                     "messages": [{"role": "user", "content": "ok"}],
                     "max_tokens": 1, "temperature": 0.0,
                     "stream": False,
-                    "chat_template_kwargs": {"enable_thinking": False},
+                    "chat_template_kwargs": _mp.no_think_kwargs(),
                 }
                 # Fire the -np per-slot warmups CONCURRENTLY. Awaiting them in
                 # series (the old loop) just re-grabs the one slot that freed
@@ -1944,7 +1963,7 @@ class LLMClient:
                             "messages": [{"role": "user", "content": "ok"}],
                             "max_tokens": 1, "temperature": 0.0,
                             "stream": False,
-                            "chat_template_kwargs": {"enable_thinking": False},
+                            "chat_template_kwargs": _mp.no_think_kwargs(),
                         }
                         await self.chat_completion(
                             payload, use_worker=(label == "worker"),
@@ -2551,6 +2570,42 @@ class LLMClient:
         except Exception:                                       # noqa: BLE001
             return 1
 
+    def _note_node_model(self, url: str, model_path) -> None:
+        """§4VM: remember the model file a node's own ``/props`` named."""
+        if url and isinstance(model_path, str) and model_path:
+            models = self.__dict__.setdefault("_node_models", {})
+            if models.get(url) != model_path:
+                models[url] = model_path
+                self.__dict__.setdefault("_node_profile_memo", {}).pop(url, None)
+
+    def node_profile(self, node) -> Optional["_mp.ModelProfile"]:
+        """§4VM: the profile of the model a node runs. A node that IS the
+        main server (the vision pool points at it) gets the main profile, so
+        one server is never spoken to in two dialects. Otherwise: the model
+        file its ``/props`` named; only when that fits no profile (or was
+        never read), its configured label; None when neither fits (the node
+        is then sent requests as written).
+
+        The file is read once, by the capacity probe at first contact: a node
+        restarted on another model keeps its profile until the agent restarts."""
+        url = (node or {}).get("url") or ""
+        if url and _same_server(url, self.__dict__.get("upstream_url", "")):
+            return _mp.main()
+        memo = self.__dict__.setdefault("_node_profile_memo", {})
+        known = _mp.profiles()
+        hit = memo.get(url)
+        if hit is not None and hit[0] is known:
+            return hit[1]
+        prof = (_mp.resolve(known, self.__dict__.get("_node_models", {}).get(url))
+                or _mp.resolve(known, (node or {}).get("model")))
+        if url:
+            memo[url] = (known, prof)
+        return prof
+
+    def _for_node(self, node, payload):
+        """§4VM: ``payload`` as the model on ``node`` must receive it."""
+        return _mp.shape(payload, self.node_profile(node))
+
     async def _node_capacity(self, node: Dict[str, Any]) -> int:
         """How many requests this node can genuinely serve at once.
 
@@ -2600,6 +2655,9 @@ class LLMClient:
                 self.node_throughput.note_context(
                     url, (data.get("default_generation_settings") or {}
                           ).get("n_ctx"))
+                # §4VM: and which model the node runs — the send words the
+                # thinking switch and the effort level for THAT model.
+                self._note_node_model(url, data.get("model_path"))
                 raw = data.get("total_slots") or data.get("n_parallel")
                 if not (isinstance(raw, int) and raw > 0):
                     # Reached the node but learned nothing — a backend with no
@@ -3160,7 +3218,7 @@ class LLMClient:
 
                             import json
 
-                            body_bytes = json.dumps(node_payload, ensure_ascii=True).encode('ascii', errors='ignore')
+                            body_bytes = json.dumps(self._for_node(node, node_payload), ensure_ascii=True).encode('ascii', errors='ignore')
 
                             kwargs = {}
                             _untried = max(1, len(self.vision_clients) - len(tried_nodes) + 1)
@@ -3268,7 +3326,7 @@ class LLMClient:
 
                         import json
 
-                        body_bytes = json.dumps(node_payload, ensure_ascii=True).encode('ascii', errors='ignore')
+                        body_bytes = json.dumps(self._for_node(node, node_payload), ensure_ascii=True).encode('ascii', errors='ignore')
 
                         kwargs = {}
                         _untried = max(1, len(self.worker_clients) - len(tried_nodes) + 1)
@@ -3401,7 +3459,7 @@ class LLMClient:
                         node_payload = _copy.deepcopy(payload)
                         node_payload["model"] = node["model"]
 
-                        body_bytes = json.dumps(node_payload, ensure_ascii=True).encode('utf-8')
+                        body_bytes = json.dumps(self._for_node(node, node_payload), ensure_ascii=True).encode('utf-8')
 
                         kwargs = {}
                         _untried = max(1, len(self.critic_clients) - len(tried_nodes) + 1)
@@ -3498,7 +3556,7 @@ class LLMClient:
                         node_payload = _copy.deepcopy(payload)
                         node_payload["model"] = node["model"]
 
-                        body_bytes = json.dumps(node_payload, ensure_ascii=True).encode('utf-8')
+                        body_bytes = json.dumps(self._for_node(node, node_payload), ensure_ascii=True).encode('utf-8')
 
                         kwargs = {}
                         _untried = max(1, len(self.coding_clients) - len(tried_nodes) + 1)
@@ -3640,7 +3698,7 @@ class LLMClient:
                 if timeout is not None:
                     kwargs["timeout"] = timeout
                 async with self._main_node_lock:
-                    resp = await self.http_client.post("/v1/chat/completions", json=with_probe_effort(payload), **kwargs)
+                    resp = await self.http_client.post("/v1/chat/completions", json=_mp.shape_main(with_probe_effort(payload)), **kwargs)
                 resp.raise_for_status()
                 # A 200 with an empty / non-JSON body crashed here as
                 # `json.JSONDecodeError: Expecting value: line 1 column 1 (char
@@ -4684,7 +4742,8 @@ class LLMClient:
                     # We use stream() to keep the connection open and read chunks.
                     req = client_to_use.build_request(
                         "POST", "/v1/chat/completions",
-                        json=payload if node is not None else with_probe_effort(payload))   # §4QZ: main only
+                        json=(self._for_node(node, payload) if node is not None
+                              else _mp.shape_main(with_probe_effort(payload))))   # §4QZ: the arm is main only
                     self._inflight_inc(_base)
                     _stack.callback(self._inflight_dec, _base)
                     _conc_at_send = self._own_inflight(_base)

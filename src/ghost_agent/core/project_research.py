@@ -24,6 +24,7 @@ A research failure must never crash the caller (tool, advancer, or HTTP).
 
 from __future__ import annotations
 
+from .model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import datetime
 import hashlib
 import logging
@@ -808,7 +809,7 @@ async def _llm_complete(context, prompt: str, *, max_tokens: int,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": _no_think_kwargs(),
         }, timeout=timeout, is_background=is_background,
            # §4SC-b: inline on the user's turn it is a main call without the
            # head — a side call, so the conversation is saved first

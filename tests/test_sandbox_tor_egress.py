@@ -288,6 +288,87 @@ def test_an_unusable_verification_answer_is_enforced_unverified(tmp_path):
     assert any("no usable answer" in str(c.args[1]) for c in plog.call_args_list)
 
 
+def _answers(*seq):
+    left = list(seq)
+
+    def _next(_cmd):
+        # past the end: a definite leak, so an extra request changes the result
+        # (a raise here would be swallowed by the retry's own except)
+        v = left.pop(0) if left else (0, b'{"IsTor":false,"IP":"8.8.8.8"}')
+        if isinstance(v, Exception):
+            raise v
+        return v
+    return _next, left
+
+
+def test_an_unusable_answer_is_retried_until_usable(tmp_path):
+    sb = _stub(tmp_path)
+    nxt, left = _answers((7, b""), (0, b"<html>x</html>"), (0, TOR_OK.encode()))
+    _, plog = _drive(sb, {T.CHECK_URL: nxt})
+    assert left == [] and sb._egress_state == "enforced"
+    assert sb._egress_exit_ip == "37.221.208.71"
+    msg = " ".join(str(c.args[1]) for c in plog.call_args_list)
+    assert "no usable answer" not in msg and "after 2 unusable answer(s): curl exit 7, empty" in msg
+
+
+def test_a_usable_first_answer_is_not_retried(tmp_path):
+    seen, plog = _drive(_stub(tmp_path))
+    assert sum(1 for c in _cmds(seen) if T.CHECK_URL in c) == 1
+    assert not any("unusable" in str(c.args[1]) for c in plog.call_args_list)
+
+
+def test_exhausted_retries_log_shapes_and_never_the_text(tmp_path):
+    sb = _stub(tmp_path)
+    nxt, left = _answers((28, b""), (0, b"<html>9.9.9.9</html>"), (0, b'{"x":"9.9.9.9"}'))
+    seen, plog = _drive(sb, {T.CHECK_URL: nxt})
+    msg = " ".join(str(c.args[1]) for c in plog.call_args_list)
+    assert left == [] and sb._egress_state == "enforced"
+    probes = [c for c, _k in seen if T.CHECK_URL in c]
+    assert len(probes) == 3 and all("-m 10 " in c for c in probes[1:])
+    warn = [c for c in plog.call_args_list if "no usable answer" in str(c.args[1])]
+    assert len(warn) == 1 and warn[0].kwargs.get("no_truncate") is True   # the reasons come last
+    assert "curl exit 28, empty" in msg and "html" in msg and "json" in msg and "9.9.9.9" not in msg
+
+
+def test_a_leak_seen_on_a_retry_is_corroborated_and_cut_off(tmp_path):
+    sb = _stub(tmp_path)
+    leak = (0, b'{"IsTor":false,"IP":"9.9.9.9"}')
+    nxt, left = _answers((7, b""), leak, leak)
+    _drive(sb, {T.CHECK_URL: nxt})
+    assert left == [] and sb._egress_state == "blocked"
+    assert sb.client.networks.get.return_value.disconnect.called
+
+
+def test_a_retry_that_raises_does_not_leave_the_sandbox_blocked(tmp_path):
+    sb = _stub(tmp_path)
+    nxt, _ = _answers((7, b""), RuntimeError("wedged 9.9.9.9"))
+    seen, plog = _drive(sb, {T.CHECK_URL: nxt})
+    msg = " ".join(str(c.args[1]) for c in plog.call_args_list)
+    assert sb._egress_state == "enforced"
+    assert sum(1 for c in _cmds(seen) if T.CHECK_URL in c) == 2
+    assert "RuntimeError" in msg and "9.9.9.9" not in msg
+
+
+def test_the_retry_waits_and_is_bounded(tmp_path, monkeypatch):
+    """The exec runs with self._lock held: each retry has its own client deadline."""
+    sb = _stub(tmp_path)
+    nxt, _ = _answers((7, b""), (0, TOR_OK.encode()))
+    deadlines, naps = [], []
+
+    def _run(cmd, deadline_s=None, **k):
+        if T.CHECK_URL in cmd:
+            deadlines.append(deadline_s)
+            return nxt(cmd)
+        return (0, b"")
+    monkeypatch.setattr(sb, "_exec_run", _run, raising=False)
+    import ghost_agent.sandbox.docker as D
+    monkeypatch.setattr(D.time, "sleep", naps.append)
+    monkeypatch.setattr(D, "pretty_log", MagicMock())
+    sb._enforce_tor_egress()
+    assert sb._egress_state == "enforced"
+    assert deadlines == [60.0, 30.0] and naps == [T.VERIFY_RETRY_S]
+
+
 def test_enforcement_runs_once_per_generation_and_again_after_recreation(tmp_path):
     sb = _stub(tmp_path)
     seen1, _ = _drive(sb)

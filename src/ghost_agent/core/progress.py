@@ -36,6 +36,7 @@ probe`` — unless ``GHOST_PROGRESS_PROBES=1``, for tests). The client chooses w
 """
 from __future__ import annotations
 
+from .model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import asyncio
 import contextvars
 import json
@@ -768,7 +769,7 @@ class ProgressNarrator:
         """(line, "") or ("", why)."""
         payload = {"messages": [{"role": "user", "content": build_prompt(self.request, job["intent"], job["calls"])}],
                    "temperature": 0.2, "max_tokens": NARRATE_MAX_TOKENS, "stream": False,
-                   "chat_template_kwargs": {"enable_thinking": False}}
+                   "chat_template_kwargs": _no_think_kwargs()}
         from ..utils.aio import wait_for
         try:
             data = await wait_for(

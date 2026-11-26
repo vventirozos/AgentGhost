@@ -283,6 +283,10 @@
   handler map, no module reads the flag, and the bench still loads. Bench-harness pins stay in
   <code>tests/test_4fi_bench_scripts.py</code> and <code>tests/test_4fj_think_probe_and_workspace.py</code>.</p>
 
+  <h2 id="arg-shapes">Lists and objects that arrive as text (§4VN)</h2>
+  <p>A tool call the model writes as text (the <code>&lt;tool_call&gt;</code> form, read by the agent's own parser) carries every parameter as text. For a parameter the tool declares as an array or an object, the model writes JSON there, and the tool used to receive that JSON as a string: the browser's <code>interact</code> answered "requires a non-empty 'actions' list" four times in one request on 2026-11-26. <code>core/arg_shapes.py</code> <code>decode_structured</code> runs where every call's arguments are prepared (<code>shape_call_arguments</code>, which also stores the result back in the call) and replaces such a string with the list or object it describes.</p>
+  <p>It reads the tool's schema and nothing else — from the ACTIVE tool set, which includes the tools defined per context (<code>image_generation</code>'s <code>reference_images</code> and <code>subjects</code> are lists too). A parameter typed as a string (file content, a command, a query) reaches the tool exactly as written, whatever it looks like; so does a string that is not valid JSON, or is JSON of the other kind, or belongs to a parameter that may also be text. This is not the blanket decoding of arguments that §4RD removed.</p>
+  <p>Tests: <code>tests/test_4vn_arg_shapes.py</code>.</p>
 </main>
 </body>
 </html>

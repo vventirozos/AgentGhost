@@ -31,12 +31,12 @@ def _closure_body(name: str) -> str:
 def test_selfhood_critique_disables_thinking():
     body = _closure_body("_selfhood_critique_fn")
     assert "/no_think" in body
-    assert '"enable_thinking": False' in body
+    assert '_no_think_kwargs()' in body        # §4VM: the agent's switch (core/model_profile)
     assert "_strip_think" in body
 
 
 def test_workspace_critique_disables_thinking():
     body = _closure_body("_workspace_critique_fn")
     assert "/no_think" in body
-    assert '"enable_thinking": False' in body
+    assert '_no_think_kwargs()' in body        # §4VM: the agent's switch (core/model_profile)
     assert "_strip_think" in body

@@ -26,6 +26,7 @@ second subject) and leaves the main slot alone.
 
 from __future__ import annotations
 
+from ..core.model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import logging
 import os
 import time
@@ -243,7 +244,7 @@ async def tool_probe_model(context, prompts: Any = None, chain: bool = False,
             data = await wait_for(llm.chat_completion(
                 {"model": model, "messages": convo, "temperature": temperature,
                  "max_tokens": max_tokens, "stream": False,
-                 "chat_template_kwargs": {"enable_thinking": False}},
+                 "chat_template_kwargs": _no_think_kwargs()},
                 # foreground inside the turn: a background call parks behind
                 # its own request (§4QA); the worker leg never touches main
                 use_worker=(node == "worker"), off_main_only=(node == "worker"),

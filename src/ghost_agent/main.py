@@ -1,3 +1,4 @@
+from .core.model_profile import no_think_kwargs as _no_think_kwargs   # §4VM
 import sys
 print("🐍 Python runtime initialized. Loading heavy AI libraries (Transformers, ChromaDB)...", flush=True)
 
@@ -148,7 +149,6 @@ def install_access_log_redaction() -> None:
 #
 # Idempotent, so importing more than once cannot stack filters.
 install_access_log_redaction()
-from .utils.token_counter import load_tokenizer
 from .tools.registry import TOOL_DEFINITIONS
 
 print(" - Importing self-improvement pipeline (distill)...", flush=True)
@@ -333,7 +333,7 @@ def parse_args():
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true", help="Disable log truncation for debugging")
     parser.add_argument("--no-memory", action="store_true")
-    parser.add_argument("--max-context", type=int, default=65536)
+    parser.add_argument("--max-context", type=int, default=65536, help="Context budget in tokens (default 65536). Lowered at boot when the main server's window cannot hold it with room for a reply; 0 = take the budget from the server's window (§4VM).")
     # No hardcoded fallback key: unset (None) means "not configured", which
     # is allowed only on a loopback bind (auth disabled there, like an
     # explicit --api-key ''). A non-loopback bind without an explicit key
@@ -488,18 +488,53 @@ def _build_resolved_config(args, context) -> dict:
 _SANDBOX_JOB_REAP_EVERY_S = 60.0
 
 
+def _arm_reaper_stop(context) -> None:
+    context._reaper_stop = asyncio.Event()
+
+
+def _ask_reaper_to_stop(context) -> None:
+    stop = getattr(context, "_reaper_stop", None)
+    if isinstance(stop, asyncio.Event):
+        stop.set()
+
+
+def _reaper_stopping(context) -> bool:
+    stop = getattr(context, "_reaper_stop", None)
+    return isinstance(stop, asyncio.Event) and stop.is_set()
+
+
+async def _reaper_pause(stop, seconds) -> bool:
+    """Sleep between reap passes; True when shutdown asked the reaper to stop. `asyncio.wait`, not
+    `wait_for`: on 3.10 `wait_for` can swallow a cancellation that lands with the result."""
+    if not isinstance(stop, asyncio.Event):
+        await asyncio.sleep(seconds)
+        return False
+    if stop.is_set():
+        return True
+    waiter = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait({waiter}, timeout=seconds)
+    finally:
+        waiter.cancel()
+    return stop.is_set()
+
+
 async def _reap_sandbox_jobs(context):
     """Periodic reaper for promoted sandbox commands (:mod:`sandbox.jobs`).
 
     Without this the TTL would only be enforced when something happened to
     call the ``jobs`` tool — i.e. the unbounded wait would have been moved
-    into the job layer rather than removed. Runs until the process exits;
+    into the job layer rather than removed. Runs until shutdown sets
+    ``context._reaper_stop`` (asleep: it returns at once; mid-pass: the pass
+    is finished first, and no new wake turn is started);
     every iteration is best-effort and swallows its own failures so a
     transient docker hiccup can't kill the loop.
     """
     from .sandbox.jobs import get_job_supervisor
+    stop = getattr(context, "_reaper_stop", None)
     while True:
-        await asyncio.sleep(_SANDBOX_JOB_REAP_EVERY_S)
+        if await _reaper_pause(stop, _SANDBOX_JOB_REAP_EVERY_S):
+            return
         try:
             sup = get_job_supervisor(getattr(context, "sandbox_manager", None))
             if sup is None:
@@ -555,6 +590,8 @@ async def _reap_sandbox_jobs(context):
             # fixes, re-created inside the fix. `pending_wakes()` selects
             # without stamping, so a deferral simply returns next tick.
             for entry in await asyncio.to_thread(sup.pending_wakes):
+                if _reaper_stopping(context):
+                    break            # shutting down: unstamped, so the next boot's sweep wakes it
                 _jid = str(entry.get("id") or "")
                 _ran = await _resume_after_job(context, entry)
                 # Stamp when the wake LANDED, or when it was permanently
@@ -590,7 +627,7 @@ def _sandbox_has_live_work(sandbox_mgr):
                 if isinstance(e, dict) and str(e.get("state") or "") == "running"]
         svcs = [e for e in (_s if isinstance(_s, list) else []) if isinstance(e, dict)]
         if jobs or svcs:
-            return True, f"{len(jobs)} running job(s), {len(svcs)} service(s) live in it"
+            return True, f"{len(jobs)} running job(s), {len(svcs)} registered service(s) (liveness not checked)"
     except Exception:  # noqa: BLE001
         pass
     return False, ""
@@ -666,7 +703,11 @@ def unattended_turn_deadline_s(request_id) -> float:
     return v if 0 < v < float("inf") else 0.0
 
 
-async def _handle_chat_foreground(context, body, request_id: str, project_id=None):
+#: what `_handle_chat_foreground` answers when its ``stop_check`` said no (compared by identity)
+_WAKE_STOPPED = "[wake not started: shutting down]"
+
+
+async def _handle_chat_foreground(context, body, request_id: str, project_id=None, stop_check=None):
     """§4CB R1 A-F3 / R2 A-MAJ-4: every autonomous full-turn dispatch
     (scheduled task, job resume) is a FOREGROUND request for its duration —
     unmarked, the biological tick ran consolidation mid-turn and the RSS
@@ -710,6 +751,10 @@ async def _handle_chat_foreground(context, body, request_id: str, project_id=Non
             v.reset(t)
         pretty_log("Unattended Turn Skipped", f"{request_id}: {_why} — not run", level="WARNING", icon=Icons.WARN)
         return f"{PROJECT_TURN_SKIPPED}: {_why}]", None, None
+    if stop_check is not None and stop_check():       # no await between here and handle_chat
+        for v, t in reversed(_clean):
+            v.reset(t)
+        return _WAKE_STOPPED, None, None
     _mark_foreground(context.agent, +1)
     try:
         return await context.agent.handle_chat(
@@ -884,7 +929,16 @@ async def _resume_after_job(context, entry) -> bool:
             pass
         # review 11-05 P-M1: the wake continues the work in the job's PROJECT (its files, labs and runs)
         _content, _, _ = await _handle_chat_foreground(context, body, _wake_id,
-                                                       project_id=(entry or {}).get("project_id"))
+                                                       project_id=(entry or {}).get("project_id"),
+                                                       **({"stop_check": lambda: _reaper_stopping(context)}
+                                                          if isinstance(getattr(context, "_reaper_stop", None),
+                                                                        asyncio.Event) else {}))
+        if _content is _WAKE_STOPPED:
+            # shutdown began while the wake was prepared: undone, so the sweep does not stamp it woken
+            _RESUMED_JOBS.discard(jid)
+            if now in _resume_times:
+                _resume_times.remove(now)
+            return False
         if str(_content or "").startswith(PROJECT_TURN_SKIPPED):
             # r12 M2: its project is archived / gone / unreadable — the result is recorded, never continued unscoped
             from .core.autonomous_activity import record_scheduled_result
@@ -1397,6 +1451,7 @@ async def lifespan(app):
             from .sandbox.jobs import jobs_enabled as _jobs_on
             if _jobs_on():
                 from .utils.logging import spawn_bg as _spawn_bg_jobs
+                _arm_reaper_stop(context)
                 _spawn_bg_jobs(_reap_sandbox_jobs(context),
                                name="sandbox-job-reaper")   # a WRITER (stamps + ledger): never cancelled mid-tick
         except Exception:
@@ -2134,7 +2189,7 @@ async def lifespan(app):
                 "temperature": 0.6,  # warm — diary, not analysis
                 "max_tokens": 1024,
                 "stream": False,
-                "chat_template_kwargs": {"enable_thinking": False},
+                "chat_template_kwargs": _no_think_kwargs(),
             }
             # BACKGROUND priority: narrative consolidation runs from the
             # biological idle watchdog (phase 2.8), never on the user's
@@ -2221,7 +2276,7 @@ async def lifespan(app):
                 "temperature": 0.4,
                 "max_tokens": 512,
                 "stream": False,
-                "chat_template_kwargs": {"enable_thinking": False},
+                "chat_template_kwargs": _no_think_kwargs(),
             }
             # BACKGROUND priority — same rationale as the selfhood
             # narrative closure above: idle-phase call, never on the
@@ -2426,6 +2481,8 @@ async def lifespan(app):
     finally:
         pretty_log("System Shutdown", shutdown_line(agent),
                    icon=Icons.SYSTEM_SHUT, level="INFO")
+        # before the first await: the job reaper starts no wake turn from here on (the drain below waits for its pass)
+        _ask_reaper_to_stop(context)
         # §4IB: a turn still running at shutdown never reaches its
         # finalize — stamp each one as aborted so the ledgers carry the
         # turn and the cause (two user requests this month ended this way
@@ -2566,7 +2623,6 @@ def main():
     sandbox_dir = base_dir / "sandbox"
     memory_dir = base_dir / "system" / "memory"
     log_file = base_dir / "system" / "ghost-agent.log"
-    tokenizer_path = base_dir / "system" / "tokenizer"
     tor_proxy = os.getenv("TOR_PROXY", "socks5://127.0.0.1:9050")
     
     setup_logging(str(log_file), args.debug, args.daemon, args.verbose)
@@ -2574,7 +2630,12 @@ def main():
     # stream by default (the operator watches it live); --no-redact-logs
     # opts out for debugging.
     set_log_redaction(not getattr(args, "no_redact_logs", False))
-    load_tokenizer(tokenizer_path)
+    # §4VM: which model the main server runs → its profile, its tokenizer
+    # (checked against the server's own count), and a context budget that
+    # fits the server's window. A silent server leaves --model / --max-context.
+    from .core import model_boot as _model_boot
+    _model_summary = _model_boot.sync(args, base_dir / "system", boot=True)
+    print(f"🧬 {_model_boot.describe(_model_summary)}", flush=True)
     
     # Ensure directories exist
     sandbox_dir.mkdir(parents=True, exist_ok=True)

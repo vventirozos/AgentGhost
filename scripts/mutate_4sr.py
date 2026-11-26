@@ -137,7 +137,7 @@ MUT = [
     # the one classifier
     ("C1 main-slot", A, "            }, use_worker=True, is_background=background, off_main_only=True,",
      "            }, is_background=background, side_main=True,"),
-    ("C2 thinking-on", A, '                "chat_template_kwargs": {"enable_thinking": False},\n            }, use_worker=True', "            }, use_worker=True"),
+    ("C2 thinking-on", A, '                "chat_template_kwargs": _no_think_kwargs(),\n            }, use_worker=True', "            }, use_worker=True"),
     ("C3 background-ignored", A, "use_worker=True, is_background=background, off_main_only=True",
      "use_worker=True, is_background=False, off_main_only=True"),
     ("C4 hook-not-called", A, "                    on_error(e)\n", "                    pass\n"),

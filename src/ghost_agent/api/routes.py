@@ -1,3 +1,4 @@
+from ..core import model_profile as _model_profile   # §4VM
 import asyncio
 import concurrent.futures
 import datetime
@@ -735,6 +736,18 @@ async def operator_lab_secrets(lab_id: str, request: Request):
                         status_code=st)
 
 
+def _model_facts() -> dict:
+    """§4VM: which model profile is in use and how well tokens are counted."""
+    try:
+        from ..core import model_boot
+        from ..utils.token_counter import calibration
+        return {"name": _model_profile.main().name, "why": _model_profile.main_why(),
+                "server_model": model_boot.last().get("server_model", ""),
+                "tokens": calibration()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _effort_enabled() -> bool:
     try:
         from ..core.effort import enabled
@@ -973,6 +986,7 @@ async def api_health(request: Request):
         "foreground_requests": getattr(llm, "foreground_requests", None),
         "reasoning_effort": _effort_enabled(),            # §4RB: the web UI shows its selector only then
         "reasoning_effort_default": _effort_default_known(),   # §4RW: the CLI bar's Default icon
+        "model_profile": _model_facts(),                  # §4VM
         "foreground_tasks": getattr(llm, "foreground_tasks", None),
         "biological_watchdog_alive": (bio_task is not None and not bio_task.done()),
         "memory_system_loaded": getattr(context, "memory_system", None) is not None,
@@ -1120,7 +1134,8 @@ async def api_generate(request: Request):
         # second number that can drift from it.
         async with _main_node_request(_llm, hold_lock=True):
             resp = await asyncio.wait_for(
-                _llm.http_client.post("/v1/chat/completions", json=chat_payload),
+                # §4VM: posted directly — in the main model's own words, like a turn's
+                _llm.http_client.post("/v1/chat/completions", json=_model_profile.shape_main(chat_payload)),
                 timeout=_main_budget,
             )
         resp.raise_for_status()
