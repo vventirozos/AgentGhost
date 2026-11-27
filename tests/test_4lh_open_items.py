@@ -3,6 +3,7 @@ world it fails in."""
 import asyncio
 import datetime
 import json
+import sys
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -173,7 +174,12 @@ async def test_a_fresh_circuit_of_the_engine_that_works_wins_the_wave(monkeypatc
     monkeypatch.setitem(S.ENGINE_TABLE, "yandex", dataclasses.replace(S.ENGINE_TABLE["yandex"], circuits=circuits))
     monkeypatch.setattr(S, "_race_wave_deadline", lambda: 2.0)
     t0 = time.monotonic()
-    with patch.dict("sys.modules", {"ddgs": mod}):
+    # §4VP: not patch.dict("sys.modules") — leaving it REPLACES the whole import table while this
+    # wave's hung engine threads are still importing; one that finishes just after puts back a fresh,
+    # empty `ghost_agent` package, and every later test on the worker fails on "no attribute 'core'"
+    # (160 failures in one suite run on 11-26). setitem touches the one name.
+    monkeypatch.setitem(sys.modules, "ddgs", mod)
+    if True:
         res = await S._race_search_wave("python release", "socks5h://127.0.0.1:9050", 0)
     took = time.monotonic() - t0
     assert bool(res) is wins
@@ -442,7 +448,8 @@ async def test_a_wave_nobody_wins_ends_with_its_engines(monkeypatch):
     mod.DDGS = Hang
     monkeypatch.setattr(S, "_engine_timeout", lambda e: 2.0)
     t0 = time.monotonic()
-    with patch.dict("sys.modules", {"ddgs": mod}):
+    monkeypatch.setitem(sys.modules, "ddgs", mod)             # (§4VP: see the wave test above — never patch.dict here)
+    if True:
         assert await S._race_search_wave("q words", "socks5h://127.0.0.1:9050", 0) == []
     assert time.monotonic() - t0 < 2.4
 

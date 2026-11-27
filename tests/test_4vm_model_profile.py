@@ -19,6 +19,7 @@ import os
 import http.server
 import inspect
 import json
+import textwrap
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -448,7 +449,7 @@ def test_the_head_is_rendered_as_it_is_sent():
     renders = [c for c in ast.walk(tree) if isinstance(c, ast.Call)
                and any(ast.unparse(a) == "_head_saves.render" for a in c.args)]
     assert len(renders) == 1
-    assert [ast.unparse(a) for a in renders[0].args][-1] == "_mp.shape_main(payload)"
+    assert [ast.unparse(a) for a in renders[0].args][-1] == "_mp.shape_main(payload, quiet=True)"
 
 
 def test_the_audio_node_gets_its_models_words(monkeypatch):
@@ -792,8 +793,9 @@ def test_a_file_that_replaces_a_built_in_is_the_one_used(tmp_path):
     assert bad == {} and mine is not M.QWEN38 and mine.match == M.QWEN38.match      # it keeps the names
     assert M.choose_main("qwen3.8-27b", "/m/Qwen3.8-27B.gguf", known, "")[0] is mine
     assert M.choose_main("", "/m/DaisyRose-27B.gguf", known, "")[0] is mine
-    assert M.choose_main("mystery", "/m/mystery.gguf", known, "") [0] is mine       # and it is the default
+    assert M.choose_main("mystery", "", known, "")[0] is mine                       # and it is the default …
     assert M.choose_main("", "", known, "")[0] is mine
+    assert M.choose_main("mystery", "/m/mystery.gguf", known, "")[0] is M.GENERIC   # … for a server that did not say
 
 
 def test_the_profile_directory(monkeypatch, tmp_path):
@@ -861,14 +863,221 @@ def test_the_choice_is_announced_again_when_only_the_reason_changes(caplog):
     ("nope", "qwen3.8-27b", "/m/gemma-4.gguf", "gemma", True),          # an unknown name is not a choice
     ("", "qwen3.8-27b", "/m/Other-9.gguf", "other", True),              # the server over --model
     ("", "qwen3.8-27b", "", "qwen38", True),                            # a silent server: --model
-    ("", "qwen3.8-27b", "/m/mystery.gguf", "qwen38", False),            # --model, but the server disagrees
-    ("", "mystery", "/m/mystery.gguf", "qwen38", False),                # nothing fits: the default, loudly
+    ("", "qwen3.8-27b", "/m/mystery.gguf", "generic", False),           # the server named a model nothing fits: nothing assumed
+    ("", "mystery", "/m/mystery.gguf", "generic", False),               # … whatever --model says, and loudly
+    ("", "mystery", "", "qwen38", True),                                # a silent server and an unknown --model: the default
     ("", "", "", "qwen38", True),
     ("generic", "", "/m/Qwen3.8.gguf", "generic", True),
 ])
 def test_choose_main(override, model_arg, served, want, sure):
     p, why, got_sure = M.choose_main(model_arg, served, KNOWN, override)
     assert (p.name, got_sure) == (want, sure) and why
+
+
+# --- by what the model file says it is (§4VP) ----------------------------------------
+
+def test_a_model_is_known_by_what_its_file_says_when_its_name_says_nothing():
+    """A finetune can be called anything; its file still says which family it is."""
+    qwen = {"architecture": "qwen35", "pre": "qwen35"}
+    p, why, sure = M.choose_main("", "/m/RVN-Q4_K_M-multilingual-mtp.gguf", KNOWN, "", meta=qwen)
+    assert p is M.QWEN38 and sure and "says it is qwen35" in why and "RVN-Q4_K_M" in why
+    assert M.choose_main("", "/m/odd-name.gguf", KNOWN, "", meta={"pre": "QWEN35 "})[0] is M.QWEN38     # either field, any case
+    assert M.choose_main("", "/m/odd-name.gguf", KNOWN, "", meta={"architecture": "gemma4"})[0] is M.GEMMA
+    for meta in (None, {}, {"architecture": "never-heard-of-it"}, {"pre": ""}, {"architecture": 7}):
+        p, why, sure = M.choose_main("qwen3.8-27b", "/m/odd-name.gguf", KNOWN, "", meta=meta)
+        assert p is M.GENERIC and not sure, meta
+    # the NAME is asked first: a file named for one profile is not re-read as another family
+    assert M.choose_main("", "/m/Other-9.gguf", KNOWN, "", meta=qwen)[0] is OTHER
+
+
+def test_an_operators_file_can_claim_a_family_and_wins_over_a_built_in(tmp_path):
+    mine = M.from_dict({"name": "myqwen", "arch": [" Qwen35 "], "sampling": {"default": {"temperature": 0.5}}})
+    assert mine.arch == ("qwen35",) and mine.match == ()
+    known = {**M.BUILTIN, "myqwen": mine}
+    assert M.resolve_by_arch(known, {"pre": "qwen35"}) is mine
+    assert M.resolve_by_arch({"myqwen": mine, **M.BUILTIN}, {"pre": "qwen35"}) is mine
+    assert M.resolve_by_arch(M.BUILTIN, {"pre": "qwen35"}) is M.QWEN38 and M.resolve_by_arch(M.BUILTIN, {"pre": "x"}) is None
+    assert M.resolve_by_arch(M.BUILTIN, None) is None and M.resolve_by_arch(M.BUILTIN, {}) is None
+    # a file that replaces a built-in keeps its families; an extension under another name does not
+    assert M.from_dict({"name": "qwen38", "reply_reserve": 1}, M.BUILTIN).arch == M.QWEN38.arch
+    assert M.from_dict({"name": "child", "extends": "qwen38"}, M.BUILTIN).arch == ()
+    for bad in ("qwen35", [""], [7], [" "]):
+        with pytest.raises(M.ProfileError):
+            M.from_dict({"name": "x", "arch": bad})
+
+
+def test_the_boot_reads_the_file_only_when_its_name_fits_nothing(server, loaded, tmp_path, monkeypatch):
+    reads = []
+
+    def meta(path):
+        reads.append(os.path.basename(path))
+        return {"architecture": "qwen35", "pre": "qwen35"}
+    monkeypatch.setattr(B._gguf, "read_meta", meta)
+    named = tmp_path / "Qwen3.8-27B.gguf"
+    odd = tmp_path / "RVN-Q4_K_M.gguf"
+    named.write_bytes(b"x")
+    odd.write_bytes(b"x")
+    s = server(model_path=str(named))
+    args = _args(s.url, model="")
+    assert B.sync(args, tmp_path, boot=True, now=0.0)["profile"] == "qwen38" and reads == []     # the name was enough
+    s.model_path = str(odd)
+    got = B.sync(args, now=100.0)
+    assert got["profile"] == "qwen38" and reads == ["RVN-Q4_K_M.gguf"] and "says it is qwen35" in got["why"]
+    s.model_path = "/elsewhere/odd.gguf"                                   # a file this machine cannot read: no guess
+    assert B.sync(args, now=200.0)["profile"] == "generic" and len(reads) == 1
+
+
+def test_a_silent_server_leaves_the_choice_to_what_the_agent_was_started_with():
+    """A reviewer's mutant that ignored --model for a silent server passed every test."""
+    for arg, want in (("qwen3.8-27b", M.QWEN38), ("gemma-4-e4b", M.GEMMA), ("Other-9", OTHER)):
+        p, why, sure = M.choose_main(arg, "", KNOWN, "")
+        assert p is want and sure, arg
+    assert M.choose_main("", "", KNOWN, "")[0] is M.QWEN38 and M.choose_main("nothing-known", "", KNOWN, "")[0] is M.QWEN38
+    assert M.choose_main("gemma-4-e4b", "", KNOWN, "", meta={"pre": "qwen35"})[0] is M.GEMMA    # no file, so nothing it "says"
+    assert M.choose_main("nothing-known", "", KNOWN, "", meta={"pre": "gemma4"})[0] is M.QWEN38
+    assert M.choose_main("", "", KNOWN, "", meta={"architecture": "gemma4"})[0] is M.QWEN38
+
+
+def test_what_a_file_said_is_remembered_while_the_file_is_unchanged(tmp_path, monkeypatch):
+    """Reading it parses the file's whole key-value block (seconds), and a model
+    whose tokenizer cannot be checked yet is looked at again every minute."""
+    reads = []
+    monkeypatch.setattr(B._gguf, "read_meta", lambda path: reads.append(path) or {"pre": "qwen35"})
+    f = tmp_path / "odd.gguf"
+    f.write_bytes(b"one")
+    assert B._file_meta(str(f)) == {"pre": "qwen35"} and B._file_meta(str(f)) == {"pre": "qwen35"} and len(reads) == 1
+    f.write_bytes(b"another file now")
+    assert B._file_meta(str(f)) == {"pre": "qwen35"} and len(reads) == 2
+    assert B._file_meta(str(tmp_path / "missing.gguf")) is None and len(reads) == 2
+
+
+def test_a_family_that_cannot_be_read_is_said_so(server, loaded, tmp_path, monkeypatch):
+    monkeypatch.setattr(B._gguf, "read_meta", lambda path: {"architecture": "never-heard-of-it"})
+    s = server(model_path="/another/machine/odd.gguf")
+    args = _args(s.url, model="")
+    got = B.sync(args, tmp_path, boot=True, now=0.0)
+    assert got["profile"] == "generic" and "cannot be read from here" in got["why"]
+    here = tmp_path / "odd.gguf"
+    here.write_bytes(b"x")
+    s.model_path = str(here)
+    got = B.sync(args, now=100.0)
+    assert got["profile"] == "generic" and "cannot be read" not in got["why"]
+
+
+# --- thinking off, for a model whose template has no switch that works (§4VP) ---------
+
+def test_a_profile_can_set_request_fields_for_a_thinking_off_call():
+    """Measured on Inkling 2: effort "none" writes level 0 and the model reasons
+    as long as before (214 characters either way); `reasoning_budget_tokens: 0`
+    stops it (0 characters, 21 tokens against 88)."""
+    prof = M.from_dict({**INKLING_LIKE, "think_off": None, "think_off_request": {"reasoning_budget_tokens": 0}})
+    assert dict(prof.think_off_request) == {"reasoning_budget_tokens": 0}
+    off = {"messages": [], "chat_template_kwargs": M.no_think_kwargs()}
+    sent = M.shape(off, prof)
+    assert sent == {"messages": [], "reasoning_budget_tokens": 0} and "reasoning_budget_tokens" not in off    # the caller's is not edited
+    # the turn's level is kept beside it: the prompt stays the one the slot holds
+    both = M.shape({"chat_template_kwargs": {**M.no_think_kwargs(), "reasoning_effort": "low"}}, prof)
+    assert both == {"chat_template_kwargs": {"reasoning_effort": "low"}, "reasoning_budget_tokens": 0}
+    # a call that thinks is sent no cap; a cap the caller set itself is the caller's
+    assert "reasoning_budget_tokens" not in M.shape({"chat_template_kwargs": {"reasoning_effort": "low"}}, prof)
+    assert "reasoning_budget_tokens" not in M.shape({"messages": []}, prof)
+    assert "reasoning_budget_tokens" not in M.shape({"chat_template_kwargs": {"enable_thinking": True}}, prof)
+    mine = M.shape({"reasoning_budget_tokens": 64, "chat_template_kwargs": M.no_think_kwargs()}, prof)
+    assert mine["reasoning_budget_tokens"] == 64
+    # with a template switch as well, both are sent
+    two = M.from_dict({**INKLING_LIKE, "think_off_request": {"thinking_budget_tokens": 0}})
+    got = M.shape(off, two)
+    assert got["thinking_budget_tokens"] == 0 and got["chat_template_kwargs"] == dict(two.think_off)
+    # the switch a caller WROTE (/no_think at the end of a user message) is taken out for this model: the fields stand in
+    soft = M.from_dict({**INKLING_LIKE, "think_off": None, "think_off_request": {"reasoning_budget_tokens": 0},
+                        "dialect": {"soft_no_think": ""}})
+    wrote = {"messages": [{"role": "user", "content": "Is it done? /no_think"}]}
+    got = M.shape(wrote, soft)
+    assert got["messages"][0]["content"] == "Is it done?" and got["reasoning_budget_tokens"] == 0
+    assert "reasoning_budget_tokens" not in M.shape({"messages": [{"role": "user", "content": "Is it done?"}]}, soft)
+    # a model with a written switch of its own gets that switch, and no field for it
+    own = M.from_dict({**INKLING_LIKE, "think_off": None, "think_off_request": {"reasoning_budget_tokens": 0},
+                       "dialect": {"soft_no_think": "/nothink"}})
+    got = M.shape(wrote, own)
+    assert got["messages"][0]["content"].endswith("/nothink") and "reasoning_budget_tokens" not in got
+    assert dict(M.from_dict({"name": "x", "think_off_request": None}).think_off_request) == {}
+    # only the message being ANSWERED turns thinking off: the same words earlier are history
+    earlier = {"messages": [{"role": "user", "content": "Quick one. /no_think"}, {"role": "assistant", "content": "Yes."},
+                            {"role": "user", "content": "Now think hard about this."}]}
+    got = M.shape(earlier, soft)
+    assert got["messages"][0]["content"] == "Quick one." and "reasoning_budget_tokens" not in got
+    parts = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}},
+                                                         {"type": "text", "text": "What is this? /no_think"}]}]}
+    assert M.shape(parts, soft)["reasoning_budget_tokens"] == 0
+    two = {"messages": [{"role": "user", "content": [{"type": "text", "text": "Look at this. /no_think"},
+                                                       {"type": "text", "text": "And think about this one."}]}]}
+    assert "reasoning_budget_tokens" not in M.shape(two, soft)             # the LAST text part is what carries it
+    spaced = M.shape({"messages": [{"role": "user", "content": "Is it done? /no_think \n"}]}, soft)
+    assert spaced["messages"][0]["content"] == "Is it done?" and spaced["reasoning_budget_tokens"] == 0
+    after_tool = {"messages": [{"role": "user", "content": "Do it /no_think"}, {"role": "assistant", "content": "ok"},
+                               {"role": "tool", "content": "done"}]}
+    assert M.shape(after_tool, soft)["reasoning_budget_tokens"] == 0        # still the message being answered
+
+
+def test_qwen_and_a_child_profile_are_sent_no_such_field():
+    off = {"messages": [], "chat_template_kwargs": M.no_think_kwargs()}
+    for prof in (M.QWEN38, M.GEMMA, M.GENERIC):
+        assert M.shape(off, prof) is off or "reasoning_budget_tokens" not in M.shape(off, prof)
+    assert M.shape(off, M.QWEN38) is off and dict(M.QWEN38.think_off_request) == {}
+    known = {**M.BUILTIN, "capped": M.from_dict({"name": "capped", "think_off_request": {"reasoning_budget_tokens": 0}})}
+    assert dict(M.from_dict({"name": "child", "extends": "capped"}, known).think_off_request) == {"reasoning_budget_tokens": 0}
+
+
+@pytest.mark.parametrize("bad", [
+    {"max_tokens": 0}, {"temperature": 0}, {"chat_template_kwargs": 0}, {"reasoning_budget_tokens": -1},
+    {"reasoning_budget_tokens": 0.5}, {"reasoning_budget_tokens": True}, {"reasoning_budget_tokens": "0"},
+    {"reasoning_budget_tokens": 10 ** 9}, ["reasoning_budget_tokens"], "reasoning_budget_tokens", 0,
+])
+def test_a_profile_file_cannot_set_any_other_request_field(bad):
+    """A profile file is the operator's, but a typo in one must not rewrite requests."""
+    with pytest.raises(M.ProfileError):
+        M.from_dict({"name": "x", "think_off_request": bad})
+
+
+# --- a level written after the head (§4VP) -------------------------------------------
+
+def test_a_level_written_after_the_head_is_not_tracked_for_the_slot(monkeypatch):
+    """Inkling 2 writes the level after the tool declarations and the system text:
+    one head serves every level and thinking off. Booking a thinking-off call as
+    "medium" (the template writes 0) was a label for nothing."""
+    from ghost_agent.core.agent import GhostAgent
+    monkeypatch.setenv("GHOST_REASONING_EFFORT", "1")
+    monkeypatch.setattr(E, "known_server_default", lambda: "medium")
+    low = {"chat_template_kwargs": {"reasoning_effort": "low"}}
+    off = {"chat_template_kwargs": {"enable_thinking": False}}
+    assert E.level_is_in_head() and GhostAgent._call_level(low) == "low" and GhostAgent._call_level(off) == "medium"   # Qwen: as before
+    after = M.from_dict({**INKLING_LIKE, "effort": {**INKLING_LIKE["effort"], "in_head": False}})
+    M.set_main(after)
+    assert not E.level_is_in_head()
+    assert GhostAgent._call_level(low) is None and GhostAgent._call_level(off) is None and GhostAgent._call_level({}) is None
+    me = SimpleNamespace(_main_effort_level="low")
+    payload = {"messages": []}
+    assert GhostAgent._warm_up_effort(me, payload) is payload               # no head per level is warmed
+    M.set_main(M.from_dict(INKLING_LIKE))                                   # the same model declared "in the head"
+    assert GhostAgent._warm_up_effort(me, payload)["chat_template_kwargs"] == {"reasoning_effort": "low"}
+    M.set_main(M.GENERIC)
+    assert not E.level_is_in_head()                                         # no levels at all: nothing to track either
+    # a level left by a model whose level WAS in the head is cleared BEFORE it is read (run, not read)
+    M.set_main(after)
+    left = SimpleNamespace(_slot_level="medium")
+    assert GhostAgent._slot_level_now(left, None) is None and left._slot_level is None
+    M.set_main(None)                                                        # Qwen: never cleared, whatever the call's level
+    kept = SimpleNamespace(_slot_level="medium")
+    assert GhostAgent._slot_level_now(kept, None) == "medium" and GhostAgent._slot_level_now(kept, "low") == "medium"
+    assert GhostAgent._slot_level_now(SimpleNamespace(), None) is None
+    # … and it is the only way the booking function reads it
+    tree = ast.parse(textwrap.dedent(inspect.getsource(GhostAgent)))
+    reads = [ast.unparse(n.value) for n in ast.walk(tree) if isinstance(n, ast.Assign)
+             and ast.unparse(n.targets[0]) == "slot_level"]
+    assert reads == ["self._slot_level_now(cur_level)"]
+    with pytest.raises(M.ProfileError):
+        M.from_dict({**INKLING_LIKE, "effort": {**INKLING_LIKE["effort"], "in_head": "no"}})
+    assert M.QWEN38.effort.in_head is True and M.from_dict(INKLING_LIKE).effort.in_head is True
 
 
 def test_select_main_sets_it_and_warns_once_when_unsure(monkeypatch, caplog):
@@ -880,8 +1089,8 @@ def test_select_main_sets_it_and_warns_once_when_unsure(monkeypatch, caplog):
         M.select_main("qwen3.8-27b", "/m/mystery.gguf")
         M.select_main("qwen3.8-27b", "/m/mystery.gguf")
     warned = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warned) == 1 and "mystery.gguf" in warned[0].getMessage()
-    assert M.main() is M.QWEN38
+    assert len(warned) == 1 and "mystery.gguf" in warned[0].getMessage() and "nothing assumed" in warned[0].getMessage()
+    assert M.main() is M.GENERIC
 
 
 def test_the_environment_names_the_profile(monkeypatch):
@@ -1420,7 +1629,7 @@ def test_a_new_profile_file_is_picked_up_by_the_next_resync(server, tmp_path, mo
     monkeypatch.setattr(T, "load_tokenizer", lambda path, repo=None, profile_name=None: None)
     s = server(model_path="/m/Other-9.gguf", n_ctx=65536)
     args = _args(s.url)
-    assert B.sync(args, tmp_path, boot=True, now=0.0)["profile"] == "qwen38"        # fits nothing yet
+    assert B.sync(args, tmp_path, boot=True, now=0.0)["profile"] == "generic"       # fits nothing yet: nothing assumed
     assert args.max_context == 65536 - 16384
     (tmp_path / "profiles" / "other.json").write_text(json.dumps(OTHER_JSON))
     got = B.sync(args, now=100.0)                           # the server did not change; the files did
@@ -1817,3 +2026,107 @@ def test_health_says_which_profile_and_how_tokens_are_counted(server):
     with B._lock:
         B._state["last"] = {"server_model": "Other-9.gguf", "tokenizer": "model file"}
     assert _model_facts()["server_model"] == "Other-9.gguf"
+
+
+# --- §4VP: the cap on reasoning is logged at the send --------------------------
+
+def _cap_lines(monkeypatch):
+    from ghost_agent.utils import logging as L
+    lines = []
+    monkeypatch.setattr(L, "pretty_log", lambda title, content=None, **kw: lines.append((title, content, kw.get("icon"))))
+    return lines
+
+
+def _capped_profile():
+    return M.from_dict({**INKLING_LIKE, "think_off": None, "think_off_request": {"reasoning_budget_tokens": 16},
+                        "dialect": {"history": "native", "think_tags": False, "soft_no_think": ""}})
+
+
+def test_a_capped_send_writes_one_log_line(monkeypatch):
+    """Nothing else shows the request as it is sent: a thinking-off call of a
+    model with a cap says so, with the field, its value and the profile."""
+    from ghost_agent.utils.logging import Icons
+    lines = _cap_lines(monkeypatch)
+    prof = _capped_profile()
+    monkeypatch.setattr(M, "main", lambda: prof)
+    off = {"messages": [], "chat_template_kwargs": M.no_think_kwargs()}
+    sent = M.shape_main(off)
+    assert sent["reasoning_budget_tokens"] == 16 and sent == M.shape(off, prof)
+    assert lines == [("Thinking Cap", f"thinking off for this call — sent with reasoning_budget_tokens=16 ({prof.name})",
+                      Icons.EFFORT_LOW)]
+    del lines[:]
+    written = {"messages": [{"role": "user", "content": "hi " + M.SOFT_NO_THINK}]}
+    assert M.shape_main(written)["reasoning_budget_tokens"] == 16 and len(lines) == 1    # the written switch too
+
+
+def test_no_cap_line_when_nothing_was_capped(monkeypatch):
+    lines = _cap_lines(monkeypatch)
+    prof = _capped_profile()
+    monkeypatch.setattr(M, "main", lambda: prof)
+    M.shape_main({"messages": []})                                                        # thinking on
+    M.shape_main({"chat_template_kwargs": {"reasoning_effort": "low"}})
+    M.shape_main({"reasoning_budget_tokens": 64, "chat_template_kwargs": M.no_think_kwargs()})   # the caller's own
+    M.shape_main({"messages": [], "chat_template_kwargs": M.no_think_kwargs()}, quiet=True)   # a render sends nothing
+    assert lines == []
+    monkeypatch.setattr(M, "main", lambda: M.DEFAULT)                                     # Qwen: no cap, same object
+    off = {"messages": [], "chat_template_kwargs": M.no_think_kwargs()}
+    assert M.shape_main(off) is off and lines == []
+
+
+def test_a_failing_log_line_does_not_cost_the_request(monkeypatch):
+    from ghost_agent.utils import logging as L
+    prof = _capped_profile()
+    monkeypatch.setattr(M, "main", lambda: prof)
+    def boom(*a, **k):
+        raise RuntimeError("log sink gone")
+    monkeypatch.setattr(L, "pretty_log", boom)
+    assert M.shape_main({"messages": [], "chat_template_kwargs": M.no_think_kwargs()})["reasoning_budget_tokens"] == 16
+
+
+def test_think_cap_added_names_only_what_shape_put_on():
+    prof = _capped_profile()
+    p = {"messages": [], "chat_template_kwargs": M.no_think_kwargs()}
+    assert M.think_cap_added(p, M.shape(p, prof), prof) == {"reasoning_budget_tokens": 16}
+    assert M.think_cap_added(p, p, prof) == {}
+    assert M.think_cap_added(p, M.shape(p, prof), None) == {}
+    own = {**p, "reasoning_budget_tokens": 64}
+    assert M.think_cap_added(own, M.shape(own, prof), prof) == {}
+
+
+def test_the_two_renders_are_quiet():
+    """A render sends nothing: it must not write the line of a send."""
+    from ghost_agent.core import effort as E
+    calls = [c for c in ast.walk(ast.parse(inspect.getsource(E._render).lstrip()))
+             if isinstance(c, ast.Call) and ast.unparse(c.func) == "_mp.shape_main"]
+    assert [ast.unparse(c) for c in calls] == ["_mp.shape_main(body, quiet=True)"]
+
+
+def test_only_the_two_renders_are_quiet_in_the_whole_tree():
+    """Every other `shape_main` call is a send and must write the line: a
+    `quiet=` on one of them would hide the cap again."""
+    import pathlib
+    import ghost_agent
+    root = pathlib.Path(ghost_agent.__file__).parent
+    quiet, loud = [], []
+    for f in sorted(root.rglob("*.py")):
+        for c in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
+            if isinstance(c, ast.Call) and ast.unparse(c.func).endswith(".shape_main"):
+                assert len(c.args) == 1, (f.name, ast.unparse(c))
+                (quiet if c.keywords else loud).append(f"{f.relative_to(root)}: {ast.unparse(c)}")
+    assert quiet == ["core/agent.py: _mp.shape_main(payload, quiet=True)", "core/effort.py: _mp.shape_main(body, quiet=True)"]
+    assert sorted(x.split(":")[0] for x in loud) == ["api/routes.py", "core/agent.py", "core/llm.py", "core/llm.py"]
+
+
+def test_quiet_is_by_name_only():
+    with pytest.raises(TypeError):
+        M.shape_main({}, True)
+
+
+def test_the_profile_module_does_not_load_the_log_module():
+    """The log module is loaded when a line is written, not with the profile."""
+    import subprocess, sys
+    code = ("import sys; from ghost_agent.core import model_profile as M; "
+            "M.shape_main({'messages': [], 'chat_template_kwargs': M.no_think_kwargs()}); "
+            "print('ghost_agent.utils.logging' in sys.modules)")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert r.stdout.strip() == "False", (r.stdout, r.stderr[-300:])

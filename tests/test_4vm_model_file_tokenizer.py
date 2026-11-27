@@ -273,6 +273,14 @@ def test_each_pair_of_settings_is_told_apart_by_a_check_string():
     assert len(G.CHECK_STRINGS) == 15 and len(set(G.CHECK_STRINGS)) == 15
 
 
+def test_what_a_model_file_says_it_is(tmp_path):
+    assert G.read_meta(str(write_model(tmp_path / "anything.gguf", pre="qwen35"))) == {"architecture": "test", "pre": "qwen35"}
+    assert G.read_meta(str(write_model(tmp_path / "other.gguf", pre="inkling2")))["pre"] == "inkling2"
+    (tmp_path / "junk.gguf").write_text("not a model")
+    assert G.read_meta(str(tmp_path / "junk.gguf")) == {} and G.read_meta(str(tmp_path / "missing.gguf")) == {}
+    assert G.read_meta(str(tmp_path)) == {}
+
+
 def test_a_file_kept_by_an_older_builder_is_not_loaded(tmp_path, server, monkeypatch):
     """The kept file is re-checked only against the check strings — which a tokenizer built by
     older, wrong rules may pass (it did). The builder's version is part of the file's name."""

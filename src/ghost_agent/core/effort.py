@@ -115,7 +115,7 @@ def _render(base_url: str, timeout: float, kwargs=None) -> str:
     body = {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]}
     if kwargs:
         body["chat_template_kwargs"] = kwargs
-        body = _mp.shape_main(body)             # §4VM: the level in the model's own word
+        body = _mp.shape_main(body, quiet=True)  # §4VM: the level in the model's own word (a render: nothing is sent)
     req = urllib.request.Request(str(base_url).rstrip("/") + "/apply-template",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -253,6 +253,15 @@ def thinking_off_level() -> Optional[str]:
     if profile.think_off is None:
         return None
     return spec.unmarked if spec is not None else "medium"
+
+
+def level_is_in_head() -> bool:
+    """The main model's template writes the effort level inside the request
+    head, so the head differs per level (Qwen). False = it is written after
+    the head (or the model has no levels): one head serves every level, and
+    the agent neither tracks a level for the slot nor keeps a head per level."""
+    spec = _spec()
+    return spec is not None and spec.in_head
 
 
 def forget_server_default() -> None:

@@ -980,10 +980,46 @@ THINK_TAG_REWORDINGS = (
 )
 
 
+#: §4VP: the agent's own sentences that name Qwen's CALL markup, for a model
+#: that is shown its calls and results in its own format (``dialect.history ==
+#: "native"``): it never sees a ``<tool_call>`` or a ``<tool_response>``, so a
+#: sentence that names one points at nothing. Same contract as above: each
+#: pair must still match a text the agent sends, and no tag may be left.
+CALL_MARKUP_REWORDINGS = (
+    ("Do NOT hallucinate tool responses like `<tool_response>`.", "Do NOT invent tool results."),
+    ("Do NOT hallucinate tool responses like <tool_response>—wait", "Do NOT invent tool results—wait"),
+    ("the native tool_calls API when tool schemas are advertised natively (do NOT type out XML or JSON call "
+     "syntax yourself in that case), otherwise the XML format instructed in the Tools section.",
+     "the native tool_calls API (do NOT type out XML or JSON call syntax yourself)."),
+    ("(the most recent <tool_response> output in this conversation)", "(the most recent tool result in this conversation)"),
+    ("DO NOT emit any <tool_call> blocks.", "Do NOT call any tool."),
+    ("but you DID NOT output the actual XML `<tool_call>` block! Do not narrate your actions. "
+     "Output the XML `<tool_call>` immediately.",
+     "but you DID NOT make the tool call! Do not narrate your actions. Make the tool call now."),
+    ("without outputting a valid XML <tool_call> or a response to the user.",
+     "without making a tool call or answering the user."),
+    ("output the required XML <tool_call> block.", "make the tool call."),
+    ("do not quote the `<tool_call>` syntax — just make the call.", "do not quote it — just make the call."),
+)
+
+#: … and the ones that name a think tag outside the tool header and the guidance.
+THINK_TAG_REWORDINGS_ELSEWHERE = (
+    ("Do not write a long <think> block.", "Do not reason at length."),
+    ("\n</think>\n[SYSTEM OVERRIDE:", "\n[SYSTEM OVERRIDE:"),
+)
+
+
+def without_call_markup(text: str) -> str:
+    """``text`` worded for a model that never sees Qwen's call markup."""
+    for old, new in CALL_MARKUP_REWORDINGS:
+        text = text.replace(old, new)
+    return text
+
+
 def without_think_tags(text: str) -> str:
     """``text`` (the tool header, the thinking guidance) worded for a model
     with no ``<think>`` tags. Text that names no tag comes back unchanged."""
-    for old, new in THINK_TAG_REWORDINGS:
+    for old, new in THINK_TAG_REWORDINGS + THINK_TAG_REWORDINGS_ELSEWHERE:
         text = text.replace(old, new)
     return text
 

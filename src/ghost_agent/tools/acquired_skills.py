@@ -1004,10 +1004,19 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
     # `<name>` directly and warns against the pre-fix workaround of
     # `python3 acquired_skills/<name>.py` via `execute`, which fails
     # because the canonical file lives outside the sandbox.
+    return acquired_text(name)
+
+
+def acquired_text(name: str) -> str:
+    """What the model is told when a skill is acquired. §4VP: a model shown its
+    calls in its own format is not told about a `<tool_call>` block; Qwen reads
+    the sentence it always read."""
+    from ..core import model_profile as _mp
+    how = (f"with a tool call, name=\"{name}\"" if _mp.main().dialect.history == "native"
+           else f"via a `<tool_call>` block with name=\"{name}\"")
     return (
         f"Success: Skill '{name}' acquired and tested successfully. "
-        f"It is now LIVE in your tool list — invoke it directly via a "
-        f"`<tool_call>` block with name=\"{name}\" (just like any "
+        f"It is now LIVE in your tool list — invoke it directly {how} (just like any "
         f"built-in tool). DO NOT run `python3 acquired_skills/{name}.py` "
         f"or `import {name}` via `execute`; the source file lives in "
         f"$GHOST_HOME/system/memory/acquired_skills/ (outside the "

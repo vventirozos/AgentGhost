@@ -175,6 +175,23 @@ def read_vocab(model_path: str) -> Dict[str, Any]:
             "model": model, "pre": str(get("tokenizer.ggml.pre", "") or "")}
 
 
+def read_meta(model_path: str) -> Dict[str, str]:
+    """What a model file says it is: its ``architecture`` and the name of its
+    vocabulary (``pre``). Empty when the file cannot be read as a GGUF here."""
+    try:
+        from gguf import GGUFReader
+        fields = GGUFReader(model_path).fields
+
+        def get(key):
+            f = fields.get(key)
+            v = f.contents() if f is not None else ""
+            return v if isinstance(v, str) else ""
+        return {k: v for k, v in (("architecture", get("general.architecture")),
+                                  ("pre", get("tokenizer.ggml.pre"))) if v}
+    except Exception:  # noqa: BLE001 — not here, not a GGUF, no library
+        return {}
+
+
 def build(vocab: Dict[str, Any], rule: str, whole_tokens: bool = False):
     """A ``tokenizers.Tokenizer`` for ``vocab`` under one split rule;
     ``whole_tokens`` = a piece that is a token is emitted without merging."""

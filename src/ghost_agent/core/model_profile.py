@@ -119,6 +119,13 @@ class Effort:
     #: the model's word → what its template WRITES for it, when that is not
     #: the word itself (Inkling 2: "low" is written "0.2"). Empty = the word.
     rendered: Mapping[str, str] = field(default_factory=dict)
+    #: the template writes the level INSIDE the request head (Qwen: it closes
+    #: the system block, before the tools) — a change of level then changes the
+    #: head, and the agent keeps a saved head per level. False = it is written
+    #: AFTER the head (Inkling 2: after the tool declarations and the system
+    #: text): one head serves every level and thinking off, and a change of
+    #: level re-reads only from that line on.
+    in_head: bool = True
 
     def native(self, level) -> Optional[str]:
         """The model's word for an agent level; a value that already is one
@@ -170,11 +177,22 @@ class ModelProfile:
     #: lower-case substrings; a profile fits a model whose file name or label
     #: contains one of them
     match: Tuple[str, ...] = ()
+    #: what the MODEL FILE says it is: its ``general.architecture`` or the
+    #: name of its vocabulary (``tokenizer.ggml.pre``), lower-case, exact.
+    #: Read from the file when its NAME fits no profile — a finetune called
+    #: anything at all is still the family its file says.
+    arch: Tuple[str, ...] = ()
     #: sampling role → sampler settings (see ``sampler``)
     sampling: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     #: the model's own ``chat_template_kwargs`` for "do not reason"; None =
     #: the template has no such switch (nothing is sent)
     think_off: Optional[Mapping[str, Any]] = field(default_factory=no_think_kwargs)
+    #: §4VP: request fields set on a thinking-off call, beside the template
+    #: kwargs — for a model whose template has no switch that works (measured
+    #: on Inkling 2: effort "none" writes level 0 and the model reasons as
+    #: long as before; the server's ``reasoning_budget_tokens`` caps it — 16
+    #: there, not 0: a zero cap broke its tool calls, 0 of 12 made).
+    think_off_request: Mapping[str, int] = field(default_factory=dict)
     #: None = the template takes no effort level
     effort: Optional[Effort] = None
     #: Hugging Face repo of the tokenizer ("" = none: tokens are estimated
@@ -216,6 +234,7 @@ _QWEN_CARD = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0, "prese
 QWEN38 = ModelProfile(
     name="qwen38",
     match=("qwen", "daisyrose"),
+    arch=("qwen35", "qwen2"),
     sampling={
         "default": dict(_QWEN_CARD),
         "general": dict(_QWEN_CARD),
@@ -239,7 +258,7 @@ QWEN38 = ModelProfile(
 )
 
 #: The worker / audio model (Gemma 4 E4B): same thinking switch, no levels.
-GEMMA = ModelProfile(name="gemma", match=("gemma",))
+GEMMA = ModelProfile(name="gemma", match=("gemma",), arch=("gemma4", "gemma3", "gemma3n"))
 
 #: A model nothing is known about: its own template, the server's sampler
 #: defaults, no effort, tokens estimated from the server's count.
@@ -287,7 +306,7 @@ def from_dict(d: Mapping[str, Any], known: Optional[Mapping[str, ModelProfile]] 
     name = d.get("name")
     if not isinstance(name, str) or not _NAME_RE.match(name):
         raise ProfileError("'name' must be lower-case letters, digits, '.', '_' or '-'")
-    extra = set(d) - {"name", "extends", "match", "sampling", "think_off", "effort",
+    extra = set(d) - {"name", "extends", "match", "arch", "sampling", "think_off", "think_off_request", "effort",
                       "tokenizer", "reply_reserve", "dialect"}
     if extra:
         raise ProfileError(f"unknown key(s): {', '.join(sorted(extra))}")
@@ -302,7 +321,9 @@ def from_dict(d: Mapping[str, Any], known: Optional[Mapping[str, ModelProfile]] 
         if base is None:
             raise ProfileError(f"'extends' names no known profile: {d['extends']!r}")
     kw: Dict[str, Any] = {"name": name, "match": base.match if base.name == name else (),
+                          "arch": base.arch if base.name == name else (),
                           "sampling": base.sampling, "think_off": base.think_off,
+                          "think_off_request": base.think_off_request,
                           "effort": base.effort, "tokenizer_repo": base.tokenizer_repo,
                           "tokenizer_dir": base.tokenizer_dir, "reply_reserve": base.reply_reserve,
                           "dialect": base.dialect}
@@ -311,6 +332,11 @@ def from_dict(d: Mapping[str, Any], known: Optional[Mapping[str, ModelProfile]] 
         if not isinstance(m, list) or not all(isinstance(x, str) and len(x.strip()) >= MATCH_MIN for x in m):
             raise ProfileError(f"'match' is a list of strings of {MATCH_MIN} or more characters")
         kw["match"] = tuple(x.strip().lower() for x in m)
+    if "arch" in d:
+        a = d["arch"]
+        if not isinstance(a, list) or not all(isinstance(x, str) and x.strip() for x in a):
+            raise ProfileError("'arch' is a list of architecture or vocabulary names")
+        kw["arch"] = tuple(x.strip().lower() for x in a)
     if "sampling" in d:
         s = d["sampling"]
         if not isinstance(s, Mapping):
@@ -338,6 +364,16 @@ def from_dict(d: Mapping[str, Any], known: Optional[Mapping[str, ModelProfile]] 
         if t is not None and THINK_KEY in t and t[THINK_KEY] is not False:
             raise ProfileError(f"'think_off' may set {THINK_KEY} only to false")
         kw["think_off"] = None if t is None else dict(t)
+    if "think_off_request" in d:
+        r = {} if d["think_off_request"] is None else d["think_off_request"]      # null = none, as for think_off
+        if not isinstance(r, dict):
+            raise ProfileError("'think_off_request' is an object of request fields")
+        for k, v in r.items():
+            if k not in THINK_OFF_REQUEST_FIELDS:
+                raise ProfileError(f"'think_off_request' may set only {sorted(THINK_OFF_REQUEST_FIELDS)}, not {k!r}")
+            if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 1_000_000:
+                raise ProfileError(f"'think_off_request' {k} is a whole number of tokens, 0 or more")
+        kw["think_off_request"] = dict(r)
     if "effort" in d:
         e = d["effort"]
         if e is None:
@@ -345,7 +381,8 @@ def from_dict(d: Mapping[str, Any], known: Optional[Mapping[str, ModelProfile]] 
         else:
             if not isinstance(e, Mapping):
                 raise ProfileError("'effort' is null or an object")
-            extra = set(e) - {"kwarg", "levels", "sentence_re", "unmarked", "escalation", "system_end", "rendered"}
+            extra = set(e) - {"kwarg", "levels", "sentence_re", "unmarked", "escalation", "system_end", "rendered",
+                              "in_head"}
             if extra:
                 raise ProfileError(f"unknown effort key(s): {', '.join(sorted(extra))}")
             levels = e.get("levels")
@@ -373,6 +410,9 @@ def from_dict(d: Mapping[str, Any], known: Optional[Mapping[str, ModelProfile]] 
             unmarked = e.get("unmarked", "medium")
             if unmarked not in EFFORT_LEVELS:
                 raise ProfileError("effort.unmarked is one of " + "/".join(EFFORT_LEVELS))
+            in_head = e.get("in_head", True)
+            if not isinstance(in_head, bool):
+                raise ProfileError("effort.in_head is true or false")
             rendered = e.get("rendered", {})
             if not (isinstance(rendered, Mapping) and all(
                     isinstance(k, str) and k in words and isinstance(v, str) and v for k, v in rendered.items())):
@@ -386,7 +426,7 @@ def from_dict(d: Mapping[str, Any], known: Optional[Mapping[str, ModelProfile]] 
             kw["effort"] = Effort(kwarg=e.get("kwarg", EFFORT_KEY), levels=dict(levels),
                                   sentence_re=pat, unmarked=unmarked,
                                   escalation=e.get("escalation", ""), system_end=e.get("system_end", ""),
-                                  rendered=dict(rendered))
+                                  rendered=dict(rendered), in_head=in_head)
     if "tokenizer" in d:
         t = d["tokenizer"]
         if t is None:
@@ -501,6 +541,18 @@ def resolve(profiles: Mapping[str, ModelProfile], *names) -> Optional[ModelProfi
     return best[2]
 
 
+def resolve_by_arch(profiles: Mapping[str, ModelProfile], meta: Optional[Mapping[str, Any]]) -> Optional[ModelProfile]:
+    """The profile for what a model file says it is (``meta``: its
+    ``architecture`` and vocabulary name ``pre``), or None. An operator's
+    file wins over a built-in; among the operator's, the first read."""
+    said = {str(v).strip().lower() for v in (meta or {}).values() if isinstance(v, str) and v.strip()}
+    if not said:
+        return None
+    hits = [p for p in profiles.values() if said & set(p.arch)]
+    mine = [p for p in hits if BUILTIN.get(p.name) is not p]
+    return (mine or hits or [None])[0]
+
+
 # --- the main model's profile --------------------------------------------------
 
 _lock = threading.Lock()
@@ -562,15 +614,20 @@ def set_main(profile: Optional[ModelProfile], why: str = "") -> None:
 
 def choose_main(model_arg: str = "", server_model: str = "",
                 known: Optional[Mapping[str, ModelProfile]] = None,
-                override: Optional[str] = None) -> Tuple[ModelProfile, str, bool]:
+                override: Optional[str] = None,
+                meta: Optional[Mapping[str, Any]] = None) -> Tuple[ModelProfile, str, bool]:
     """Which profile the main model gets: ``(profile, why, sure)``.
 
     1. ``GHOST_MODEL_PROFILE`` (``override``) names one — the operator's word.
-    2. The running server's model file fits one.
-    3. ``--model`` fits one.
-    4. The default profile (``DEFAULT``, or the operator's file of that
-       name); ``sure`` is False when the server named a model no profile
-       fits — the caller says so loudly, once.
+    2. The running server's model file NAME fits one.
+    3. What that file SAYS it is fits one (``meta``: its architecture and
+       vocabulary name, read from the file when its name fits nothing).
+    4. The server named a model and nothing fits: ``generic`` — nothing is
+       assumed about a model nothing is known about (§4VP; until then it got
+       Qwen's sampler, effort words and thinking switch). ``sure`` is False:
+       the caller says so loudly, once.
+    5. The server did not say which model it runs: ``--model``, else the
+       default profile (``DEFAULT``, or the operator's file of that name).
     """
     known = known if known is not None else profiles()
     want = (os.environ.get("GHOST_MODEL_PROFILE", "") if override is None else override).strip().lower()
@@ -583,12 +640,15 @@ def choose_main(model_arg: str = "", server_model: str = "",
         p = resolve(known, served)
         if p is not None:
             return p, f"the server runs {served}", True
+        p = resolve_by_arch(known, meta)
+        if p is not None:
+            said = ", ".join(sorted({str(v) for v in (meta or {}).values() if v}))
+            return p, f"the server runs {served}, which says it is {said}", True
+        return known.get(GENERIC.name, GENERIC), f"the server's {served} fits no profile", False
     p = resolve(known, model_arg) if model_arg else None
     if p is not None:
-        return p, f"--model {model_arg}" + (f" (the server's {served} fits no profile)" if served else ""), not served
-    return known.get(DEFAULT.name, DEFAULT), (
-        f"default (the server's {served} fits no profile)" if served
-        else "default (the server did not say which model it runs)"), not served
+        return p, f"--model {model_arg} (the server did not say which model it runs)", True
+    return known.get(DEFAULT.name, DEFAULT), "default (the server did not say which model it runs)", True
 
 
 def announce_main(profile: ModelProfile, why: str, sure: bool = True) -> None:
@@ -599,16 +659,16 @@ def announce_main(profile: ModelProfile, why: str, sure: bool = True) -> None:
     if prev is profile and prev_why == why:
         return
     if not sure:
-        logger.warning("model profile: %s — using '%s'. Add a profile file to %s or set "
-                       "GHOST_MODEL_PROFILE.", why, profile.name,
+        logger.warning("model profile: %s — using '%s' (nothing assumed: the server's sampler defaults, no "
+                       "effort levels). Add a profile file to %s or set GHOST_MODEL_PROFILE.", why, profile.name,
                        profiles_dir() or "$GHOST_HOME/system/model_profiles")
     else:
         logger.info("model profile: %s (%s)", profile.name, why)
 
 
-def select_main(model_arg: str = "", server_model: str = "") -> ModelProfile:
+def select_main(model_arg: str = "", server_model: str = "", meta: Optional[Mapping[str, Any]] = None) -> ModelProfile:
     """Choose, set and announce the main profile; returns it."""
-    p, why, sure = choose_main(model_arg, server_model)
+    p, why, sure = choose_main(model_arg, server_model, meta=meta)
     announce_main(p, why, sure)
     return p
 
@@ -656,6 +716,32 @@ def context_budget(flag: int, n_ctx: int, profile: Optional[ModelProfile] = None
 
 # --- intent → the model's dialect ---------------------------------------------
 
+#: The request fields a profile may set on a thinking-off call: the server's
+#: cap on reasoning tokens, under both names llama-server reads.
+THINK_OFF_REQUEST_FIELDS = frozenset({"reasoning_budget_tokens", "thinking_budget_tokens"})
+
+
+def _asks_no_think_now(payload: dict) -> bool:
+    """The LAST user message ends in the written switch: this call is the one
+    asked not to think. (One in an older message is history: the owner wrote
+    it once, and every later call of the conversation must still think.)"""
+    for m in reversed(payload.get("messages") or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, list):
+                c = next((p.get("text") for p in reversed(c)
+                          if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str)), "")
+            return isinstance(c, str) and c.rstrip().endswith(SOFT_NO_THINK)
+    return False
+
+
+def _with_think_off_fields(payload: dict, profile: "ModelProfile") -> dict:
+    """``payload`` with the profile's thinking-off request fields (a field
+    the caller set itself is the caller's). The same object when none apply."""
+    add = {k: v for k, v in profile.think_off_request.items() if k not in payload}
+    return {**payload, **add} if add else payload
+
+
 def shape(payload, profile: Optional[ModelProfile]):
     """``payload`` as the model behind ``profile`` must receive it: the
     agent's thinking-off switch and effort level rewritten into the model's
@@ -666,10 +752,15 @@ def shape(payload, profile: Optional[ModelProfile]):
     sent as written."""
     if profile is None or not isinstance(payload, dict):
         return payload
-    payload = _soft_switch(payload, profile)
+    switched = _soft_switch(payload, profile)
+    if switched is not payload and not profile.dialect.soft_no_think and _asks_no_think_now(payload):
+        switched = _with_think_off_fields(switched, profile)      # its written switch was taken out: the fields stand in
+    payload = switched
     kw = payload.get("chat_template_kwargs")
     if not isinstance(kw, dict) or not kw:
         return payload
+    if kw.get(THINK_KEY) is False:
+        payload = _with_think_off_fields(payload, profile)
     new = dict(kw)
     eff = profile.effort
     level = new.get(EFFORT_KEY)
@@ -740,6 +831,29 @@ def _soft_switch(payload: dict, profile: ModelProfile) -> dict:
     return payload if out is None else {**payload, "messages": out}
 
 
-def shape_main(payload):
-    """``shape`` for the main model."""
-    return shape(payload, main())
+def think_cap_added(payload, shaped, profile: Optional[ModelProfile]) -> dict:
+    """The thinking-off request fields ``shape`` put on ``shaped`` that
+    ``payload`` did not carry ({} = none: thinking was not off, the model has
+    no such fields, or the caller set its own)."""
+    if profile is None or shaped is payload or not isinstance(payload, dict) or not isinstance(shaped, dict):
+        return {}
+    return {k: shaped[k] for k in profile.think_off_request if k in shaped and k not in payload}
+
+
+def shape_main(payload, *, quiet: bool = False):
+    """``shape`` for the main model, for a request about to be SENT: a cap on
+    reasoning it put on is logged, one line per call (the only place the
+    request as sent can be seen). ``quiet`` = shaped for a render, not a send."""
+    profile = main()
+    shaped = shape(payload, profile)
+    if not quiet:
+        try:
+            added = think_cap_added(payload, shaped, profile)
+            if added:
+                from ..utils.logging import Icons, pretty_log
+                pretty_log("Thinking Cap", "thinking off for this call — sent with "
+                           + ", ".join(f"{k}={v}" for k, v in sorted(added.items())) + f" ({profile.name})",
+                           icon=Icons.EFFORT_LOW)
+        except Exception:                           # a log line never costs a request
+            pass
+    return shaped

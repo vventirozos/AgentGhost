@@ -319,7 +319,9 @@ def test_one_hook_per_turn_and_no_automatic_level():
                     "level_in_render", "LEVELS",
                     # §4VM: none of these picks a level either — whether the main model HAS a harder
                     # sentence, which level a thinking-off call renders, and dropping a looked-up level
-                    "escalation_sentence", "thinking_off_level", "forget_server_default"}
+                    "escalation_sentence", "thinking_off_level", "forget_server_default",
+                    # §4VP: whether the level is written in the head at all (it picks none)
+                    "level_is_in_head"}
 
 
 def test_routes_and_autonomous_turns():

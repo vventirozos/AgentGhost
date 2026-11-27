@@ -8474,6 +8474,43 @@ from .stream_guards import (  # noqa: E402
 _TEXT_CALL_RE = re.compile(r"<tool_call>\s*(?:<function\b|\{).*?(?:</tool_call>|\Z)", re.S | re.I)
 
 
+def model_wording(text: str) -> str:
+    """§4VP: one of the agent's own messages as the main model should read it —
+    for a model without `<think>` tags no tag is named, and for a model shown
+    its calls in its own format no `<tool_call>` / `<tool_response>` is named
+    (fixed rewordings, `prompts.py`). Unchanged for Qwen. For the agent's OWN
+    sentences only — never for text from the owner, a tool or the model."""
+    d = _mp.main().dialect
+    if d.think_tags and d.history != "native":
+        return text
+    from .prompts import without_call_markup, without_think_tags
+    if not d.think_tags:
+        text = without_think_tags(text)
+    if d.history == "native":
+        text = without_call_markup(text)
+    return text
+
+
+def native_parse_error(reason: str, failures: int = 1) -> str:
+    """§4VP: what a model with its own call format is told after it wrote a
+    tool call as TEXT that could not be read (the Qwen messages explain XML
+    closing tags and CDATA — none of it is this model's). Two cases matter to
+    it: the output was cut off, or it was text. From the second failure in a
+    row it is told to stop repeating itself, as Qwen is."""
+    if reason != "truncated" and failures >= 2:
+        return (f"SYSTEM ERROR (failed {failures}x): STOP repeating the same output — it is text, and text is never "
+                "run. Nothing ran. Do not type call syntax at all: make ONE structured tool call, as "
+                + _tool_call_format_example(True, param="path", value="file.py")
+                + ". For a large file, write it in parts with several `file_system` calls. Do not ask for clarification.")
+    if reason == "truncated":
+        return ("SYSTEM ERROR: your previous output was CUT OFF before the tool call was complete — a length "
+                "problem, not a format problem. Make the call again with LESS in it: a shorter script (under "
+                "80 lines), or write the file in parts with several calls. Make it as "
+                + _tool_call_format_example(True, param="path", value="file.py") + ".")
+    return ("SYSTEM ERROR: you wrote a tool call as text and it could not be read. Nothing ran. Make the call "
+            "again as " + _tool_call_format_example(True, param="path", value="file.py") + ".")
+
+
 def native_history_on(context) -> bool:
     """§4VO: the main model is shown its earlier calls and their results in
     its OWN format — the profile asks for it and the native-tools path is on."""
@@ -8492,6 +8529,18 @@ def think_guidance_for_model(think_budget: str) -> str:
         from .prompts import without_think_tags
         text = without_think_tags(text)
     return text
+
+
+def final_generation_directive(think_budget: str) -> str:
+    """The header of a forced final answer: no tool this turn, plain prose."""
+    return model_wording(
+        "# Final-generation turn\n\n"
+        "You are answering the user directly this turn. "
+        "DO NOT emit any <tool_call> blocks. Reply in "
+        "plain prose only.\n\n"
+        "ADAPT YOUR THINKING DEPTH TO THE TASK:\n"
+        f"{think_guidance_for_model(think_budget)}\n"
+    ).replace("\r", "")
 
 
 def native_tool_header(pointer: str, think_budget: str) -> str:
@@ -8552,6 +8601,8 @@ def _native_history_row(m: dict) -> dict:
         calls.append({"id": str(tc.get("id") or f"call_{len(calls)}"), "type": "function",
                       "function": {"name": str(name), "arguments": _object_arguments(fn.get("arguments", "{}"))}})
     content = m.get("content")
+    if isinstance(content, str) and WATCHDOG_BREAK_NOTE in content:
+        content = content.replace(WATCHDOG_BREAK_NOTE, model_wording(WATCHDOG_BREAK_NOTE))   # the agent's own note
     if calls and isinstance(content, str):
         content = _TEXT_CALL_RE.sub("", content).strip()
     row = {"role": "assistant", "content": content if content is not None else ""}
@@ -17540,13 +17591,13 @@ class GhostAgent:
         the server's default level)."""
         profile_str = (_MEMBER_PROFILE_PLACEHOLDER if member
                        else await request_state.get_profile_str())
-        base_prompt = SYSTEM_PROMPT.replace("{{PROFILE}}", profile_str)
+        base_prompt = model_wording(SYSTEM_PROMPT).replace("{{PROFILE}}", profile_str)   # §4VP: as _select_system_prompt
         # Mirror the one config-driven system-slot splice a live request
         # applies (handle_chat's perfect_it block) — byte-exactness.
         if getattr(self.context.args, 'perfect_it', False) is True:
             base_prompt = base_prompt.replace(
                 "### TOOL ORCHESTRATION",
-                '5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (the most recent <tool_response> output in this conversation) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION'
+                model_wording('5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (the most recent <tool_response> output in this conversation) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION')
             )
 
         # §4N D-MAJOR-1: match the live system slot byte-for-byte —
@@ -17839,7 +17890,7 @@ class GhostAgent:
             new_hs = await self._head_plan_for_level(llm, cur_level, rid)
             if isinstance(new_hs, dict):
                 hs = self._head_plan_last = new_hs
-        slot_level = getattr(self, "_slot_level", None)
+        slot_level = self._slot_level_now(cur_level)
         level_moved = slot_level is not None and cur_level is not None and slot_level != cur_level
         held_by = getattr(llm, "_slot_request", None)
         if (_conv and level_moved and owner and owner == key and isinstance(held_by, str) and held_by
@@ -18030,6 +18081,19 @@ class GhostAgent:
             return
         await self._conv_save(llm, what, _late)
 
+    def _slot_level_now(self, cur_level) -> Optional[str]:
+        """The effort level the slot is booked at. §4VP: for a model that writes
+        the level AFTER the head nothing is booked — and a level left from a
+        model that did (the operator switched models under a running agent) is
+        cleared here: it would key this model's saved conversations under a
+        level its restores never ask for. Cleared at the first call of an owner
+        conversation after the switch — a member's or another conversation's
+        call that displaces the slot before that can still key ONE save under
+        the old level (a re-read at worst; the server has just restarted)."""
+        if cur_level is None and not _effort.level_is_in_head():
+            self._slot_level = None
+        return getattr(self, "_slot_level", None)
+
     @staticmethod
     def _call_level(payload) -> Optional[str]:
         """§4RW-f: the effort level a main call's system block renders — None
@@ -18037,6 +18101,8 @@ class GhostAgent:
         a template without levels). Thinking off writes no sentence: the
         medium head; Default is the server's own level."""
         try:
+            if not _effort.level_is_in_head():
+                return None             # §4VP: one head for every level — nothing to track or restore
             default = _effort.known_server_default()
             if not default:
                 return None
@@ -18990,7 +19056,7 @@ class GhostAgent:
             _head_saves.secure_dir(d)        # §4UD (H14): the owner's tokens — 0700
             ident = await asyncio.to_thread(_head_saves.server_identity, base)
             # §4VM: rendered as it is sent (the level in the model's own word)
-            rendered = await asyncio.to_thread(_head_saves.render, base, _mp.shape_main(payload))
+            rendered = await asyncio.to_thread(_head_saves.render, base, _mp.shape_main(payload, quiet=True))
             key = _head_saves.head_key(ident, rendered)
             n_tokens = _head_saves.stored_tokens(d, key)
             return {"base": base, "dir": d, "key": key, "identity": ident,
@@ -20113,8 +20179,11 @@ class GhostAgent:
         measured no difference between the two (87/95 vs 87/95, p = 1.0), so
         the variant and its seam are retired. The method stays as the ONE
         site a future prompt A/B would reattach to — `body` is accepted and
-        ignored so the call site does not change."""
-        return SYSTEM_PROMPT
+        ignored so the call site does not change.
+
+        §4VP: in the main model's wording (`model_wording`: Qwen's is the text
+        as written)."""
+        return model_wording(SYSTEM_PROMPT)
 
     def _active_project_constraints(self, limit: int = 5, *, project_id=None,
                                     request_text: str) -> List[str]:
@@ -23695,8 +23764,8 @@ class GhostAgent:
         the cached prompt the next turn needs. The same object when the switch
         is off or the last turn used the default."""
         try:
-            if not _effort.enabled():
-                return payload
+            if not _effort.enabled() or not _effort.level_is_in_head():
+                return payload          # §4VP: a level written after the head does not make another head
             return _effort.apply(payload, str(getattr(self, "_main_effort_level", "") or ""))
         except Exception:  # noqa: BLE001
             return payload
@@ -25450,6 +25519,8 @@ class GhostAgent:
                             "wrap it in `<![CDATA[ ... ]]>`."
                         )
 
+                    if native_history_on(self.context):
+                        err_msg_content = native_parse_error(parse_failure_reason, consecutive_parse_errors)   # §4VP: not Qwen's XML advice
                     err_msg = {
                         "role": "tool",
                         "tool_call_id": tool["id"],
@@ -31141,8 +31212,10 @@ class GhostAgent:
                         "`<tool_call>` syntax — just make the call. Do not write a "
                         "long <think> block."
                     ) if tool_call_flood_detected else (
-                        thinking_loop_answer_steer(last_user_content) if _answer_retry
+                        thinking_loop_answer_steer(last_user_content) if _answer_retry        # quotes the owner: sent as is
                         else "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block.")
+                    if tool_call_flood_detected or not _answer_retry:
+                        _loop_steer = model_wording(_loop_steer)                     # §4VP: the agent's own sentences only
                     messages.append({"role": "user", "content": _loop_steer})
                     if execution_failure_count >= 6:
                         # (§4KV, found in review: the Strike Cap at the top of
@@ -31806,7 +31879,7 @@ class GhostAgent:
                         if not is_valid_final and len(clean_ui.split()) < 100:
                             pretty_log("Agent Parser", f"Caught conversational filler without XML ({mentioned_tools[0]}).", level="WARNING", icon=Icons.WARN)
                             messages.append(msg)
-                            messages.append({"role": "user", "content": f"{_FILLER_ALERT_HEAD} `{mentioned_tools[0]}`, but you DID NOT output the actual XML `<tool_call>` block! Do not narrate your actions. Output the XML `<tool_call>` immediately."})
+                            messages.append({"role": "user", "content": model_wording(f"{_FILLER_ALERT_HEAD} `{mentioned_tools[0]}`, but you DID NOT output the actual XML `<tool_call>` block! Do not narrate your actions. Output the XML `<tool_call>` immediately.")})
                             # a nudge, not a strike (req 8ecb1424: two false
                             # alarms booked two strikes on a chat turn)
                             return "continue"
@@ -31902,7 +31975,7 @@ class GhostAgent:
                             reasoning_content, cut_round_note(request_id_context.get(), "", last_user_content))})
                     else:
                         pretty_log("Agent Parser", "Model stalled after thinking. Forcing retry.", level="WARNING", icon=Icons.WARN)
-                        messages.append({"role": "user", "content": "SYSTEM ALERT: You generated a thought process but stopped abruptly without outputting a valid XML <tool_call> or a response to the user. DO NOT STOP. If you need to use a tool, output the required XML <tool_call> block. If the task is fully complete, provide your final response to the user."})
+                        messages.append({"role": "user", "content": model_wording("SYSTEM ALERT: You generated a thought process but stopped abruptly without outputting a valid XML <tool_call> or a response to the user. DO NOT STOP. If you need to use a tool, output the required XML <tool_call> block. If the task is fully complete, provide your final response to the user.")})
                     execution_failure_count += 1
                     _forget_wall(strikes)   # §4UR-w r4: the latest strike is not a wall
                     return "continue"
@@ -33399,7 +33472,7 @@ class GhostAgent:
                     # placeholder was always the literal string "None").
                     base_prompt = base_prompt.replace(
                         "### TOOL ORCHESTRATION",
-                        '5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (the most recent <tool_response> output in this conversation) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION'
+                        model_wording('5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (the most recent <tool_response> output in this conversation) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION')
                     )
                 base_prompt += working_memory_context
 
@@ -34185,14 +34258,7 @@ class GhostAgent:
                         # re-prefill), so the pinned path keeps the normal header
                         # below and routes this directive through the volatile
                         # block (built at _stable_injection).
-                        tool_header_block = (
-                            f"# Final-generation turn\n\n"
-                            f"You are answering the user directly this turn. "
-                            f"DO NOT emit any <tool_call> blocks. Reply in "
-                            f"plain prose only.\n\n"
-                            f"ADAPT YOUR THINKING DEPTH TO THE TASK:\n"
-                            f"{think_guidance_for_model(think_budget)}\n"
-                        ).replace("\r", "")
+                        tool_header_block = final_generation_directive(think_budget)   # §4VP
                         minified_schemas = ""  # for downstream visibility
                     elif _native_tools_active:
                         # Tool definitions arrive via the native API
@@ -34238,14 +34304,7 @@ class GhostAgent:
                         # suppressed downstream (is_final_generation), so the model
                         # cannot call a native tool, and this directive forbids a
                         # text <tool_call>.
-                        _final_gen_directive = (
-                            f"# Final-generation turn\n\n"
-                            f"You are answering the user directly this turn. "
-                            f"DO NOT emit any <tool_call> blocks. Reply in "
-                            f"plain prose only.\n\n"
-                            f"ADAPT YOUR THINKING DEPTH TO THE TASK:\n"
-                            f"{think_guidance_for_model(think_budget)}\n"
-                        ).replace("\r", "")
+                        _final_gen_directive = final_generation_directive(think_budget)   # §4VP
                     # (§4TD: no "### SKILL PLAYBOOK" block — lesson retrieval,
                     # off behind a flag since §4ON, is removed with the store.)
 

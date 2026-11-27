@@ -119,6 +119,26 @@ def sync(args, system_dir: Optional[Path] = None, *, boot: bool = False, timeout
         _running.release()
 
 
+#: What a model file said it is, by (path, size, modified): reading it parses the
+#: file's whole key-value block (seconds), and a model whose tokenizer cannot be
+#: checked yet is looked at again every minute.
+_META_SEEN: dict = {}
+
+
+def _file_meta(path: str):
+    """``read_meta`` of a model file this process can read, remembered while
+    the file is unchanged. None = not readable here (another machine's file)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_size, st.st_mtime_ns)
+    if key not in _META_SEEN:
+        _META_SEEN.clear()                          # one model at a time
+        _META_SEEN[key] = _gguf.read_meta(path)
+    return _META_SEEN[key]
+
+
 def _sync(args, system_dir, boot: bool, timeout: float, now: float) -> Dict[str, Any]:
     with _lock:
         _state["asked_at"] = now
@@ -145,7 +165,13 @@ def _sync(args, system_dir, boot: bool, timeout: float, now: float) -> Dict[str,
         model_changed = (boot or seen.get("model_path") != seen_before.get("model_path")
                          or files != files_before or build_again)
         if model_changed:
-            profile, why, sure = _mp.choose_main(str(getattr(args, "model", "") or ""), seen.get("model_path", ""))
+            path = seen.get("model_path", "")
+            meta = None
+            if path and _mp.resolve(_mp.profiles(), path) is None:
+                meta = _file_meta(path)             # the name fits nothing: what does the file say it is?
+            profile, why, sure = _mp.choose_main(str(getattr(args, "model", "") or ""), path, meta=meta)
+            if not sure and path and meta is None:
+                why += " (its file cannot be read from here, so its family is not known)"
             source = _load_counting(profile, seen.get("model_path", ""), sysdir, base, timeout)
             build_again = source != "model file" and _gguf.last_outcome == _gguf.SERVER_SILENT
             _mp.announce_main(profile, why, sure)
